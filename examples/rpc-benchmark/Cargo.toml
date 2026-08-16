@@ -10,7 +10,7 @@ async-trait.workspace = true
 bytes.workspace = true
 clap.workspace = true
 futures-util.workspace = true
-lattice-actor.workspace = true
+lattice-actor = { workspace = true, features = ["distributed"] }
 lattice-core.workspace = true
 lattice-gateway.workspace = true
 lattice-placement.workspace = true

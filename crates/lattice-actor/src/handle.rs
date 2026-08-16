@@ -10,6 +10,7 @@ use std::{
 };
 
 use broadcast::error::{RecvError, TryRecvError};
+#[cfg(feature = "distributed")]
 use lattice_core::actor_ref::{ActorRef, ProtocolTag, ReferenceError};
 use tokio::sync::{broadcast, oneshot, watch};
 
@@ -40,6 +41,7 @@ pub(crate) struct ActorHandleInit<A: Actor> {
     pub(crate) terminal_hook: Arc<Mutex<Option<TerminalHook>>>,
     pub(crate) normal_tx: Sender<ActorCommand<A>>,
     pub(crate) system_tx: Sender<ActorCommand<A>>,
+    #[cfg(feature = "distributed")]
     pub(crate) actor_ref: Option<ActorRef>,
     pub(crate) observer: ActorObserverHandle,
 }
@@ -173,6 +175,7 @@ impl<A: Actor> ActorHandle<A> {
             metadata: Arc::new(ActorMetadata::new(
                 type_name::<A>(),
                 init.local_ref,
+                #[cfg(feature = "distributed")]
                 init.actor_ref,
             )),
             observer: init.observer,
@@ -184,6 +187,7 @@ impl<A: Actor> ActorHandle<A> {
         self.local_ref
     }
 
+    #[cfg(feature = "distributed")]
     pub fn actor_ref(&self) -> Option<&ActorRef> {
         self.metadata.actor_ref()
     }
@@ -199,6 +203,7 @@ impl<A: Actor> ActorHandle<A> {
     /// Returns this activation's exact reference typed by a protocol marker.
     /// The embedded protocol ID is checked before the typed reference is
     /// returned.
+    #[cfg(feature = "distributed")]
     pub fn typed_actor_ref<P: ProtocolTag>(&self) -> Result<Option<ActorRef<P>>, ReferenceError> {
         self.actor_ref().map(ActorRef::try_typed::<P>).transpose()
     }
@@ -263,6 +268,7 @@ impl<A: Actor> ActorHandle<A> {
         }
     }
 
+    #[cfg(feature = "distributed")]
     pub(crate) async fn ask_until_owned<R>(
         self,
         request: R,
@@ -295,7 +301,7 @@ impl<A: Actor> ActorHandle<A> {
         <A as crate::traits::Actor>::Behavior: crate::state_machine::Accepts<M>,
         M: Message,
     {
-        self.send_tell_on_lane(msg, None, MailboxLane::Normal).await
+        self.send_tell_on_lane(msg, MailboxLane::Normal).await
     }
 
     /// Attempts to admit one one-way message without waiting for capacity.
@@ -307,7 +313,7 @@ impl<A: Actor> ActorHandle<A> {
         <A as crate::traits::Actor>::Behavior: crate::state_machine::Accepts<M>,
         M: Message,
     {
-        self.try_tell_on_lane(msg, None, MailboxLane::Normal)
+        self.try_tell_on_lane(msg, MailboxLane::Normal)
     }
 
     pub async fn stop(&self, reason: StopReason) -> Result<(), ActorTellError<StopReason>> {
@@ -406,6 +412,7 @@ impl<A: Actor> ActorHandle<A> {
         }
     }
 
+    #[cfg(feature = "distributed")]
     pub(crate) fn mark_external_authority_lost(&self) -> ActorLifecycleState {
         let previous = self.lifecycle_state();
         self.mark_stop_failure_quarantined();
@@ -413,6 +420,7 @@ impl<A: Actor> ActorHandle<A> {
         previous
     }
 
+    #[cfg(feature = "distributed")]
     pub(crate) fn begin_fenced_stop(
         &self,
         previous: ActorLifecycleState,
@@ -442,7 +450,7 @@ impl<A: Actor> ActorHandle<A> {
         <A as crate::traits::Actor>::Behavior: crate::state_machine::Accepts<M>,
         M: Message,
     {
-        self.try_tell_on_lane(msg, None, MailboxLane::Normal)
+        self.try_tell_on_lane(msg, MailboxLane::Normal)
     }
 
     pub(crate) async fn send_tell_internal<M>(&self, msg: M) -> Result<(), ActorTellError<M>>
@@ -451,7 +459,7 @@ impl<A: Actor> ActorHandle<A> {
         <A as crate::traits::Actor>::Behavior: crate::state_machine::Accepts<M>,
         M: Message,
     {
-        self.send_tell_on_lane(msg, None, MailboxLane::Normal).await
+        self.send_tell_on_lane(msg, MailboxLane::Normal).await
     }
 
     pub(crate) async fn send_system_tell_internal<M>(&self, msg: M) -> Result<(), ActorTellError<M>>
@@ -460,7 +468,7 @@ impl<A: Actor> ActorHandle<A> {
         <A as crate::traits::Actor>::Behavior: crate::state_machine::Accepts<M>,
         M: Message,
     {
-        self.send_tell_on_lane(msg, None, MailboxLane::System).await
+        self.send_tell_on_lane(msg, MailboxLane::System).await
     }
 
     pub(crate) async fn send_envelope_internal<E>(&self, envelope: E) -> Result<(), ActorCallError>
@@ -502,6 +510,7 @@ impl<A: Actor> ActorHandle<A> {
         self.terminal_cleanup_started.store(true, Ordering::Release);
     }
 
+    #[cfg(feature = "distributed")]
     pub(crate) fn terminal_cleanup_started(&self) -> bool {
         self.terminal_cleanup_started.load(Ordering::Acquire)
     }
@@ -572,7 +581,7 @@ impl<A: Actor> ActorHandle<A> {
         <A as crate::traits::Actor>::Behavior: crate::state_machine::Accepts<M>,
         M: Message,
     {
-        self.try_tell_on_lane(msg, None, MailboxLane::Normal)
+        self.try_tell_on_lane(msg, MailboxLane::Normal)
     }
 
     #[cfg(test)]
@@ -582,42 +591,10 @@ impl<A: Actor> ActorHandle<A> {
         <A as crate::traits::Actor>::Behavior: crate::state_machine::Accepts<M>,
         M: Message,
     {
-        self.try_tell_on_lane(msg, None, MailboxLane::System)
+        self.try_tell_on_lane(msg, MailboxLane::System)
     }
 
-    pub(crate) fn try_tell_from<M>(
-        &self,
-        msg: M,
-        sender: Option<ActorRef>,
-    ) -> Result<(), ActorTellError<M>>
-    where
-        A: Handler<M>,
-        <A as crate::traits::Actor>::Behavior: crate::state_machine::Accepts<M>,
-        M: Message,
-    {
-        self.try_tell_on_lane(msg, sender, MailboxLane::Normal)
-    }
-
-    pub(crate) async fn tell_from<M>(
-        &self,
-        msg: M,
-        sender: Option<ActorRef>,
-    ) -> Result<(), ActorTellError<M>>
-    where
-        A: Handler<M>,
-        <A as crate::traits::Actor>::Behavior: crate::state_machine::Accepts<M>,
-        M: Message,
-    {
-        self.send_tell_on_lane(msg, sender, MailboxLane::Normal)
-            .await
-    }
-
-    fn try_tell_on_lane<M>(
-        &self,
-        msg: M,
-        sender: Option<ActorRef>,
-        lane: MailboxLane,
-    ) -> Result<(), ActorTellError<M>>
+    fn try_tell_on_lane<M>(&self, msg: M, lane: MailboxLane) -> Result<(), ActorTellError<M>>
     where
         A: Handler<M>,
         <A as crate::traits::Actor>::Behavior: crate::state_machine::Accepts<M>,
@@ -647,19 +624,14 @@ impl<A: Actor> ActorHandle<A> {
                 message: msg,
             });
         }
-        let command = ActorCommand::envelope(TellEnvelope::new(msg, sender));
+        let command = ActorCommand::envelope(TellEnvelope::new(msg));
         let metadata = self.observed_metadata(&command, lane);
         permit.send(command);
         self.observe_command_enqueued(metadata, channel);
         Ok(())
     }
 
-    async fn send_tell_on_lane<M>(
-        &self,
-        msg: M,
-        sender: Option<ActorRef>,
-        lane: MailboxLane,
-    ) -> Result<(), ActorTellError<M>>
+    async fn send_tell_on_lane<M>(&self, msg: M, lane: MailboxLane) -> Result<(), ActorTellError<M>>
     where
         A: Handler<M>,
         <A as crate::traits::Actor>::Behavior: crate::state_machine::Accepts<M>,
@@ -703,7 +675,7 @@ impl<A: Actor> ActorHandle<A> {
                 message: msg,
             });
         }
-        let command = ActorCommand::envelope(TellEnvelope::new(msg, sender));
+        let command = ActorCommand::envelope(TellEnvelope::new(msg));
         let metadata = self.observed_metadata(&command, lane);
         permit.send(command);
         self.observe_command_enqueued(metadata, channel);

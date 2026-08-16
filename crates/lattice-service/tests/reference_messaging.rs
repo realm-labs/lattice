@@ -23,7 +23,7 @@ use tokio::sync::oneshot;
 
 const SOURCE_PROTOCOL_ID: u64 = 0x7265_665f_7372_6301;
 const SINK_PROTOCOL_ID: u64 = 0x7265_665f_736e_6b01;
-type SenderObserver = Arc<Mutex<Option<oneshot::Sender<Option<ActorRef>>>>>;
+type DeliveryObserver = Arc<Mutex<Option<oneshot::Sender<()>>>>;
 
 #[derive(Debug, Serialize, Deserialize, lattice_actor::Message)]
 #[serde(bound = "")]
@@ -91,7 +91,7 @@ impl Handler<SendTo> for SourceActor {
 
 #[derive(Debug)]
 struct SinkActor {
-    observed: SenderObserver,
+    observed: DeliveryObserver,
 }
 
 impl Actor for SinkActor {
@@ -102,11 +102,11 @@ impl Actor for SinkActor {
 impl Handler<Delivered> for SinkActor {
     async fn handle(
         &mut self,
-        ctx: &mut HandlerContext<'_, Self>,
+        _ctx: &mut HandlerContext<'_, Self>,
         _message: Delivered,
     ) -> Result<(), ActorError> {
         if let Some(observed) = self.observed.lock().expect("observer poisoned").take() {
-            let _ = observed.send(ctx.sender().cloned());
+            let _ = observed.send(());
         }
         Ok(())
     }
@@ -227,8 +227,7 @@ async fn deserialized_actor_ref_sends_without_binding() {
         .await
         .unwrap();
 
-    let sender = observed_rx.await.unwrap().expect("actor sender missing");
-    assert!(sender.same_activation(&source_ref));
+    observed_rx.await.unwrap();
 
     source_handle.stop(StopReason::Requested).await.unwrap();
     sink_handle.stop(StopReason::Requested).await.unwrap();

@@ -7,12 +7,13 @@ use lattice_actor::error::{ActorError, ActorSpawnError};
 use lattice_actor::handle::ActorHandle;
 use lattice_actor::mailbox::MailboxConfig;
 use lattice_actor::reply::ReplyTo;
-use lattice_actor::runtime::{ActorExecutionPolicy, ActorScheduler, PassivationPolicy};
-use lattice_actor::runtime::{ActorRuntime, ActorSpawnOptions};
+use lattice_actor::runtime::{
+    ActorExecutionPolicy, ActorRuntime, ActorScheduler, ActorSpawnOptions, PassivationPolicy,
+    SchedulerKey,
+};
 use lattice_actor::traits::{
     Actor, ChildActorKey, ChildActorOptions, ChildSupervision, Handler, Responder, StopReason,
 };
-use lattice_core::id::ActorId;
 use lattice_core::service_context::ServiceContext;
 use tokio::sync::{Mutex, mpsc};
 
@@ -71,12 +72,12 @@ impl Actor for ParentActor {
             (
                 "keyed-a",
                 ActorExecutionPolicy::KeyedWorkerPool { worker_count: 2 },
-                Some(ActorId::Str("shared-child-key".to_owned())),
+                Some(SchedulerKey::from("shared-child-key")),
             ),
             (
                 "keyed-b",
                 ActorExecutionPolicy::KeyedWorkerPool { worker_count: 2 },
-                Some(ActorId::Str("shared-child-key".to_owned())),
+                Some(SchedulerKey::from("shared-child-key")),
             ),
             (
                 "dedicated-a",
@@ -227,11 +228,11 @@ async fn dedicated_thread_pool_policy_runs_actor_with_same_mailbox_semantics() {
                 execution: Some(ActorExecutionPolicy::DedicatedThreadPool { worker_count: 2 }),
                 scheduler_key: None,
                 passivation: PassivationPolicy::Disabled,
+                #[cfg(feature = "distributed")]
                 self_ref: None,
                 service: ServiceContext::empty(),
             },
         )
-        .await
         .unwrap();
 
     let reply = handle.ask(Ping("dedicated"), ASK_TIMEOUT).await.unwrap();
@@ -252,13 +253,13 @@ async fn keyed_worker_pool_execution_policy_runs_actor_with_same_mailbox_semanti
             ActorSpawnOptions {
                 mailbox: MailboxConfig::bounded(8),
                 execution: Some(ActorExecutionPolicy::KeyedWorkerPool { worker_count: 4 }),
-                scheduler_key: Some(ActorId::U64(42)),
+                scheduler_key: Some(SchedulerKey::U64(42)),
                 passivation: PassivationPolicy::Disabled,
+                #[cfg(feature = "distributed")]
                 self_ref: None,
                 service: ServiceContext::empty(),
             },
         )
-        .await
         .unwrap();
 
     let reply = handle.ask(Ping("shard-worker"), ASK_TIMEOUT).await.unwrap();
@@ -276,7 +277,6 @@ async fn child_actors_use_selected_execution_policies_and_scheduler_affinity() {
             },
             ActorSpawnOptions::default(),
         )
-        .await
         .unwrap();
 
     let threads = parent.ask(ChildThreads, ASK_TIMEOUT).await.unwrap();
@@ -297,7 +297,6 @@ async fn supervised_child_restart_preserves_the_selected_execution_policy() {
             },
             ActorSpawnOptions::default(),
         )
-        .await
         .unwrap();
 
     let first = tokio::time::timeout(ASK_TIMEOUT, started_rx.recv())
@@ -315,36 +314,34 @@ async fn supervised_child_restart_preserves_the_selected_execution_policy() {
 #[tokio::test]
 async fn execution_policies_reject_zero_workers() {
     let runtime = ActorRuntime::default();
-    let shard = runtime
-        .spawn_actor(
-            TestActor {
-                events: Arc::new(Mutex::new(Vec::new())),
-            },
-            ActorSpawnOptions {
-                mailbox: MailboxConfig::bounded(8),
-                execution: Some(ActorExecutionPolicy::KeyedWorkerPool { worker_count: 0 }),
-                scheduler_key: None,
-                passivation: PassivationPolicy::Disabled,
-                self_ref: None,
-                service: ServiceContext::empty(),
-            },
-        )
-        .await;
-    let dedicated = runtime
-        .spawn_actor(
-            TestActor {
-                events: Arc::new(Mutex::new(Vec::new())),
-            },
-            ActorSpawnOptions {
-                mailbox: MailboxConfig::bounded(8),
-                execution: Some(ActorExecutionPolicy::DedicatedThreadPool { worker_count: 0 }),
-                scheduler_key: None,
-                passivation: PassivationPolicy::Disabled,
-                self_ref: None,
-                service: ServiceContext::empty(),
-            },
-        )
-        .await;
+    let shard = runtime.spawn_actor(
+        TestActor {
+            events: Arc::new(Mutex::new(Vec::new())),
+        },
+        ActorSpawnOptions {
+            mailbox: MailboxConfig::bounded(8),
+            execution: Some(ActorExecutionPolicy::KeyedWorkerPool { worker_count: 0 }),
+            scheduler_key: None,
+            passivation: PassivationPolicy::Disabled,
+            #[cfg(feature = "distributed")]
+            self_ref: None,
+            service: ServiceContext::empty(),
+        },
+    );
+    let dedicated = runtime.spawn_actor(
+        TestActor {
+            events: Arc::new(Mutex::new(Vec::new())),
+        },
+        ActorSpawnOptions {
+            mailbox: MailboxConfig::bounded(8),
+            execution: Some(ActorExecutionPolicy::DedicatedThreadPool { worker_count: 0 }),
+            scheduler_key: None,
+            passivation: PassivationPolicy::Disabled,
+            #[cfg(feature = "distributed")]
+            self_ref: None,
+            service: ServiceContext::empty(),
+        },
+    );
 
     assert!(matches!(
         shard,
@@ -369,11 +366,11 @@ async fn dedicated_thread_pool_reuses_configured_worker_threads() {
                 execution: Some(ActorExecutionPolicy::DedicatedThreadPool { worker_count: 1 }),
                 scheduler_key: None,
                 passivation: PassivationPolicy::Disabled,
+                #[cfg(feature = "distributed")]
                 self_ref: None,
                 service: ServiceContext::empty(),
             },
         )
-        .await
         .unwrap();
     let second = runtime
         .spawn_actor(
@@ -385,11 +382,11 @@ async fn dedicated_thread_pool_reuses_configured_worker_threads() {
                 execution: Some(ActorExecutionPolicy::DedicatedThreadPool { worker_count: 1 }),
                 scheduler_key: None,
                 passivation: PassivationPolicy::Disabled,
+                #[cfg(feature = "distributed")]
                 self_ref: None,
                 service: ServiceContext::empty(),
             },
         )
-        .await
         .unwrap();
 
     assert_eq!(
@@ -411,11 +408,11 @@ async fn dedicated_thread_pool_is_scoped_by_actor_type() {
                 execution: Some(ActorExecutionPolicy::DedicatedThreadPool { worker_count: 1 }),
                 scheduler_key: None,
                 passivation: PassivationPolicy::Disabled,
+                #[cfg(feature = "distributed")]
                 self_ref: None,
                 service: ServiceContext::empty(),
             },
         )
-        .await
         .unwrap();
     let second = runtime
         .spawn_actor(
@@ -425,11 +422,11 @@ async fn dedicated_thread_pool_is_scoped_by_actor_type() {
                 execution: Some(ActorExecutionPolicy::DedicatedThreadPool { worker_count: 1 }),
                 scheduler_key: None,
                 passivation: PassivationPolicy::Disabled,
+                #[cfg(feature = "distributed")]
                 self_ref: None,
                 service: ServiceContext::empty(),
             },
         )
-        .await
         .unwrap();
 
     assert_ne!(
@@ -449,13 +446,13 @@ async fn keyed_worker_pool_uses_scheduler_key_for_worker_affinity() {
             ActorSpawnOptions {
                 mailbox: MailboxConfig::bounded(8),
                 execution: Some(ActorExecutionPolicy::KeyedWorkerPool { worker_count: 2 }),
-                scheduler_key: Some(ActorId::Str("same-key".to_string())),
+                scheduler_key: Some(SchedulerKey::from("same-key")),
                 passivation: PassivationPolicy::Disabled,
+                #[cfg(feature = "distributed")]
                 self_ref: None,
                 service: ServiceContext::empty(),
             },
         )
-        .await
         .unwrap();
     let second = runtime
         .spawn_actor(
@@ -465,13 +462,13 @@ async fn keyed_worker_pool_uses_scheduler_key_for_worker_affinity() {
             ActorSpawnOptions {
                 mailbox: MailboxConfig::bounded(8),
                 execution: Some(ActorExecutionPolicy::KeyedWorkerPool { worker_count: 2 }),
-                scheduler_key: Some(ActorId::Str("same-key".to_string())),
+                scheduler_key: Some(SchedulerKey::from("same-key")),
                 passivation: PassivationPolicy::Disabled,
+                #[cfg(feature = "distributed")]
                 self_ref: None,
                 service: ServiceContext::empty(),
             },
         )
-        .await
         .unwrap();
 
     assert_eq!(
@@ -482,11 +479,11 @@ async fn keyed_worker_pool_uses_scheduler_key_for_worker_affinity() {
 
 #[test]
 fn keyed_worker_pool_maps_actor_identity_deterministically_to_worker() {
-    let actor_id = ActorId::U64(42);
+    let scheduler_key = SchedulerKey::U64(42);
 
-    let first = ActorScheduler::keyed_worker_index(&actor_id, 8).unwrap();
-    let second = ActorScheduler::keyed_worker_index(&actor_id, 8).unwrap();
-    let zero = ActorScheduler::keyed_worker_index(&actor_id, 0);
+    let first = ActorScheduler::keyed_worker_index(&scheduler_key, 8).unwrap();
+    let second = ActorScheduler::keyed_worker_index(&scheduler_key, 8).unwrap();
+    let zero = ActorScheduler::keyed_worker_index(&scheduler_key, 0);
 
     assert_eq!(first, second);
     assert!(first < 8);

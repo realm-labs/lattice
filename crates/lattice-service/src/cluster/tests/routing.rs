@@ -216,7 +216,7 @@ async fn unavailable_resolution_fails_fast_and_clears_route_single_flight() {
         let reference = reference.clone();
         async move {
             router
-                .tell_entity(None, reference, fingerprint, 1, Bytes::new())
+                .tell_entity(reference, fingerprint, 1, Bytes::new())
                 .await
         }
     });
@@ -225,7 +225,7 @@ async fn unavailable_resolution_fails_fast_and_clears_route_single_flight() {
         let reference = reference.clone();
         async move {
             router
-                .tell_entity(None, reference, fingerprint, 2, Bytes::new())
+                .tell_entity(reference, fingerprint, 2, Bytes::new())
                 .await
         }
     });
@@ -275,7 +275,7 @@ async fn unavailable_resolution_fails_fast_and_clears_route_single_flight() {
         let reference = reference.clone();
         async move {
             router
-                .tell_entity(None, reference, fingerprint, 3, Bytes::new())
+                .tell_entity(reference, fingerprint, 3, Bytes::new())
                 .await
         }
     });
@@ -306,7 +306,7 @@ async fn unavailable_resolution_fails_fast_and_clears_route_single_flight() {
         let router = router.clone();
         async move {
             router
-                .tell_singleton(None, singleton, fingerprint, 4, Bytes::new())
+                .tell_singleton(singleton, fingerprint, 4, Bytes::new())
                 .await
         }
     });

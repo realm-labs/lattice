@@ -1,7 +1,6 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
-use lattice_core::actor_ref::ActorRef;
 
 use crate::{
     handle::ActorHandle,
@@ -17,7 +16,6 @@ pub(crate) enum ProtocolTellDispatch {
     Accepted,
     Deferred {
         payload: Bytes,
-        sender: Option<ActorRef>,
         completion: DispatchFuture,
     },
     Rejected(DispatchError),
@@ -29,7 +27,6 @@ impl<A: Actor, P: Protocol> ActorProtocolBinding<A, P> {
         handle: &ActorHandle<A>,
         message_id: u64,
         payload: Bytes,
-        sender: Option<ActorRef>,
     ) -> ProtocolTellDispatch {
         let payload_size = payload.len();
         let result = match self.protocol.bindings_by_id.get(&message_id) {
@@ -45,7 +42,7 @@ impl<A: Actor, P: Protocol> ActorProtocolBinding<A, P> {
                     })
                 } else {
                     match self.dispatch.get(&message_id) {
-                        Some(ServerDispatch::Tell(dispatch)) => dispatch(handle, payload, sender),
+                        Some(ServerDispatch::Tell(dispatch)) => dispatch(handle, payload),
                         Some(ServerDispatch::Async(_)) => {
                             ProtocolTellDispatch::Rejected(DispatchError::ModeMismatch)
                         }
@@ -83,25 +80,23 @@ impl<A: Actor, P: Protocol> ActorProtocolBindingBuilder<A, P> {
                 .tell::<M, _>(message_id, schema_version, SharedCodec(codec.clone()));
         self.dispatch.push((
             message_id,
-            ServerDispatch::Tell(Arc::new(move |handle, payload, sender| {
+            ServerDispatch::Tell(Arc::new(move |handle, payload| {
                 let message = match codec.decode(&payload) {
                     Ok(message) => message,
                     Err(error) => {
                         return ProtocolTellDispatch::Rejected(DispatchError::Decode(error));
                     }
                 };
-                let retry_sender = sender.clone();
-                match handle.try_tell_from(message, sender) {
+                match handle.try_tell(message) {
                     Ok(()) => ProtocolTellDispatch::Accepted,
                     Err(crate::error::ActorTellError::MailboxFull(message)) => {
-                        let completion_sender = retry_sender.clone();
                         let handle = handle.clone();
                         let observer = handle.observer().clone();
                         let actor = handle.observation_metadata().clone();
                         let payload_size = payload.len();
                         let completion = Box::pin(async move {
                             let result = handle
-                                .tell_from(message, completion_sender)
+                                .tell(message)
                                 .await
                                 .map(|()| DispatchReply::TellAccepted)
                                 .map_err(|_| DispatchError::MailboxRejected);
@@ -118,7 +113,6 @@ impl<A: Actor, P: Protocol> ActorProtocolBindingBuilder<A, P> {
                         });
                         ProtocolTellDispatch::Deferred {
                             payload,
-                            sender: retry_sender,
                             completion,
                         }
                     }

@@ -1,3 +1,5 @@
+#![cfg(feature = "distributed")]
+
 #[test]
 fn protocol_capabilities_are_checked_at_compile_time() {
     let tests = trybuild::TestCases::new();

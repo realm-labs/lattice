@@ -26,9 +26,8 @@ use crate::{
     },
     messaging::{
         codec::{
-            decode_ask_cached, decode_entity_ask, decode_entity_tell_cached, decode_failure,
-            decode_reply, decode_singleton_ask, decode_singleton_tell_cached, decode_tell_cached,
-            failure_frame,
+            decode_ask_cached, decode_entity_ask, decode_entity_tell, decode_failure, decode_reply,
+            decode_singleton_ask, decode_singleton_tell, decode_tell_cached, failure_frame,
         },
         error::{AskError, RemoteFailureCode, RemoteMessageError},
         inbound::{InboundDispatch, dispatch_tell},
@@ -562,11 +561,10 @@ where
                         }
                     }
                     FrameKind::EntityTell if matches!(lane, LaneKind::Bulk(_)) => {
-                        match decode_entity_tell_cached(&frame, target_cache) {
+                        match decode_entity_tell(&frame) {
                             Ok(tell) => {
                                 let _ = dispatch
                                     .tell_entity(
-                                        tell.sender,
                                         tell.target,
                                         tell.message_id,
                                         tell.payload,
@@ -577,11 +575,10 @@ where
                         }
                     }
                     FrameKind::SingletonTell if matches!(lane, LaneKind::Bulk(_)) => {
-                        match decode_singleton_tell_cached(&frame, target_cache) {
+                        match decode_singleton_tell(&frame) {
                             Ok(tell) => {
                                 let _ = dispatch
                                     .tell_singleton(
-                                        tell.sender,
                                         tell.target,
                                         tell.message_id,
                                         tell.payload,

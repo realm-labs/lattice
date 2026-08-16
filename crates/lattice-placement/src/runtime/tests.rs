@@ -2,8 +2,8 @@ use std::{collections::BTreeSet, time::Instant as StdInstant};
 
 use async_trait::async_trait;
 use lattice_core::actor_ref::{
-    ActorRef, ClusterId, ConfigFingerprint, EntityType, NodeAddress, NodeIncarnation,
-    PlacementDomainId, ProtocolId, SingletonKind,
+    ClusterId, ConfigFingerprint, EntityType, NodeAddress, NodeIncarnation, PlacementDomainId,
+    ProtocolId, SingletonKind,
 };
 use lattice_remoting::{
     association::{AssociationKey, LaneAttachment, LaneKind},
@@ -294,7 +294,6 @@ struct NoActors;
 impl InboundDispatch for NoActors {
     async fn tell(
         &self,
-        _sender: Option<ActorRef>,
         _target: ExactActorTarget,
         _message_id: u64,
         _payload: Bytes,

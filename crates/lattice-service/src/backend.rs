@@ -24,10 +24,7 @@ use lattice_remoting::{
         error::{AskError, RemoteFailureCode, RemoteMessageError, TellError},
         inbound::{ImmediateTellDispatch, InboundDispatch},
         outbound::{OutboundMessage, OutboundMessaging},
-        target::{
-            ExactActorTarget, InboundTell, LogicalEntityTarget, LogicalSingletonTarget,
-            SenderIdentity,
-        },
+        target::{ExactActorTarget, InboundTell, LogicalEntityTarget, LogicalSingletonTarget},
     },
     protocol::ProtocolFingerprint,
     watch::{RegisteredWatch, WatchCommand, WatchError, WatchRegistry, encode_watch_command},
@@ -43,7 +40,6 @@ use crate::{
 pub trait LogicalRouter: Send + Sync + 'static {
     async fn tell_entity(
         &self,
-        sender: Option<ActorRef>,
         target: EntityRef,
         fingerprint: ProtocolFingerprint,
         message_id: u64,
@@ -61,7 +57,6 @@ pub trait LogicalRouter: Send + Sync + 'static {
 
     async fn tell_singleton(
         &self,
-        sender: Option<ActorRef>,
         target: SingletonRef,
         fingerprint: ProtocolFingerprint,
         message_id: u64,
@@ -101,7 +96,6 @@ pub trait LogicalRouter: Send + Sync + 'static {
 
     async fn receive_entity_tell(
         &self,
-        _sender: Option<ActorRef>,
         _target: LogicalEntityTarget,
         _message_id: u64,
         _payload: Bytes,
@@ -121,7 +115,6 @@ pub trait LogicalRouter: Send + Sync + 'static {
 
     async fn receive_singleton_tell(
         &self,
-        _sender: Option<ActorRef>,
         _target: LogicalSingletonTarget,
         _message_id: u64,
         _payload: Bytes,
@@ -176,14 +169,13 @@ impl SwitchableDomainRouter {
 impl LogicalRouter for SwitchableDomainRouter {
     async fn tell_entity(
         &self,
-        sender: Option<ActorRef>,
         target: EntityRef,
         fingerprint: ProtocolFingerprint,
         message_id: u64,
         payload: Bytes,
     ) -> Result<(), RemoteMessageError> {
         self.current()?
-            .tell_entity(sender, target, fingerprint, message_id, payload)
+            .tell_entity(target, fingerprint, message_id, payload)
             .await
     }
 
@@ -203,14 +195,13 @@ impl LogicalRouter for SwitchableDomainRouter {
 
     async fn tell_singleton(
         &self,
-        sender: Option<ActorRef>,
         target: SingletonRef,
         fingerprint: ProtocolFingerprint,
         message_id: u64,
         payload: Bytes,
     ) -> Result<(), RemoteMessageError> {
         self.current()?
-            .tell_singleton(sender, target, fingerprint, message_id, payload)
+            .tell_singleton(target, fingerprint, message_id, payload)
             .await
     }
 
@@ -262,13 +253,12 @@ impl LogicalRouter for SwitchableDomainRouter {
 
     async fn receive_entity_tell(
         &self,
-        sender: Option<ActorRef>,
         target: LogicalEntityTarget,
         message_id: u64,
         payload: Bytes,
     ) -> Result<(), RemoteMessageError> {
         self.current()?
-            .receive_entity_tell(sender, target, message_id, payload)
+            .receive_entity_tell(target, message_id, payload)
             .await
     }
 
@@ -286,13 +276,12 @@ impl LogicalRouter for SwitchableDomainRouter {
 
     async fn receive_singleton_tell(
         &self,
-        sender: Option<ActorRef>,
         target: LogicalSingletonTarget,
         message_id: u64,
         payload: Bytes,
     ) -> Result<(), RemoteMessageError> {
         self.current()?
-            .receive_singleton_tell(sender, target, message_id, payload)
+            .receive_singleton_tell(target, message_id, payload)
             .await
     }
 
@@ -365,14 +354,13 @@ impl DomainRouterDirectory {
 impl LogicalRouter for DomainRouterDirectory {
     async fn tell_entity(
         &self,
-        sender: Option<ActorRef>,
         target: EntityRef,
         fingerprint: ProtocolFingerprint,
         message_id: u64,
         payload: Bytes,
     ) -> Result<(), RemoteMessageError> {
         self.router(target.domain())?
-            .tell_entity(sender, target, fingerprint, message_id, payload)
+            .tell_entity(target, fingerprint, message_id, payload)
             .await
     }
 
@@ -392,14 +380,13 @@ impl LogicalRouter for DomainRouterDirectory {
 
     async fn tell_singleton(
         &self,
-        sender: Option<ActorRef>,
         target: SingletonRef,
         fingerprint: ProtocolFingerprint,
         message_id: u64,
         payload: Bytes,
     ) -> Result<(), RemoteMessageError> {
         self.router(target.domain())?
-            .tell_singleton(sender, target, fingerprint, message_id, payload)
+            .tell_singleton(target, fingerprint, message_id, payload)
             .await
     }
 
@@ -451,13 +438,12 @@ impl LogicalRouter for DomainRouterDirectory {
 
     async fn receive_entity_tell(
         &self,
-        sender: Option<ActorRef>,
         target: LogicalEntityTarget,
         message_id: u64,
         payload: Bytes,
     ) -> Result<(), RemoteMessageError> {
         self.router(target.reference.domain())?
-            .receive_entity_tell(sender, target, message_id, payload)
+            .receive_entity_tell(target, message_id, payload)
             .await
     }
 
@@ -475,13 +461,12 @@ impl LogicalRouter for DomainRouterDirectory {
 
     async fn receive_singleton_tell(
         &self,
-        sender: Option<ActorRef>,
         target: LogicalSingletonTarget,
         message_id: u64,
         payload: Bytes,
     ) -> Result<(), RemoteMessageError> {
         self.router(target.reference.domain())?
-            .receive_singleton_tell(sender, target, message_id, payload)
+            .receive_singleton_tell(target, message_id, payload)
             .await
     }
 
@@ -506,7 +491,7 @@ pub(crate) struct ServiceInboundDispatch {
 
 impl ServiceInboundDispatch {
     /// Peer traffic never carries the external scope: the remoting handshake already proved the
-    /// sender is a member of this cluster, so what arrives here is only ever exact or logical.
+    /// peer is a member of this cluster, so what arrives here is only ever exact or logical.
     fn admitted<E: FromClosedAdmission>(&self, scope: AdmissionScope) -> Result<(), E> {
         if self.admission.is_open(scope) {
             Ok(())
@@ -533,15 +518,12 @@ impl InboundDispatch for ServiceInboundDispatch {
 
     async fn tell(
         &self,
-        sender: Option<ActorRef>,
         target: ExactActorTarget,
         message_id: u64,
         payload: Bytes,
     ) -> Result<(), RemoteMessageError> {
         self.admitted::<RemoteMessageError>(AdmissionScope::Exact)?;
-        self.hosts
-            .tell_wait(sender, target, message_id, payload)
-            .await
+        self.hosts.tell_wait(target, message_id, payload).await
     }
 
     async fn ask(
@@ -557,14 +539,13 @@ impl InboundDispatch for ServiceInboundDispatch {
 
     async fn tell_entity(
         &self,
-        sender: Option<ActorRef>,
         target: LogicalEntityTarget,
         message_id: u64,
         payload: Bytes,
     ) -> Result<(), RemoteMessageError> {
         self.admitted::<RemoteMessageError>(AdmissionScope::Logical)?;
         self.logical()?
-            .receive_entity_tell(sender, target, message_id, payload)
+            .receive_entity_tell(target, message_id, payload)
             .await
     }
 
@@ -583,14 +564,13 @@ impl InboundDispatch for ServiceInboundDispatch {
 
     async fn tell_singleton(
         &self,
-        sender: Option<ActorRef>,
         target: LogicalSingletonTarget,
         message_id: u64,
         payload: Bytes,
     ) -> Result<(), RemoteMessageError> {
         self.admitted::<RemoteMessageError>(AdmissionScope::Logical)?;
         self.logical()?
-            .receive_singleton_tell(sender, target, message_id, payload)
+            .receive_singleton_tell(target, message_id, payload)
             .await
     }
 
@@ -686,19 +666,14 @@ impl ServiceRecipientBackend {
 
     fn try_tell_remote_actor(
         &self,
-        sender: Option<ActorRef>,
         reference: ActorRef,
         protocol_fingerprint: ProtocolFingerprint,
         message_id: u64,
         payload: Bytes,
     ) -> Result<(), Box<RejectedExactTell>> {
         debug_assert!(!self.is_local(&reference));
-        let sender = sender
-            .map(SenderIdentity::Actor)
-            .unwrap_or_else(|| SenderIdentity::Process(self.local_incarnation.get()));
         self.exact_tell_routes.tell(
             &self.messaging,
-            sender,
             reference,
             ExactTellMessage {
                 fingerprint: protocol_fingerprint,
@@ -711,19 +686,14 @@ impl ServiceRecipientBackend {
 
     async fn tell_remote_actor(
         &self,
-        sender: Option<ActorRef>,
         reference: ActorRef,
         protocol_fingerprint: ProtocolFingerprint,
         message_id: u64,
         payload: Bytes,
     ) -> Result<(), TellError> {
-        let sender = sender
-            .map(SenderIdentity::Actor)
-            .unwrap_or_else(|| SenderIdentity::Process(self.local_incarnation.get()));
         self.exact_tell_routes
             .tell_wait(
                 &self.messaging,
-                sender,
                 reference,
                 ExactTellMessage {
                     fingerprint: protocol_fingerprint,
@@ -745,7 +715,6 @@ impl RecipientBackend for ServiceRecipientBackend {
             )));
         }
         let RecipientTell {
-            sender,
             target,
             protocol_fingerprint,
             message_id,
@@ -755,12 +724,11 @@ impl RecipientBackend for ServiceRecipientBackend {
             RecipientRef::Actor(reference) if self.is_local(&reference) => {
                 ImmediateRecipientTellDispatch::Complete(
                     self.hosts
-                        .try_tell(sender, (&reference).into(), message_id, payload)
+                        .try_tell((&reference).into(), message_id, payload)
                         .map_err(TellError::Remote),
                 )
             }
             RecipientRef::Actor(reference) => match self.try_tell_remote_actor(
-                sender,
                 reference,
                 protocol_fingerprint,
                 message_id,
@@ -768,12 +736,7 @@ impl RecipientBackend for ServiceRecipientBackend {
             ) {
                 Ok(()) => ImmediateRecipientTellDispatch::Complete(Ok(())),
                 Err(rejected) if is_temporary_backpressure(&rejected.error) => {
-                    let sender = match rejected.sender {
-                        SenderIdentity::Actor(sender) => Some(sender),
-                        SenderIdentity::Process(_) => None,
-                    };
                     ImmediateRecipientTellDispatch::Deferred(RecipientTell {
-                        sender,
                         target: RecipientRef::Actor(rejected.target),
                         protocol_fingerprint: rejected.fingerprint,
                         message_id: rejected.message_id,
@@ -783,7 +746,6 @@ impl RecipientBackend for ServiceRecipientBackend {
                 Err(rejected) => ImmediateRecipientTellDispatch::Complete(Err(rejected.error)),
             },
             target => ImmediateRecipientTellDispatch::Deferred(RecipientTell {
-                sender,
                 target,
                 protocol_fingerprint,
                 message_id,
@@ -794,7 +756,6 @@ impl RecipientBackend for ServiceRecipientBackend {
 
     async fn tell(
         &self,
-        sender: Option<ActorRef>,
         target: RecipientRef,
         protocol_fingerprint: ProtocolFingerprint,
         message_id: u64,
@@ -804,24 +765,24 @@ impl RecipientBackend for ServiceRecipientBackend {
         match target {
             RecipientRef::Actor(reference) if self.is_local(&reference) => self
                 .hosts
-                .try_tell(sender, (&reference).into(), message_id, payload)
+                .try_tell((&reference).into(), message_id, payload)
                 .map_err(TellError::Remote),
             RecipientRef::Actor(reference) => {
-                self.tell_remote_actor(sender, reference, protocol_fingerprint, message_id, payload)
+                self.tell_remote_actor(reference, protocol_fingerprint, message_id, payload)
                     .await
             }
             RecipientRef::Entity(reference) => self
                 .logical
                 .as_ref()
                 .ok_or(TellError::Remote(RemoteMessageError::Unauthorized))?
-                .tell_entity(sender, reference, protocol_fingerprint, message_id, payload)
+                .tell_entity(reference, protocol_fingerprint, message_id, payload)
                 .await
                 .map_err(TellError::Remote),
             RecipientRef::Singleton(reference) => self
                 .logical
                 .as_ref()
                 .ok_or(TellError::Remote(RemoteMessageError::Unauthorized))?
-                .tell_singleton(sender, reference, protocol_fingerprint, message_id, payload)
+                .tell_singleton(reference, protocol_fingerprint, message_id, payload)
                 .await
                 .map_err(TellError::Remote),
         }
@@ -847,7 +808,6 @@ impl RecipientBackend for ServiceRecipientBackend {
                 self.messaging
                     .ask(
                         &association,
-                        &SenderIdentity::Process(self.local_incarnation.get()),
                         &reference,
                         OutboundMessage::new(protocol_fingerprint, message_id, payload),
                         deadline,

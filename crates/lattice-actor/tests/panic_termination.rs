@@ -1,3 +1,5 @@
+#![cfg(feature = "distributed")]
+
 use lattice_actor::context::HandlerContext;
 use std::{
     any::type_name,
@@ -18,7 +20,9 @@ use lattice_actor::{
     },
     registry::{ActorRegistry, ActorRegistryConfig},
     reply::ReplyTo,
-    runtime::{ActorExecutionPolicy, ActorRuntime, ActorRuntimeConfig, ActorSpawnOptions},
+    runtime::{
+        ActorExecutionPolicy, ActorRuntime, ActorRuntimeConfig, ActorSpawnOptions, SchedulerKey,
+    },
     traits::{
         Actor, ActorLifecycleState, ChildActorKey, ChildActorOptions, ChildSupervision, Handler,
         MessageMetadata, MessageOutcome, MessageView, Responder, StopReason,
@@ -161,7 +165,6 @@ async fn callback_panic_terminates_actor_under_every_execution_policy() {
                 },
                 options(policy),
             )
-            .await
             .unwrap();
         let mut terminated = handle.subscribe_terminated();
 
@@ -181,7 +184,6 @@ async fn callback_panic_terminates_actor_under_every_execution_policy() {
                 },
                 options(policy),
             )
-            .await
             .unwrap();
         assert_eq!(replacement.ask(Ping, TIMEOUT).await.unwrap(), 1);
     }
@@ -191,7 +193,7 @@ fn options(policy: ActorExecutionPolicy) -> ActorSpawnOptions {
     ActorSpawnOptions {
         mailbox: MailboxConfig::bounded(8),
         execution: Some(policy),
-        scheduler_key: Some(ActorId::U64(7)),
+        scheduler_key: Some(SchedulerKey::U64(7)),
         ..ActorSpawnOptions::default()
     }
 }
@@ -227,7 +229,6 @@ async fn request_panic_completes_ask_and_observation_once() {
     });
     let handle = runtime
         .spawn_actor(RequestPanicActor, ActorSpawnOptions::default())
-        .await
         .unwrap();
     let mut terminated = handle.subscribe_terminated();
 
@@ -392,7 +393,6 @@ async fn queued_ask_is_rejected_with_actor_panicked() {
     });
     let handle = runtime
         .spawn_actor(QueueActor, ActorSpawnOptions::default())
-        .await
         .unwrap();
     let entered = Arc::new(Semaphore::new(0));
     let release = Arc::new(Semaphore::new(0));
@@ -817,7 +817,6 @@ async fn prefetched_ask_is_rejected_with_actor_panicked() {
     });
     let handle = runtime
         .spawn_actor(QueueActor, ActorSpawnOptions::default())
-        .await
         .unwrap();
     let entered = Arc::new(Semaphore::new(0));
     let release = Arc::new(Semaphore::new(0));

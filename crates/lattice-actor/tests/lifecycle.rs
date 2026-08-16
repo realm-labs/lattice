@@ -260,6 +260,7 @@ async fn child_supervision_stop_parent_stops_parent_when_child_stops() {
                 ChildActorKey::new("child"),
                 ChildActor,
                 ChildActorOptions {
+                    #[cfg(feature = "distributed")]
                     protocol_id: None,
                     mailbox: MailboxConfig::bounded(8),
                     supervision: ChildSupervision::StopParent,
@@ -343,6 +344,7 @@ async fn child_supervision_restart_child_recreates_child_from_factory() {
                     ChildActor
                 },
                 ChildActorOptions {
+                    #[cfg(feature = "distributed")]
                     protocol_id: None,
                     mailbox: MailboxConfig::bounded(8),
                     supervision: ChildSupervision::RestartChild,
@@ -707,11 +709,11 @@ async fn passivation_policy_idle_timeout_stops_idle_actor() {
                 execution: None,
                 scheduler_key: None,
                 passivation: PassivationPolicy::IdleTimeout(Duration::from_millis(10)),
+                #[cfg(feature = "distributed")]
                 self_ref: None,
                 service: ServiceContext::empty(),
             },
         )
-        .await
         .unwrap();
 
     tokio::time::timeout(Duration::from_millis(100), stopped.acquire())

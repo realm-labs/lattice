@@ -8,9 +8,9 @@ use super::{
     ActorRef, AskError, AssociationKey, AssociationManager, AssociationState, Bytes, Instant,
     LOGICAL_RESOLVE_MESSAGE_ID, LogicPlacementState, LogicalSingletonTarget, Mutex, NodeKey,
     OutboundMessage, OutboundMessaging, PlacementSlot, PlacementSlotKey, PlacementSlotState,
-    ProtocolFingerprint, RemoteMessageError, RouteBuffer, SenderIdentity, SingletonConfig,
-    SingletonRef, WatchError, async_trait, decode_resolved_actor, map_tell,
-    next_logical_resolution, peers::PeerReconciler, singleton::SingletonRoute,
+    ProtocolFingerprint, RemoteMessageError, RouteBuffer, SingletonConfig, SingletonRef,
+    WatchError, async_trait, decode_resolved_actor, map_tell, next_logical_resolution,
+    peers::PeerReconciler, singleton::SingletonRoute,
 };
 
 pub(super) struct SingletonProxyRoute {
@@ -169,7 +169,6 @@ impl SingletonProxyRoute {
 impl SingletonRoute for SingletonProxyRoute {
     async fn tell(
         &self,
-        sender: Option<ActorRef>,
         target: SingletonRef,
         fingerprint: ProtocolFingerprint,
         message_id: u64,
@@ -183,14 +182,9 @@ impl SingletonRoute for SingletonProxyRoute {
             .await?;
         let owner = slot.owner.ok_or(RemoteMessageError::StaleAuthority)?;
         let association = self.remote_association(&target, &owner).await?;
-        let sender = sender
-            .as_ref()
-            .map(SenderIdentity::from)
-            .unwrap_or_else(|| SenderIdentity::Process(self.local_node.incarnation.get()));
         self.messaging
             .tell_singleton(
                 &association,
-                &sender,
                 LogicalSingletonTarget {
                     reference: target,
                     owner_address: owner.address,
@@ -230,7 +224,6 @@ impl SingletonRoute for SingletonProxyRoute {
         self.messaging
             .ask_singleton(
                 &association,
-                &SenderIdentity::Process(self.local_node.incarnation.get()),
                 LogicalSingletonTarget {
                     reference: target,
                     owner_address: owner.address,
@@ -245,7 +238,6 @@ impl SingletonRoute for SingletonProxyRoute {
 
     async fn receive_tell(
         &self,
-        _sender: Option<ActorRef>,
         _target: LogicalSingletonTarget,
         _message_id: u64,
         _payload: Bytes,
@@ -278,7 +270,6 @@ impl SingletonRoute for SingletonProxyRoute {
             .messaging
             .ask_singleton(
                 &association,
-                &SenderIdentity::Process(self.local_node.incarnation.get()),
                 LogicalSingletonTarget {
                     reference: target,
                     owner_address: owner.address.clone(),

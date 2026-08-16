@@ -178,7 +178,6 @@ async fn business_actor_models_state_machine_with_typed_messages_and_timer() {
             },
             ActorSpawnOptions::default(),
         )
-        .await
         .unwrap();
 
     handle.try_tell(WorldTick).unwrap();

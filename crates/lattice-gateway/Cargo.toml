@@ -9,7 +9,7 @@ repository.workspace = true
 async-trait.workspace = true
 dashmap.workspace = true
 lattice-core.workspace = true
-lattice-actor.workspace = true
+lattice-actor = { workspace = true, features = ["distributed"] }
 lattice-remoting.workspace = true
 prost.workspace = true
 thiserror.workspace = true

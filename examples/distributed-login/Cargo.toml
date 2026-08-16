@@ -8,7 +8,7 @@ repository.workspace = true
 [dependencies]
 clap.workspace = true
 http.workspace = true
-lattice-actor.workspace = true
+lattice-actor = { workspace = true, features = ["distributed"] }
 lattice-core.workspace = true
 lattice-gateway.workspace = true
 lattice-placement.workspace = true

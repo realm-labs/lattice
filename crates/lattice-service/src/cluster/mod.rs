@@ -35,7 +35,7 @@ use lattice_remoting::{
     messaging::{
         error::{AskError, RemoteMessageError, TellError},
         outbound::{OutboundMessage, OutboundMessaging},
-        target::{LogicalEntityTarget, LogicalSingletonTarget, SenderIdentity},
+        target::{LogicalEntityTarget, LogicalSingletonTarget},
     },
     protocol::ProtocolFingerprint,
     watch::WatchError,

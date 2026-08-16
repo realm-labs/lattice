@@ -2126,13 +2126,11 @@ name = "lattice-actor"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "blake3",
  "bytes",
  "concurrent-queue",
  "dashmap",
  "event-listener",
  "futures-util",
- "http",
  "lattice-actor-macros",
  "lattice-core",
  "lattice-remoting",

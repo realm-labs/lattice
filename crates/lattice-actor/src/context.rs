@@ -10,24 +10,31 @@ use std::{
     collections::HashMap,
     fmt,
     sync::{
-        Arc, OnceLock,
+        Arc,
         atomic::{AtomicUsize, Ordering},
     },
     time::Instant,
 };
 
-use lattice_core::{actor_ref::ActorRef, service_context::ServiceContext};
+#[cfg(feature = "distributed")]
+use std::sync::OnceLock;
+
+#[cfg(feature = "distributed")]
+use lattice_core::actor_ref::ActorRef;
+use lattice_core::service_context::ServiceContext;
 use tokio::task::{JoinHandle, JoinSet};
 
 use crate::{
     error::ActorError,
     handle::ActorHandle,
-    recipient::ActorSystem,
     reply::PendingReply,
     runtime::spawner::ActorSpawner,
     traits::{Actor, ChildActorKey, PassivationReason, StopReason},
     watch::WatchId,
 };
+
+#[cfg(feature = "distributed")]
+use crate::recipient::ActorSystem;
 
 mod children;
 mod deferred;
@@ -35,6 +42,7 @@ mod extensions;
 mod messaging;
 mod tasks;
 
+pub use messaging::TellTarget;
 pub use tasks::ContextWatchTarget;
 
 use children::ChildStop;
@@ -52,17 +60,16 @@ pub struct PipeTaskHandle {
 
 /// Owned, message-scoped capability for typed Actor messaging.
 ///
-/// This is the narrow owned counterpart of [`ActorContext::tell`],
-/// [`ActorContext::ask`], and [`ActorContext::forward`]. It snapshots only the
-/// current Actor system, self/sender identity, and request deadline, so an
+/// This is the narrow owned counterpart of [`ActorContext::tell`] and
+/// [`ActorContext::ask`]. It snapshots only the current Actor system and
+/// request deadline, so an
 /// adapter may retain it across an async call without retaining or erasing an
 /// [`ActorContext`] borrow. The target protocol and message types remain
 /// statically checked at each call site.
+#[cfg(feature = "distributed")]
 #[derive(Clone, Debug)]
 pub struct ActorTurnMessaging {
     actor_system: ActorSystem,
-    self_ref: Option<ActorRef>,
-    sender: Option<ActorRef>,
     deadline: Option<Instant>,
 }
 
@@ -77,7 +84,9 @@ pub struct ActorLocalExtensions {
 
 pub struct ActorContext<A: Actor> {
     handle: ActorHandle<A>,
+    #[cfg(feature = "distributed")]
     self_ref: Option<ActorRef>,
+    #[cfg(feature = "distributed")]
     actor_system: Option<Arc<OnceLock<ActorSystem>>>,
     service: ServiceContext,
     local_extensions: ActorLocalExtensions,
@@ -90,22 +99,22 @@ pub struct ActorContext<A: Actor> {
     deferred_capacity: usize,
     watches: HashMap<WatchId, JoinHandle<()>>,
     children: HashMap<ChildActorKey, Box<dyn ChildStop>>,
-    sender: Option<ActorRef>,
     current_deadline: Option<Instant>,
 }
 
 impl<A: Actor> fmt::Debug for ActorContext<A> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("ActorContext")
-            .field("handle", &self.handle)
-            .field(
-                "self_ref",
-                &self
-                    .self_ref
-                    .as_ref()
-                    .map(|actor_ref| actor_ref.actor_path()),
-            )
+        let mut debug = formatter.debug_struct("ActorContext");
+        debug.field("handle", &self.handle);
+        #[cfg(feature = "distributed")]
+        debug.field(
+            "self_ref",
+            &self
+                .self_ref
+                .as_ref()
+                .map(|actor_ref| actor_ref.actor_path()),
+        );
+        debug
             .field("service", &self.service)
             .field("local_extensions", &self.local_extensions)
             .field("lifecycle_request", &self.lifecycle_request)
@@ -118,8 +127,8 @@ impl<A: Actor> fmt::Debug for ActorContext<A> {
             .field("pending_reply_count", &self.pending_replies.len())
             .field("deferred_capacity", &self.deferred_capacity)
             .field("watch_count", &self.watches.len())
-            .field("child_count", &self.children.len())
-            .field("has_sender", &self.sender.is_some())
+            .field("child_count", &self.children.len());
+        debug
             .field("current_deadline", &self.current_deadline)
             .finish()
     }
@@ -128,15 +137,17 @@ impl<A: Actor> fmt::Debug for ActorContext<A> {
 impl<A: Actor> ActorContext<A> {
     pub(crate) fn new(
         handle: ActorHandle<A>,
-        self_ref: Option<ActorRef>,
-        actor_system: Option<Arc<OnceLock<ActorSystem>>>,
+        #[cfg(feature = "distributed")] self_ref: Option<ActorRef>,
+        #[cfg(feature = "distributed")] actor_system: Option<Arc<OnceLock<ActorSystem>>>,
         service: ServiceContext,
         spawner: ActorSpawner,
         deferred_capacity: usize,
     ) -> Self {
         Self {
             handle,
+            #[cfg(feature = "distributed")]
             self_ref,
+            #[cfg(feature = "distributed")]
             actor_system,
             service,
             local_extensions: ActorLocalExtensions::new(),
@@ -149,7 +160,6 @@ impl<A: Actor> ActorContext<A> {
             deferred_capacity,
             watches: HashMap::new(),
             children: HashMap::new(),
-            sender: None,
             current_deadline: None,
         }
     }
@@ -159,6 +169,7 @@ impl<A: Actor> ActorContext<A> {
     /// Clone the reference before putting it in a message or retaining it. The
     /// reference remains bound to this activation and becomes stale after the
     /// actor stops or is replaced.
+    #[cfg(feature = "distributed")]
     pub fn self_ref(&self) -> Option<&ActorRef> {
         self.self_ref.as_ref()
     }
@@ -179,18 +190,11 @@ impl<A: Actor> ActorContext<A> {
         &mut self.local_extensions
     }
 
+    #[cfg(feature = "distributed")]
     pub fn require_self_ref(&self) -> Result<&ActorRef, ActorError> {
         self.self_ref
             .as_ref()
             .ok_or_else(|| ActorError::new("actor self ref is not available"))
-    }
-
-    /// Returns the actor that sent the current one-way message.
-    ///
-    /// The value is message-scoped and read-only. Process-originated tells and
-    /// asks have no actor sender; asks reply through their typed `ReplyTo`.
-    pub fn sender(&self) -> Option<&ActorRef> {
-        self.sender.as_ref()
     }
 
     /// Returns the absolute deadline attached to the current request, if any.
@@ -200,14 +204,6 @@ impl<A: Actor> ActorContext<A> {
     /// convert it to an owned duration or timestamp first.
     pub fn current_deadline(&self) -> Option<Instant> {
         self.current_deadline
-    }
-
-    pub(crate) fn set_sender(&mut self, sender: ActorRef) {
-        self.sender = Some(sender);
-    }
-
-    pub(crate) fn clear_sender(&mut self) {
-        self.sender = None;
     }
 
     pub(crate) fn set_current_deadline(&mut self, deadline: Option<Instant>) {

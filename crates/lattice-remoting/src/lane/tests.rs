@@ -13,7 +13,7 @@ use crate::{
         codec::reply_frame,
         error::RemoteMessageError,
         outbound::OutboundMessage,
-        target::{CorrelationId, ExactActorTarget, SenderIdentity},
+        target::{CorrelationId, ExactActorTarget},
     },
     protocol::{ProtocolDescriptor, ProtocolFingerprint},
     transport::FramedConnection,
@@ -32,7 +32,6 @@ struct RecordingDispatch {
 impl InboundDispatch for RecordingDispatch {
     async fn tell(
         &self,
-        _sender: Option<ActorRef>,
         target: ExactActorTarget,
         _message_id: u64,
         _payload: Bytes,
@@ -59,7 +58,6 @@ impl InboundDispatch for RecordingDispatch {
 impl InboundDispatch for EchoDispatch {
     async fn tell(
         &self,
-        _sender: Option<ActorRef>,
         _target: ExactActorTarget,
         _message_id: u64,
         _payload: Bytes,
@@ -239,7 +237,6 @@ async fn interactive_lane_stays_awake_while_ask_is_in_flight() {
             let reply = messaging
                 .ask(
                     &association,
-                    &SenderIdentity::Process(9),
                     &target,
                     OutboundMessage::new(fingerprint, u64::from(index) + 1, expected.clone()),
                     Instant::now() + Duration::from_secs(1),
@@ -331,7 +328,6 @@ async fn a_bulk_stripe_failure_keeps_interactive_asks_pending() {
             messaging
                 .ask(
                     &association,
-                    &SenderIdentity::Process(9),
                     &target,
                     OutboundMessage::new(fingerprint, 1, Bytes::from_static(b"ask")),
                     Instant::now() + Duration::from_secs(5),
@@ -440,12 +436,7 @@ async fn a_queued_compact_tell_is_expanded_after_the_stripe_reconnects() {
     let messaging = Arc::new(OutboundMessaging::new(8).unwrap());
     let target = lane_target(&server_address, server_incarnation, protocol_id);
     let route = messaging
-        .prepare_exact_tell_route(
-            client_association.clone(),
-            &SenderIdentity::Process(9),
-            &target,
-            fingerprint,
-        )
+        .prepare_exact_tell_route(client_association.clone(), &target, fingerprint)
         .unwrap();
     let mut client_bulk = client_association
         .take_lane_receiver(LaneKind::Bulk(0))
@@ -548,12 +539,7 @@ async fn an_unregistered_dictionary_id_drops_one_frame_and_keeps_the_lane() {
     let messaging = Arc::new(OutboundMessaging::new(8).unwrap());
     let target = lane_target(&server_address, server_incarnation, protocol_id);
     let route = messaging
-        .prepare_exact_tell_route(
-            client_association.clone(),
-            &SenderIdentity::Process(9),
-            &target,
-            fingerprint,
-        )
+        .prepare_exact_tell_route(client_association.clone(), &target, fingerprint)
         .unwrap();
     route.tell(1, Bytes::from_static(b"registration")).unwrap();
     route.tell(1, Bytes::from_static(b"compact")).unwrap();
@@ -720,7 +706,6 @@ async fn a_remote_close_completes_pending_asks_by_dispatch_knowledge() {
             messaging
                 .ask(
                     &association,
-                    &SenderIdentity::Process(9),
                     &target,
                     OutboundMessage::new(fingerprint, 1, Bytes::from_static(b"ask")),
                     Instant::now() + Duration::from_secs(5),

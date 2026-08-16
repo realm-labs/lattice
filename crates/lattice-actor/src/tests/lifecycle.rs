@@ -130,7 +130,6 @@ async fn idle_passivation_retries_after_a_full_system_lane() {
                 ..ActorSpawnOptions::default()
             },
         )
-        .await
         .unwrap();
 
     // Park the Actor, then occupy the only system slot so the idle stop is rejected once.

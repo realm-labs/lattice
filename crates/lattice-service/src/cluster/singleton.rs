@@ -11,8 +11,8 @@ use super::{
     DispatchMode, DispatchReply, Instant, LOGICAL_RESOLVE_MESSAGE_ID, LogicPlacementState,
     LogicalSingletonTarget, Mutex, NodeKey, OutboundMessage, OutboundMessaging, PlacementDomainId,
     PlacementSlot, PlacementSlotKey, PlacementSlotState, Protocol, ProtocolFingerprint, ProtocolId,
-    RemoteMessageError, RouteBuffer, SenderIdentity, SingletonKind, SingletonRef, WatchError,
-    async_trait, decode_resolved_actor, drain_actor_ids, map_ask, map_dispatch, map_tell,
+    RemoteMessageError, RouteBuffer, SingletonKind, SingletonRef, WatchError, async_trait,
+    decode_resolved_actor, drain_actor_ids, map_ask, map_dispatch, map_tell,
     next_logical_resolution,
 };
 
@@ -20,7 +20,6 @@ use super::{
 pub(super) trait SingletonRoute: Send + Sync {
     async fn tell(
         &self,
-        sender: Option<ActorRef>,
         target: SingletonRef,
         fingerprint: ProtocolFingerprint,
         message_id: u64,
@@ -36,7 +35,6 @@ pub(super) trait SingletonRoute: Send + Sync {
     ) -> Result<Bytes, AskError>;
     async fn receive_tell(
         &self,
-        sender: Option<ActorRef>,
         target: LogicalSingletonTarget,
         message_id: u64,
         payload: Bytes,
@@ -249,7 +247,6 @@ impl<A: Actor, L: ActorLoader<A>, P: Protocol> SingletonRouteHost<A, L, P> {
 impl<A: Actor, L: ActorLoader<A>, P: Protocol> SingletonRoute for SingletonRouteHost<A, L, P> {
     async fn tell(
         &self,
-        sender: Option<ActorRef>,
         target: SingletonRef,
         fingerprint: ProtocolFingerprint,
         message_id: u64,
@@ -269,9 +266,7 @@ impl<A: Actor, L: ActorLoader<A>, P: Protocol> SingletonRoute for SingletonRoute
             assignment_generation: slot.assignment_generation.get(),
         };
         if owner == self.local_node {
-            return self
-                .receive_tell(sender, logical, message_id, payload)
-                .await;
+            return self.receive_tell(logical, message_id, payload).await;
         }
         let association = self
             .associations
@@ -281,14 +276,9 @@ impl<A: Actor, L: ActorLoader<A>, P: Protocol> SingletonRoute for SingletonRoute
                 owner.incarnation,
             )
             .ok_or(RemoteMessageError::StaleAuthority)?;
-        let sender = sender
-            .as_ref()
-            .map(SenderIdentity::from)
-            .unwrap_or_else(|| SenderIdentity::Process(self.local_node.incarnation.get()));
         self.messaging
             .tell_singleton(
                 &association,
-                &sender,
                 logical,
                 OutboundMessage::new(fingerprint, message_id, payload),
             )
@@ -339,7 +329,6 @@ impl<A: Actor, L: ActorLoader<A>, P: Protocol> SingletonRoute for SingletonRoute
         self.messaging
             .ask_singleton(
                 &association,
-                &SenderIdentity::Process(self.local_node.incarnation.get()),
                 logical,
                 OutboundMessage::new(fingerprint, message_id, payload),
                 deadline,
@@ -349,28 +338,14 @@ impl<A: Actor, L: ActorLoader<A>, P: Protocol> SingletonRoute for SingletonRoute
 
     async fn receive_tell(
         &self,
-        sender: Option<ActorRef>,
         target: LogicalSingletonTarget,
         message_id: u64,
         payload: Bytes,
     ) -> Result<(), RemoteMessageError> {
-        if sender
-            .as_ref()
-            .is_some_and(|sender| sender.cluster_id() != target.reference.cluster_id())
-        {
-            return Err(RemoteMessageError::Unauthorized);
-        }
         let handle = self.activate(&target).await?;
         match self
             .protocol
-            .dispatch_with_sender(
-                handle,
-                message_id,
-                DispatchMode::Tell,
-                payload,
-                None,
-                sender,
-            )
+            .dispatch(handle, message_id, DispatchMode::Tell, payload, None)
             .await
             .map_err(map_dispatch)?
         {
@@ -435,7 +410,6 @@ impl<A: Actor, L: ActorLoader<A>, P: Protocol> SingletonRoute for SingletonRoute
                 .messaging
                 .ask_singleton(
                     &association,
-                    &SenderIdentity::Process(self.local_node.incarnation.get()),
                     logical,
                     OutboundMessage::new(
                         self.protocol.fingerprint(),

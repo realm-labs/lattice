@@ -11,7 +11,7 @@ use std::{
 use bytes::{Bytes, BytesMut};
 #[doc(hidden)]
 pub use lattice_core::actor_ref::ProtocolTag as __ProtocolTag;
-use lattice_core::actor_ref::{ActorRef, ProtocolId, ProtocolTag};
+use lattice_core::actor_ref::{ProtocolId, ProtocolTag};
 use lattice_remoting::protocol::{ProtocolDescriptor, ProtocolFingerprint};
 use thiserror::Error;
 
@@ -156,14 +156,10 @@ pub enum DispatchReply {
 
 pub(crate) type DispatchFuture =
     Pin<Box<dyn Future<Output = Result<DispatchReply, DispatchError>> + Send + 'static>>;
-type DispatchFn<A> = dyn Fn(ActorHandle<A>, Bytes, Option<Instant>, Option<ActorRef>) -> DispatchFuture
-    + Send
-    + Sync
-    + 'static;
-type TellDispatchFn<A> = dyn Fn(&ActorHandle<A>, Bytes, Option<ActorRef>) -> ProtocolTellDispatch
-    + Send
-    + Sync
-    + 'static;
+type DispatchFn<A> =
+    dyn Fn(ActorHandle<A>, Bytes, Option<Instant>) -> DispatchFuture + Send + Sync + 'static;
+type TellDispatchFn<A> =
+    dyn Fn(&ActorHandle<A>, Bytes) -> ProtocolTellDispatch + Send + Sync + 'static;
 
 enum ServerDispatch<A: Actor> {
     Tell(Arc<TellDispatchFn<A>>),
@@ -477,22 +473,8 @@ impl<A: Actor, P: Protocol> ActorProtocolBinding<A, P> {
         payload: Bytes,
         deadline: Option<Instant>,
     ) -> Result<DispatchReply, DispatchError> {
-        self.dispatch_with_sender(handle, message_id, mode, payload, deadline, None)
-            .await
-    }
-
-    #[doc(hidden)]
-    pub async fn dispatch_with_sender(
-        &self,
-        handle: ActorHandle<A>,
-        message_id: u64,
-        mode: DispatchMode,
-        payload: Bytes,
-        deadline: Option<Instant>,
-        sender: Option<ActorRef>,
-    ) -> Result<DispatchReply, DispatchError> {
         if mode == DispatchMode::Tell {
-            return match self.try_dispatch_tell(&handle, message_id, payload, sender) {
+            return match self.try_dispatch_tell(&handle, message_id, payload) {
                 ProtocolTellDispatch::Accepted => Ok(DispatchReply::TellAccepted),
                 ProtocolTellDispatch::Deferred { completion, .. } => completion.await,
                 ProtocolTellDispatch::Rejected(error) => Err(error),
@@ -523,9 +505,7 @@ impl<A: Actor, P: Protocol> ActorProtocolBinding<A, P> {
                 .get(&message_id)
                 .ok_or(DispatchError::UnknownMessage(message_id))?;
             match dispatch {
-                ServerDispatch::Async(dispatch) => {
-                    dispatch(handle, payload, deadline, sender).await
-                }
+                ServerDispatch::Async(dispatch) => dispatch(handle, payload, deadline).await,
                 ServerDispatch::Tell(_) => Err(DispatchError::ModeMismatch),
             }
         }
@@ -540,32 +520,6 @@ impl<A: Actor, P: Protocol> ActorProtocolBinding<A, P> {
             );
         }
         result
-    }
-
-    #[doc(hidden)]
-    pub fn try_dispatch_tell_with_sender(
-        &self,
-        handle: ActorHandle<A>,
-        message_id: u64,
-        payload: Bytes,
-        sender: Option<ActorRef>,
-    ) -> Result<DispatchReply, DispatchError> {
-        let payload_size = payload.len();
-        match self.try_dispatch_tell(&handle, message_id, payload, sender) {
-            ProtocolTellDispatch::Accepted => Ok(DispatchReply::TellAccepted),
-            ProtocolTellDispatch::Deferred { .. } => {
-                let error = DispatchError::MailboxRejected;
-                handle.observer().protocol_failed(
-                    handle.observation_metadata(),
-                    message_id,
-                    MessageKind::Tell,
-                    payload_size,
-                    protocol_failure(&error),
-                );
-                Err(error)
-            }
-            ProtocolTellDispatch::Rejected(error) => Err(error),
-        }
     }
 }
 
@@ -607,7 +561,7 @@ impl<A: Actor, P: Protocol> ActorProtocolBindingBuilder<A, P> {
         );
         self.dispatch.push((
             message_id,
-            ServerDispatch::Async(Arc::new(move |handle, payload, deadline, _sender| {
+            ServerDispatch::Async(Arc::new(move |handle, payload, deadline| {
                 let codec = codec.clone();
                 let reply_codec = reply_codec.clone();
                 Box::pin(async move {
@@ -941,20 +895,10 @@ pub fn __protocol_id(value: u64) -> Result<ProtocolId, ProtocolBuildError> {
 
 #[cfg(test)]
 mod tests {
-    use lattice_core::actor_ref::{
-        ActivationId, ActorPath, ClusterId, NodeAddress, NodeIncarnation,
-    };
-    use tokio::sync::oneshot;
-
     use super::*;
-    use crate::{
-        context::HandlerContext, error::ActorError, mailbox::MailboxConfig, reply::ReplyTo,
-        runtime::spawn_actor, traits::Handler,
-    };
+    use crate::{context::HandlerContext, error::ActorError, reply::ReplyTo, traits::Handler};
 
-    struct TestActor {
-        observed_sender: Option<oneshot::Sender<Option<ActorRef>>>,
-    }
+    struct TestActor;
 
     impl Actor for TestActor {
         type Error = ActorError;
@@ -1020,12 +964,9 @@ mod tests {
     impl Handler<Tell> for TestActor {
         async fn handle(
             &mut self,
-            ctx: &mut HandlerContext<'_, Self>,
+            _ctx: &mut HandlerContext<'_, Self>,
             _msg: Tell,
         ) -> Result<(), Self::Error> {
-            if let Some(observed_sender) = self.observed_sender.take() {
-                let _ = observed_sender.send(ctx.sender().cloned());
-            }
             Ok(())
         }
     }
@@ -1115,47 +1056,5 @@ mod tests {
             result,
             Err(ProtocolBuildError::ZeroSchemaVersion(1))
         ));
-    }
-
-    #[tokio::test]
-    async fn protocol_tell_dispatch_preserves_actor_sender_metadata() {
-        let (observed_tx, observed_rx) = oneshot::channel();
-        let handle = spawn_actor(
-            TestActor {
-                observed_sender: Some(observed_tx),
-            },
-            MailboxConfig::default(),
-        );
-        let incarnation = NodeIncarnation::new(9).unwrap();
-        let sender = ActorRef::new(
-            ClusterId::new("test").unwrap(),
-            NodeAddress::new("sender", 25521).unwrap(),
-            incarnation,
-            ActorPath::user(["user", "sender"]).unwrap(),
-            ActivationId::new(incarnation, 1).unwrap(),
-            ProtocolId::new(77).unwrap(),
-        )
-        .unwrap();
-        let protocol = TestProtocol::bind::<TestActor>().unwrap();
-
-        let result = protocol
-            .dispatch_with_sender(
-                handle,
-                1,
-                DispatchMode::Tell,
-                Bytes::copy_from_slice(&5_u64.to_be_bytes()),
-                None,
-                Some(sender.clone()),
-            )
-            .await
-            .unwrap();
-
-        assert!(matches!(result, DispatchReply::TellAccepted));
-        assert!(
-            observed_rx
-                .await
-                .unwrap()
-                .is_some_and(|actual| actual.same_activation(&sender))
-        );
     }
 }

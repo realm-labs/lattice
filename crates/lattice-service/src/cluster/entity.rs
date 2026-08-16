@@ -9,7 +9,7 @@ use super::{
     DispatchReply, EntityConfig, EntityRef, Instant, LOGICAL_RESOLVE_MESSAGE_ID,
     LogicPlacementState, LogicalEntityTarget, Mutex, NodeKey, OutboundMessage, OutboundMessaging,
     PlacementSlot, PlacementSlotKey, PlacementSlotState, Protocol, ProtocolFingerprint,
-    RemoteMessageError, RouteBuffer, SenderIdentity, ShardMapperBinding, WatchError, async_trait,
+    RemoteMessageError, RouteBuffer, ShardMapperBinding, WatchError, async_trait,
     decode_resolved_actor, drain_actor_ids, map_ask, map_dispatch, map_tell,
     next_logical_resolution,
 };
@@ -18,7 +18,6 @@ use super::{
 pub(super) trait EntityRoute: Send + Sync {
     async fn tell(
         &self,
-        sender: Option<ActorRef>,
         target: EntityRef,
         fingerprint: ProtocolFingerprint,
         message_id: u64,
@@ -34,7 +33,6 @@ pub(super) trait EntityRoute: Send + Sync {
     ) -> Result<Bytes, AskError>;
     async fn receive_tell(
         &self,
-        sender: Option<ActorRef>,
         target: LogicalEntityTarget,
         message_id: u64,
         payload: Bytes,
@@ -308,7 +306,6 @@ where
 {
     async fn tell(
         &self,
-        sender: Option<ActorRef>,
         target: EntityRef,
         fingerprint: ProtocolFingerprint,
         message_id: u64,
@@ -328,9 +325,7 @@ where
             assignment_generation: slot.assignment_generation.get(),
         };
         if owner == self.local_node {
-            return self
-                .receive_tell(sender, logical, message_id, payload)
-                .await;
+            return self.receive_tell(logical, message_id, payload).await;
         }
         let association = self
             .associations
@@ -340,14 +335,9 @@ where
                 owner.incarnation,
             )
             .ok_or(RemoteMessageError::StaleAuthority)?;
-        let sender = sender
-            .as_ref()
-            .map(SenderIdentity::from)
-            .unwrap_or_else(|| SenderIdentity::Process(self.local_node.incarnation.get()));
         self.messaging
             .tell_entity(
                 &association,
-                &sender,
                 logical,
                 OutboundMessage::new(fingerprint, message_id, payload),
             )
@@ -398,7 +388,6 @@ where
         self.messaging
             .ask_entity(
                 &association,
-                &SenderIdentity::Process(self.local_node.incarnation.get()),
                 logical,
                 OutboundMessage::new(fingerprint, message_id, payload),
                 deadline,
@@ -408,17 +397,10 @@ where
 
     async fn receive_tell(
         &self,
-        sender: Option<ActorRef>,
         target: LogicalEntityTarget,
         message_id: u64,
         payload: Bytes,
     ) -> Result<(), RemoteMessageError> {
-        if sender
-            .as_ref()
-            .is_some_and(|sender| sender.cluster_id() != target.reference.cluster_id())
-        {
-            return Err(RemoteMessageError::Unauthorized);
-        }
         let handle = self.activate(&target).await.map_err(|error| {
             if let Some(suppressed) = self.route_failures.admit() {
                 tracing::warn!(
@@ -434,14 +416,7 @@ where
         })?;
         match self
             .protocol
-            .dispatch_with_sender(
-                handle,
-                message_id,
-                DispatchMode::Tell,
-                payload,
-                None,
-                sender,
-            )
+            .dispatch(handle, message_id, DispatchMode::Tell, payload, None)
             .await
             .map_err(|error| {
                 if let Some(suppressed) = self.route_failures.admit() {
@@ -538,7 +513,6 @@ where
                 .messaging
                 .ask_entity(
                     &association,
-                    &SenderIdentity::Process(self.local_node.incarnation.get()),
                     logical,
                     OutboundMessage::new(
                         self.protocol.fingerprint(),

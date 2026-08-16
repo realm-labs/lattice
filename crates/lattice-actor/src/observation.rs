@@ -3,9 +3,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
+#[cfg(feature = "distributed")]
 use lattice_core::actor_ref::ActorRef;
 
-use crate::traits::{MessageKind, MessageMetadata, MessageOutcome, StopReason};
+#[cfg(feature = "distributed")]
+use crate::traits::MessageKind;
+use crate::traits::{MessageMetadata, MessageOutcome, StopReason};
 use crate::watch::LocalActorRef;
 
 static ACTIVE_STOP_FAILURES: AtomicU64 = AtomicU64::new(0);
@@ -47,6 +50,7 @@ pub(crate) fn record_abandoned_stop_failure() {
 pub struct ActorMetadata {
     actor_type: &'static str,
     local_ref: LocalActorRef,
+    #[cfg(feature = "distributed")]
     actor_ref: Option<ActorRef>,
 }
 
@@ -54,11 +58,12 @@ impl ActorMetadata {
     pub(crate) fn new(
         actor_type: &'static str,
         local_ref: LocalActorRef,
-        actor_ref: Option<ActorRef>,
+        #[cfg(feature = "distributed")] actor_ref: Option<ActorRef>,
     ) -> Self {
         Self {
             actor_type,
             local_ref,
+            #[cfg(feature = "distributed")]
             actor_ref,
         }
     }
@@ -71,6 +76,7 @@ impl ActorMetadata {
         self.local_ref
     }
 
+    #[cfg(feature = "distributed")]
     pub fn actor_ref(&self) -> Option<&ActorRef> {
         self.actor_ref.as_ref()
     }
@@ -109,6 +115,7 @@ pub enum ActorLifecycleEvent {
     ForcedDataLoss(StopReason),
 }
 
+#[cfg(feature = "distributed")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProtocolFailure {
     UnknownMessage,
@@ -160,6 +167,7 @@ pub trait ActorObserver: Send + Sync + 'static {
 
     fn lifecycle(&self, _actor: &ActorMetadata, _event: ActorLifecycleEvent) {}
 
+    #[cfg(feature = "distributed")]
     fn protocol_failed(
         &self,
         _actor: &ActorMetadata,
@@ -248,6 +256,7 @@ impl ActorObserverHandle {
         self.inner.lifecycle(actor, event);
     }
 
+    #[cfg(feature = "distributed")]
     pub(crate) fn protocol_failed(
         &self,
         actor: &ActorMetadata,

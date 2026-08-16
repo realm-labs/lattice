@@ -6,25 +6,38 @@
 
 use std::{
     any::type_name,
-    sync::{Arc, Mutex, OnceLock},
+    sync::{Arc, Mutex},
 };
 
-use lattice_core::{
-    actor_ref::{ActorRef, ProtocolId},
-    service_context::ServiceContext,
-};
+#[cfg(feature = "distributed")]
+use std::sync::OnceLock;
+
+#[cfg(feature = "distributed")]
+use lattice_core::actor_ref::{ActorRef, ProtocolId};
+use lattice_core::service_context::ServiceContext;
 use tokio::task::AbortHandle;
 
 use super::ActorContext;
 use crate::{
-    directory::ActivationDirectory,
     error::{ActorError, ActorTellError},
     handle::{ActorHandle, TerminalHook},
     observation::ActorObserverHandle,
-    recipient::ActorSystem,
-    runtime::{ActorSpawnContext, ActorSpawnOptions, PassivationPolicy, spawner::ActorSpawner},
+    runtime::{
+        ActorSpawnContext, ActorSpawnOptions, PassivationPolicy, spawn_actor_with_self_ref,
+        spawner::ActorSpawner,
+    },
     traits::{Actor, ChildActorKey, ChildActorOptions, ChildSupervision, StopReason},
 };
+
+#[cfg(feature = "distributed")]
+use crate::{directory::ActivationDirectory, recipient::ActorSystem};
+
+#[cfg(feature = "distributed")]
+type ChildReference = Option<ActorRef>;
+
+#[cfg(not(feature = "distributed"))]
+#[derive(Clone)]
+struct ChildReference;
 
 impl<A: Actor> ActorContext<A> {
     pub fn spawn_child<C>(
@@ -56,7 +69,10 @@ impl<A: Actor> ActorContext<A> {
             child.key = key.as_str()
         );
         let _entered = span.enter();
+        #[cfg(feature = "distributed")]
         let child_ref = self.child_actor_ref(&key, options.protocol_id)?;
+        #[cfg(not(feature = "distributed"))]
+        let child_ref = ChildReference;
         let handle = self
             .child_spawn_env()
             .spawn(actor, &options, child_ref.clone())?;
@@ -89,7 +105,10 @@ impl<A: Actor> ActorContext<A> {
             child.key = key.as_str()
         );
         let _entered = span.enter();
+        #[cfg(feature = "distributed")]
         let child_ref = self.child_actor_ref(&key, options.protocol_id)?;
+        #[cfg(not(feature = "distributed"))]
+        let child_ref = ChildReference;
         let handle = self
             .child_spawn_env()
             .spawn(factory(), &options, child_ref.clone())?;
@@ -122,6 +141,7 @@ impl<A: Actor> ActorContext<A> {
     fn child_spawn_env(&self) -> ChildSpawnEnv {
         ChildSpawnEnv {
             service: self.service.clone(),
+            #[cfg(feature = "distributed")]
             actor_system: self.actor_system.clone(),
             observer: self.handle.observer().clone(),
             spawner: self.spawner.clone(),
@@ -133,7 +153,7 @@ impl<A: Actor> ActorContext<A> {
         key: ChildActorKey,
         options: &ChildActorOptions,
         handle: ActorHandle<C>,
-        reference: Option<ActorRef>,
+        reference: ChildReference,
         factory: Option<F>,
     ) where
         C: Actor,
@@ -144,6 +164,7 @@ impl<A: Actor> ActorContext<A> {
             key,
             Box::new(ChildSlotStopper {
                 slot: slot.clone(),
+                #[cfg(feature = "distributed")]
                 directory: self.service.extension::<ActivationDirectory>(),
             }),
         );
@@ -190,8 +211,7 @@ impl<A: Actor> ActorContext<A> {
                         }
                         // The replacement is a distinct activation, so it takes a fresh activation
                         // ID. References to the dead child must never resolve to it.
-                        reference = match reference.as_ref().map(next_child_activation).transpose()
-                        {
+                        reference = match next_child_reference(&reference) {
                             Ok(reference) => reference,
                             Err(error) => {
                                 tracing::warn!(
@@ -220,6 +240,7 @@ impl<A: Actor> ActorContext<A> {
         slot.set_supervision(supervision);
     }
 
+    #[cfg(feature = "distributed")]
     fn child_actor_ref(
         &self,
         key: &ChildActorKey,
@@ -254,6 +275,7 @@ pub(super) trait ChildStop: Send {
 /// that no longer holds the [`ActorContext`].
 struct ChildSpawnEnv {
     service: ServiceContext,
+    #[cfg(feature = "distributed")]
     actor_system: Option<Arc<OnceLock<ActorSystem>>>,
     observer: ActorObserverHandle,
     spawner: ActorSpawner,
@@ -264,19 +286,25 @@ impl ChildSpawnEnv {
         &self,
         actor: C,
         options: &ChildActorOptions,
-        reference: Option<ActorRef>,
+        reference: ChildReference,
     ) -> Result<ActorHandle<C>, ActorError>
     where
         C: Actor,
     {
+        #[cfg(not(feature = "distributed"))]
+        let _ = reference;
+        #[cfg(feature = "distributed")]
         let directory = self.service.extension::<ActivationDirectory>();
+        #[cfg(feature = "distributed")]
         let terminal_hook: Option<TerminalHook> = match (directory.clone(), reference.clone()) {
             (Some(directory), Some(reference)) => Some(Box::new(move |_local_ref| {
                 directory.remove(&reference);
             })),
             _ => None,
         };
-        let handle = crate::runtime::spawn_actor_with_self_ref(
+        #[cfg(not(feature = "distributed"))]
+        let terminal_hook: Option<TerminalHook> = None;
+        let handle = spawn_actor_with_self_ref(
             actor,
             ActorSpawnContext {
                 options: ActorSpawnOptions {
@@ -284,9 +312,11 @@ impl ChildSpawnEnv {
                     execution: Some(options.execution),
                     scheduler_key: options.scheduler_key.clone(),
                     passivation: PassivationPolicy::Disabled,
+                    #[cfg(feature = "distributed")]
                     self_ref: reference.clone(),
                     service: self.service.clone(),
                 },
+                #[cfg(feature = "distributed")]
                 actor_system: self.actor_system.clone(),
                 observer: self.observer.clone(),
                 terminal_hook,
@@ -294,6 +324,7 @@ impl ChildSpawnEnv {
             },
         )
         .map_err(|error| ActorError::new(error.to_string()))?;
+        #[cfg(feature = "distributed")]
         if let Some(directory) = &directory {
             if let Err(error) = directory.register(&handle) {
                 let _ = handle.try_stop_internal(StopReason::StartFailed);
@@ -309,6 +340,17 @@ impl ChildSpawnEnv {
     }
 }
 
+#[cfg(feature = "distributed")]
+fn next_child_reference(previous: &ChildReference) -> Result<ChildReference, ActorError> {
+    previous.as_ref().map(next_child_activation).transpose()
+}
+
+#[cfg(not(feature = "distributed"))]
+fn next_child_reference(_previous: &ChildReference) -> Result<ChildReference, ActorError> {
+    Ok(ChildReference)
+}
+
+#[cfg(feature = "distributed")]
 fn next_child_activation(previous: &ActorRef) -> Result<ActorRef, ActorError> {
     ActorRef::new(
         previous.cluster_id().clone(),
@@ -337,7 +379,7 @@ where
 
 struct ChildActivation<C: Actor> {
     handle: ActorHandle<C>,
-    reference: Option<ActorRef>,
+    reference: ChildReference,
 }
 
 struct ChildSlot<C: Actor> {
@@ -346,7 +388,7 @@ struct ChildSlot<C: Actor> {
 }
 
 impl<C: Actor> ChildSlot<C> {
-    fn new(handle: ActorHandle<C>, reference: Option<ActorRef>) -> Self {
+    fn new(handle: ActorHandle<C>, reference: ChildReference) -> Self {
         Self {
             current: Mutex::new(Some(ChildActivation { handle, reference })),
             supervision: Mutex::new(None),
@@ -368,7 +410,7 @@ impl<C: Actor> ChildSlot<C> {
         self.current.lock().expect("child slot poisoned").take()
     }
 
-    fn replace(&self, handle: ActorHandle<C>, reference: Option<ActorRef>) {
+    fn replace(&self, handle: ActorHandle<C>, reference: ChildReference) {
         *self.current.lock().expect("child slot poisoned") =
             Some(ChildActivation { handle, reference });
     }
@@ -386,6 +428,7 @@ impl<C: Actor> ChildSlot<C> {
 
 struct ChildSlotStopper<C: Actor> {
     slot: Arc<ChildSlot<C>>,
+    #[cfg(feature = "distributed")]
     directory: Option<Arc<ActivationDirectory>>,
 }
 
@@ -397,6 +440,7 @@ impl<C: Actor> ChildStop for ChildSlotStopper<C> {
         let Some(activation) = self.slot.take() else {
             return;
         };
+        #[cfg(feature = "distributed")]
         if let (Some(directory), Some(reference)) = (&self.directory, &activation.reference) {
             directory.remove(reference);
         }

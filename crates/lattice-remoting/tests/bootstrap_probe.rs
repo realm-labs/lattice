@@ -6,7 +6,7 @@ use std::{
 use async_trait::async_trait;
 use bytes::Bytes;
 use lattice_core::{
-    actor_ref::{ActorRef, ClusterId, NodeAddress, NodeIncarnation, ProtocolId},
+    actor_ref::{ClusterId, NodeAddress, NodeIncarnation, ProtocolId},
     coordinator::CoordinatorScope,
 };
 use lattice_remoting::{
@@ -56,7 +56,6 @@ fn test_crypto_provider() -> Arc<CryptoProvider> {
 impl InboundDispatch for RejectDispatch {
     async fn tell(
         &self,
-        _sender: Option<ActorRef>,
         _target: ExactActorTarget,
         _message_id: u64,
         _payload: Bytes,

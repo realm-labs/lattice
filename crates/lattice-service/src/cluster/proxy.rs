@@ -8,9 +8,9 @@ use super::{
     ActorRef, AskError, AssociationKey, AssociationManager, AssociationState, Bytes, EntityConfig,
     EntityRef, Instant, LOGICAL_RESOLVE_MESSAGE_ID, LogicPlacementState, LogicalEntityTarget,
     Mutex, NodeKey, OutboundMessage, OutboundMessaging, PlacementSlot, PlacementSlotKey,
-    PlacementSlotState, ProtocolFingerprint, RemoteMessageError, RouteBuffer, SenderIdentity,
-    ShardMapperBinding, WatchError, async_trait, decode_resolved_actor, entity::EntityRoute,
-    map_tell, next_logical_resolution, peers::PeerReconciler,
+    PlacementSlotState, ProtocolFingerprint, RemoteMessageError, RouteBuffer, ShardMapperBinding,
+    WatchError, async_trait, decode_resolved_actor, entity::EntityRoute, map_tell,
+    next_logical_resolution, peers::PeerReconciler,
 };
 
 pub(super) struct EntityProxyRoute {
@@ -195,7 +195,6 @@ impl EntityProxyRoute {
 impl EntityRoute for EntityProxyRoute {
     async fn tell(
         &self,
-        sender: Option<ActorRef>,
         target: EntityRef,
         fingerprint: ProtocolFingerprint,
         message_id: u64,
@@ -209,14 +208,9 @@ impl EntityRoute for EntityProxyRoute {
             .await?;
         let owner = slot.owner.ok_or(RemoteMessageError::StaleAuthority)?;
         let association = self.remote_association(&target, &owner).await?;
-        let sender = sender
-            .as_ref()
-            .map(SenderIdentity::from)
-            .unwrap_or_else(|| SenderIdentity::Process(self.local_node.incarnation.get()));
         self.messaging
             .tell_entity(
                 &association,
-                &sender,
                 LogicalEntityTarget {
                     reference: target,
                     owner_address: owner.address,
@@ -256,7 +250,6 @@ impl EntityRoute for EntityProxyRoute {
         self.messaging
             .ask_entity(
                 &association,
-                &SenderIdentity::Process(self.local_node.incarnation.get()),
                 LogicalEntityTarget {
                     reference: target,
                     owner_address: owner.address,
@@ -271,7 +264,6 @@ impl EntityRoute for EntityProxyRoute {
 
     async fn receive_tell(
         &self,
-        _sender: Option<ActorRef>,
         _target: LogicalEntityTarget,
         _message_id: u64,
         _payload: Bytes,
@@ -305,7 +297,6 @@ impl EntityRoute for EntityProxyRoute {
             .messaging
             .ask_entity(
                 &association,
-                &SenderIdentity::Process(self.local_node.incarnation.get()),
                 LogicalEntityTarget {
                     reference: target,
                     owner_address: owner.address,

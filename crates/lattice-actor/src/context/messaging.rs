@@ -1,37 +1,159 @@
 //! Typed messaging performed from inside an actor turn.
 //!
-//! The methods here are the only place an [`ActorContext`] reaches the surrounding
-//! [`ActorSystem`], so self/sender propagation and deadline inheritance stay in one place.
+//! Local handles and distributed references implement the same [`TellTarget`]
+//! capability. Callers therefore choose a target, not a transport.
 
+use std::future::Future;
+
+#[cfg(feature = "distributed")]
 use std::time::Duration;
 
-use lattice_core::actor_ref::{ActorRef, RecipientRef};
+#[cfg(feature = "distributed")]
+use lattice_core::actor_ref::{ActorRef, EntityRef, RecipientRef, SingletonRef};
 
-use super::{ActorContext, ActorTurnMessaging};
+use super::ActorContext;
+#[cfg(feature = "distributed")]
+use super::ActorTurnMessaging;
 use crate::{
     error::ActorTellError,
     handle::ActorHandle,
-    protocol::{SupportsAsk, SupportsTell},
-    recipient::{ActorSystem, RecipientError, deadline_from_timeout},
-    traits::{Actor, Handler, Message, Request},
+    traits::{Actor, Handler, Message},
 };
 
-impl ActorTurnMessaging {
-    /// Sends with the current Actor as the envelope sender.
-    pub async fn tell<P, M>(
+#[cfg(feature = "distributed")]
+use crate::{
+    protocol::{Protocol, SupportsAsk, SupportsTell},
+    recipient::{ActorSystem, RecipientError, deadline_from_timeout},
+    traits::Request,
+};
+
+#[doc(hidden)]
+#[derive(Clone, Debug)]
+pub struct OutboundTell {
+    #[cfg(feature = "distributed")]
+    actor_system: Option<ActorSystem>,
+}
+
+mod private {
+    pub trait Sealed {}
+}
+
+/// A statically typed destination for a one-way Actor message.
+///
+/// [`ActorHandle`] implements this capability through its process-local
+/// mailbox. With the `distributed` feature enabled, exact and logical Actor
+/// references implement it through the current Actor system.
+pub trait TellTarget<M: Message>: private::Sealed + Sync {
+    type Error;
+
+    #[doc(hidden)]
+    fn deliver(
         &self,
-        target: impl Into<RecipientRef<P>>,
+        outbound: OutboundTell,
         message: M,
-    ) -> Result<(), RecipientError>
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
+}
+
+impl<B: Actor> private::Sealed for ActorHandle<B> {}
+
+impl<B, M> TellTarget<M> for ActorHandle<B>
+where
+    B: Actor + Handler<M>,
+    B::Behavior: crate::state_machine::Accepts<M>,
+    M: Message,
+{
+    type Error = ActorTellError<M>;
+
+    fn deliver(
+        &self,
+        _outbound: OutboundTell,
+        message: M,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send {
+        let handle = self.clone();
+        async move { handle.tell(message).await }
+    }
+}
+
+#[cfg(feature = "distributed")]
+async fn deliver_reference<P, M>(
+    target: RecipientRef<P>,
+    outbound: OutboundTell,
+    message: M,
+) -> Result<(), RecipientError>
+where
+    P: Protocol + SupportsTell<M>,
+    M: Message,
+{
+    let actor_system = outbound
+        .actor_system
+        .ok_or(RecipientError::ActorSystemUnavailable)?;
+    actor_system.tell(target, message).await
+}
+
+#[cfg(feature = "distributed")]
+macro_rules! impl_reference_target {
+    ($target:ident) => {
+        impl<P: Protocol> private::Sealed for $target<P> {}
+
+        impl<P, M> TellTarget<M> for $target<P>
+        where
+            P: Protocol + SupportsTell<M>,
+            M: Message,
+        {
+            type Error = RecipientError;
+
+            fn deliver(
+                &self,
+                outbound: OutboundTell,
+                message: M,
+            ) -> impl Future<Output = Result<(), Self::Error>> + Send {
+                deliver_reference(self.clone().into(), outbound, message)
+            }
+        }
+    };
+}
+
+#[cfg(feature = "distributed")]
+impl_reference_target!(ActorRef);
+#[cfg(feature = "distributed")]
+impl_reference_target!(EntityRef);
+#[cfg(feature = "distributed")]
+impl_reference_target!(SingletonRef);
+
+#[cfg(feature = "distributed")]
+impl<P: Protocol> private::Sealed for RecipientRef<P> {}
+
+#[cfg(feature = "distributed")]
+impl<P, M> TellTarget<M> for RecipientRef<P>
+where
+    P: Protocol + SupportsTell<M>,
+    M: Message,
+{
+    type Error = RecipientError;
+
+    fn deliver(
+        &self,
+        outbound: OutboundTell,
+        message: M,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send {
+        deliver_reference(self.clone(), outbound, message)
+    }
+}
+
+#[cfg(feature = "distributed")]
+impl ActorTurnMessaging {
+    /// Sends to a local handle or distributed Actor reference.
+    pub async fn tell<T, M>(&self, target: &T, message: M) -> Result<(), T::Error>
     where
-        P: SupportsTell<M>,
+        T: TellTarget<M>,
         M: Message,
     {
-        self.actor_system
-            .tell_with_sender(
-                target.into(),
+        target
+            .deliver(
+                OutboundTell {
+                    actor_system: Some(self.actor_system.clone()),
+                },
                 message,
-                self.self_ref.as_ref().map(ActorRef::erase),
             )
             .await
     }
@@ -55,94 +177,48 @@ impl ActorTurnMessaging {
             .ask_until(target.into(), request, deadline)
             .await
     }
-
-    /// Forwards while preserving the original envelope sender.
-    pub async fn forward<P, M>(
-        &self,
-        target: impl Into<RecipientRef<P>>,
-        message: M,
-    ) -> Result<(), RecipientError>
-    where
-        P: SupportsTell<M>,
-        M: Message,
-    {
-        self.actor_system
-            .tell_with_sender(
-                target.into(),
-                message,
-                self.sender.as_ref().map(ActorRef::erase),
-            )
-            .await
-    }
 }
 
 impl<A: Actor> ActorContext<A> {
+    fn outbound_tell(&self) -> OutboundTell {
+        OutboundTell {
+            #[cfg(feature = "distributed")]
+            actor_system: self
+                .actor_system
+                .as_ref()
+                .and_then(|actor_system| actor_system.get())
+                .cloned(),
+        }
+    }
+
+    /// Sends to a local handle or distributed Actor reference.
+    pub fn tell<'a, T, M>(
+        &self,
+        target: &'a T,
+        message: M,
+    ) -> impl Future<Output = Result<(), T::Error>> + Send + 'a
+    where
+        T: TellTarget<M> + 'a,
+        M: Message,
+    {
+        target.deliver(self.outbound_tell(), message)
+    }
+
+    #[cfg(feature = "distributed")]
     /// Snapshots the current turn's typed messaging authority.
     ///
     /// The returned handle does not expose placement, mailbox, child, task, or
-    /// extension internals. It preserves self/sender propagation and the
-    /// current request deadline for adapters that must perform typed messaging
-    /// after releasing the `ActorContext` borrow.
+    /// extension internals. It preserves the current request deadline for
+    /// adapters that must perform typed messaging after releasing the
+    /// `ActorContext` borrow.
     pub fn turn_messaging(&self) -> Result<ActorTurnMessaging, RecipientError> {
         Ok(ActorTurnMessaging {
             actor_system: self.actor_system()?.clone(),
-            self_ref: self.self_ref.clone(),
-            sender: self.sender.clone(),
             deadline: self.current_deadline,
         })
     }
 
-    /// Sends to a process-local handle with this actor as the envelope sender.
-    pub fn tell_local<B, M>(
-        &self,
-        target: &ActorHandle<B>,
-        message: M,
-    ) -> Result<(), ActorTellError<M>>
-    where
-        B: Actor + Handler<M>,
-        <B as crate::traits::Actor>::Behavior: crate::state_machine::Accepts<M>,
-        M: Message,
-    {
-        let sender = self.self_ref.as_ref().map(ActorRef::erase);
-        target.try_tell_from(message, sender)
-    }
-
-    /// Forwards a one-way message while preserving the current envelope sender.
-    ///
-    /// If the current message has no actor sender, the forwarded message also
-    /// has no actor sender.
-    pub fn forward_local<B, M>(
-        &self,
-        target: &ActorHandle<B>,
-        message: M,
-    ) -> Result<(), ActorTellError<M>>
-    where
-        B: Actor + Handler<M>,
-        <B as crate::traits::Actor>::Behavior: crate::state_machine::Accepts<M>,
-        M: Message,
-    {
-        target.try_tell_from(message, self.sender.as_ref().map(ActorRef::erase))
-    }
-
-    /// Sends to an exact or logical actor reference with this actor as sender.
-    pub async fn tell<P, M>(
-        &mut self,
-        target: impl Into<RecipientRef<P>>,
-        message: M,
-    ) -> Result<(), RecipientError>
-    where
-        P: SupportsTell<M>,
-        M: Message,
-    {
-        self.actor_system()?
-            .tell_with_sender(
-                target.into(),
-                message,
-                self.self_ref.as_ref().map(ActorRef::erase),
-            )
-            .await
-    }
-
+    #[cfg(feature = "distributed")]
     /// Sends a request using a relative timeout.
     ///
     /// While handling another request, the downstream ask cannot outlive the
@@ -166,26 +242,7 @@ impl<A: Actor> ActorContext<A> {
             .await
     }
 
-    /// Forwards to an exact or logical actor reference while preserving the
-    /// current envelope sender.
-    pub async fn forward<P, M>(
-        &mut self,
-        target: impl Into<RecipientRef<P>>,
-        message: M,
-    ) -> Result<(), RecipientError>
-    where
-        P: SupportsTell<M>,
-        M: Message,
-    {
-        self.actor_system()?
-            .tell_with_sender(
-                target.into(),
-                message,
-                self.sender.as_ref().map(ActorRef::erase),
-            )
-            .await
-    }
-
+    #[cfg(feature = "distributed")]
     pub(super) fn actor_system(&self) -> Result<&ActorSystem, RecipientError> {
         self.actor_system
             .as_ref()
@@ -194,7 +251,7 @@ impl<A: Actor> ActorContext<A> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "distributed"))]
 #[allow(dead_code)]
 mod turn_messaging_tests {
     use std::sync::{Arc, Mutex};
@@ -264,7 +321,7 @@ mod turn_messaging_tests {
 
     #[derive(Default)]
     struct RecordingBackend {
-        tell_senders: Mutex<Vec<Option<ActorRef>>>,
+        tell_count: Mutex<usize>,
         ask_deadlines: Mutex<Vec<Instant>>,
     }
 
@@ -272,16 +329,13 @@ mod turn_messaging_tests {
     impl RecipientBackend for RecordingBackend {
         async fn tell(
             &self,
-            sender: Option<ActorRef>,
             _target: lattice_core::actor_ref::RecipientRef,
             _protocol_fingerprint: ProtocolFingerprint,
             _message_id: u64,
             _payload: Bytes,
         ) -> Result<(), TellError> {
-            self.tell_senders
-                .lock()
-                .expect("tell sender mutex")
-                .push(sender);
+            let mut count = self.tell_count.lock().expect("tell count mutex");
+            *count += 1;
             Ok(())
         }
 
@@ -326,50 +380,32 @@ mod turn_messaging_tests {
     }
 
     #[tokio::test]
-    async fn owned_turn_messaging_preserves_sender_and_parent_deadline() {
+    async fn owned_turn_messaging_sends_and_preserves_parent_deadline() {
         let backend = Arc::new(RecordingBackend::default());
         let protocol = Arc::new(TurnProtocol::build().expect("turn protocol"));
         let actor_system =
             ActorSystem::new(backend.clone(), [RegisteredActorProtocol::new(protocol)])
                 .expect("actor system");
-        let self_ref = actor_ref("self", 1);
-        let original_sender = actor_ref("sender", 2);
         let target = actor_ref("target", 3)
             .try_typed::<TurnProtocol>()
             .expect("typed target");
         let parent_deadline = Instant::now() + Duration::from_secs(1);
         let messaging = ActorTurnMessaging {
             actor_system,
-            self_ref: Some(self_ref.clone()),
-            sender: Some(original_sender.clone()),
             deadline: Some(parent_deadline),
         };
 
         messaging
-            .tell(target.clone(), Probe { value: 1 })
+            .tell(&target, Probe { value: 1 })
             .await
             .expect("typed tell");
-        messaging
-            .forward(target.clone(), Probe { value: 2 })
-            .await
-            .expect("typed forward");
         let reply = messaging
             .ask(target, Query { value: 3 }, Duration::from_secs(30))
             .await
             .expect("typed ask");
 
         assert_eq!(reply.value, 41);
-        let tell_senders = backend.tell_senders.lock().expect("tell sender mutex");
-        assert!(
-            tell_senders[0]
-                .as_ref()
-                .is_some_and(|sender| { sender.same_activation(&self_ref) })
-        );
-        assert!(
-            tell_senders[1]
-                .as_ref()
-                .is_some_and(|sender| { sender.same_activation(&original_sender) })
-        );
+        assert_eq!(*backend.tell_count.lock().expect("tell count mutex"), 1);
         let ask_deadlines = backend.ask_deadlines.lock().expect("ask deadline mutex");
         assert_eq!(ask_deadlines.as_slice(), &[parent_deadline]);
     }

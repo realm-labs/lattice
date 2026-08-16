@@ -1,3 +1,5 @@
+#![cfg(feature = "distributed")]
+
 use lattice_actor::context::HandlerContext;
 use std::{
     any::type_name,
@@ -275,7 +277,6 @@ async fn runtime_observer_reports_deferred_completion_lifecycle_and_protocol_fai
     let (runtime, events, signal) = observed_runtime();
     let handle = runtime
         .spawn_actor(ObservedActor, ActorSpawnOptions::default())
-        .await
         .unwrap();
     wait_for_event(&events, &signal, |event| {
         *event == ObserverEvent::Lifecycle(ActorLifecycleEvent::Started)
@@ -370,7 +371,6 @@ async fn runtime_observer_reports_mailbox_rejection() {
                 ..ActorSpawnOptions::default()
             },
         )
-        .await
         .unwrap();
     let entered = Arc::new(Semaphore::new(0));
     let release = Arc::new(Semaphore::new(0));
@@ -418,7 +418,6 @@ async fn stop_completes_every_message_left_in_the_mailbox() {
                 ..ActorSpawnOptions::default()
             },
         )
-        .await
         .unwrap();
     let entered = Arc::new(Semaphore::new(0));
     let release = Arc::new(Semaphore::new(0));

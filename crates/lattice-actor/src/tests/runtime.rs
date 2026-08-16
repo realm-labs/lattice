@@ -34,7 +34,6 @@ async fn actor_runtime_spawns_task_per_actor() {
 
     let handle = runtime
         .spawn_actor(actor, ActorSpawnOptions::default())
-        .await
         .unwrap();
     let reply = handle.ask(Ping("runtime"), ASK_TIMEOUT).await.unwrap();
 
@@ -74,7 +73,6 @@ async fn actor_spawn_options_pass_service_context_to_handler_and_child() {
                 ..ActorSpawnOptions::default()
             },
         )
-        .await
         .unwrap();
 
     assert_eq!(

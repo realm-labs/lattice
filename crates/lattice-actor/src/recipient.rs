@@ -24,7 +24,6 @@ use crate::watch::{ActorTerminated, TerminatedTarget};
 
 #[doc(hidden)]
 pub struct RecipientTell {
-    pub sender: Option<ActorRef>,
     pub target: RecipientRef,
     pub protocol_fingerprint: ProtocolFingerprint,
     pub message_id: u64,
@@ -32,10 +31,6 @@ pub struct RecipientTell {
 }
 
 #[doc(hidden)]
-#[expect(
-    clippy::large_enum_variant,
-    reason = "keeping a deferred tell inline avoids a heap allocation on backend fallback"
-)]
 pub enum ImmediateRecipientTellDispatch {
     Complete(Result<(), TellError>),
     Deferred(RecipientTell),
@@ -50,7 +45,6 @@ pub trait RecipientBackend: Send + Sync + 'static {
 
     async fn tell(
         &self,
-        sender: Option<ActorRef>,
         target: RecipientRef,
         protocol_fingerprint: ProtocolFingerprint,
         message_id: u64,
@@ -214,8 +208,7 @@ impl ActorSystem {
         })
     }
 
-    /// Sends a one-way message from process code. The receiver observes no
-    /// actor sender.
+    /// Sends a one-way message from process code.
     ///
     /// Remote exact-actor delivery waits for bounded outbound queue and byte
     /// capacity when they are temporarily exhausted. Permanent routing,
@@ -229,25 +222,12 @@ impl ActorSystem {
         P: SupportsTell<M>,
         M: Message,
     {
-        self.tell_with_sender(target.into(), message, None).await
-    }
-
-    pub(crate) async fn tell_with_sender<P, M>(
-        &self,
-        target: RecipientRef<P>,
-        message: M,
-        sender: Option<ActorRef>,
-    ) -> Result<(), RecipientError>
-    where
-        P: SupportsTell<M>,
-        M: Message,
-    {
+        let target = target.into();
         let protocol = self.protocol::<P>(target_protocol_id(&target))?;
         let (message_id, payload) = protocol
             .encode_request(DispatchMode::Tell, &message)
             .map_err(RecipientError::Dispatch)?;
         let tell = RecipientTell {
-            sender,
             target: target.erase(),
             protocol_fingerprint: protocol.fingerprint(),
             message_id,
@@ -260,7 +240,6 @@ impl ActorSystem {
             ImmediateRecipientTellDispatch::Deferred(tell) => self
                 .backend
                 .tell(
-                    tell.sender,
                     tell.target,
                     tell.protocol_fingerprint,
                     tell.message_id,

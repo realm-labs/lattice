@@ -1,7 +1,6 @@
 use std::any::type_name;
 use std::time::Instant;
 
-use lattice_core::actor_ref::ActorRef;
 use tokio::sync::oneshot;
 use tracing::{debug, warn};
 
@@ -212,15 +211,11 @@ impl<R: Request> RequestEnvelope<R> {
 
 pub(crate) struct TellEnvelope<M: Message> {
     msg: Option<M>,
-    sender: Option<ActorRef>,
 }
 
 impl<M: Message> TellEnvelope<M> {
-    pub(crate) fn new(msg: M, sender: Option<ActorRef>) -> Self {
-        Self {
-            msg: Some(msg),
-            sender,
-        }
+    pub(crate) fn new(msg: M) -> Self {
+        Self { msg: Some(msg) }
     }
 }
 
@@ -242,11 +237,7 @@ where
         metadata: &'a MessageMetadata,
     ) -> EnvelopeFuture<'a> {
         PooledFuture::new(async move {
-            ctx.clear_sender();
             ctx.set_current_deadline(None);
-            if let Some(sender) = self.sender.take() {
-                ctx.set_sender(sender);
-            }
             let msg = self
                 .msg
                 .as_ref()
@@ -257,7 +248,6 @@ where
             {
                 let outcome = MessageOutcome::Rejected(MessageRejection::UnhandledInCurrentState);
                 actor.after_message(ctx, metadata, outcome);
-                ctx.clear_sender();
                 ctx.set_current_deadline(None);
                 return outcome;
             }
@@ -277,7 +267,6 @@ where
                 }
             };
             actor.after_message(ctx, metadata, outcome);
-            ctx.clear_sender();
             ctx.set_current_deadline(None);
             outcome
         })
@@ -316,7 +305,6 @@ where
         metadata: &'a MessageMetadata,
     ) -> EnvelopeFuture<'a> {
         PooledFuture::new(async move {
-            ctx.clear_sender();
             ctx.set_current_deadline(metadata.deadline());
             let request = self
                 .request

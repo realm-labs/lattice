@@ -1,3 +1,5 @@
+#![cfg(feature = "distributed")]
+
 use std::time::Duration;
 
 use lattice_actor::{
@@ -108,7 +110,6 @@ async fn spawn_parent(
                 ..ActorSpawnOptions::default()
             },
         )
-        .await
         .expect("parent spawns");
     (handle, receiver)
 }

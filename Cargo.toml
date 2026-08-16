@@ -55,7 +55,7 @@ lattice-config-etcd = { path = "crates/lattice-config-etcd" }
 lattice-core = { path = "crates/lattice-core" }
 lattice-discovery = { path = "crates/lattice-discovery" }
 lattice-discovery-k8s = { path = "crates/lattice-discovery-k8s" }
-lattice-actor = { path = "crates/lattice-actor", version = "0.1.0" }
+lattice-actor = { path = "crates/lattice-actor", version = "0.1.0", default-features = false }
 lattice-actor-macros = { path = "crates/lattice-actor-macros" }
 lattice-codegen = { path = "crates/lattice-codegen" }
 lattice-remoting = { path = "crates/lattice-remoting", default-features = false }

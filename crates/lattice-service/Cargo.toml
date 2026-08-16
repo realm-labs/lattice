@@ -17,7 +17,7 @@ async-trait.workspace = true
 bytes.workspace = true
 dashmap.workspace = true
 futures-util.workspace = true
-lattice-actor.workspace = true
+lattice-actor = { workspace = true, features = ["distributed"] }
 lattice-core.workspace = true
 lattice-discovery.workspace = true
 lattice-placement.workspace = true

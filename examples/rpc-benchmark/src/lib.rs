@@ -21,10 +21,7 @@ use lattice_core::actor_ref::{
 use lattice_remoting::{
     association::{Association, AssociationKey, LaneAttachment, LaneKind},
     config::RemotingConfig,
-    messaging::{
-        outbound::{OutboundMessage, OutboundMessaging, PreparedExactTellRoute},
-        target::SenderIdentity,
-    },
+    messaging::outbound::{OutboundMessage, OutboundMessaging, PreparedExactTellRoute},
     protocol::{ProtocolDescriptor, ProtocolFingerprint},
 };
 use metrics::WorkloadReport;
@@ -66,7 +63,6 @@ pub struct RemotingTopology {
     messaging: OutboundMessaging,
     target: ActorRef,
     fingerprint: ProtocolFingerprint,
-    sender: SenderIdentity,
     prepared: PreparedExactTellRoute,
     drains: Vec<JoinHandle<()>>,
 }
@@ -144,19 +140,13 @@ impl RemotingTopology {
             })
             .collect();
         let messaging = OutboundMessaging::new(1)?;
-        let sender = SenderIdentity::Process(1);
-        let prepared = messaging.prepare_exact_tell_route(
-            association.clone(),
-            &sender,
-            &target,
-            fingerprint,
-        )?;
+        let prepared =
+            messaging.prepare_exact_tell_route(association.clone(), &target, fingerprint)?;
         Ok(Self {
             association,
             messaging,
             target,
             fingerprint,
-            sender,
             prepared,
             drains,
         })
@@ -209,7 +199,6 @@ impl RemotingTopology {
             loop {
                 match self.messaging.tell(
                     &self.association,
-                    &self.sender,
                     &self.target,
                     OutboundMessage::new(self.fingerprint, 1, payload.clone()),
                 ) {

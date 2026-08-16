@@ -77,7 +77,6 @@ struct RecordingDispatch {
 impl InboundDispatch for RecordingDispatch {
     async fn tell(
         &self,
-        _sender: Option<ActorRef>,
         target: ExactActorTarget,
         _message_id: u64,
         _payload: Bytes,
@@ -139,7 +138,6 @@ async fn real_tcp_tell_and_ask_dispatch_exact_activation() {
                 target: Some(target_to_wire(&actor_ref)),
                 message_id: 1,
                 payload: Bytes::from_static(b"tell"),
-                sender_actor: None,
                 target_id: 0,
             },
         ))
@@ -190,27 +188,16 @@ async fn real_tcp_tell_and_ask_dispatch_exact_activation() {
 }
 
 #[tokio::test]
-async fn outbound_tell_preserves_an_exact_actor_sender() {
+async fn outbound_tell_encodes_the_exact_target() {
     let protocol_id = ProtocolId::new(7).unwrap();
     let fingerprint = ProtocolFingerprint::digest(b"test/v1");
     let association = active_association(protocol_id, fingerprint);
     let mut receivers = association.take_receivers().unwrap();
     let messaging = OutboundMessaging::new(4).unwrap();
     let recipient = target(protocol_id);
-    let sender: ActorRef = ActorRef::new(
-        ClusterId::new("test").unwrap(),
-        NodeAddress::new("sender", 25521).unwrap(),
-        NodeIncarnation::new(3).unwrap(),
-        ActorPath::user(["user", "sender"]).unwrap(),
-        ActivationId::new(NodeIncarnation::new(3).unwrap(), 9).unwrap(),
-        protocol_id,
-    )
-    .unwrap();
-    let sender_identity = SenderIdentity::from(&sender);
     let stripe = messaging
         .tell(
             &association,
-            &sender_identity,
             &recipient,
             OutboundMessage::new(fingerprint, 1, Bytes::from_static(b"tell")),
         )
@@ -218,38 +205,20 @@ async fn outbound_tell_preserves_an_exact_actor_sender() {
 
     let frame = receivers.bulk[stripe].recv().await.unwrap();
     let decoded = decode_tell(&frame).unwrap();
-    assert!(
-        decoded
-            .sender
-            .as_ref()
-            .is_some_and(|actual| actual.same_activation(&sender))
-    );
+    let decoded_target: ActorRef = decoded.target.actor_ref().unwrap();
+    assert!(decoded_target.same_activation(&recipient));
 }
 
 #[tokio::test]
-async fn prepared_exact_tell_preserves_sender_and_is_bound_to_association() {
+async fn prepared_exact_tell_is_bound_to_association() {
     let protocol_id = ProtocolId::new(7).unwrap();
     let fingerprint = ProtocolFingerprint::digest(b"test/v1");
     let association = active_association(protocol_id, fingerprint);
     let mut receivers = association.take_receivers().unwrap();
     let messaging = OutboundMessaging::new(4).unwrap();
     let recipient = target(protocol_id);
-    let sender: ActorRef = ActorRef::new(
-        ClusterId::new("test").unwrap(),
-        NodeAddress::new("sender", 25521).unwrap(),
-        NodeIncarnation::new(3).unwrap(),
-        ActorPath::user(["user", "sender"]).unwrap(),
-        ActivationId::new(NodeIncarnation::new(3).unwrap(), 9).unwrap(),
-        protocol_id,
-    )
-    .unwrap();
     let route = messaging
-        .prepare_exact_tell_route(
-            association.clone(),
-            &SenderIdentity::from(&sender),
-            &recipient,
-            fingerprint,
-        )
+        .prepare_exact_tell_route(association.clone(), &recipient, fingerprint)
         .unwrap();
 
     let stripe = route.tell(1, Bytes::from_static(b"tell")).unwrap();
@@ -265,12 +234,6 @@ async fn prepared_exact_tell_preserves_sender_and_is_bound_to_association() {
     let compact_target: ActorRef = compact_decoded.target.actor_ref().unwrap();
     assert!(decoded_target.same_activation(&recipient));
     assert!(compact_target.same_activation(&recipient));
-    assert!(
-        decoded
-            .sender
-            .as_ref()
-            .is_some_and(|actual| actual.same_activation(&sender))
-    );
 
     association.begin_close();
     assert!(matches!(
@@ -296,7 +259,6 @@ async fn disconnect_result_changes_only_at_socket_write_boundary() {
             task_messaging
                 .ask(
                     &task_association,
-                    &SenderIdentity::Process(9),
                     &actor_ref,
                     OutboundMessage::new(fingerprint, 1, Bytes::new()),
                     Instant::now() + Duration::from_secs(5),
@@ -327,7 +289,6 @@ async fn expired_queued_ask_is_dropped_before_socket_write() {
         task_messaging
             .ask(
                 &task_association,
-                &SenderIdentity::Process(9),
                 &actor_ref,
                 OutboundMessage::new(fingerprint, 1, Bytes::new()),
                 Instant::now() + Duration::from_millis(10),
@@ -353,7 +314,6 @@ async fn cancelling_an_ask_removes_it_from_the_shared_deadline_driver() {
         task_messaging
             .ask(
                 &task_association,
-                &SenderIdentity::Process(9),
                 &actor_ref,
                 OutboundMessage::new(fingerprint, 1, Bytes::new()),
                 Instant::now() + Duration::from_secs(30),
@@ -381,7 +341,6 @@ async fn an_earlier_ask_wakes_the_shared_deadline_driver() {
         long_messaging
             .ask(
                 &long_association,
-                &SenderIdentity::Process(9),
                 &long_target,
                 OutboundMessage::new(fingerprint, 1, Bytes::new()),
                 Instant::now() + Duration::from_secs(30),
@@ -397,7 +356,6 @@ async fn an_earlier_ask_wakes_the_shared_deadline_driver() {
         short_messaging
             .ask(
                 &short_association,
-                &SenderIdentity::Process(9),
                 &short_target,
                 OutboundMessage::new(fingerprint, 2, Bytes::new()),
                 Instant::now() + Duration::from_millis(10),
@@ -424,7 +382,6 @@ fn one_protocol_mismatch_does_not_close_the_association() {
     let actor_ref = target(protocol_id);
     let mismatch = messaging.tell(
         &association,
-        &SenderIdentity::Process(9),
         &actor_ref,
         OutboundMessage::new(ProtocolFingerprint::digest(b"other"), 1, Bytes::new()),
     );
@@ -439,7 +396,6 @@ fn one_protocol_mismatch_does_not_close_the_association() {
         messaging
             .tell(
                 &association,
-                &SenderIdentity::Process(9),
                 &actor_ref,
                 OutboundMessage::new(fingerprint, 1, Bytes::new()),
             )

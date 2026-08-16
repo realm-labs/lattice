@@ -32,7 +32,6 @@ struct PendingDrainRouter;
 impl LogicalRouter for PendingDrainRouter {
     async fn tell_entity(
         &self,
-        _sender: Option<ActorRef>,
         _target: EntityRef,
         _fingerprint: ProtocolFingerprint,
         _message_id: u64,
@@ -54,7 +53,6 @@ impl LogicalRouter for PendingDrainRouter {
 
     async fn tell_singleton(
         &self,
-        _sender: Option<ActorRef>,
         _target: SingletonRef,
         _fingerprint: ProtocolFingerprint,
         _message_id: u64,

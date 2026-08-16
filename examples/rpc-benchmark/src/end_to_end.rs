@@ -34,7 +34,7 @@ use lattice_remoting::{
         error::RemoteMessageError,
         inbound::{ImmediateTellDispatch, InboundDispatch},
         outbound::{OutboundMessage, OutboundMessaging, PreparedExactTellRoute},
-        target::{ExactActorTarget, InboundTell, SenderIdentity},
+        target::{ExactActorTarget, InboundTell},
     },
     protocol::{ProtocolDescriptor, ProtocolFingerprint},
 };
@@ -138,7 +138,6 @@ impl InboundDispatch for ActorDispatch {
 
     async fn tell(
         &self,
-        _sender: Option<ActorRef>,
         _target: ExactActorTarget,
         _message_id: u64,
         _payload: Bytes,
@@ -174,7 +173,6 @@ struct RejectDispatch;
 impl InboundDispatch for RejectDispatch {
     async fn tell(
         &self,
-        _sender: Option<ActorRef>,
         _target: ExactActorTarget,
         _message_id: u64,
         _payload: Bytes,
@@ -300,12 +298,8 @@ impl RemoteActorTopology {
             ActivationId::new(server_identity.incarnation, 1)?,
             protocol_id,
         )?;
-        let prepared_tell = client_messaging.prepare_exact_tell_route(
-            association.clone(),
-            &SenderIdentity::Process(1),
-            &target,
-            fingerprint,
-        )?;
+        let prepared_tell =
+            client_messaging.prepare_exact_tell_route(association.clone(), &target, fingerprint)?;
         let topology = Self {
             actor_registry,
             client,
@@ -442,7 +436,6 @@ impl RemoteActorTopology {
         self.messaging
             .ask(
                 &self.association,
-                &SenderIdentity::Process(1),
                 &self.target,
                 OutboundMessage::new(self.fingerprint, 1, payload),
                 Instant::now() + Duration::from_secs(5),

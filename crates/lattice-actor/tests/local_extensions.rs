@@ -306,6 +306,7 @@ impl Actor for RestartingParent {
                 starts: starts.clone(),
             },
             ChildActorOptions {
+                #[cfg(feature = "distributed")]
                 protocol_id: None,
                 mailbox: MailboxConfig::bounded(8),
                 supervision: ChildSupervision::RestartChild,

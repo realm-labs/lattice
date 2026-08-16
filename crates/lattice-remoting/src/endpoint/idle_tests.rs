@@ -20,7 +20,7 @@ use crate::{
         error::RemoteMessageError,
         inbound::InboundDispatch,
         outbound::{OutboundMessage, OutboundMessaging},
-        target::{ExactActorTarget, SenderIdentity},
+        target::ExactActorTarget,
     },
     protocol::{ProtocolDescriptor, ProtocolFingerprint},
 };
@@ -31,7 +31,6 @@ struct EchoDispatch;
 impl InboundDispatch for EchoDispatch {
     async fn tell(
         &self,
-        _sender: Option<ActorRef>,
         _target: ExactActorTarget,
         _message_id: u64,
         _payload: Bytes,
@@ -138,7 +137,6 @@ async fn idle_data_lanes_sleep_until_either_side_wakes_them() {
     let reply = client_messaging
         .ask(
             &association,
-            &SenderIdentity::Process(9),
             &target,
             OutboundMessage::new(fingerprint, 1, Bytes::from_static(b"wake")),
             Instant::now() + Duration::from_secs(1),
@@ -167,7 +165,6 @@ async fn idle_data_lanes_sleep_until_either_side_wakes_them() {
     let reverse_reply = server_messaging
         .ask(
             &reverse_association,
-            &SenderIdentity::Process(10),
             &reverse_target,
             OutboundMessage::new(fingerprint, 1, Bytes::from_static(b"reverse-wake")),
             Instant::now() + Duration::from_secs(1),

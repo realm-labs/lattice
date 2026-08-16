@@ -14,10 +14,7 @@ use super::{
     },
     error::{AskError, RemoteMessageError, TellError},
     oneshot,
-    target::{
-        CorrelationId, LogicalEntityTarget, LogicalSingletonTarget, SenderIdentity,
-        update_actor_route_hash,
-    },
+    target::{CorrelationId, LogicalEntityTarget, LogicalSingletonTarget, update_actor_route_hash},
 };
 
 const DEADLINE_DRIVER_IDLE_TIMEOUT: Duration = Duration::from_secs(1);
@@ -84,7 +81,7 @@ pub struct OutboundMessaging {
 
 /// A stable exact-actor bulk-tell route bound to one Association generation.
 ///
-/// Protocol compatibility, target encoding, sender encoding, and bulk stripe
+/// Protocol compatibility, target encoding, and bulk stripe
 /// selection are completed during preparation. If the bound Association is
 /// replaced or closes, admission fails and callers must prepare a new route.
 #[derive(Debug, Clone)]
@@ -209,11 +206,10 @@ impl OutboundMessaging {
     pub fn tell<A: ProtocolTag>(
         &self,
         association: &Association,
-        sender: &SenderIdentity,
         target: &ActorRef<A>,
         message: OutboundMessage,
     ) -> Result<usize, TellError> {
-        self.try_tell_retained(association, sender, target, message)
+        self.try_tell_retained(association, target, message)
             .map_err(|(error, _)| error)
     }
 
@@ -221,7 +217,6 @@ impl OutboundMessaging {
     pub fn try_tell_retained<A: ProtocolTag>(
         &self,
         association: &Association,
-        sender: &SenderIdentity,
         target: &ActorRef<A>,
         message: OutboundMessage,
     ) -> Result<usize, (TellError, Bytes)> {
@@ -232,15 +227,9 @@ impl OutboundMessaging {
         ) {
             return Err((TellError::Protocol(error), message.payload));
         }
-        let frame_len = tell_frame_len(
-            target,
-            sender.actor_ref(),
-            message.message_id,
-            message.payload.len(),
-        );
+        let frame_len = tell_frame_len(target, message.message_id, message.payload.len());
         let (stripe, admission) = match association.try_reserve_bulk(
             |hasher| {
-                sender.update_route_hash(hasher);
                 update_actor_route_hash(hasher, target);
             },
             frame_len,
@@ -248,12 +237,7 @@ impl OutboundMessaging {
             Ok(admission) => admission,
             Err(error) => return Err((TellError::Association(error), message.payload)),
         };
-        admission.send(tell_frame(
-            target,
-            sender.actor_ref(),
-            message.message_id,
-            message.payload,
-        ));
+        admission.send(tell_frame(target, message.message_id, message.payload));
         Ok(stripe)
     }
 
@@ -261,7 +245,6 @@ impl OutboundMessaging {
     pub async fn tell_wait<A: ProtocolTag>(
         &self,
         association: &Association,
-        sender: &SenderIdentity,
         target: &ActorRef<A>,
         message: OutboundMessage,
     ) -> Result<usize, TellError> {
@@ -271,15 +254,9 @@ impl OutboundMessaging {
             message.expected_fingerprint,
         )
         .map_err(TellError::Protocol)?;
-        let frame_len = tell_frame_len(
-            target,
-            sender.actor_ref(),
-            message.message_id,
-            message.payload.len(),
-        );
+        let frame_len = tell_frame_len(target, message.message_id, message.payload.len());
         let stripe = association
             .bulk_stripe(|hasher| {
-                sender.update_route_hash(hasher);
                 update_actor_route_hash(hasher, target);
             })
             .map_err(TellError::Association)?;
@@ -287,41 +264,32 @@ impl OutboundMessaging {
             .reserve_prepared_bulk(stripe, frame_len)
             .await
             .map_err(TellError::Association)?;
-        admission.send(tell_frame(
-            target,
-            sender.actor_ref(),
-            message.message_id,
-            message.payload,
-        ));
+        admission.send(tell_frame(target, message.message_id, message.payload));
         Ok(stripe)
     }
 
     /// Prepares a stable exact-actor tell route for a hot send loop.
     ///
     /// Preparation validates the immutable peer protocol catalogue and caches
-    /// the encoded target, optional actor sender, and selected bulk stripe.
+    /// the encoded target and selected bulk stripe.
     /// The returned route is bound to `association`; callers prepare another
     /// route after that Association closes or is replaced.
     pub fn prepare_exact_tell_route<A: ProtocolTag>(
         &self,
         association: Arc<Association>,
-        sender: &SenderIdentity,
         target: &ActorRef<A>,
         expected_fingerprint: ProtocolFingerprint,
     ) -> Result<PreparedExactTellRoute, TellError> {
         check_protocol(&association, target.protocol_id(), expected_fingerprint)
             .map_err(TellError::Protocol)?;
         let stripe = association
-            .bulk_stripe(|hasher| {
-                sender.update_route_hash(hasher);
-                update_actor_route_hash(hasher, target);
-            })
+            .bulk_stripe(|hasher| update_actor_route_hash(hasher, target))
             .map_err(TellError::Association)?;
         let dictionary_id = association.allocate_exact_target_dictionary_id(stripe);
         Ok(PreparedExactTellRoute {
             association,
             stripe,
-            envelope: PreparedExactTellEnvelope::new(target, sender.actor_ref(), dictionary_id),
+            envelope: PreparedExactTellEnvelope::new(target, dictionary_id),
             dictionary_id,
             registered_epoch: Arc::new(AtomicU64::new(0)),
         })
@@ -330,7 +298,6 @@ impl OutboundMessaging {
     pub fn tell_entity(
         &self,
         association: &Association,
-        sender: &SenderIdentity,
         target: LogicalEntityTarget,
         message: OutboundMessage,
     ) -> Result<usize, TellError> {
@@ -340,24 +307,12 @@ impl OutboundMessaging {
             message.expected_fingerprint,
         )
         .map_err(TellError::Protocol)?;
-        let frame_len = entity_tell_frame_len(
-            &target,
-            sender.actor_ref(),
-            message.message_id,
-            message.payload.len(),
-        );
+        let frame_len = entity_tell_frame_len(&target, message.message_id, message.payload.len());
         let (stripe, admission) = association
-            .try_reserve_bulk(
-                |hasher| {
-                    sender.update_route_hash(hasher);
-                    target.update_route_hash(hasher);
-                },
-                frame_len,
-            )
+            .try_reserve_bulk(|hasher| target.update_route_hash(hasher), frame_len)
             .map_err(TellError::Association)?;
         admission.send(entity_tell_frame(
             &target,
-            sender.actor_ref(),
             message.message_id,
             message.payload,
         ));
@@ -367,7 +322,6 @@ impl OutboundMessaging {
     pub fn tell_singleton(
         &self,
         association: &Association,
-        sender: &SenderIdentity,
         target: LogicalSingletonTarget,
         message: OutboundMessage,
     ) -> Result<usize, TellError> {
@@ -377,24 +331,13 @@ impl OutboundMessaging {
             message.expected_fingerprint,
         )
         .map_err(TellError::Protocol)?;
-        let frame_len = singleton_tell_frame_len(
-            &target,
-            sender.actor_ref(),
-            message.message_id,
-            message.payload.len(),
-        );
+        let frame_len =
+            singleton_tell_frame_len(&target, message.message_id, message.payload.len());
         let (stripe, admission) = association
-            .try_reserve_bulk(
-                |hasher| {
-                    sender.update_route_hash(hasher);
-                    target.update_route_hash(hasher);
-                },
-                frame_len,
-            )
+            .try_reserve_bulk(|hasher| target.update_route_hash(hasher), frame_len)
             .map_err(TellError::Association)?;
         admission.send(singleton_tell_frame(
             &target,
-            sender.actor_ref(),
             message.message_id,
             message.payload,
         ));
@@ -404,7 +347,6 @@ impl OutboundMessaging {
     pub async fn ask<A: ProtocolTag>(
         &self,
         association: &Association,
-        _sender: &SenderIdentity,
         target: &ActorRef<A>,
         message: OutboundMessage,
         deadline: Instant,
@@ -453,7 +395,6 @@ impl OutboundMessaging {
     pub async fn ask_entity(
         &self,
         association: &Association,
-        _sender: &SenderIdentity,
         target: LogicalEntityTarget,
         message: OutboundMessage,
         deadline: Instant,
@@ -482,7 +423,6 @@ impl OutboundMessaging {
     pub async fn ask_singleton(
         &self,
         association: &Association,
-        _sender: &SenderIdentity,
         target: LogicalSingletonTarget,
         message: OutboundMessage,
         deadline: Instant,

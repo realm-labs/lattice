@@ -5,40 +5,6 @@ use super::{
     NodeIncarnation, ProtocolId, SingletonRef, error::RemoteFailureCode,
 };
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum SenderIdentity {
-    Actor(ActorRef),
-    Process(u128),
-}
-
-impl SenderIdentity {
-    pub(super) fn update_route_hash(&self, hasher: &mut blake3::Hasher) {
-        match self {
-            Self::Actor(reference) => {
-                hasher.update(b"actor-sender");
-                update_actor_route_hash(hasher, reference);
-            }
-            Self::Process(value) => {
-                hasher.update(b"process-sender");
-                hasher.update(&value.to_be_bytes());
-            }
-        }
-    }
-
-    pub(super) fn actor_ref(&self) -> Option<&ActorRef> {
-        match self {
-            Self::Actor(reference) => Some(reference),
-            Self::Process(_) => None,
-        }
-    }
-}
-
-impl<A: ProtocolTag> From<&ActorRef<A>> for SenderIdentity {
-    fn from(value: &ActorRef<A>) -> Self {
-        Self::Actor(value.erase())
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct ExactActorTarget {
     pub cluster_id: ClusterId,
@@ -144,7 +110,6 @@ fn update_route_bytes(hasher: &mut blake3::Hasher, bytes: &[u8]) {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InboundTell {
-    pub sender: Option<ActorRef>,
     pub target: ExactActorTarget,
     pub message_id: u64,
     pub payload: Bytes,
@@ -204,7 +169,6 @@ impl LogicalSingletonTarget {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InboundEntityTell {
-    pub sender: Option<ActorRef>,
     pub target: LogicalEntityTarget,
     pub message_id: u64,
     pub payload: Bytes,
@@ -221,7 +185,6 @@ pub struct InboundEntityAsk {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InboundSingletonTell {
-    pub sender: Option<ActorRef>,
     pub target: LogicalSingletonTarget,
     pub message_id: u64,
     pub payload: Bytes,

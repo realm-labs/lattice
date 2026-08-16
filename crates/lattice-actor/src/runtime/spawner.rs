@@ -18,6 +18,7 @@ impl ActorSpawner {
         }
     }
 
+    #[cfg(feature = "distributed")]
     pub(crate) fn task_per_actor() -> Self {
         Self::new(
             ActorScheduler::default(),

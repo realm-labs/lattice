@@ -46,7 +46,6 @@ where
         metadata: &'a MessageMetadata,
     ) -> EnvelopeFuture<'a> {
         EnvelopeFuture::new(async move {
-            context.clear_sender();
             context.set_current_deadline(None);
             let output = self
                 .output
@@ -76,7 +75,6 @@ where
                     }
                 };
             actor.after_message(context, metadata, outcome);
-            context.clear_sender();
             context.set_current_deadline(None);
             outcome
         })

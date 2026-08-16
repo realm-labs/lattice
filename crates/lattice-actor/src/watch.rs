@@ -1,4 +1,5 @@
 use crate::traits::{PassivationReason, StopReason};
+#[cfg(feature = "distributed")]
 use lattice_core::actor_ref::ActorRef;
 
 pub use lattice_core::watch::{TerminatedReason, WatchId, WatchStatus};
@@ -21,6 +22,7 @@ impl LocalActorRef {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum TerminatedTarget {
     Local(LocalActorRef),
+    #[cfg(feature = "distributed")]
     Exact(ActorRef),
 }
 

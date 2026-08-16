@@ -6,9 +6,7 @@ use super::outbound::OutboundMessaging;
 use super::target::{
     ExactActorTarget, InboundTell, LogicalEntityTarget, LogicalSingletonTarget, RemoteFailure,
 };
-use super::{
-    ActorRef, Arc, Bytes, Frame, FrameKind, FramedConnection, Instant, RemotingIo, async_trait,
-};
+use super::{Arc, Bytes, Frame, FrameKind, FramedConnection, Instant, RemotingIo, async_trait};
 
 #[async_trait]
 pub trait InboundDispatch: Send + Sync + 'static {
@@ -18,7 +16,6 @@ pub trait InboundDispatch: Send + Sync + 'static {
 
     async fn tell(
         &self,
-        sender: Option<ActorRef>,
         target: ExactActorTarget,
         message_id: u64,
         payload: Bytes,
@@ -34,7 +31,6 @@ pub trait InboundDispatch: Send + Sync + 'static {
 
     async fn tell_entity(
         &self,
-        _sender: Option<ActorRef>,
         _target: LogicalEntityTarget,
         _message_id: u64,
         _payload: Bytes,
@@ -54,7 +50,6 @@ pub trait InboundDispatch: Send + Sync + 'static {
 
     async fn tell_singleton(
         &self,
-        _sender: Option<ActorRef>,
         _target: LogicalSingletonTarget,
         _message_id: u64,
         _payload: Bytes,
@@ -73,10 +68,6 @@ pub trait InboundDispatch: Send + Sync + 'static {
     }
 }
 
-#[expect(
-    clippy::large_enum_variant,
-    reason = "keeping a deferred tell inline avoids a heap allocation on dispatch fallback"
-)]
 pub enum ImmediateTellDispatch {
     Complete(Result<(), RemoteMessageError>),
     Deferred(InboundTell),
@@ -90,7 +81,7 @@ pub(crate) async fn dispatch_tell<D: InboundDispatch + ?Sized>(
         ImmediateTellDispatch::Complete(result) => result,
         ImmediateTellDispatch::Deferred(tell) => {
             dispatch
-                .tell(tell.sender, tell.target, tell.message_id, tell.payload)
+                .tell(tell.target, tell.message_id, tell.payload)
                 .await
         }
     }

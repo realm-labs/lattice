@@ -13,12 +13,8 @@ pub(super) struct PreparedExactTellEnvelope {
 }
 
 impl PreparedExactTellEnvelope {
-    pub(super) fn new<A: ProtocolTag>(
-        target: &ActorRef<A>,
-        sender: Option<&ActorRef>,
-        dictionary_id: Option<u64>,
-    ) -> Self {
-        let suffix = prepared_tell_suffix(sender, dictionary_id);
+    pub(super) fn new<A: ProtocolTag>(target: &ActorRef<A>, dictionary_id: Option<u64>) -> Self {
+        let suffix = prepared_tell_suffix(dictionary_id);
         Self {
             full: Arc::new(FrameEnvelope::new(
                 encode_exact_target_field(2, target),
@@ -53,17 +49,11 @@ impl PreparedExactTellEnvelope {
     }
 }
 
-fn prepared_tell_suffix(sender: Option<&ActorRef>, dictionary_id: Option<u64>) -> Bytes {
-    let sender_len = sender.map_or(0, |sender| nested_len(5, exact_target_len(sender)));
-    let dictionary_len = dictionary_id.map_or(0, |id| varint_field_len(6, id));
-    let mut encoded = BytesMut::with_capacity(sender_len + dictionary_len);
-    if let Some(sender) = sender {
-        let target_len = exact_target_len(sender);
-        encode_nested_prefix(5, target_len, &mut encoded);
-        encode_exact_target(sender, &mut encoded);
-    }
+fn prepared_tell_suffix(dictionary_id: Option<u64>) -> Bytes {
+    let dictionary_len = dictionary_id.map_or(0, |id| varint_field_len(5, id));
+    let mut encoded = BytesMut::with_capacity(dictionary_len);
     if let Some(id) = dictionary_id {
-        encode_varint_field(6, id, &mut encoded);
+        encode_varint_field(5, id, &mut encoded);
     }
     encoded.freeze()
 }
@@ -78,37 +68,25 @@ fn encode_exact_target_field<A: ProtocolTag>(tag: u32, target: &ActorRef<A>) -> 
 
 pub(super) fn tell_frame<A: ProtocolTag>(
     target: &ActorRef<A>,
-    sender_actor: Option<&ActorRef>,
     message_id: u64,
     payload: Bytes,
 ) -> Frame {
     let target_len = exact_target_len(target);
-    let sender_len = sender_actor.map(exact_target_len);
-    let encoded_len = tell_frame_len_from_parts(target_len, sender_len, message_id, payload.len());
+    let encoded_len = tell_frame_len_from_parts(target_len, message_id, payload.len());
     encode_frame(FrameKind::Tell, encoded_len, |output| {
         encode_nested_prefix(2, target_len, output);
         encode_exact_target(target, output);
         encode_varint_field(3, message_id, output);
         encode_bytes_field(4, &payload, output);
-        if let Some(sender) = sender_actor {
-            encode_nested_prefix(5, sender_len.expect("sender length must exist"), output);
-            encode_exact_target(sender, output);
-        }
     })
 }
 
 pub(super) fn tell_frame_len<A: ProtocolTag>(
     target: &ActorRef<A>,
-    sender_actor: Option<&ActorRef>,
     message_id: u64,
     payload_len: usize,
 ) -> usize {
-    tell_frame_len_from_parts(
-        exact_target_len(target),
-        sender_actor.map(exact_target_len),
-        message_id,
-        payload_len,
-    )
+    tell_frame_len_from_parts(exact_target_len(target), message_id, payload_len)
 }
 
 pub(super) fn prepared_tell_frame(
@@ -174,37 +152,25 @@ pub(super) fn ask_frame<A: ProtocolTag>(
 
 pub(super) fn entity_tell_frame(
     target: &LogicalEntityTarget,
-    sender_actor: Option<&ActorRef>,
     message_id: u64,
     payload: Bytes,
 ) -> Frame {
     let target_len = entity_target_len(target);
-    let sender_len = sender_actor.map(exact_target_len);
-    let encoded_len = tell_frame_len_from_parts(target_len, sender_len, message_id, payload.len());
+    let encoded_len = tell_frame_len_from_parts(target_len, message_id, payload.len());
     encode_frame(FrameKind::EntityTell, encoded_len, |output| {
         encode_nested_prefix(2, target_len, output);
         encode_entity_target(target, output);
         encode_varint_field(3, message_id, output);
         encode_bytes_field(4, &payload, output);
-        if let Some(sender) = sender_actor {
-            encode_nested_prefix(5, sender_len.expect("sender length must exist"), output);
-            encode_exact_target(sender, output);
-        }
     })
 }
 
 pub(super) fn entity_tell_frame_len(
     target: &LogicalEntityTarget,
-    sender_actor: Option<&ActorRef>,
     message_id: u64,
     payload_len: usize,
 ) -> usize {
-    tell_frame_len_from_parts(
-        entity_target_len(target),
-        sender_actor.map(exact_target_len),
-        message_id,
-        payload_len,
-    )
+    tell_frame_len_from_parts(entity_target_len(target), message_id, payload_len)
 }
 
 pub(super) fn entity_ask_frame(
@@ -233,45 +199,28 @@ pub(super) fn entity_ask_frame(
 
 pub(super) fn singleton_tell_frame(
     target: &LogicalSingletonTarget,
-    sender_actor: Option<&ActorRef>,
     message_id: u64,
     payload: Bytes,
 ) -> Frame {
     let target_len = singleton_target_len(target);
-    let sender_len = sender_actor.map(exact_target_len);
-    let encoded_len = tell_frame_len_from_parts(target_len, sender_len, message_id, payload.len());
+    let encoded_len = tell_frame_len_from_parts(target_len, message_id, payload.len());
     encode_frame(FrameKind::SingletonTell, encoded_len, |output| {
         encode_nested_prefix(2, target_len, output);
         encode_singleton_target(target, output);
         encode_varint_field(3, message_id, output);
         encode_bytes_field(4, &payload, output);
-        if let Some(sender) = sender_actor {
-            encode_nested_prefix(5, sender_len.expect("sender length must exist"), output);
-            encode_exact_target(sender, output);
-        }
     })
 }
 
 pub(super) fn singleton_tell_frame_len(
     target: &LogicalSingletonTarget,
-    sender_actor: Option<&ActorRef>,
     message_id: u64,
     payload_len: usize,
 ) -> usize {
-    tell_frame_len_from_parts(
-        singleton_target_len(target),
-        sender_actor.map(exact_target_len),
-        message_id,
-        payload_len,
-    )
+    tell_frame_len_from_parts(singleton_target_len(target), message_id, payload_len)
 }
 
-fn tell_frame_len_from_parts(
-    target_len: usize,
-    sender_len: Option<usize>,
-    message_id: u64,
-    payload_len: usize,
-) -> usize {
+fn tell_frame_len_from_parts(target_len: usize, message_id: u64, payload_len: usize) -> usize {
     nested_len(2, target_len)
         + varint_field_len(3, message_id)
         + if payload_len == 0 {
@@ -279,7 +228,6 @@ fn tell_frame_len_from_parts(
         } else {
             length_delimited_field_len(4, payload_len)
         }
-        + sender_len.map_or(0, |len| nested_len(5, len))
 }
 
 pub(super) fn singleton_ask_frame(
@@ -571,31 +519,29 @@ mod tests {
     #[test]
     fn borrowed_exact_frames_match_prost_encoding() {
         let target = actor("target", 11, 1);
-        let sender = actor("sender", 12, 2);
         let correlation = CorrelationId::new(17, 23).unwrap();
         let payload = Bytes::from_static(b"payload");
 
         assert_eq!(
-            tell_frame(&target, Some(&sender), 31, payload.clone()),
+            tell_frame(&target, 31, payload.clone()),
             Frame::encode_message(
                 FrameKind::Tell,
                 &TellWire {
                     target: Some(target_to_wire(&target)),
                     message_id: 31,
                     payload: payload.clone(),
-                    sender_actor: Some(target_to_wire(&sender)),
                     target_id: 0,
                 },
             )
         );
         assert_eq!(
             prepared_tell_frame(
-                &PreparedExactTellEnvelope::new(&target, Some(&sender), None),
+                &PreparedExactTellEnvelope::new(&target, None),
                 31,
                 payload.clone(),
                 None,
             ),
-            tell_frame(&target, Some(&sender), 31, payload.clone())
+            tell_frame(&target, 31, payload.clone())
         );
         assert_eq!(
             ask_frame(&target, correlation, 41, 31, payload.clone()),
@@ -611,14 +557,13 @@ mod tests {
             )
         );
         assert_eq!(
-            tell_frame(&target, None, 31, Bytes::new()),
+            tell_frame(&target, 31, Bytes::new()),
             Frame::encode_message(
                 FrameKind::Tell,
                 &TellWire {
                     target: Some(target_to_wire(&target)),
                     message_id: 31,
                     payload: Bytes::new(),
-                    sender_actor: None,
                     target_id: 0,
                 },
             )
@@ -629,19 +574,17 @@ mod tests {
     fn borrowed_logical_and_completion_frames_match_prost_encoding() {
         let entity = entity_target();
         let singleton = singleton_target();
-        let sender = actor("sender", 12, 2);
         let correlation = CorrelationId::new(17, 23).unwrap();
         let payload = Bytes::from_static(b"payload");
 
         assert_eq!(
-            entity_tell_frame(&entity, Some(&sender), 31, payload.clone()),
+            entity_tell_frame(&entity, 31, payload.clone()),
             Frame::encode_message(
                 FrameKind::EntityTell,
                 &EntityTellWire {
                     target: Some(entity_target_to_wire(&entity)),
                     message_id: 31,
                     payload: payload.clone(),
-                    sender_actor: Some(target_to_wire(&sender)),
                 },
             )
         );
@@ -659,14 +602,13 @@ mod tests {
             )
         );
         assert_eq!(
-            singleton_tell_frame(&singleton, Some(&sender), 31, payload.clone()),
+            singleton_tell_frame(&singleton, 31, payload.clone()),
             Frame::encode_message(
                 FrameKind::SingletonTell,
                 &SingletonTellWire {
                     target: Some(singleton_target_to_wire(&singleton)),
                     message_id: 31,
                     payload: payload.clone(),
-                    sender_actor: Some(target_to_wire(&sender)),
                 },
             )
         );

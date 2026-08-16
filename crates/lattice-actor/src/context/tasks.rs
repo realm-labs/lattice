@@ -5,25 +5,32 @@
 
 use std::{any::type_name, future::Future, time::Duration};
 
-use lattice_core::actor_ref::{ActorRef, EntityRef, ProtocolTag, SingletonRef};
 use tokio::task::{AbortHandle, JoinSet};
 use tracing::Instrument;
+
+#[cfg(feature = "distributed")]
+use lattice_core::actor_ref::{ActorRef, EntityRef, ProtocolTag, SingletonRef};
 
 use super::ActorContext;
 use crate::{
     error::{ActorCallError, ActorError, ActorTellError},
     handle::ActorHandle,
-    recipient::WatchSubscription,
     traits::{Actor, Handler, Message},
     watch::{ActorTerminated, TerminatedTarget, WatchId},
 };
+
+#[cfg(feature = "distributed")]
+use crate::recipient::WatchSubscription;
 
 pub struct ContextWatchTarget(ContextWatchSource);
 
 enum ContextWatchSource {
     Local(crate::handle::ActorTerminationSubscription),
+    #[cfg(feature = "distributed")]
     Exact(ActorRef),
+    #[cfg(feature = "distributed")]
     EntityCurrent(EntityRef),
+    #[cfg(feature = "distributed")]
     SingletonCurrent(SingletonRef),
 }
 
@@ -33,18 +40,21 @@ impl<B: Actor> From<&ActorHandle<B>> for ContextWatchTarget {
     }
 }
 
+#[cfg(feature = "distributed")]
 impl<P: ProtocolTag> From<&ActorRef<P>> for ContextWatchTarget {
     fn from(target: &ActorRef<P>) -> Self {
         Self(ContextWatchSource::Exact(target.erase()))
     }
 }
 
+#[cfg(feature = "distributed")]
 impl<P: ProtocolTag> From<&EntityRef<P>> for ContextWatchTarget {
     fn from(target: &EntityRef<P>) -> Self {
         Self(ContextWatchSource::EntityCurrent(target.erase()))
     }
 }
 
+#[cfg(feature = "distributed")]
 impl<P: ProtocolTag> From<&SingletonRef<P>> for ContextWatchTarget {
     fn from(target: &SingletonRef<P>) -> Self {
         Self(ContextWatchSource::SingletonCurrent(target.erase()))
@@ -53,6 +63,7 @@ impl<P: ProtocolTag> From<&SingletonRef<P>> for ContextWatchTarget {
 
 enum ContextWatchSubscription {
     Local(crate::handle::ActorTerminationSubscription),
+    #[cfg(feature = "distributed")]
     Cluster(WatchSubscription),
 }
 
@@ -67,6 +78,7 @@ impl ContextWatchSubscription {
                     reason: termination.reason,
                 })
             }
+            #[cfg(feature = "distributed")]
             Self::Cluster(subscription) => subscription.recv().await.ok(),
         }
     }
@@ -170,18 +182,21 @@ impl<A: Actor> ActorContext<A> {
             ContextWatchSource::Local(subscription) => {
                 ContextWatchSubscription::Local(subscription)
             }
+            #[cfg(feature = "distributed")]
             ContextWatchSource::Exact(target) => ContextWatchSubscription::Cluster(
                 self.actor_system()?
                     .watch(&target)
                     .await
                     .map_err(|error| ActorError::new(error.to_string()))?,
             ),
+            #[cfg(feature = "distributed")]
             ContextWatchSource::EntityCurrent(target) => ContextWatchSubscription::Cluster(
                 self.actor_system()?
                     .watch(&target)
                     .await
                     .map_err(|error| ActorError::new(error.to_string()))?,
             ),
+            #[cfg(feature = "distributed")]
             ContextWatchSource::SingletonCurrent(target) => ContextWatchSubscription::Cluster(
                 self.actor_system()?
                     .watch(&target)
@@ -191,6 +206,7 @@ impl<A: Actor> ActorContext<A> {
         };
         let watch_id = match &terminations {
             ContextWatchSubscription::Local(_) => WatchId::random(),
+            #[cfg(feature = "distributed")]
             ContextWatchSubscription::Cluster(subscription) => subscription.id(),
         };
         let self_handle = self.handle.clone();

@@ -24,10 +24,7 @@ use lattice_core::actor_ref::{
 use crate::{
     association::AssociationKey,
     control::{CommandId, ControlDispatchError, ControlGap, RejectControlDispatch},
-    messaging::{
-        error::RemoteMessageError,
-        target::{ExactActorTarget, SenderIdentity},
-    },
+    messaging::{error::RemoteMessageError, target::ExactActorTarget},
     protocol::ProtocolFingerprint,
 };
 
@@ -248,7 +245,6 @@ impl ControlDispatch for StreamIsolatingControl {
 impl InboundDispatch for EchoDispatch {
     async fn tell(
         &self,
-        _sender: Option<ActorRef>,
         _target: ExactActorTarget,
         _message_id: u64,
         _payload: Bytes,
@@ -794,7 +790,6 @@ async fn real_tcp_endpoint_establishes_all_lanes_and_delivers_ask() {
         .messaging
         .ask(
             &association,
-            &SenderIdentity::Process(9),
             &target,
             OutboundMessage::new(fingerprint, 1, Bytes::from_static(b"hello")),
             Instant::now() + Duration::from_secs(1),
@@ -838,7 +833,6 @@ async fn real_tcp_endpoint_establishes_all_lanes_and_delivers_ask() {
         .messaging
         .ask(
             &association,
-            &SenderIdentity::Process(9),
             &target,
             OutboundMessage::new(fingerprint, 1, Bytes::from_static(b"again")),
             Instant::now() + Duration::from_secs(1),

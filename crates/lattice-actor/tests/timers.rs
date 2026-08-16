@@ -84,7 +84,6 @@ async fn interval_timer_drives_tick_and_business_request_stop() {
             },
             ActorSpawnOptions::default(),
         )
-        .await
         .unwrap();
 
     tokio::time::timeout(Duration::from_millis(100), stopped.acquire())
@@ -154,7 +153,6 @@ async fn interval_timer_survives_a_transiently_full_mailbox() {
                 ..ActorSpawnOptions::default()
             },
         )
-        .await
         .unwrap();
 
     // Park the Actor so the single normal slot fills and the timer observes backpressure.

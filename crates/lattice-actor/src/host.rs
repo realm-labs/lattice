@@ -45,7 +45,6 @@ trait ErasedActorHost: Send + Sync {
 
     async fn tell(
         &self,
-        sender: Option<ActorRef>,
         target: ExactActorTarget,
         message_id: u64,
         payload: Bytes,
@@ -151,36 +150,28 @@ impl<A: Actor, P: Protocol> ErasedActorHost for ActorHost<A, P> {
 
     fn try_tell(&self, tell: InboundTell) -> ImmediateTellDispatch {
         let InboundTell {
-            sender,
             target,
             message_id,
             payload,
         } = tell;
-        if sender
-            .as_ref()
-            .is_some_and(|sender| sender.cluster_id() != &target.cluster_id)
-        {
-            return ImmediateTellDispatch::Complete(Err(RemoteMessageError::Unauthorized));
-        }
         let handle = match self.resolve(&target) {
             Ok(handle) => handle,
             Err(error) => return ImmediateTellDispatch::Complete(Err(error)),
         };
         match self
             .protocol
-            .try_dispatch_tell(&handle, message_id, payload, sender)
+            .try_dispatch_tell(&handle, message_id, payload)
         {
             crate::protocol::tell::ProtocolTellDispatch::Accepted => {
                 ImmediateTellDispatch::Complete(Ok(()))
             }
-            crate::protocol::tell::ProtocolTellDispatch::Deferred {
-                payload, sender, ..
-            } => ImmediateTellDispatch::Deferred(InboundTell {
-                sender,
-                target,
-                message_id,
-                payload,
-            }),
+            crate::protocol::tell::ProtocolTellDispatch::Deferred { payload, .. } => {
+                ImmediateTellDispatch::Deferred(InboundTell {
+                    target,
+                    message_id,
+                    payload,
+                })
+            }
             crate::protocol::tell::ProtocolTellDispatch::Rejected(error) => {
                 ImmediateTellDispatch::Complete(Err(map_dispatch(error)))
             }
@@ -189,28 +180,14 @@ impl<A: Actor, P: Protocol> ErasedActorHost for ActorHost<A, P> {
 
     async fn tell(
         &self,
-        sender: Option<ActorRef>,
         target: ExactActorTarget,
         message_id: u64,
         payload: Bytes,
     ) -> Result<(), RemoteMessageError> {
-        if sender
-            .as_ref()
-            .is_some_and(|sender| sender.cluster_id() != &target.cluster_id)
-        {
-            return Err(RemoteMessageError::Unauthorized);
-        }
         let handle = self.resolve(&target)?;
         match self
             .protocol
-            .dispatch_with_sender(
-                handle,
-                message_id,
-                DispatchMode::Tell,
-                payload,
-                None,
-                sender,
-            )
+            .dispatch(handle, message_id, DispatchMode::Tell, payload, None)
             .await
             .map_err(map_dispatch)?
         {
@@ -322,13 +299,11 @@ impl ProtocolHostRegistry {
 
     pub fn try_tell(
         &self,
-        sender: Option<ActorRef>,
         target: ExactActorTarget,
         message_id: u64,
         payload: Bytes,
     ) -> Result<(), RemoteMessageError> {
         match self.try_tell_immediate(InboundTell {
-            sender,
             target,
             message_id,
             payload,
@@ -347,7 +322,6 @@ impl ProtocolHostRegistry {
 
     pub async fn tell_wait(
         &self,
-        sender: Option<ActorRef>,
         target: ExactActorTarget,
         message_id: u64,
         payload: Bytes,
@@ -355,7 +329,7 @@ impl ProtocolHostRegistry {
         self.hosts
             .get(&target.protocol_id.get())
             .ok_or(RemoteMessageError::UnsupportedProtocol)?
-            .tell(sender, target, message_id, payload)
+            .tell(target, message_id, payload)
             .await
     }
 
@@ -391,12 +365,11 @@ impl InboundDispatch for ProtocolHostRegistry {
 
     async fn tell(
         &self,
-        sender: Option<ActorRef>,
         target: ExactActorTarget,
         message_id: u64,
         payload: Bytes,
     ) -> Result<(), RemoteMessageError> {
-        self.tell_wait(sender, target, message_id, payload).await
+        self.tell_wait(target, message_id, payload).await
     }
 
     async fn ask(

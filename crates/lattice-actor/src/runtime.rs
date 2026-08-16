@@ -4,18 +4,19 @@ use std::{
     fmt::{Debug, Formatter, Result as FmtResult},
     panic::AssertUnwindSafe,
     sync::{
-        Arc, Mutex, OnceLock,
+        Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
     time::{Duration, Instant, SystemTime},
 };
 
+#[cfg(feature = "distributed")]
+use std::sync::OnceLock;
+
 use futures_util::FutureExt;
-use lattice_core::{
-    actor_ref::{ActivationId, ActorRef, NodeIncarnation},
-    id::ActorId,
-    service_context::ServiceContext,
-};
+#[cfg(feature = "distributed")]
+use lattice_core::actor_ref::{ActivationId, ActorRef, NodeIncarnation};
+use lattice_core::service_context::ServiceContext;
 use tokio::sync::{broadcast, oneshot, watch};
 use tracing::{Instrument, debug, error, info};
 
@@ -28,10 +29,12 @@ use crate::{
         channel::{self, Receiver},
     },
     observation::{ActorLifecycleEvent, ActorObserverHandle},
-    recipient::ActorSystem,
     traits::{Actor, ActorLifecycleState, MessageOutcome, StopReason},
     watch::{ActorTermination, LocalActorRef, TerminatedReason},
 };
+
+#[cfg(feature = "distributed")]
+use crate::recipient::ActorSystem;
 
 mod panic;
 mod passivation;
@@ -46,11 +49,13 @@ use spawner::ActorSpawner;
 use worker_pool::{ActorWorkerPool, WorkerPoolKind};
 
 static NEXT_LOCAL_ACTOR_ID: AtomicU64 = AtomicU64::new(1);
+#[cfg(feature = "distributed")]
 static NEXT_ACTIVATION_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 // Match the default turn budget so the common saturated path releases mailbox capacity once per
 // turn instead of once per message. Smaller turn budgets still cap the prefetch.
 const NORMAL_RECEIVE_BATCH_SIZE: usize = 64;
 
+#[cfg(feature = "distributed")]
 pub(crate) fn next_activation_id(node_incarnation: NodeIncarnation) -> ActivationId {
     let sequence = NEXT_ACTIVATION_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     ActivationId::new(node_incarnation, sequence).expect("process activation sequence is nonzero")
@@ -61,6 +66,45 @@ pub enum ActorExecutionPolicy {
     TaskPerActor,
     KeyedWorkerPool { worker_count: usize },
     DedicatedThreadPool { worker_count: usize },
+}
+
+/// Stable affinity key for actors scheduled on a keyed worker pool.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum SchedulerKey {
+    String(String),
+    U64(u64),
+    I64(i64),
+    Bytes(Vec<u8>),
+}
+
+impl From<String> for SchedulerKey {
+    fn from(value: String) -> Self {
+        Self::String(value)
+    }
+}
+
+impl From<&str> for SchedulerKey {
+    fn from(value: &str) -> Self {
+        Self::String(value.to_owned())
+    }
+}
+
+impl From<u64> for SchedulerKey {
+    fn from(value: u64) -> Self {
+        Self::U64(value)
+    }
+}
+
+impl From<i64> for SchedulerKey {
+    fn from(value: i64) -> Self {
+        Self::I64(value)
+    }
+}
+
+impl From<Vec<u8>> for SchedulerKey {
+    fn from(value: Vec<u8>) -> Self {
+        Self::Bytes(value)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -82,8 +126,9 @@ impl Default for ActorRuntimeConfig {
 pub struct ActorSpawnOptions {
     pub mailbox: MailboxConfig,
     pub execution: Option<ActorExecutionPolicy>,
-    pub scheduler_key: Option<ActorId>,
+    pub scheduler_key: Option<SchedulerKey>,
     pub passivation: PassivationPolicy,
+    #[cfg(feature = "distributed")]
     pub self_ref: Option<ActorRef>,
     pub service: ServiceContext,
 }
@@ -95,6 +140,7 @@ pub enum PassivationPolicy {
     IdleTimeout(Duration),
 }
 
+#[cfg(feature = "distributed")]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum ShardMigrationPolicy {
     #[default]
@@ -120,18 +166,7 @@ impl ActorRuntime {
         &self.scheduler
     }
 
-    pub async fn spawn_actor<A>(
-        &self,
-        actor: A,
-        options: ActorSpawnOptions,
-    ) -> Result<ActorHandle<A>, ActorSpawnError>
-    where
-        A: Actor,
-    {
-        self.spawn_actor_now(actor, options)
-    }
-
-    pub(crate) fn spawn_actor_now<A>(
+    pub fn spawn_actor<A>(
         &self,
         actor: A,
         options: ActorSpawnOptions,
@@ -144,6 +179,7 @@ impl ActorRuntime {
             actor,
             ActorSpawnContext {
                 options,
+                #[cfg(feature = "distributed")]
                 actor_system: None,
                 observer: self.config.observer.clone(),
                 terminal_hook: None,
@@ -192,7 +228,7 @@ struct DedicatedPoolKey {
 
 impl ActorScheduler {
     pub fn keyed_worker_index(
-        actor_id: &ActorId,
+        scheduler_key: &SchedulerKey,
         worker_count: usize,
     ) -> Result<usize, ActorSpawnError> {
         if worker_count == 0 {
@@ -200,7 +236,7 @@ impl ActorScheduler {
                 reason: "KeyedWorkerPool worker_count must be greater than zero",
             });
         }
-        Ok((stable_actor_id_hash(actor_id) % worker_count as u64) as usize)
+        Ok((stable_scheduler_key_hash(scheduler_key) % worker_count as u64) as usize)
     }
 
     fn spawn<A>(
@@ -245,7 +281,7 @@ impl ActorScheduler {
         let pool = self.keyed_worker_pool(worker_count)?;
         let (parts, passivation, scheduler_key) = context.into_parts();
         let scheduler_key =
-            scheduler_key.unwrap_or_else(|| ActorId::U64(parts.handle.local_ref().id()));
+            scheduler_key.unwrap_or_else(|| SchedulerKey::U64(parts.handle.local_ref().id()));
         let worker_index = Self::keyed_worker_index(&scheduler_key, worker_count)?;
         Ok(spawn_actor_on_pool(
             actor,
@@ -328,7 +364,7 @@ impl ActorScheduler {
     }
 }
 
-fn stable_actor_id_hash(actor_id: &ActorId) -> u64 {
+fn stable_scheduler_key_hash(scheduler_key: &SchedulerKey) -> u64 {
     let mut hash = 0xcbf29ce484222325u64;
     fn write(hash: &mut u64, bytes: &[u8]) {
         for byte in bytes {
@@ -337,20 +373,20 @@ fn stable_actor_id_hash(actor_id: &ActorId) -> u64 {
         }
     }
 
-    match actor_id {
-        ActorId::Str(value) => {
+    match scheduler_key {
+        SchedulerKey::String(value) => {
             write(&mut hash, b"str");
             write(&mut hash, value.as_bytes());
         }
-        ActorId::U64(value) => {
+        SchedulerKey::U64(value) => {
             write(&mut hash, b"u64");
             write(&mut hash, &value.to_be_bytes());
         }
-        ActorId::I64(value) => {
+        SchedulerKey::I64(value) => {
             write(&mut hash, b"i64");
             write(&mut hash, &value.to_be_bytes());
         }
-        ActorId::Bytes(value) => {
+        SchedulerKey::Bytes(value) => {
             write(&mut hash, b"bytes");
             write(&mut hash, value);
         }
@@ -363,13 +399,14 @@ where
     A: Actor,
 {
     ActorRuntime::default()
-        .spawn_actor_now(
+        .spawn_actor(
             actor,
             ActorSpawnOptions {
                 mailbox,
                 execution: Some(ActorExecutionPolicy::TaskPerActor),
                 scheduler_key: None,
                 passivation: PassivationPolicy::Disabled,
+                #[cfg(feature = "distributed")]
                 self_ref: None,
                 service: ServiceContext::empty(),
             },
@@ -386,13 +423,14 @@ where
     A: Actor,
 {
     ActorRuntime::default()
-        .spawn_actor_now(
+        .spawn_actor(
             actor,
             ActorSpawnOptions {
                 mailbox,
                 execution: Some(ActorExecutionPolicy::TaskPerActor),
                 scheduler_key: None,
                 passivation: PassivationPolicy::Disabled,
+                #[cfg(feature = "distributed")]
                 self_ref: None,
                 service,
             },
@@ -402,6 +440,7 @@ where
 
 pub(crate) struct ActorSpawnContext {
     pub(crate) options: ActorSpawnOptions,
+    #[cfg(feature = "distributed")]
     pub(crate) actor_system: Option<Arc<OnceLock<ActorSystem>>>,
     pub(crate) observer: ActorObserverHandle,
     pub(crate) terminal_hook: Option<TerminalHook>,
@@ -409,12 +448,19 @@ pub(crate) struct ActorSpawnContext {
 }
 
 impl ActorSpawnContext {
-    fn into_parts<A>(self) -> (ActorRuntimeParts<A>, PassivationPolicy, Option<ActorId>)
+    fn into_parts<A>(
+        self,
+    ) -> (
+        ActorRuntimeParts<A>,
+        PassivationPolicy,
+        Option<SchedulerKey>,
+    )
     where
         A: Actor,
     {
         let ActorSpawnContext {
             options,
+            #[cfg(feature = "distributed")]
             actor_system,
             observer,
             terminal_hook,
@@ -423,6 +469,7 @@ impl ActorSpawnContext {
         let ActorSpawnOptions {
             mailbox,
             passivation,
+            #[cfg(feature = "distributed")]
             self_ref,
             service,
             scheduler_key,
@@ -431,7 +478,9 @@ impl ActorSpawnContext {
         (
             create_actor_parts(
                 mailbox,
+                #[cfg(feature = "distributed")]
                 self_ref,
+                #[cfg(feature = "distributed")]
                 actor_system,
                 service,
                 observer,
@@ -467,7 +516,9 @@ struct ActorRuntimeParts<A: Actor> {
     handle: ActorHandle<A>,
     normal_rx: Receiver<ActorCommand<A>>,
     system_rx: Receiver<ActorCommand<A>>,
+    #[cfg(feature = "distributed")]
     self_ref: Option<ActorRef>,
+    #[cfg(feature = "distributed")]
     actor_system: Option<Arc<OnceLock<ActorSystem>>>,
     service: ServiceContext,
     spawner: ActorSpawner,
@@ -477,8 +528,8 @@ struct ActorRuntimeParts<A: Actor> {
 
 fn create_actor_parts<A>(
     mailbox: MailboxConfig,
-    self_ref: Option<ActorRef>,
-    actor_system: Option<Arc<OnceLock<ActorSystem>>>,
+    #[cfg(feature = "distributed")] self_ref: Option<ActorRef>,
+    #[cfg(feature = "distributed")] actor_system: Option<Arc<OnceLock<ActorSystem>>>,
     service: ServiceContext,
     observer: ActorObserverHandle,
     terminal_hook: Option<TerminalHook>,
@@ -495,7 +546,6 @@ where
     let stop_failure = Arc::new(Mutex::new(None));
     let (forced_data_loss_tx, _forced_data_loss_rx) = broadcast::channel(16);
     let terminal_hook = Arc::new(Mutex::new(terminal_hook));
-    let actor_ref = self_ref.clone();
     let handle = ActorHandle::new(ActorHandleInit {
         local_ref,
         terminated_tx,
@@ -505,7 +555,8 @@ where
         terminal_hook,
         normal_tx,
         system_tx,
-        actor_ref,
+        #[cfg(feature = "distributed")]
+        actor_ref: self_ref.clone(),
         observer,
     });
 
@@ -513,7 +564,9 @@ where
         handle,
         normal_rx,
         system_rx,
+        #[cfg(feature = "distributed")]
         self_ref,
+        #[cfg(feature = "distributed")]
         actor_system,
         service,
         spawner,
@@ -580,7 +633,9 @@ where
         handle,
         mut normal_rx,
         mut system_rx,
+        #[cfg(feature = "distributed")]
         self_ref,
+        #[cfg(feature = "distributed")]
         actor_system,
         service,
         spawner,
@@ -589,7 +644,9 @@ where
     } = parts;
     let mut ctx = ActorContext::new(
         handle.clone(),
+        #[cfg(feature = "distributed")]
         self_ref,
+        #[cfg(feature = "distributed")]
         actor_system,
         service,
         spawner,

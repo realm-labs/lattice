@@ -15,14 +15,12 @@ use lattice_remoting::{
     messaging::{
         error::TellError,
         outbound::{OutboundMessage, OutboundMessaging, PreparedExactTellRoute},
-        target::SenderIdentity,
     },
     protocol::ProtocolFingerprint,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ExactTellRouteKey {
-    sender: SenderIdentity,
     target: ActorRef,
     fingerprint: ProtocolFingerprint,
 }
@@ -32,18 +30,6 @@ impl Hash for ExactTellRouteKey {
         self.target.node_incarnation().hash(state);
         self.target.activation_id().hash(state);
         self.target.protocol_id().hash(state);
-        match &self.sender {
-            SenderIdentity::Actor(sender) => {
-                0_u8.hash(state);
-                sender.node_incarnation().hash(state);
-                sender.activation_id().hash(state);
-                sender.protocol_id().hash(state);
-            }
-            SenderIdentity::Process(incarnation) => {
-                1_u8.hash(state);
-                incarnation.hash(state);
-            }
-        }
     }
 }
 
@@ -68,7 +54,6 @@ pub(crate) struct ExactTellMessage {
 #[derive(Debug)]
 pub(crate) struct RejectedExactTell {
     pub(crate) error: TellError,
-    pub(crate) sender: SenderIdentity,
     pub(crate) target: ActorRef,
     pub(crate) fingerprint: ProtocolFingerprint,
     pub(crate) message_id: u64,
@@ -88,7 +73,6 @@ impl ExactTellRouteCache {
     pub(crate) fn tell<F>(
         &self,
         messaging: &OutboundMessaging,
-        sender: SenderIdentity,
         target: ActorRef,
         message: ExactTellMessage,
         association: F,
@@ -97,7 +81,6 @@ impl ExactTellRouteCache {
         F: FnOnce(&ActorRef) -> Result<Arc<Association>, TellError>,
     {
         let key = ExactTellRouteKey {
-            sender,
             target,
             fingerprint: message.fingerprint,
         };
@@ -109,7 +92,6 @@ impl ExactTellRouteCache {
             return messaging
                 .try_tell_retained(
                     &association,
-                    &key.sender,
                     &key.target,
                     OutboundMessage::new(message.fingerprint, message.message_id, message.payload),
                 )
@@ -199,7 +181,6 @@ impl ExactTellRouteCache {
     pub(crate) async fn tell_wait<F>(
         &self,
         messaging: &OutboundMessaging,
-        sender: SenderIdentity,
         target: ActorRef,
         message: ExactTellMessage,
         association: F,
@@ -208,7 +189,6 @@ impl ExactTellRouteCache {
         F: FnOnce(&ActorRef) -> Result<Arc<Association>, TellError>,
     {
         let key = ExactTellRouteKey {
-            sender,
             target,
             fingerprint: message.fingerprint,
         };
@@ -217,7 +197,6 @@ impl ExactTellRouteCache {
             return messaging
                 .tell_wait(
                     &association,
-                    &key.sender,
                     &key.target,
                     OutboundMessage::new(message.fingerprint, message.message_id, message.payload),
                 )
@@ -234,7 +213,6 @@ impl ExactTellRouteCache {
             Some(route) => route,
             None => messaging.prepare_exact_tell_route(
                 association(&key.target)?,
-                &key.sender,
                 &key.target,
                 key.fingerprint,
             )?,
@@ -344,8 +322,7 @@ where
         Ok(association) => association,
         Err(error) => return Err(rejected_exact_tell(error, key, message)),
     };
-    match messaging.prepare_exact_tell_route(association, &key.sender, &key.target, key.fingerprint)
-    {
+    match messaging.prepare_exact_tell_route(association, &key.target, key.fingerprint) {
         Ok(route) => Ok((route, message)),
         Err(error) => Err(rejected_exact_tell(error, key, message)),
     }
@@ -358,7 +335,6 @@ fn rejected_exact_tell(
 ) -> Box<RejectedExactTell> {
     Box::new(RejectedExactTell {
         error,
-        sender: key.sender.clone(),
         target: key.target.clone(),
         fingerprint: message.fingerprint,
         message_id: message.message_id,
@@ -458,7 +434,6 @@ mod tests {
             cache
                 .tell(
                     &messaging,
-                    SenderIdentity::Process(1),
                     target(protocol_id, 1),
                     ExactTellMessage {
                         fingerprint,
@@ -490,7 +465,6 @@ mod tests {
             cache
                 .tell(
                     &messaging,
-                    SenderIdentity::Process(1),
                     target(protocol_id, sequence),
                     ExactTellMessage {
                         fingerprint,
@@ -522,7 +496,6 @@ mod tests {
             cache
                 .tell(
                     &messaging,
-                    SenderIdentity::Process(1),
                     target(protocol_id, 1),
                     ExactTellMessage {
                         fingerprint,
@@ -552,7 +525,6 @@ mod tests {
         cache
             .tell(
                 &messaging,
-                SenderIdentity::Process(1),
                 target(protocol_id, 1),
                 ExactTellMessage {
                     fingerprint,
@@ -565,7 +537,6 @@ mod tests {
         assert!(matches!(
             cache.tell(
                 &messaging,
-                SenderIdentity::Process(1),
                 target(protocol_id, 1),
                 ExactTellMessage {
                     fingerprint,
@@ -586,7 +557,6 @@ mod tests {
         assert!(matches!(
             cache.tell(
                 &messaging,
-                SenderIdentity::Process(1),
                 target(protocol_id, 1),
                 ExactTellMessage {
                     fingerprint,
@@ -616,7 +586,6 @@ mod tests {
         cache
             .tell(
                 &messaging,
-                SenderIdentity::Process(1),
                 target.clone(),
                 ExactTellMessage {
                     fingerprint,
@@ -629,7 +598,6 @@ mod tests {
         let rejected = cache
             .tell(
                 &messaging,
-                SenderIdentity::Process(1),
                 target.clone(),
                 ExactTellMessage {
                     fingerprint,
@@ -647,7 +615,6 @@ mod tests {
         let mut receiver = association.take_lane_receiver(LaneKind::Bulk(0)).unwrap();
         let send = cache.tell_wait(
             &messaging,
-            rejected.sender,
             rejected.target,
             ExactTellMessage {
                 fingerprint: rejected.fingerprint,

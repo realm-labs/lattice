@@ -7,7 +7,7 @@ repository.workspace = true
 
 [dependencies]
 async-trait.workspace = true
-lattice-actor.workspace = true
+lattice-actor = { workspace = true, features = ["distributed"] }
 lattice-config.workspace = true
 lattice-core.workspace = true
 lattice-discovery.workspace = true

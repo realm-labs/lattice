@@ -1,9 +1,8 @@
 use std::{any::Any, error::Error as StdError, future::Future, time::Instant};
 
-use lattice_core::{
-    actor_ref::{EntityId, ProtocolId},
-    id::ActorId,
-};
+use lattice_core::actor_ref::EntityId;
+#[cfg(feature = "distributed")]
+use lattice_core::actor_ref::ProtocolId;
 use thiserror::Error;
 
 use crate::{
@@ -11,7 +10,7 @@ use crate::{
     error::ActorStopError,
     mailbox::MailboxConfig,
     reply::ReplyTo,
-    runtime::ActorExecutionPolicy,
+    runtime::{ActorExecutionPolicy, SchedulerKey},
     state_machine::Behavior,
 };
 
@@ -322,11 +321,12 @@ impl ChildActorKey {
 pub struct ChildActorOptions {
     pub mailbox: MailboxConfig,
     pub supervision: ChildSupervision,
+    #[cfg(feature = "distributed")]
     pub protocol_id: Option<ProtocolId>,
     /// Execution policy used to run this child.
     pub execution: ActorExecutionPolicy,
     /// Affinity key used only by [`crate::runtime::ActorExecutionPolicy::KeyedWorkerPool`].
-    pub scheduler_key: Option<ActorId>,
+    pub scheduler_key: Option<SchedulerKey>,
 }
 
 impl Default for ChildActorOptions {
@@ -334,6 +334,7 @@ impl Default for ChildActorOptions {
         Self {
             mailbox: MailboxConfig::default(),
             supervision: ChildSupervision::default(),
+            #[cfg(feature = "distributed")]
             protocol_id: None,
             execution: ActorExecutionPolicy::TaskPerActor,
             scheduler_key: None,

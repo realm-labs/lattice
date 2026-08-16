@@ -5,22 +5,31 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+default = []
+distributed = [
+    "dep:async-trait",
+    "dep:bytes",
+    "dep:dashmap",
+    "dep:lattice-remoting",
+    "dep:prost",
+]
+
 [dependencies]
-async-trait.workspace = true
-blake3.workspace = true
-bytes.workspace = true
+async-trait = { workspace = true, optional = true }
+bytes = { workspace = true, optional = true }
 concurrent-queue.workspace = true
 event-listener.workspace = true
-dashmap.workspace = true
+dashmap = { workspace = true, optional = true }
 futures-util.workspace = true
-http.workspace = true
 lattice-core.workspace = true
 lattice-actor-macros.workspace = true
-lattice-remoting.workspace = true
-prost.workspace = true
+lattice-remoting = { workspace = true, optional = true }
+prost = { workspace = true, optional = true }
 thiserror.workspace = true
-tokio.workspace = true
+tokio = { version = "1.48.0", features = ["macros", "rt", "rt-multi-thread", "sync", "time"] }
 tracing.workspace = true
 
 [dev-dependencies]
+tokio.workspace = true
 trybuild.workspace = true

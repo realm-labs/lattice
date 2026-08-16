@@ -24,6 +24,7 @@ mod deferred;
 mod handlers;
 mod lifecycle;
 mod mailbox;
+#[cfg(feature = "distributed")]
 mod registry;
 mod runtime;
 mod tasks;
@@ -146,7 +147,7 @@ impl Responder<Ping> for TestActor {
         reply_to: ReplyTo<String>,
     ) -> Result<(), ActorError> {
         self.events.lock().await.push(request.0);
-        assert!(ctx.sender().is_none());
+        let _ = ctx;
         let _ = reply_to.send(format!("pong:{}", request.0));
         Ok(())
     }

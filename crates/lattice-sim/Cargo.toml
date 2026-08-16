@@ -11,7 +11,7 @@ bytes.workspace = true
 clap.workspace = true
 futures-util.workspace = true
 lattice-core = { workspace = true, features = ["test-failpoints"] }
-lattice-actor.workspace = true
+lattice-actor = { workspace = true, features = ["distributed"] }
 lattice-config.workspace = true
 lattice-config-etcd.workspace = true
 lattice-discovery.workspace = true
