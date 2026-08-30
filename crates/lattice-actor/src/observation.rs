@@ -3,11 +3,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
-#[cfg(feature = "distributed")]
-use lattice_core::actor_ref::ActorRef;
-
-#[cfg(feature = "distributed")]
-use crate::traits::MessageKind;
 use crate::traits::{MessageMetadata, MessageOutcome, StopReason};
 use crate::watch::LocalActorRef;
 
@@ -50,21 +45,13 @@ pub(crate) fn record_abandoned_stop_failure() {
 pub struct ActorMetadata {
     actor_type: &'static str,
     local_ref: LocalActorRef,
-    #[cfg(feature = "distributed")]
-    actor_ref: Option<ActorRef>,
 }
 
 impl ActorMetadata {
-    pub(crate) fn new(
-        actor_type: &'static str,
-        local_ref: LocalActorRef,
-        #[cfg(feature = "distributed")] actor_ref: Option<ActorRef>,
-    ) -> Self {
+    pub(crate) fn new(actor_type: &'static str, local_ref: LocalActorRef) -> Self {
         Self {
             actor_type,
             local_ref,
-            #[cfg(feature = "distributed")]
-            actor_ref,
         }
     }
 
@@ -74,11 +61,6 @@ impl ActorMetadata {
 
     pub fn local_ref(&self) -> LocalActorRef {
         self.local_ref
-    }
-
-    #[cfg(feature = "distributed")]
-    pub fn actor_ref(&self) -> Option<&ActorRef> {
-        self.actor_ref.as_ref()
     }
 }
 
@@ -113,20 +95,6 @@ pub enum ActorLifecycleEvent {
     StopFailed(StopReason),
     StopRetried(StopReason),
     ForcedDataLoss(StopReason),
-}
-
-#[cfg(feature = "distributed")]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ProtocolFailure {
-    UnknownMessage,
-    ModeMismatch,
-    PayloadTooLarge,
-    DecodeFailed,
-    EncodeFailed,
-    MissingDeadline,
-    MailboxRejected,
-    ActorFailed,
-    ReplyTypeMismatch,
 }
 
 pub trait ActorObserver: Send + Sync + 'static {
@@ -166,17 +134,6 @@ pub trait ActorObserver: Send + Sync + 'static {
     }
 
     fn lifecycle(&self, _actor: &ActorMetadata, _event: ActorLifecycleEvent) {}
-
-    #[cfg(feature = "distributed")]
-    fn protocol_failed(
-        &self,
-        _actor: &ActorMetadata,
-        _message_id: u64,
-        _kind: MessageKind,
-        _payload_size: usize,
-        _failure: ProtocolFailure,
-    ) {
-    }
 }
 
 #[derive(Clone)]
@@ -254,19 +211,6 @@ impl ActorObserverHandle {
 
     pub(crate) fn lifecycle(&self, actor: &ActorMetadata, event: ActorLifecycleEvent) {
         self.inner.lifecycle(actor, event);
-    }
-
-    #[cfg(feature = "distributed")]
-    pub(crate) fn protocol_failed(
-        &self,
-        actor: &ActorMetadata,
-        message_id: u64,
-        kind: MessageKind,
-        payload_size: usize,
-        failure: ProtocolFailure,
-    ) {
-        self.inner
-            .protocol_failed(actor, message_id, kind, payload_size, failure);
     }
 }
 

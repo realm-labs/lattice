@@ -3,7 +3,7 @@ use std::io::{Error, ErrorKind, IoSlice};
 use std::sync::Arc;
 
 use bytes::{BufMut, Bytes, BytesMut};
-use lattice_core::{actor_ref::NodeAddress, failpoint::Failpoint};
+use lattice_core::{actor_address::NodeAddress, failpoint::Failpoint};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::{TcpListener, TcpStream},
@@ -658,7 +658,7 @@ mod tests {
     };
 
     use bytes::Bytes;
-    use lattice_core::actor_ref::{ClusterId, NodeAddress, NodeIncarnation, ProtocolId};
+    use lattice_core::actor_address::{ClusterId, NodeAddress, NodeIncarnation, ProtocolId};
     #[cfg(feature = "tls")]
     use rcgen::{CertificateParams, KeyPair, SanType};
     use tokio::{

@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use lattice_core::actor_ref::{NodeAddress, NodeIncarnation};
+use lattice_core::actor_address::{NodeAddress, NodeIncarnation};
 use lattice_placement::coordinator::{
     MemberChange, MemberEvent, MemberHello, MemberRecord, MemberRemovalReason, MemberStatus,
 };

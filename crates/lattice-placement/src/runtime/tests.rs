@@ -1,7 +1,7 @@
 use std::{collections::BTreeSet, time::Instant as StdInstant};
 
 use async_trait::async_trait;
-use lattice_core::actor_ref::{
+use lattice_core::actor_address::{
     ClusterId, ConfigFingerprint, EntityType, NodeAddress, NodeIncarnation, PlacementDomainId,
     ProtocolId, SingletonKind,
 };

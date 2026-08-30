@@ -1,7 +1,7 @@
 use std::time::Duration;
 
-use lattice_core::actor_ref::PlacementDomainId;
-use lattice_core::actor_ref::{ClusterId, NodeAddress, NodeIncarnation};
+use lattice_core::actor_address::PlacementDomainId;
+use lattice_core::actor_address::{ClusterId, NodeAddress, NodeIncarnation};
 use lattice_core::coordinator::CoordinatorScope;
 use prost::{Enumeration, Message};
 

@@ -7,18 +7,18 @@ use std::{
 };
 
 use bytes::BytesMut;
-use lattice_actor::{
+use lattice_actor_distributed::{
     actor_protocol,
     context::HandlerContext,
     error::ActorError,
     mailbox::MailboxConfig,
     protocol::{CodecDescriptor, DecodeError, EncodeError, WireCodec},
-    registry::{ActorRefConfig, ActorRegistry, ActorRegistryConfig},
+    registry::{ActorAddressConfig, ActorRegistry, ActorRegistryConfig},
     traits::{Actor, Handler},
 };
 use lattice_core::{
+    actor_address::{ActorAddress, ClusterId, NodeIncarnation},
     actor_kind,
-    actor_ref::{ActorRef, ClusterId, NodeIncarnation},
     id::ActorId,
 };
 use lattice_remoting::handshake::NodeIdentity;
@@ -102,7 +102,7 @@ async fn remote_tell_waits_for_mailbox_capacity_without_losing_messages() {
         actor_kind!("Flood"),
         ActorRegistryConfig {
             mailbox: MailboxConfig::bounded(1),
-            actor_ref: Some(ActorRefConfig {
+            address: Some(ActorAddressConfig {
                 cluster_id: cluster_id.clone(),
                 node_address: server_address.clone(),
                 node_incarnation: server_incarnation,
@@ -113,7 +113,7 @@ async fn remote_tell_waits_for_mailbox_capacity_without_losing_messages() {
     ));
     let processed = Arc::new(AtomicUsize::new(0));
     let completed = Arc::new(Notify::new());
-    let handle = registry
+    registry
         .start(
             ActorId::U64(1),
             FloodActor {
@@ -123,7 +123,7 @@ async fn remote_tell_waits_for_mailbox_capacity_without_losing_messages() {
         )
         .await
         .unwrap();
-    let target: ActorRef<FloodProtocol> = handle.typed_actor_ref().unwrap().unwrap();
+    let target: ActorAddress<FloodProtocol> = registry.address(&ActorId::U64(1)).unwrap().unwrap();
     let server = LatticeService::builder(node_config(
         cluster_id.clone(),
         "server",

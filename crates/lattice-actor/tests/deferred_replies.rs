@@ -314,7 +314,7 @@ async fn stopping_actor_fails_an_active_deferred_request() {
     });
 
     entered.acquire().await.unwrap().forget();
-    handle.stop(StopReason::Requested).await.unwrap();
+    handle.stop(StopReason::Requested).unwrap();
 
     assert!(matches!(
         ask.await.unwrap(),

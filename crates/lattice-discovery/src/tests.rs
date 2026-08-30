@@ -12,7 +12,7 @@ use std::{
 use async_trait::async_trait;
 use futures_util::{Stream, StreamExt};
 use lattice_config::store::{ConfigStore, ConfigStoreError, ConfigWatch, LocalConfigStore};
-use lattice_core::{actor_ref::NodeAddress, coordinator::CoordinatorScope};
+use lattice_core::{actor_address::NodeAddress, coordinator::CoordinatorScope};
 use serde_json::json;
 use tokio::sync::{Mutex, watch::Sender};
 

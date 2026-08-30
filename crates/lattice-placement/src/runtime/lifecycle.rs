@@ -2,7 +2,7 @@ use std::{collections::BTreeSet, sync::Arc, time::Duration};
 
 use tokio::time::MissedTickBehavior;
 
-use lattice_core::actor_ref::{EntityType, NodeIncarnation, PlacementDomainId};
+use lattice_core::actor_address::{EntityType, NodeIncarnation, PlacementDomainId};
 
 use super::{
     AllocationError, CoordinatorLeaseStore, CoordinatorRuntimeError, HandoffEvent, HandoffMachine,

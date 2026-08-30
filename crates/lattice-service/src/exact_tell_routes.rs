@@ -9,7 +9,7 @@ use std::{
 use arc_swap::ArcSwapOption;
 use bytes::Bytes;
 use dashmap::{DashMap, mapref::entry::Entry};
-use lattice_core::actor_ref::ActorRef;
+use lattice_core::actor_address::ActorAddress;
 use lattice_remoting::{
     association::{Association, AssociationError, AssociationId},
     messaging::{
@@ -21,7 +21,7 @@ use lattice_remoting::{
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ExactTellRouteKey {
-    target: ActorRef,
+    target: ActorAddress,
     fingerprint: ProtocolFingerprint,
 }
 
@@ -54,7 +54,7 @@ pub(crate) struct ExactTellMessage {
 #[derive(Debug)]
 pub(crate) struct RejectedExactTell {
     pub(crate) error: TellError,
-    pub(crate) target: ActorRef,
+    pub(crate) target: ActorAddress,
     pub(crate) fingerprint: ProtocolFingerprint,
     pub(crate) message_id: u64,
     pub(crate) payload: Bytes,
@@ -73,12 +73,12 @@ impl ExactTellRouteCache {
     pub(crate) fn tell<F>(
         &self,
         messaging: &OutboundMessaging,
-        target: ActorRef,
+        target: ActorAddress,
         message: ExactTellMessage,
         association: F,
     ) -> Result<(), Box<RejectedExactTell>>
     where
-        F: FnOnce(&ActorRef) -> Result<Arc<Association>, TellError>,
+        F: FnOnce(&ActorAddress) -> Result<Arc<Association>, TellError>,
     {
         let key = ExactTellRouteKey {
             target,
@@ -181,12 +181,12 @@ impl ExactTellRouteCache {
     pub(crate) async fn tell_wait<F>(
         &self,
         messaging: &OutboundMessaging,
-        target: ActorRef,
+        target: ActorAddress,
         message: ExactTellMessage,
         association: F,
     ) -> Result<(), TellError>
     where
-        F: FnOnce(&ActorRef) -> Result<Arc<Association>, TellError>,
+        F: FnOnce(&ActorAddress) -> Result<Arc<Association>, TellError>,
     {
         let key = ExactTellRouteKey {
             target,
@@ -316,7 +316,7 @@ fn prepare_retained<F>(
     association: F,
 ) -> Result<(PreparedExactTellRoute, ExactTellMessage), Box<RejectedExactTell>>
 where
-    F: FnOnce(&ActorRef) -> Result<Arc<Association>, TellError>,
+    F: FnOnce(&ActorAddress) -> Result<Arc<Association>, TellError>,
 {
     let association = match association(&key.target) {
         Ok(association) => association,
@@ -353,7 +353,7 @@ fn is_inactive_error(error: &TellError) -> bool {
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use lattice_core::actor_ref::{
+    use lattice_core::actor_address::{
         ActivationId, ActorPath, ClusterId, NodeAddress, NodeIncarnation, ProtocolId,
     };
     use lattice_remoting::{
@@ -408,9 +408,9 @@ mod tests {
         association
     }
 
-    fn target(protocol_id: ProtocolId, sequence: u64) -> ActorRef {
+    fn target(protocol_id: ProtocolId, sequence: u64) -> ActorAddress {
         let incarnation = NodeIncarnation::new(2).unwrap();
-        ActorRef::new(
+        ActorAddress::new(
             ClusterId::new("test").unwrap(),
             NodeAddress::new("remote", 25520).unwrap(),
             incarnation,

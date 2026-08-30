@@ -1,6 +1,6 @@
 use std::time::SystemTime;
 
-use lattice_core::{actor_ref::EntityType, failpoint::Failpoint};
+use lattice_core::{actor_address::EntityType, failpoint::Failpoint};
 
 use super::{
     BTreeMap, CoordinatorInspection, CoordinatorLeaseStore, CoordinatorOperation,

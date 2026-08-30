@@ -1,6 +1,6 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use lattice_actor::{error::ActorStopError, recipient::RecipientError, traits::StopReason};
+use lattice_actor_distributed::{error::ActorStopError, recipient::RecipientError, traits::StopReason};
 
 const SPLIT_PROTOCOL_ID: u64 = 0x7369_6d00_0000_0002;
 const SPLIT_ENTITY_ID: &[u8] = b"split-brain-entity";
@@ -586,7 +586,7 @@ impl SplitHost {
         let registry = Arc::new(ActorRegistry::new_bound(
             actor_kind!("DistributedSplitFixture"),
             ActorRegistryConfig {
-                actor_ref: Some(ActorRefConfig {
+                address: Some(ActorAddressConfig {
                     cluster_id: cluster.clone(),
                     node_address: config.address.clone(),
                     node_incarnation: incarnation,

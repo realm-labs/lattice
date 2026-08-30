@@ -300,7 +300,7 @@ fn try_remove_global_member_from_domain(
 mod snapshot_backpressure_tests {
     use std::sync::Arc;
 
-    use lattice_core::actor_ref::{ClusterId, NodeAddress, NodeIncarnation};
+    use lattice_core::actor_address::{ClusterId, NodeAddress, NodeIncarnation};
     use lattice_remoting::{
         association::{Association, LaneAttachment, LaneKind},
         config::RemotingConfig,

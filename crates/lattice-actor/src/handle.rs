@@ -10,8 +10,6 @@ use std::{
 };
 
 use broadcast::error::{RecvError, TryRecvError};
-#[cfg(feature = "distributed")]
-use lattice_core::actor_ref::{ActorRef, ProtocolTag, ReferenceError};
 use tokio::sync::{broadcast, oneshot, watch};
 
 use crate::{
@@ -41,8 +39,6 @@ pub(crate) struct ActorHandleInit<A: Actor> {
     pub(crate) terminal_hook: Arc<Mutex<Option<TerminalHook>>>,
     pub(crate) normal_tx: Sender<ActorCommand<A>>,
     pub(crate) system_tx: Sender<ActorCommand<A>>,
-    #[cfg(feature = "distributed")]
-    pub(crate) actor_ref: Option<ActorRef>,
     pub(crate) observer: ActorObserverHandle,
 }
 
@@ -71,7 +67,6 @@ pub struct StopFailureRecord {
     pub first_failure_time: SystemTime,
     pub latest_attempt_time: SystemTime,
     pub attempt_count: u32,
-    pub authoritative: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -172,12 +167,7 @@ impl<A: Actor> ActorHandle<A> {
             terminal_hook: init.terminal_hook,
             normal_tx: init.normal_tx,
             system_tx: init.system_tx,
-            metadata: Arc::new(ActorMetadata::new(
-                type_name::<A>(),
-                init.local_ref,
-                #[cfg(feature = "distributed")]
-                init.actor_ref,
-            )),
+            metadata: Arc::new(ActorMetadata::new(type_name::<A>(), init.local_ref)),
             observer: init.observer,
             _marker: PhantomData,
         }
@@ -187,9 +177,15 @@ impl<A: Actor> ActorHandle<A> {
         self.local_ref
     }
 
-    #[cfg(feature = "distributed")]
-    pub fn actor_ref(&self) -> Option<&ActorRef> {
-        self.metadata.actor_ref()
+    /// Observes this local activation through the same DeathWatch shape used by
+    /// bound distributed references.
+    pub fn watch(
+        &self,
+    ) -> impl Future<Output = Result<crate::watch::LocalWatchSubscription, std::convert::Infallible>>
+    + Send {
+        std::future::ready(Ok(crate::watch::LocalWatchSubscription::new(
+            self.subscribe_terminated(),
+        )))
     }
 
     pub(crate) fn observer(&self) -> &ActorObserverHandle {
@@ -198,14 +194,6 @@ impl<A: Actor> ActorHandle<A> {
 
     pub(crate) fn observation_metadata(&self) -> &ActorMetadata {
         &self.metadata
-    }
-
-    /// Returns this activation's exact reference typed by a protocol marker.
-    /// The embedded protocol ID is checked before the typed reference is
-    /// returned.
-    #[cfg(feature = "distributed")]
-    pub fn typed_actor_ref<P: ProtocolTag>(&self) -> Result<Option<ActorRef<P>>, ReferenceError> {
-        self.actor_ref().map(ActorRef::try_typed::<P>).transpose()
     }
 
     pub fn lifecycle_state(&self) -> ActorLifecycleState {
@@ -218,9 +206,6 @@ impl<A: Actor> ActorHandle<A> {
             value if value == ActorLifecycleState::Stopping as u8 => ActorLifecycleState::Stopping,
             value if value == ActorLifecycleState::StopFailed as u8 => {
                 ActorLifecycleState::StopFailed
-            }
-            value if value == ActorLifecycleState::Quarantined as u8 => {
-                ActorLifecycleState::Quarantined
             }
             value if value == ActorLifecycleState::Stopped as u8 => ActorLifecycleState::Stopped,
             _ => unreachable!("actor lifecycle atomic contains an invalid state"),
@@ -268,8 +253,8 @@ impl<A: Actor> ActorHandle<A> {
         }
     }
 
-    #[cfg(feature = "distributed")]
-    pub(crate) async fn ask_until_owned<R>(
+    #[doc(hidden)]
+    pub async fn ask_until_owned<R>(
         self,
         request: R,
         deadline: Instant,
@@ -279,16 +264,7 @@ impl<A: Actor> ActorHandle<A> {
         <A as crate::traits::Actor>::Behavior: crate::state_machine::Accepts<R>,
         R: Request,
     {
-        if Instant::now() >= deadline {
-            return Err(ActorCallError::DeadlineExceeded);
-        }
-        let (reply_tx, reply_rx) = oneshot::channel();
-        let command = ActorCommand::envelope(RequestEnvelope::new(request, reply_tx, deadline));
-        self.send_command(command, MailboxLane::Normal)?;
-        match tokio::time::timeout_at(deadline.into(), reply_rx).await {
-            Ok(result) => result.map_err(|_| ActorCallError::ResponseDropped)?,
-            Err(_) => Err(ActorCallError::DeadlineExceeded),
-        }
+        self.ask_until(request, deadline).await
     }
 
     /// Waits for normal-mailbox capacity and admits one one-way message.
@@ -316,7 +292,7 @@ impl<A: Actor> ActorHandle<A> {
         self.try_tell_on_lane(msg, MailboxLane::Normal)
     }
 
-    pub async fn stop(&self, reason: StopReason) -> Result<(), ActorTellError<StopReason>> {
+    pub fn stop(&self, reason: StopReason) -> Result<(), ActorTellError<StopReason>> {
         self.try_send_stop(reason)
     }
 
@@ -329,10 +305,7 @@ impl<A: Actor> ActorHandle<A> {
 
     pub async fn retry_stop(&self) -> Result<(), ActorAdminError> {
         let state = self.lifecycle_state();
-        if !matches!(
-            state,
-            ActorLifecycleState::StopFailed | ActorLifecycleState::Quarantined
-        ) {
+        if state != ActorLifecycleState::StopFailed {
             return Err(ActorAdminError::InvalidState {
                 operation: "retry_stop",
                 state,
@@ -345,31 +318,13 @@ impl<A: Actor> ActorHandle<A> {
             .map_err(|_| ActorAdminError::ResponseDropped)?
     }
 
-    pub async fn quarantine_after_authority_loss(&self) -> Result<(), ActorAdminError> {
-        let state = self.lifecycle_state();
-        if state != ActorLifecycleState::StopFailed {
-            return Err(ActorAdminError::InvalidState {
-                operation: "quarantine_after_authority_loss",
-                state,
-            });
-        }
-        let (result_tx, result_rx) = oneshot::channel();
-        self.send_admin_command(ActorCommand::Quarantine(result_tx))?;
-        result_rx
-            .await
-            .map_err(|_| ActorAdminError::ResponseDropped)?
-    }
-
     pub async fn force_stop(
         &self,
         reason: impl Into<String>,
         ticket: impl Into<String>,
     ) -> Result<(), ActorAdminError> {
         let state = self.lifecycle_state();
-        if !matches!(
-            state,
-            ActorLifecycleState::StopFailed | ActorLifecycleState::Quarantined
-        ) {
+        if state != ActorLifecycleState::StopFailed {
             return Err(ActorAdminError::InvalidState {
                 operation: "force_stop",
                 state,
@@ -388,10 +343,8 @@ impl<A: Actor> ActorHandle<A> {
             .map_err(|_| ActorAdminError::ResponseDropped)?
     }
 
-    pub(crate) fn try_stop_internal(
-        &self,
-        reason: StopReason,
-    ) -> Result<(), ActorTellError<StopReason>> {
+    #[doc(hidden)]
+    pub fn try_stop_internal(&self, reason: StopReason) -> Result<(), ActorTellError<StopReason>> {
         self.try_send_stop(reason)
     }
 
@@ -409,38 +362,6 @@ impl<A: Actor> ActorHandle<A> {
                 Ok(())
             }
             Err(_) => Err(ActorTellError::MailboxClosed(reason)),
-        }
-    }
-
-    #[cfg(feature = "distributed")]
-    pub(crate) fn mark_external_authority_lost(&self) -> ActorLifecycleState {
-        let previous = self.lifecycle_state();
-        self.mark_stop_failure_quarantined();
-        self.set_lifecycle_state(ActorLifecycleState::Quarantined);
-        previous
-    }
-
-    #[cfg(feature = "distributed")]
-    pub(crate) fn begin_fenced_stop(
-        &self,
-        previous: ActorLifecycleState,
-        reason: StopReason,
-    ) -> Result<(), ActorAdminError> {
-        if matches!(
-            previous,
-            ActorLifecycleState::Passivating
-                | ActorLifecycleState::Stopping
-                | ActorLifecycleState::StopFailed
-        ) {
-            let (result, _response) = oneshot::channel();
-            self.send_admin_command(ActorCommand::Quarantine(result))
-        } else {
-            self.try_send_stop(reason).map_err(|error| match error {
-                ActorTellError::MailboxFull(_) => ActorAdminError::MailboxFull,
-                ActorTellError::MailboxClosed(_) | ActorTellError::LifecycleUnavailable { .. } => {
-                    ActorAdminError::MailboxClosed
-                }
-            })
         }
     }
 
@@ -510,8 +431,8 @@ impl<A: Actor> ActorHandle<A> {
         self.terminal_cleanup_started.store(true, Ordering::Release);
     }
 
-    #[cfg(feature = "distributed")]
-    pub(crate) fn terminal_cleanup_started(&self) -> bool {
+    #[doc(hidden)]
+    pub fn terminal_cleanup_started(&self) -> bool {
         self.terminal_cleanup_started.load(Ordering::Acquire)
     }
 
@@ -550,17 +471,6 @@ impl<A: Actor> ActorHandle<A> {
             .expect("actor stop failure mutex poisoned")
             .take()
             .is_some()
-    }
-
-    pub(crate) fn mark_stop_failure_quarantined(&self) {
-        if let Some(failure) = self
-            .stop_failure
-            .lock()
-            .expect("actor stop failure mutex poisoned")
-            .as_mut()
-        {
-            failure.authoritative = false;
-        }
     }
 
     pub(crate) fn run_terminal_hook(&self) {
@@ -708,7 +618,6 @@ impl<A: Actor> ActorHandle<A> {
             ActorLifecycleState::Passivating
                 | ActorLifecycleState::Stopping
                 | ActorLifecycleState::StopFailed
-                | ActorLifecycleState::Quarantined
                 | ActorLifecycleState::Stopped
         )
         .then_some(state)
@@ -769,7 +678,6 @@ impl<A: Actor> ActorHandle<A> {
                 ActorLifecycleState::Passivating
                     | ActorLifecycleState::Stopping
                     | ActorLifecycleState::StopFailed
-                    | ActorLifecycleState::Quarantined
                     | ActorLifecycleState::Stopped
             ) {
                 return Err(ActorCallError::LifecycleUnavailable { state });

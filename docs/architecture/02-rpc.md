@@ -488,3 +488,8 @@ No parallel RPC and actor-message transports.
 No separate stream/session abstraction for high-throughput actor tells.
 No route cache repaired through NOT_OWNER business responses.
 ```
+# Hard-switch API note
+
+The public address/reference and sender API in this chapter is superseded by
+[`09-actor-api-boundaries.md`](09-actor-api-boundaries.md). Serializable
+`*Address` values must be bound to `*Ref` capabilities before messaging.

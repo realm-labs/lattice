@@ -8,81 +8,12 @@ use std::{any::type_name, future::Future, time::Duration};
 use tokio::task::{AbortHandle, JoinSet};
 use tracing::Instrument;
 
-#[cfg(feature = "distributed")]
-use lattice_core::actor_ref::{ActorRef, EntityRef, ProtocolTag, SingletonRef};
-
 use super::ActorContext;
 use crate::{
     error::{ActorCallError, ActorError, ActorTellError},
-    handle::ActorHandle,
     traits::{Actor, Handler, Message},
-    watch::{ActorTerminated, TerminatedTarget, WatchId},
+    watch::{ActorTerminated, TerminationSubscription, WatchId, WatchTarget},
 };
-
-#[cfg(feature = "distributed")]
-use crate::recipient::WatchSubscription;
-
-pub struct ContextWatchTarget(ContextWatchSource);
-
-enum ContextWatchSource {
-    Local(crate::handle::ActorTerminationSubscription),
-    #[cfg(feature = "distributed")]
-    Exact(ActorRef),
-    #[cfg(feature = "distributed")]
-    EntityCurrent(EntityRef),
-    #[cfg(feature = "distributed")]
-    SingletonCurrent(SingletonRef),
-}
-
-impl<B: Actor> From<&ActorHandle<B>> for ContextWatchTarget {
-    fn from(target: &ActorHandle<B>) -> Self {
-        Self(ContextWatchSource::Local(target.subscribe_terminated()))
-    }
-}
-
-#[cfg(feature = "distributed")]
-impl<P: ProtocolTag> From<&ActorRef<P>> for ContextWatchTarget {
-    fn from(target: &ActorRef<P>) -> Self {
-        Self(ContextWatchSource::Exact(target.erase()))
-    }
-}
-
-#[cfg(feature = "distributed")]
-impl<P: ProtocolTag> From<&EntityRef<P>> for ContextWatchTarget {
-    fn from(target: &EntityRef<P>) -> Self {
-        Self(ContextWatchSource::EntityCurrent(target.erase()))
-    }
-}
-
-#[cfg(feature = "distributed")]
-impl<P: ProtocolTag> From<&SingletonRef<P>> for ContextWatchTarget {
-    fn from(target: &SingletonRef<P>) -> Self {
-        Self(ContextWatchSource::SingletonCurrent(target.erase()))
-    }
-}
-
-enum ContextWatchSubscription {
-    Local(crate::handle::ActorTerminationSubscription),
-    #[cfg(feature = "distributed")]
-    Cluster(WatchSubscription),
-}
-
-impl ContextWatchSubscription {
-    async fn recv(&mut self, watch_id: WatchId) -> Option<ActorTerminated> {
-        match self {
-            Self::Local(subscription) => {
-                let termination = subscription.recv().await.ok()?;
-                Some(ActorTerminated {
-                    watch_id,
-                    target: TerminatedTarget::Local(termination.target),
-                    reason: termination.reason,
-                })
-            }
-            #[cfg(feature = "distributed")]
-            Self::Cluster(subscription) => subscription.recv().await.ok(),
-        }
-    }
-}
 
 /// Upper bound on concurrently registered DeathWatch subscriptions per activation.
 ///
@@ -164,13 +95,11 @@ impl<A: Actor> ActorContext<A> {
         self.tasks.spawn(future)
     }
 
-    pub async fn watch(
-        &mut self,
-        target: impl Into<ContextWatchTarget>,
-    ) -> Result<WatchId, ActorError>
+    pub async fn watch<T>(&mut self, target: &T) -> Result<WatchId, ActorError>
     where
         A: Handler<ActorTerminated>,
         <A as crate::traits::Actor>::Behavior: crate::state_machine::Accepts<ActorTerminated>,
+        T: WatchTarget + ?Sized,
     {
         self.watches.retain(|_watch_id, task| !task.is_finished());
         if self.watches.len() >= MAX_ACTIVE_WATCHES {
@@ -178,37 +107,11 @@ impl<A: Actor> ActorContext<A> {
                 "actor watch capacity {MAX_ACTIVE_WATCHES} is exhausted"
             )));
         }
-        let mut terminations = match target.into().0 {
-            ContextWatchSource::Local(subscription) => {
-                ContextWatchSubscription::Local(subscription)
-            }
-            #[cfg(feature = "distributed")]
-            ContextWatchSource::Exact(target) => ContextWatchSubscription::Cluster(
-                self.actor_system()?
-                    .watch(&target)
-                    .await
-                    .map_err(|error| ActorError::new(error.to_string()))?,
-            ),
-            #[cfg(feature = "distributed")]
-            ContextWatchSource::EntityCurrent(target) => ContextWatchSubscription::Cluster(
-                self.actor_system()?
-                    .watch(&target)
-                    .await
-                    .map_err(|error| ActorError::new(error.to_string()))?,
-            ),
-            #[cfg(feature = "distributed")]
-            ContextWatchSource::SingletonCurrent(target) => ContextWatchSubscription::Cluster(
-                self.actor_system()?
-                    .watch(&target)
-                    .await
-                    .map_err(|error| ActorError::new(error.to_string()))?,
-            ),
-        };
-        let watch_id = match &terminations {
-            ContextWatchSubscription::Local(_) => WatchId::random(),
-            #[cfg(feature = "distributed")]
-            ContextWatchSubscription::Cluster(subscription) => subscription.id(),
-        };
+        let mut terminations = target
+            .watch()
+            .await
+            .map_err(|error| ActorError::new(error.to_string()))?;
+        let watch_id = terminations.id();
         let self_handle = self.handle.clone();
         let span = tracing::info_span!(
             "actor.watch",
@@ -218,7 +121,8 @@ impl<A: Actor> ActorContext<A> {
         );
         let task = tokio::spawn(
             async move {
-                if let Some(notification) = terminations.recv(watch_id).await {
+                if let Some(reason) = terminations.recv().await {
+                    let notification = ActorTerminated { watch_id, reason };
                     let _ = self_handle.send_system_tell_internal(notification).await;
                 }
             }

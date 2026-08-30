@@ -4,38 +4,26 @@
 //! bookkeeping, and stop propagation all observe the same activation, even after a replacement
 //! takes over the slot.
 
+use lattice_core::service_context::ServiceContext;
 use std::{
     any::type_name,
     sync::{Arc, Mutex},
 };
-
-#[cfg(feature = "distributed")]
-use std::sync::OnceLock;
-
-#[cfg(feature = "distributed")]
-use lattice_core::actor_ref::{ActorRef, ProtocolId};
-use lattice_core::service_context::ServiceContext;
 use tokio::task::AbortHandle;
 
 use super::ActorContext;
 use crate::{
     error::{ActorError, ActorTellError},
-    handle::{ActorHandle, TerminalHook},
+    handle::ActorHandle,
     observation::ActorObserverHandle,
+    resources::ActorResources,
     runtime::{
-        ActorSpawnContext, ActorSpawnOptions, PassivationPolicy, spawn_actor_with_self_ref,
+        ActorSpawnContext, ActorSpawnOptions, PassivationPolicy, spawn_actor_from_context,
         spawner::ActorSpawner,
     },
     traits::{Actor, ChildActorKey, ChildActorOptions, ChildSupervision, StopReason},
 };
 
-#[cfg(feature = "distributed")]
-use crate::{directory::ActivationDirectory, recipient::ActorSystem};
-
-#[cfg(feature = "distributed")]
-type ChildReference = Option<ActorRef>;
-
-#[cfg(not(feature = "distributed"))]
 #[derive(Clone)]
 struct ChildReference;
 
@@ -69,9 +57,6 @@ impl<A: Actor> ActorContext<A> {
             child.key = key.as_str()
         );
         let _entered = span.enter();
-        #[cfg(feature = "distributed")]
-        let child_ref = self.child_actor_ref(&key, options.protocol_id)?;
-        #[cfg(not(feature = "distributed"))]
         let child_ref = ChildReference;
         let handle = self
             .child_spawn_env()
@@ -105,9 +90,6 @@ impl<A: Actor> ActorContext<A> {
             child.key = key.as_str()
         );
         let _entered = span.enter();
-        #[cfg(feature = "distributed")]
-        let child_ref = self.child_actor_ref(&key, options.protocol_id)?;
-        #[cfg(not(feature = "distributed"))]
         let child_ref = ChildReference;
         let handle = self
             .child_spawn_env()
@@ -141,8 +123,7 @@ impl<A: Actor> ActorContext<A> {
     fn child_spawn_env(&self) -> ChildSpawnEnv {
         ChildSpawnEnv {
             service: self.service.clone(),
-            #[cfg(feature = "distributed")]
-            actor_system: self.actor_system.clone(),
+            resources: self.resources.clone(),
             observer: self.handle.observer().clone(),
             spawner: self.spawner.clone(),
         }
@@ -160,14 +141,8 @@ impl<A: Actor> ActorContext<A> {
         F: FnMut() -> C + Send + 'static,
     {
         let slot = Arc::new(ChildSlot::new(handle, reference));
-        self.children.insert(
-            key,
-            Box::new(ChildSlotStopper {
-                slot: slot.clone(),
-                #[cfg(feature = "distributed")]
-                directory: self.service.extension::<ActivationDirectory>(),
-            }),
-        );
+        self.children
+            .insert(key, Box::new(ChildSlotStopper { slot: slot.clone() }));
         self.spawn_supervision_task(slot, options, factory);
     }
 
@@ -239,32 +214,6 @@ impl<A: Actor> ActorContext<A> {
         };
         slot.set_supervision(supervision);
     }
-
-    #[cfg(feature = "distributed")]
-    fn child_actor_ref(
-        &self,
-        key: &ChildActorKey,
-        protocol_id: Option<ProtocolId>,
-    ) -> Result<Option<ActorRef>, ActorError> {
-        let Some(protocol_id) = protocol_id else {
-            return Ok(None);
-        };
-        let parent = self.require_self_ref()?;
-        let path = parent
-            .actor_path()
-            .child(key.as_str())
-            .map_err(|error| ActorError::new(error.to_string()))?;
-        ActorRef::new(
-            parent.cluster_id().clone(),
-            parent.node_address().clone(),
-            parent.node_incarnation(),
-            path,
-            crate::runtime::next_activation_id(parent.node_incarnation()),
-            protocol_id,
-        )
-        .map(Some)
-        .map_err(|error| ActorError::new(error.to_string()))
-    }
 }
 
 pub(super) trait ChildStop: Send {
@@ -275,8 +224,7 @@ pub(super) trait ChildStop: Send {
 /// that no longer holds the [`ActorContext`].
 struct ChildSpawnEnv {
     service: ServiceContext,
-    #[cfg(feature = "distributed")]
-    actor_system: Option<Arc<OnceLock<ActorSystem>>>,
+    resources: ActorResources,
     observer: ActorObserverHandle,
     spawner: ActorSpawner,
 }
@@ -291,20 +239,8 @@ impl ChildSpawnEnv {
     where
         C: Actor,
     {
-        #[cfg(not(feature = "distributed"))]
         let _ = reference;
-        #[cfg(feature = "distributed")]
-        let directory = self.service.extension::<ActivationDirectory>();
-        #[cfg(feature = "distributed")]
-        let terminal_hook: Option<TerminalHook> = match (directory.clone(), reference.clone()) {
-            (Some(directory), Some(reference)) => Some(Box::new(move |_local_ref| {
-                directory.remove(&reference);
-            })),
-            _ => None,
-        };
-        #[cfg(not(feature = "distributed"))]
-        let terminal_hook: Option<TerminalHook> = None;
-        let handle = spawn_actor_with_self_ref(
+        let handle = spawn_actor_from_context(
             actor,
             ActorSpawnContext {
                 options: ActorSpawnOptions {
@@ -312,55 +248,21 @@ impl ChildSpawnEnv {
                     execution: Some(options.execution),
                     scheduler_key: options.scheduler_key.clone(),
                     passivation: PassivationPolicy::Disabled,
-                    #[cfg(feature = "distributed")]
-                    self_ref: reference.clone(),
                     service: self.service.clone(),
                 },
-                #[cfg(feature = "distributed")]
-                actor_system: self.actor_system.clone(),
                 observer: self.observer.clone(),
-                terminal_hook,
+                terminal_hook: None,
+                resources: self.resources.clone(),
                 spawner: self.spawner.clone(),
             },
         )
         .map_err(|error| ActorError::new(error.to_string()))?;
-        #[cfg(feature = "distributed")]
-        if let Some(directory) = &directory {
-            if let Err(error) = directory.register(&handle) {
-                let _ = handle.try_stop_internal(StopReason::StartFailed);
-                return Err(ActorError::new(error.to_string()));
-            }
-            if handle.terminal_cleanup_started()
-                && let Some(reference) = &reference
-            {
-                directory.remove(reference);
-            }
-        }
         Ok(handle)
     }
 }
 
-#[cfg(feature = "distributed")]
-fn next_child_reference(previous: &ChildReference) -> Result<ChildReference, ActorError> {
-    previous.as_ref().map(next_child_activation).transpose()
-}
-
-#[cfg(not(feature = "distributed"))]
 fn next_child_reference(_previous: &ChildReference) -> Result<ChildReference, ActorError> {
     Ok(ChildReference)
-}
-
-#[cfg(feature = "distributed")]
-fn next_child_activation(previous: &ActorRef) -> Result<ActorRef, ActorError> {
-    ActorRef::new(
-        previous.cluster_id().clone(),
-        previous.node_address().clone(),
-        previous.node_incarnation(),
-        previous.actor_path().clone(),
-        crate::runtime::next_activation_id(previous.node_incarnation()),
-        previous.protocol_id(),
-    )
-    .map_err(|error| ActorError::new(error.to_string()))
 }
 
 fn request_child_stop<C>(handle: ActorHandle<C>, reason: StopReason)
@@ -428,8 +330,6 @@ impl<C: Actor> ChildSlot<C> {
 
 struct ChildSlotStopper<C: Actor> {
     slot: Arc<ChildSlot<C>>,
-    #[cfg(feature = "distributed")]
-    directory: Option<Arc<ActivationDirectory>>,
 }
 
 impl<C: Actor> ChildStop for ChildSlotStopper<C> {
@@ -440,10 +340,6 @@ impl<C: Actor> ChildStop for ChildSlotStopper<C> {
         let Some(activation) = self.slot.take() else {
             return;
         };
-        #[cfg(feature = "distributed")]
-        if let (Some(directory), Some(reference)) = (&self.directory, &activation.reference) {
-            directory.remove(reference);
-        }
         request_child_stop(activation.handle, reason);
     }
 }

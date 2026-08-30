@@ -1,7 +1,7 @@
 use std::{collections::BTreeSet, time::Duration};
 
 use lattice_core::{
-    actor_ref::{ClusterId, NodeAddress, NodeIncarnation},
+    actor_address::{ClusterId, NodeAddress, NodeIncarnation},
     release::ReleaseManifest,
 };
 use lattice_remoting::config::{RemotingConfig, RemotingConfigError};

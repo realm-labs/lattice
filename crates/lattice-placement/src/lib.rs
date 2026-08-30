@@ -22,8 +22,8 @@ mod tests {
         time::Duration,
     };
 
-    use lattice_core::actor_ref::{
-        ClusterId, ConfigFingerprint, EntityId, EntityRef, EntityType, NodeAddress,
+    use lattice_core::actor_address::{
+        ClusterId, ConfigFingerprint, EntityAddress, EntityId, EntityType, NodeAddress,
         NodeIncarnation, PlacementDomainId, ProtocolId,
     };
 
@@ -190,7 +190,7 @@ mod tests {
         .unwrap();
         let entity = EntityId::new(b"player-42".to_vec()).unwrap();
         assert_eq!(config.shard_for(&entity).unwrap(), ShardId::new(17));
-        let reference: EntityRef = config
+        let reference: EntityAddress = config
             .entity_ref(ClusterId::new("test").unwrap(), entity)
             .unwrap();
         assert_eq!(reference.config_fingerprint(), config.fingerprint());

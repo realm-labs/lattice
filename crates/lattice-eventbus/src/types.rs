@@ -1,5 +1,5 @@
 use base64::engine::general_purpose::STANDARD as BASE64;
-use lattice_core::actor_ref::RecipientRef;
+use lattice_core::actor_address::RecipientAddress;
 use lattice_core::instance::InstanceId;
 use lattice_core::kind::ServiceKind;
 use lattice_core::trace::TraceContext;
@@ -40,7 +40,7 @@ pub struct EventEnvelope {
     pub event_type: String,
     pub source_service: ServiceKind,
     pub source_instance: InstanceId,
-    pub recipient: Option<RecipientRef>,
+    pub recipient: Option<RecipientAddress>,
     pub correlation_id: Option<String>,
     pub trace: TraceContext,
     pub occurred_unix_ms: u64,

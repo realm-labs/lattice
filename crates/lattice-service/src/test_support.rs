@@ -3,7 +3,7 @@ use std::{
     sync::{Mutex, OnceLock},
 };
 
-use lattice_core::actor_ref::NodeAddress;
+use lattice_core::actor_address::NodeAddress;
 use tokio::{
     net::TcpListener,
     sync::{Mutex as AsyncMutex, MutexGuard},

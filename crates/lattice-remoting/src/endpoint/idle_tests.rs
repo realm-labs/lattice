@@ -5,8 +5,8 @@ use std::{
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use lattice_core::actor_ref::{
-    ActivationId, ActorPath, ActorRef, ClusterId, NodeAddress, NodeIncarnation, ProtocolId,
+use lattice_core::actor_address::{
+    ActivationId, ActorAddress, ActorPath, ClusterId, NodeAddress, NodeIncarnation, ProtocolId,
 };
 use tokio::net::TcpListener;
 
@@ -125,7 +125,7 @@ async fn idle_data_lanes_sleep_until_either_side_wakes_them() {
     let association = client.connect_peer(server_identity.clone()).await.unwrap();
     wait_for_data_lanes_to_sleep(&client, &association).await;
 
-    let target = ActorRef::new(
+    let target = ActorAddress::new(
         cluster_id.clone(),
         server_identity.address,
         server_identity.incarnation,
@@ -153,7 +153,7 @@ async fn idle_data_lanes_sleep_until_either_side_wakes_them() {
             client_identity.incarnation,
         )
         .unwrap();
-    let reverse_target = ActorRef::new(
+    let reverse_target = ActorAddress::new(
         cluster_id,
         client_identity.address,
         client_identity.incarnation,

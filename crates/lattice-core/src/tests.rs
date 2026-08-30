@@ -1,5 +1,5 @@
-use crate::actor_ref::{
-    ActivationId, ActorPath, ActorRef, ClusterId, ConfigFingerprint, EntityId, EntityRef,
+use crate::actor_address::{
+    ActivationId, ActorAddress, ActorPath, ClusterId, ConfigFingerprint, EntityAddress, EntityId,
     EntityType, NodeAddress, NodeIncarnation, PlacementDomainId, ProtocolId,
 };
 use crate::id::{ActorId, ActorKey, ActorKeyDecodeError, RouteKey};
@@ -54,7 +54,7 @@ fn actor_key_converts_through_framework_ids() {
 fn actor_and_entity_refs_have_distinct_exact_and_logical_identity() {
     let node = NodeIncarnation::new(7).unwrap();
     let protocol = ProtocolId::new(11).unwrap();
-    let actor = ActorRef::new(
+    let actor = ActorAddress::new(
         ClusterId::new("test").unwrap(),
         NodeAddress::new("127.0.0.1", 19083).unwrap(),
         node,
@@ -63,7 +63,7 @@ fn actor_and_entity_refs_have_distinct_exact_and_logical_identity() {
         protocol,
     )
     .unwrap();
-    let entity = EntityRef::new(
+    let entity = EntityAddress::new(
         ClusterId::new("test").unwrap(),
         PlacementDomainId::new("world").unwrap(),
         EntityType::new("world").unwrap(),

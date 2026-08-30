@@ -4,7 +4,7 @@ use std::{
 };
 
 use lattice_core::{
-    actor_ref::{EntityType, NodeIncarnation, PlacementDomainId, ProtocolId},
+    actor_address::{EntityType, NodeIncarnation, PlacementDomainId, ProtocolId},
     release::ReleaseId,
 };
 
@@ -639,7 +639,7 @@ pub enum AllocationError {
 
 #[cfg(test)]
 mod tests {
-    use lattice_core::actor_ref::{NodeAddress, NodeIncarnation, PlacementDomainId};
+    use lattice_core::actor_address::{NodeAddress, NodeIncarnation, PlacementDomainId};
 
     use super::*;
     use crate::types::{CoordinatorTerm, PlacementVersion, Revision};

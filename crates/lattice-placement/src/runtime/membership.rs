@@ -1,5 +1,5 @@
 use lattice_core::{
-    actor_ref::{NodeIncarnation, PlacementDomainId},
+    actor_address::{NodeIncarnation, PlacementDomainId},
     coordinator::CoordinatorScope,
 };
 use lattice_remoting::{association::AssociationKey, control::ControlDispatchError};

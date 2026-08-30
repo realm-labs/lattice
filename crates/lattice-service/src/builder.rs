@@ -5,7 +5,8 @@ use std::{
     sync::{Arc, Mutex, atomic::AtomicBool},
 };
 
-use lattice_actor::{
+use lattice_actor::traits::{Actor, Message, Request};
+use lattice_actor_distributed::{
     host::{ActorHost, ProtocolHostRegistry},
     protocol::{
         ActorProtocol, ActorProtocolBinder, ActorProtocolBinding, Protocol, SupportsAsk,
@@ -15,11 +16,10 @@ use lattice_actor::{
         ActorSystem, ProtocolRegistrationError, RecipientBackend, RecipientError,
         RegisteredActorProtocol,
     },
-    registry::{ActorLoader, ActorRefConfig, ActorRegistry, ActorRegistryConfig},
-    traits::{Actor, Message, Request},
+    registry::{ActorAddressConfig, ActorLoader, ActorRegistry, ActorRegistryConfig},
 };
 use lattice_core::{
-    actor_ref::{PlacementDomainId, ProtocolId, RecipientRef},
+    actor_address::{PlacementDomainId, ProtocolId, RecipientAddress},
     coordinator::CoordinatorScope,
 };
 use lattice_discovery::provider::CoordinatorDiscovery;
@@ -258,7 +258,7 @@ impl LatticeServiceBuilder {
             .build(protocol.protocol_id())
             .map_err(ServiceError::EntityConfig)?;
         let mut registry_config: ActorRegistryConfig = options.registry;
-        registry_config.actor_ref = Some(ActorRefConfig {
+        registry_config.address = Some(ActorAddressConfig {
             cluster_id: self.config.cluster_id.clone(),
             node_address: self.config.address.clone(),
             node_incarnation: self.config.incarnation,
@@ -434,7 +434,7 @@ impl LatticeServiceBuilder {
         let protocol = Arc::new(P::bind_actor().map_err(ServiceError::ProtocolBuild)?);
         let config = options.build(protocol.protocol_id());
         let mut registry_config = options.registry;
-        registry_config.actor_ref = Some(ActorRefConfig {
+        registry_config.address = Some(ActorAddressConfig {
             cluster_id: self.config.cluster_id.clone(),
             node_address: self.config.address.clone(),
             node_incarnation: self.config.incarnation,

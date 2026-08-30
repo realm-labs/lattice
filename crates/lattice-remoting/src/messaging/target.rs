@@ -1,8 +1,8 @@
-use lattice_core::actor_ref::{ProtocolTag, ReferenceError};
+use lattice_core::actor_address::{AddressError, ProtocolTag};
 
 use super::{
-    ActivationId, ActorPath, ActorRef, Bytes, ClusterId, Duration, EntityRef, NodeAddress,
-    NodeIncarnation, ProtocolId, SingletonRef, error::RemoteFailureCode,
+    ActivationId, ActorAddress, ActorPath, Bytes, ClusterId, Duration, EntityAddress, NodeAddress,
+    NodeIncarnation, ProtocolId, SingletonAddress, error::RemoteFailureCode,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -15,8 +15,8 @@ pub struct ExactActorTarget {
     pub protocol_id: ProtocolId,
 }
 
-impl<A: ProtocolTag> From<&ActorRef<A>> for ExactActorTarget {
-    fn from(value: &ActorRef<A>) -> Self {
+impl<A: ProtocolTag> From<&ActorAddress<A>> for ExactActorTarget {
+    fn from(value: &ActorAddress<A>) -> Self {
         Self {
             cluster_id: value.cluster_id().clone(),
             node_address: value.node_address().clone(),
@@ -29,8 +29,8 @@ impl<A: ProtocolTag> From<&ActorRef<A>> for ExactActorTarget {
 }
 
 impl ExactActorTarget {
-    pub fn actor_ref<A: ProtocolTag>(&self) -> Result<ActorRef<A>, ReferenceError> {
-        ActorRef::new(
+    pub fn actor_address<A: ProtocolTag>(&self) -> Result<ActorAddress<A>, AddressError> {
+        ActorAddress::new(
             self.cluster_id.clone(),
             self.node_address.clone(),
             self.node_incarnation,
@@ -87,7 +87,7 @@ impl CorrelationId {
 
 pub(super) fn update_actor_route_hash<A: ProtocolTag>(
     hasher: &mut blake3::Hasher,
-    target: &ActorRef<A>,
+    target: &ActorAddress<A>,
 ) {
     hasher.update(b"exact-actor-target");
     update_route_bytes(hasher, target.cluster_id().as_str().as_bytes());
@@ -126,7 +126,7 @@ pub struct InboundAsk {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LogicalEntityTarget {
-    pub reference: EntityRef,
+    pub reference: EntityAddress,
     pub owner_address: NodeAddress,
     pub owner_incarnation: NodeIncarnation,
     pub assignment_generation: u64,
@@ -148,7 +148,7 @@ impl LogicalEntityTarget {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LogicalSingletonTarget {
-    pub reference: SingletonRef,
+    pub reference: SingletonAddress,
     pub owner_address: NodeAddress,
     pub owner_incarnation: NodeIncarnation,
     pub assignment_generation: u64,

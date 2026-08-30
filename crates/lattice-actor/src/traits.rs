@@ -1,10 +1,5 @@
 use std::{any::Any, error::Error as StdError, future::Future, time::Instant};
 
-use lattice_core::actor_ref::EntityId;
-#[cfg(feature = "distributed")]
-use lattice_core::actor_ref::ProtocolId;
-use thiserror::Error;
-
 use crate::{
     context::{ActorContext, HandlerContext},
     error::ActorStopError,
@@ -124,21 +119,6 @@ pub enum MessageOutcome {
     HandlerErrorRecovered,
     Panicked,
     Rejected(MessageRejection),
-}
-
-pub trait EntityKey: Clone + Send + Sync + 'static {
-    fn to_entity_id(&self) -> Result<EntityId, EntityKeyDecodeError>;
-    fn try_from_entity_id(entity_id: &EntityId) -> Result<Self, EntityKeyDecodeError>;
-}
-
-pub trait ShardedActor: Actor {
-    type Key: EntityKey;
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Error)]
-#[error("entity key encoding is invalid: {reason}")]
-pub struct EntityKeyDecodeError {
-    pub reason: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -273,7 +253,6 @@ pub enum StopReason {
     Passivated(PassivationReason),
     MailboxClosed,
     StartFailed,
-    AuthorityLost,
 }
 
 #[repr(u8)]
@@ -284,16 +263,7 @@ pub enum ActorLifecycleState {
     Passivating,
     Stopping,
     StopFailed,
-    Quarantined,
     Stopped,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EntityActivationState {
-    Absent,
-    Activating,
-    Loading,
-    Active,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -301,7 +271,6 @@ pub enum PassivationReason {
     BusinessIdle,
     IdleTimeout,
     Drain,
-    Migrate,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -321,8 +290,6 @@ impl ChildActorKey {
 pub struct ChildActorOptions {
     pub mailbox: MailboxConfig,
     pub supervision: ChildSupervision,
-    #[cfg(feature = "distributed")]
-    pub protocol_id: Option<ProtocolId>,
     /// Execution policy used to run this child.
     pub execution: ActorExecutionPolicy,
     /// Affinity key used only by [`crate::runtime::ActorExecutionPolicy::KeyedWorkerPool`].
@@ -334,8 +301,6 @@ impl Default for ChildActorOptions {
         Self {
             mailbox: MailboxConfig::default(),
             supervision: ChildSupervision::default(),
-            #[cfg(feature = "distributed")]
-            protocol_id: None,
             execution: ActorExecutionPolicy::TaskPerActor,
             scheduler_key: None,
         }

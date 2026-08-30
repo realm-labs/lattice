@@ -1,7 +1,7 @@
 use std::{collections::BTreeSet, sync::Arc, time::Duration};
 
 use lattice_core::{
-    actor_ref::{NodeAddress, NodeIncarnation, PlacementDomainId},
+    actor_address::{NodeAddress, NodeIncarnation, PlacementDomainId},
     coordinator::CoordinatorScope,
 };
 use lattice_remoting::{
@@ -139,7 +139,7 @@ async fn stale_coordinator_term_is_fenced_before_membership_dispatch() {
     host.route_control(PlacementControlEvent {
         kind: PlacementControlEventKind::Command(Box::new(InboundPlacementControl {
             association: AssociationKey {
-                cluster_id: lattice_core::actor_ref::ClusterId::new("term-fencing").unwrap(),
+                cluster_id: lattice_core::actor_address::ClusterId::new("term-fencing").unwrap(),
                 local_incarnation: local.incarnation,
                 remote_address: remote.address,
                 remote_incarnation: remote.incarnation,
@@ -195,7 +195,8 @@ async fn standby_scope_fences_old_control_instead_of_retrying_it() {
         .route_control(PlacementControlEvent {
             kind: PlacementControlEventKind::Command(Box::new(InboundPlacementControl {
                 association: AssociationKey {
-                    cluster_id: lattice_core::actor_ref::ClusterId::new("standby-fencing").unwrap(),
+                    cluster_id: lattice_core::actor_address::ClusterId::new("standby-fencing")
+                        .unwrap(),
                     local_incarnation: standby_node.incarnation,
                     remote_address: remote.address,
                     remote_incarnation: remote.incarnation,

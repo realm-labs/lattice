@@ -9,8 +9,8 @@
 use std::collections::BTreeSet;
 
 use lattice_core::{
-    actor_ref::{
-        ActivationId, ActorPath, ActorRef, ClusterId, EntityType, NodeAddress, NodeIncarnation,
+    actor_address::{
+        ActivationId, ActorAddress, ActorPath, ClusterId, EntityType, NodeAddress, NodeIncarnation,
         PlacementDomainId, ProtocolId,
     },
     watch::{WatchId, WatchStatus},
@@ -151,7 +151,7 @@ impl Scenario {
             barrier,
         )
         .map_err(ScenarioError::Handoff)?;
-        let actor = actor_ref(&source);
+        let actor = actor_address(&source);
         let mut watches = WatchRegistry::new(16, 16).map_err(ScenarioError::Watch)?;
         let (registered_watch, _) = watches
             .watch(AssociationId::new(1).unwrap(), &actor)
@@ -344,8 +344,8 @@ fn process(id: &str, value: u128, port: u16) -> SimProcess {
     }
 }
 
-fn actor_ref(node: &NodeKey) -> ActorRef {
-    ActorRef::new(
+fn actor_address(node: &NodeKey) -> ActorAddress {
+    ActorAddress::new(
         ClusterId::new("sim-cluster").unwrap(),
         node.address.clone(),
         node.incarnation,

@@ -6,7 +6,7 @@ use std::{
 };
 
 use bytes::Bytes;
-use lattice_actor::{
+use lattice_actor_distributed::{
     context::HandlerContext,
     error::{ActorError, ActorTellError},
     handle::ActorHandle,

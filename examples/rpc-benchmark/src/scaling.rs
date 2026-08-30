@@ -5,7 +5,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use lattice_actor::{
+use lattice_actor_distributed::{
     context::HandlerContext,
     error::{ActorError, ActorTellError},
     handle::ActorHandle,

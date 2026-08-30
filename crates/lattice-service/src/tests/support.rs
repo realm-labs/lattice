@@ -4,7 +4,7 @@ use std::{collections::BTreeSet, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use bytes::BytesMut;
-use lattice_actor::{
+use lattice_actor_distributed::{
     actor_protocol,
     context::HandlerContext,
     error::ActorError,
@@ -13,7 +13,7 @@ use lattice_actor::{
     reply::ReplyTo,
     traits::{Actor, Responder},
 };
-use lattice_core::actor_ref::{
+use lattice_core::actor_address::{
     ClusterId, EntityType, NodeAddress, NodeIncarnation, PlacementDomainId,
 };
 use lattice_placement::{

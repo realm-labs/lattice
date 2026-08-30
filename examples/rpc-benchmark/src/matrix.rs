@@ -7,17 +7,17 @@ use std::{
 };
 
 use bytes::Bytes;
-use lattice_actor::{
+use lattice_actor_distributed::{
     error::{ActorError, ActorTellError},
     mailbox::MailboxConfig,
     registry::{ActorRegistry, ActorRegistryConfig},
     traits::{Actor, Handler, StopReason},
 };
 use lattice_core::{
-    actor_kind,
-    actor_ref::{
+    actor_address::{
         EntityId, EntityType, NodeAddress, NodeIncarnation, PlacementDomainId, ProtocolId,
     },
+    actor_kind,
     id::ActorId,
 };
 use lattice_placement::{
@@ -93,7 +93,7 @@ pub async fn local_actor_admission(operations: usize) -> Result<MatrixMeasuremen
         }
     }
     let elapsed = started.elapsed();
-    handle.stop(StopReason::Requested).await?;
+    handle.stop(StopReason::Requested)?;
     Ok(MatrixMeasurement {
         name: "local_actor_tell_admission",
         operations,

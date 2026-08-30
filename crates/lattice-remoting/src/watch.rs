@@ -6,9 +6,9 @@ use std::{
 use async_trait::async_trait;
 use bytes::Bytes;
 use lattice_core::{
-    actor_ref::{
-        ActivationId, ActorPath, ActorRef, ClusterId, EntityRef, NodeAddress, NodeIncarnation,
-        ProtocolId, ProtocolTag, SingletonRef,
+    actor_address::{
+        ActivationId, ActorAddress, ActorPath, ClusterId, EntityAddress, NodeAddress,
+        NodeIncarnation, ProtocolId, ProtocolTag, SingletonAddress,
     },
     failpoint::{Failpoint, FailpointAction},
     watch::{TerminatedReason, WatchId, WatchStatus},
@@ -393,7 +393,7 @@ impl WatchRegistry {
     pub fn watch<A: ProtocolTag>(
         &mut self,
         association_id: AssociationId,
-        target: &ActorRef<A>,
+        target: &ActorAddress<A>,
     ) -> Result<(RegisteredWatch, WatchCommand), WatchError> {
         if self.desired.len() == self.maximum_desired {
             return Err(WatchError::DesiredCapacity);
@@ -692,13 +692,13 @@ impl WatchRegistry {
 pub trait CurrentActivationResolver: Send + Sync {
     async fn resolve_entity_current<A: ProtocolTag>(
         &self,
-        reference: &EntityRef<A>,
-    ) -> Result<Option<ActorRef<A>>, WatchError>;
+        reference: &EntityAddress<A>,
+    ) -> Result<Option<ActorAddress<A>>, WatchError>;
 
     async fn resolve_singleton_current<A: ProtocolTag>(
         &self,
-        reference: &SingletonRef<A>,
-    ) -> Result<Option<ActorRef<A>>, WatchError>;
+        reference: &SingletonAddress<A>,
+    ) -> Result<Option<ActorAddress<A>>, WatchError>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -729,13 +729,15 @@ pub enum WatchError {
 
 #[cfg(test)]
 mod tests {
-    use lattice_core::actor_ref::{ActivationId, ActorPath, ClusterId, NodeAddress, ProtocolId};
+    use lattice_core::actor_address::{
+        ActivationId, ActorPath, ClusterId, NodeAddress, ProtocolId,
+    };
 
     use super::*;
 
-    fn actor(sequence: u64) -> ActorRef {
+    fn actor(sequence: u64) -> ActorAddress {
         let node = NodeIncarnation::new(2).unwrap();
-        ActorRef::new(
+        ActorAddress::new(
             ClusterId::new("test").unwrap(),
             NodeAddress::new("remote", 25520).unwrap(),
             node,

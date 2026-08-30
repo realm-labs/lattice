@@ -88,7 +88,7 @@ async fn scoped_task_is_cancelled_when_actor_stops() {
         MailboxConfig::bounded(8),
     );
 
-    handle.stop(StopReason::Requested).await.unwrap();
+    handle.stop(StopReason::Requested).unwrap();
 
     tokio::time::timeout(Duration::from_millis(100), dropped_rx)
         .await

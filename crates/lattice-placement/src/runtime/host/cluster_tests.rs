@@ -1,7 +1,7 @@
 use std::{collections::BTreeSet, sync::Arc, time::Duration};
 
 use lattice_core::{
-    actor_ref::{NodeAddress, NodeIncarnation, PlacementDomainId},
+    actor_address::{NodeAddress, NodeIncarnation, PlacementDomainId},
     coordinator::CoordinatorScope,
 };
 use lattice_remoting::{association::AssociationManager, config::RemotingConfig};

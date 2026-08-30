@@ -9,7 +9,7 @@ use std::{
     time::Duration,
 };
 
-use lattice_actor::{
+use lattice_actor_distributed::{
     context::{ActorContext, HandlerContext},
     error::{ActorError, ActorStopError},
     recipient::ProtocolRegistrationError,
@@ -18,8 +18,8 @@ use lattice_actor::{
     traits::{Actor, ActorLifecycleState, Responder, StopReason},
 };
 use lattice_core::{
+    actor_address::{ClusterId, NodeAddress, NodeIncarnation},
     actor_kind,
-    actor_ref::{ClusterId, NodeAddress, NodeIncarnation},
     id::ActorId,
 };
 use lattice_placement::{
@@ -135,7 +135,7 @@ async fn force_shutdown_forces_retained_actor_before_publishing_terminated() {
     service.start().await.unwrap();
 
     let mut lifecycle = handle.subscribe_lifecycle();
-    handle.stop(StopReason::Requested).await.unwrap();
+    handle.stop(StopReason::Requested).unwrap();
     while *lifecycle.borrow() != ActorLifecycleState::StopFailed {
         lifecycle.changed().await.unwrap();
     }
@@ -261,7 +261,7 @@ async fn service_retry_api_resolves_retained_actor_cell() {
     service.start().await.unwrap();
 
     let mut lifecycle = handle.subscribe_lifecycle();
-    handle.stop(StopReason::Requested).await.unwrap();
+    handle.stop(StopReason::Requested).unwrap();
     while *lifecycle.borrow() != ActorLifecycleState::StopFailed {
         lifecycle.changed().await.unwrap();
     }

@@ -6,17 +6,17 @@ use std::{
     time::Duration,
 };
 
-use lattice_actor::{
+use lattice_actor_distributed::{
     actor_protocol,
     error::ActorError,
     protocol::ProstCodec,
-    registry::{ActorRefConfig, ActorRegistry, ActorRegistryConfig},
+    registry::{ActorAddressConfig, ActorRegistry, ActorRegistryConfig},
     reply::ReplyTo,
     traits::{Actor, Responder},
 };
 use lattice_core::{
+    actor_address::{ActorAddress, ClusterId, NodeAddress, NodeIncarnation},
     actor_kind,
-    actor_ref::{ActorRef, ClusterId, NodeAddress, NodeIncarnation},
     id::ActorId,
 };
 use lattice_remoting::config::RemotingConfig;
@@ -132,7 +132,7 @@ pub async fn run_demo() -> Result<LoginAcceptedReply, Box<dyn StdError>> {
     let registry = Arc::new(ActorRegistry::new_bound(
         actor_kind!("World"),
         ActorRegistryConfig {
-            actor_ref: Some(ActorRefConfig {
+            address: Some(ActorAddressConfig {
                 cluster_id: cluster_id.clone(),
                 node_address: address.clone(),
                 node_incarnation: incarnation,
@@ -141,18 +141,19 @@ pub async fn run_demo() -> Result<LoginAcceptedReply, Box<dyn StdError>> {
         },
         protocol.as_ref(),
     ));
-    let handle = registry
+    let actor_id = ActorId::U64(7);
+    registry
         .start(
-            ActorId::U64(7),
+            actor_id.clone(),
             WorldActor {
                 world_id: 7,
                 sessions: 0,
             },
         )
         .await?;
-    let actor_ref: ActorRef<WorldProtocol> = handle
-        .typed_actor_ref()?
-        .ok_or_else(|| IoError::other("missing exact World ActorRef"))?;
+    let actor_address: ActorAddress<WorldProtocol> = registry
+        .address(&actor_id)?
+        .ok_or_else(|| IoError::other("missing exact World ActorAddress"))?;
     let service = LatticeService::builder(NodeConfig {
         release: lattice_core::release::ReleaseManifest::development(1),
         cluster_id,
@@ -169,9 +170,9 @@ pub async fn run_demo() -> Result<LoginAcceptedReply, Box<dyn StdError>> {
     .register_actor(registry, protocol)?
     .build()?;
     service.start().await?;
-    let reply = service
+    let world = service.bind_actor(actor_address)?;
+    let reply = world
         .ask(
-            &actor_ref,
             LoginRequest {
                 world_id: 7,
                 player_id: 42,

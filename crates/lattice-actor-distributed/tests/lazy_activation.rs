@@ -1,5 +1,3 @@
-#![cfg(feature = "distributed")]
-
 use lattice_actor::context::HandlerContext;
 use std::{
     sync::{
@@ -10,10 +8,12 @@ use std::{
 };
 
 use async_trait::async_trait;
-use lattice_actor::{
-    error::{ActorActivationError, ActorError},
+use lattice_actor_distributed::{
+    error::ActorError,
     mailbox::MailboxConfig,
-    registry::{ActorCreateContext, ActorLoader, ActorRegistry, ActorRegistryConfig},
+    registry::{
+        ActorActivationError, ActorCreateContext, ActorLoader, ActorRegistry, ActorRegistryConfig,
+    },
     reply::ReplyTo,
     traits::{Actor, Responder},
 };

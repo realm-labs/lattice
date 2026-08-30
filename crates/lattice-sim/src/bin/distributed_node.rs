@@ -13,26 +13,26 @@ use std::{
 use async_trait::async_trait;
 use bytes::BytesMut;
 use clap::{Parser, ValueEnum};
-use lattice_actor::{
+use lattice_actor_distributed::{
     actor_protocol,
     context::ActorContext,
     directory::ActivationDirectory,
     error::ActorError,
     protocol::{CodecDescriptor, DecodeError, EncodeError, WireCodec},
     registry::{
-        ActorCreateContext, ActorLoader, ActorRefConfig, ActorRegistry, ActorRegistryConfig,
+        ActorAddressConfig, ActorCreateContext, ActorLoader, ActorRegistry, ActorRegistryConfig,
     },
     reply::ReplyTo,
-    traits::{Actor, ChildActorKey, ChildActorOptions, Handler, Responder},
+    traits::{Actor, Handler, Responder},
 };
 use lattice_config::store::ConfigStore;
 use lattice_config_etcd::{config::EtcdConfigStoreConfig, store::EtcdConfigStore};
 use lattice_core::{
-    actor_kind,
-    actor_ref::{
-        ActorRef, ClusterId, EntityId, EntityRef, EntityType, NodeAddress, NodeIncarnation,
+    actor_address::{
+        ActorAddress, ClusterId, EntityAddress, EntityId, EntityType, NodeAddress, NodeIncarnation,
         PlacementDomainId, ProtocolId,
     },
+    actor_kind,
     coordinator::CoordinatorScope,
     id::ActorId,
     instance::InstanceId,
@@ -209,7 +209,7 @@ struct LogicEvidence {
 #[derive(Debug, Serialize, Deserialize)]
 struct ScaleActorArtifact {
     node_id: String,
-    reference: ActorRef<FixtureProtocol>,
+    reference: ActorAddress<FixtureProtocol>,
 }
 
 #[derive(Debug, Clone, lattice_actor::Request)]
@@ -277,9 +277,7 @@ impl WireCodec<Pong> for PongCodec {
     }
 }
 
-struct PingActor {
-    child_reference: Option<PathBuf>,
-}
+struct PingActor;
 
 #[derive(Clone)]
 struct PingLoader;
@@ -287,9 +285,7 @@ struct PingLoader;
 #[async_trait]
 impl ActorLoader<PingActor> for PingLoader {
     async fn load(&self, _context: ActorCreateContext) -> Result<PingActor, ActorError> {
-        Ok(PingActor {
-            child_reference: None,
-        })
+        Ok(PingActor)
     }
 }
 
@@ -298,7 +294,7 @@ struct EntityFixture {
     owner_node_id: String,
     owner_address: NodeAddress,
     owner_incarnation: String,
-    reference: EntityRef<FixtureProtocol>,
+    reference: EntityAddress<FixtureProtocol>,
 }
 
 struct EntityServiceFixture {
@@ -327,33 +323,6 @@ impl EntityFixture {
 impl Actor for PingActor {
     type Error = ActorError;
     type Behavior = ::lattice_actor::state_machine::Stateless;
-
-    async fn started(&mut self, context: &mut ActorContext<Self>) -> Result<(), Self::Error> {
-        let Some(reference) = self.child_reference.take() else {
-            return Ok(());
-        };
-        let child = context.spawn_child(
-            ChildActorKey::new("remote-child"),
-            PingActor {
-                child_reference: None,
-            },
-            ChildActorOptions {
-                protocol_id: Some(
-                    ProtocolId::new(PROTOCOL_ID)
-                        .map_err(|error| ActorError::new(error.to_string()))?,
-                ),
-                ..ChildActorOptions::default()
-            },
-        )?;
-        let child_ref = child
-            .actor_ref()
-            .ok_or_else(|| ActorError::new("missing child ref"))?;
-        std::fs::write(
-            reference,
-            serde_json::to_vec(child_ref).map_err(ActorError::from_error)?,
-        )
-        .map_err(ActorError::from_error)
-    }
 }
 
 impl Responder<Ping> for PingActor {
@@ -657,7 +626,7 @@ async fn server(reference: PathBuf) -> Result<(), Box<dyn Error>> {
     let registry = Arc::new(ActorRegistry::new_bound(
         actor_kind!("DistributedFixture"),
         ActorRegistryConfig {
-            actor_ref: Some(ActorRefConfig {
+            address: Some(ActorAddressConfig {
                 cluster_id: cluster.clone(),
                 node_address: address.clone(),
                 node_incarnation: incarnation,
@@ -667,16 +636,20 @@ async fn server(reference: PathBuf) -> Result<(), Box<dyn Error>> {
         },
         protocol.as_ref(),
     ));
-    let child_reference = reference.with_file_name("child-ref.json");
-    let handle = registry
-        .start(
-            ActorId::U64(1),
-            PingActor {
-                child_reference: Some(child_reference),
-            },
-        )
-        .await?;
-    let target: ActorRef<FixtureProtocol> = handle.typed_actor_ref()?.ok_or("missing actor ref")?;
+    let actor_id = ActorId::U64(1);
+    registry.start(actor_id.clone(), PingActor).await?;
+    let target: ActorAddress<FixtureProtocol> = registry
+        .address(&actor_id)?
+        .ok_or("missing actor address")?;
+    let child_id = ActorId::U64(2);
+    registry.start(child_id.clone(), PingActor).await?;
+    let child: ActorAddress<FixtureProtocol> = registry
+        .address(&child_id)?
+        .ok_or("missing child actor address")?;
+    std::fs::write(
+        reference.with_file_name("child-ref.json"),
+        serde_json::to_vec(&child)?,
+    )?;
     let service =
         LatticeService::builder(node_config(cluster, "fixture-server", address, incarnation))?
             .register_actor(registry, protocol)?
@@ -699,7 +672,7 @@ async fn client(reference: PathBuf, expect_failure: bool) -> Result<(), Box<dyn 
             Err(error) => return Err(Box::new(error)),
         }
     };
-    let target: ActorRef<FixtureProtocol> = serde_json::from_slice(&encoded)?;
+    let target: ActorAddress<FixtureProtocol> = serde_json::from_slice(&encoded)?;
     let cluster = ClusterId::new("docker-e2e")?;
     let client_address = NodeAddress::new("aaa-client", 25521)?;
     let client_incarnation = NodeIncarnation::new(200)?;
@@ -743,7 +716,7 @@ async fn client(reference: PathBuf, expect_failure: bool) -> Result<(), Box<dyn 
         return Err("unexpected distributed reply".into());
     }
     let child_encoded = std::fs::read(reference.with_file_name("child-ref.json"))?;
-    let child: ActorRef<FixtureProtocol> = serde_json::from_slice(&child_encoded)?;
+    let child: ActorAddress<FixtureProtocol> = serde_json::from_slice(&child_encoded)?;
     if service
         .ask(&child, Ping(99), Duration::from_secs(10))
         .await?
@@ -767,7 +740,7 @@ async fn client(reference: PathBuf, expect_failure: bool) -> Result<(), Box<dyn 
 
 async fn monitor(reference: PathBuf) -> Result<(), Box<dyn Error>> {
     let encoded = wait_for_file(&reference).await?;
-    let target: ActorRef<FixtureProtocol> = serde_json::from_slice(&encoded)?;
+    let target: ActorAddress<FixtureProtocol> = serde_json::from_slice(&encoded)?;
     let cluster = ClusterId::new("docker-e2e")?;
     let address = NodeAddress::new("aaa-monitor", 25522)?;
     let incarnation = NodeIncarnation::generate();
@@ -945,7 +918,7 @@ async fn gateway(reference: PathBuf) -> Result<(), Box<dyn Error>> {
         .ask(&fixture.reference, Ping(41), Duration::from_secs(10))
         .await?;
     if reply != Pong(42) {
-        return Err("unexpected gateway EntityRef reply".into());
+        return Err("unexpected gateway EntityAddress reply".into());
     }
     std::fs::write(
         "/artifacts/admin-snapshot.json",
@@ -981,7 +954,7 @@ fn entity_service(
     let registry = Arc::new(ActorRegistry::new_bound(
         actor_kind!("DistributedEntityFixture"),
         ActorRegistryConfig {
-            actor_ref: Some(ActorRefConfig {
+            address: Some(ActorAddressConfig {
                 cluster_id: cluster.clone(),
                 node_address: node.address.clone(),
                 node_incarnation: node.incarnation,

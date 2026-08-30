@@ -1,8 +1,8 @@
 use std::{fmt, sync::Arc};
 
 use lattice_actor::mailbox::MailboxConfig;
-use lattice_actor::registry::ActorRegistryConfig;
-use lattice_core::actor_ref::{EntityType, PlacementDomainId, ProtocolId, SingletonKind};
+use lattice_actor_distributed::registry::ActorRegistryConfig;
+use lattice_core::actor_address::{EntityType, PlacementDomainId, ProtocolId, SingletonKind};
 use lattice_core::kind::ActorKind;
 use lattice_placement::coordinator::SingletonConfig;
 use lattice_placement::{
@@ -156,7 +156,7 @@ impl SingletonOptions {
 
 #[cfg(test)]
 mod tests {
-    use lattice_core::actor_ref::{EntityId, ProtocolId};
+    use lattice_core::actor_address::{EntityId, ProtocolId};
     use lattice_placement::{
         allocation::{
             AllocationDecision, AllocationError, AllocationRequest, PlacementView, RebalanceLimits,

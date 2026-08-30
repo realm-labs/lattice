@@ -9,17 +9,15 @@ use std::{
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use lattice_actor::{
-    error::ActorCallError,
-    handle::ActorHandle,
+use lattice_actor_distributed::{error::ActorCallError, handle::ActorHandle, traits::Actor};
+use lattice_actor_distributed::{
     protocol::{ActorProtocolBinding, DispatchError, DispatchMode, DispatchReply, Protocol},
     registry::{ActorLoader, ActorRegistry},
-    traits::Actor,
 };
 use lattice_core::{
-    actor_ref::{
-        ActorRef, ClusterId, ConfigFingerprint, EntityRef, EntityType, NodeAddress,
-        NodeIncarnation, PlacementDomainId, ProtocolId, SingletonKind, SingletonRef,
+    actor_address::{
+        ActorAddress, ClusterId, ConfigFingerprint, EntityAddress, EntityType, NodeAddress,
+        NodeIncarnation, PlacementDomainId, ProtocolId, SingletonAddress, SingletonKind,
     },
     id::ActorId,
 };
@@ -155,8 +153,8 @@ fn decode_resolved_actor(
     address: &NodeAddress,
     incarnation: NodeIncarnation,
     protocol_id: ProtocolId,
-) -> Result<ActorRef, WatchError> {
-    let actor: ActorRef =
+) -> Result<ActorAddress, WatchError> {
+    let actor: ActorAddress =
         serde_json::from_slice(payload).map_err(|_| WatchError::InvalidCommand)?;
     if actor.cluster_id() != cluster
         || actor.node_address() != address

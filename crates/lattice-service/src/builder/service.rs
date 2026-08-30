@@ -1,13 +1,17 @@
 use std::{sync::atomic::Ordering, time::Duration};
 
-use lattice_actor::{
-    recipient::{WatchSubscription, WatchTarget},
-    registry::ActorCellDiagnostics,
+use lattice_actor_distributed::{
+    ActorRef, EntityRef, SingletonRef,
+    protocol::Protocol,
     traits::ActorLifecycleState,
     watch::{LocalActorRef, WatchId},
 };
+use lattice_actor_distributed::{
+    recipient::{WatchSubscription, WatchTarget},
+    registry::ActorCellDiagnostics,
+};
 use lattice_core::{
-    actor_ref::ClusterId,
+    actor_address::{ActorAddress, ClusterId, EntityAddress, SingletonAddress},
     release::{ClusterReleaseState, ReleaseError, ReleaseManifest},
 };
 use lattice_placement::{membership_session::MembershipCoordinatorHandle, types::PlacementSlotKey};
@@ -34,7 +38,7 @@ use super::{
     LogicCoordinatorHandle, LogicJoinRuntime, LogicRuntimeAssembly, MemberDirectory, MemberEvent,
     MemberSnapshot, MembershipJoinRuntime, Message, Mutex, NodeConfig, NodeIdentity, NodeKey,
     NodeLifecycleState, OutboundMessaging, PeerReconciler, PlacementDomainId, PlacementDomainState,
-    ProductionLifecycleDriver, ProtocolHostRegistry, RecipientError, RecipientRef,
+    ProductionLifecycleDriver, ProtocolHostRegistry, RecipientAddress, RecipientError,
     RemotingEndpoint, Request, ServiceError, ServiceHealthSnapshot, ServiceLifecycleEvent,
     SupportsAsk, SupportsTell, TaskSupervisor, WatchRegistry, watch,
 };
@@ -87,6 +91,27 @@ impl LatticeService {
         &self.actor_system
     }
 
+    pub fn bind_actor<P: Protocol>(
+        &self,
+        address: ActorAddress<P>,
+    ) -> Result<ActorRef<P>, RecipientError> {
+        self.actor_system.bind_actor(address)
+    }
+
+    pub fn bind_entity<P: Protocol>(
+        &self,
+        address: EntityAddress<P>,
+    ) -> Result<EntityRef<P>, RecipientError> {
+        self.actor_system.bind_entity(address)
+    }
+
+    pub fn bind_singleton<P: Protocol>(
+        &self,
+        address: SingletonAddress<P>,
+    ) -> Result<SingletonRef<P>, RecipientError> {
+        self.actor_system.bind_singleton(address)
+    }
+
     /// The edge handle for traffic originating outside the cluster.
     ///
     /// Gateways and other process edges should send through this rather than
@@ -132,12 +157,7 @@ impl LatticeService {
         self.hosts
             .live_cells()
             .into_iter()
-            .filter(|cell| {
-                matches!(
-                    cell.lifecycle,
-                    ActorLifecycleState::StopFailed | ActorLifecycleState::Quarantined
-                )
-            })
+            .filter(|cell| cell.quarantined || cell.lifecycle == ActorLifecycleState::StopFailed)
             .collect()
     }
 
@@ -166,7 +186,7 @@ impl LatticeService {
     /// instead, so that a node without a membership session sheds it.
     pub async fn tell<P, M>(
         &self,
-        target: impl Into<RecipientRef<P>>,
+        target: impl Into<RecipientAddress<P>>,
         message: M,
     ) -> Result<(), RecipientError>
     where
@@ -182,7 +202,7 @@ impl LatticeService {
     /// instead, so that a node without a membership session sheds it.
     pub async fn ask<P, R>(
         &self,
-        target: impl Into<RecipientRef<P>>,
+        target: impl Into<RecipientAddress<P>>,
         request: R,
         timeout: Duration,
     ) -> Result<R::Response, RecipientError>

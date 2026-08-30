@@ -1,5 +1,3 @@
-#![cfg(feature = "distributed")]
-
 use lattice_actor::context::HandlerContext;
 use std::{
     any::type_name,
@@ -7,26 +5,23 @@ use std::{
     time::Duration,
 };
 
-use bytes::Bytes;
 use lattice_actor::{
-    actor_protocol,
     error::{ActorCallError, ActorError, ActorTellError},
     mailbox::MailboxConfig,
     observation::{
         ActorLifecycleEvent, ActorMetadata, ActorObserver, ActorObserverHandle, MailboxRejection,
-        ProtocolFailure, RequestCompletion,
+        RequestCompletion,
     },
-    protocol::{DispatchError, DispatchMode, ProstCodec},
     reply::ReplyTo,
     runtime::{ActorRuntime, ActorRuntimeConfig, ActorSpawnOptions},
-    traits::{Actor, Handler, MessageKind, MessageMetadata, MessageOutcome, Responder, StopReason},
+    traits::{Actor, Handler, MessageMetadata, MessageOutcome, Responder, StopReason},
 };
 use tokio::sync::Semaphore;
 
 const ASK_TIMEOUT: Duration = Duration::from_secs(5);
 
-#[derive(Clone, PartialEq, prost::Message, lattice_actor::Message)]
-struct WireTell {}
+#[derive(lattice_actor::Message)]
+struct WireTell;
 
 #[derive(lattice_actor::Request)]
 #[request(response = &'static str)]
@@ -138,17 +133,6 @@ impl Responder<QueuedRequest> for ObservedActor {
     }
 }
 
-actor_protocol! {
-    ObserverProtocol {
-        protocol_id: 991;
-        name: "observer/v1";
-        tell 1 => WireTell {
-            schema_version: 1,
-            codec: ProstCodec,
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ObserverEvent {
     Enqueued(&'static str),
@@ -156,7 +140,6 @@ enum ObserverEvent {
     Finished(&'static str, MessageOutcome),
     RequestCompleted(&'static str, RequestCompletion),
     Lifecycle(ActorLifecycleEvent),
-    ProtocolFailed(u64, MessageKind, ProtocolFailure),
 }
 
 #[derive(Clone)]
@@ -219,17 +202,6 @@ impl ActorObserver for RecordingObserver {
     fn lifecycle(&self, _actor: &ActorMetadata, event: ActorLifecycleEvent) {
         self.record(ObserverEvent::Lifecycle(event));
     }
-
-    fn protocol_failed(
-        &self,
-        _actor: &ActorMetadata,
-        message_id: u64,
-        kind: MessageKind,
-        _payload_size: usize,
-        failure: ProtocolFailure,
-    ) {
-        self.record(ObserverEvent::ProtocolFailed(message_id, kind, failure));
-    }
 }
 
 fn observed_runtime() -> (ActorRuntime, Arc<Mutex<Vec<ObserverEvent>>>, Arc<Semaphore>) {
@@ -273,7 +245,7 @@ async fn wait_for_event(
 }
 
 #[tokio::test]
-async fn runtime_observer_reports_deferred_completion_lifecycle_and_protocol_failure() {
+async fn runtime_observer_reports_deferred_completion_and_lifecycle() {
     let (runtime, events, signal) = observed_runtime();
     let handle = runtime
         .spawn_actor(ObservedActor, ActorSpawnOptions::default())
@@ -283,7 +255,7 @@ async fn runtime_observer_reports_deferred_completion_lifecycle_and_protocol_fai
     })
     .await;
 
-    handle.tell(WireTell {}).await.unwrap();
+    handle.tell(WireTell).await.unwrap();
     wait_for_event(&events, &signal, |event| {
         *event == ObserverEvent::Finished(type_name::<WireTell>(), MessageOutcome::Handled)
     })
@@ -327,23 +299,7 @@ async fn runtime_observer_reports_deferred_completion_lifecycle_and_protocol_fai
     })
     .await;
 
-    let protocol = ObserverProtocol::bind::<ObservedActor>().unwrap();
-    let error = protocol
-        .dispatch(handle.clone(), 999, DispatchMode::Tell, Bytes::new(), None)
-        .await
-        .unwrap_err();
-    assert!(matches!(error, DispatchError::UnknownMessage(999)));
-    wait_for_event(&events, &signal, |event| {
-        *event
-            == ObserverEvent::ProtocolFailed(
-                999,
-                MessageKind::Tell,
-                ProtocolFailure::UnknownMessage,
-            )
-    })
-    .await;
-
-    handle.stop(StopReason::Requested).await.unwrap();
+    handle.stop(StopReason::Requested).unwrap();
     wait_for_event(&events, &signal, |event| {
         *event == ObserverEvent::Lifecycle(ActorLifecycleEvent::Stopped(StopReason::Requested))
     })

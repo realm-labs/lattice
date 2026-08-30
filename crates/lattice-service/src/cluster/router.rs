@@ -1,11 +1,11 @@
 use super::{
-    Actor, ActorId, ActorLoader, ActorProtocolBinding, ActorRef, ActorRegistry, Arc, AskError,
+    Actor, ActorAddress, ActorId, ActorLoader, ActorProtocolBinding, ActorRegistry, Arc, AskError,
     AssociationKey, AssociationManager, BTreeMap, Bytes, ClusterRouterError, DomainLogicalRouter,
-    EntityConfig, EntityRef, Instant, LOGICAL_RESOLVE_MESSAGE_ID, LogicPlacementState,
+    EntityAddress, EntityConfig, Instant, LOGICAL_RESOLVE_MESSAGE_ID, LogicPlacementState,
     LogicalBufferConfig, LogicalEntityTarget, LogicalRouter, LogicalSingletonTarget, Mutex,
     NodeKey, OutboundMessaging, PlacementSlotKey, PlacementSlotState, Protocol,
-    ProtocolFingerprint, RemoteMessageError, RouteBuffer, ShardMapper, SingletonConfig,
-    SingletonRef, WatchError, Xxh3V1ShardMapper, async_trait,
+    ProtocolFingerprint, RemoteMessageError, RouteBuffer, ShardMapper, SingletonAddress,
+    SingletonConfig, WatchError, Xxh3V1ShardMapper, async_trait,
     entity::{EntityRouteHost, RouteFailureLog},
     peers::PeerReconciler,
     proxy::EntityProxyRoute,
@@ -109,7 +109,7 @@ impl DomainLogicalRouter {
             let ActorId::Bytes(entity_id) = actor_id else {
                 return None;
             };
-            let entity_id = lattice_core::actor_ref::EntityId::new(entity_id.clone()).ok()?;
+            let entity_id = lattice_core::actor_address::EntityId::new(entity_id.clone()).ok()?;
             let shard_id = authority_mapper.shard_for(&entity_id).ok()?;
             let key = PlacementSlotKey::Shard {
                 domain: authority_domain.clone(),
@@ -318,7 +318,7 @@ impl DomainLogicalRouter {
 impl LogicalRouter for DomainLogicalRouter {
     async fn tell_entity(
         &self,
-        target: EntityRef,
+        target: EntityAddress,
         fingerprint: ProtocolFingerprint,
         message_id: u64,
         payload: Bytes,
@@ -332,7 +332,7 @@ impl LogicalRouter for DomainLogicalRouter {
 
     async fn ask_entity(
         &self,
-        target: EntityRef,
+        target: EntityAddress,
         fingerprint: ProtocolFingerprint,
         message_id: u64,
         payload: Bytes,
@@ -347,7 +347,7 @@ impl LogicalRouter for DomainLogicalRouter {
 
     async fn tell_singleton(
         &self,
-        target: SingletonRef,
+        target: SingletonAddress,
         fingerprint: ProtocolFingerprint,
         message_id: u64,
         payload: Bytes,
@@ -361,7 +361,7 @@ impl LogicalRouter for DomainLogicalRouter {
 
     async fn ask_singleton(
         &self,
-        target: SingletonRef,
+        target: SingletonAddress,
         fingerprint: ProtocolFingerprint,
         message_id: u64,
         payload: Bytes,
@@ -376,8 +376,8 @@ impl LogicalRouter for DomainLogicalRouter {
 
     async fn resolve_entity_current(
         &self,
-        target: EntityRef,
-    ) -> Result<Option<ActorRef>, WatchError> {
+        target: EntityAddress,
+    ) -> Result<Option<ActorAddress>, WatchError> {
         self.entities
             .get(&(target.domain().clone(), target.entity_type().clone()))
             .ok_or(WatchError::NotActive)?
@@ -387,8 +387,8 @@ impl LogicalRouter for DomainLogicalRouter {
 
     async fn resolve_singleton_current(
         &self,
-        target: SingletonRef,
-    ) -> Result<Option<ActorRef>, WatchError> {
+        target: SingletonAddress,
+    ) -> Result<Option<ActorAddress>, WatchError> {
         self.singletons
             .get(&(target.domain().clone(), target.singleton_kind().clone()))
             .ok_or(WatchError::Unavailable)?

@@ -1,6 +1,6 @@
 #![cfg_attr(not(test), deny(clippy::wildcard_imports))]
 
-pub mod actor_ref;
+pub mod actor_address;
 pub mod coordinator;
 pub mod failpoint;
 pub mod id;

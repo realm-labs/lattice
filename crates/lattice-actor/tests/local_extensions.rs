@@ -241,7 +241,7 @@ async fn extensions_survive_actor_turns_continuations_and_stop_retries() {
     );
     assert_eq!(handle.ask(BumpAndRead, TIMEOUT).await.unwrap(), 14);
 
-    handle.stop(StopReason::Requested).await.unwrap();
+    handle.stop(StopReason::Requested).unwrap();
     assert_eq!(
         next_event(&mut events_rx).await,
         ExtensionEvent::Stopping {
@@ -306,8 +306,6 @@ impl Actor for RestartingParent {
                 starts: starts.clone(),
             },
             ChildActorOptions {
-                #[cfg(feature = "distributed")]
-                protocol_id: None,
                 mailbox: MailboxConfig::bounded(8),
                 supervision: ChildSupervision::RestartChild,
                 ..ChildActorOptions::default()
@@ -327,7 +325,6 @@ impl Handler<StopSupervisedChild> for RestartingParent {
             .as_ref()
             .expect("supervised child should exist")
             .stop(StopReason::Requested)
-            .await
             .map_err(|error| ActorError::new(error.to_string()))
     }
 }
@@ -358,7 +355,7 @@ async fn supervision_restart_starts_with_empty_extensions() {
             .unwrap(),
         "replacement actor context should be empty"
     );
-    parent.stop(StopReason::Requested).await.unwrap();
+    parent.stop(StopReason::Requested).unwrap();
 }
 
 struct DropProbe(Arc<AtomicUsize>);

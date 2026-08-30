@@ -3,7 +3,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use lattice_core::actor_ref::{ClusterId, NodeAddress, NodeIncarnation};
+use lattice_core::actor_address::{ClusterId, NodeAddress, NodeIncarnation};
 
 use super::{
     Association, AssociationError, AssociationId, AssociationKey, AssociationManager,

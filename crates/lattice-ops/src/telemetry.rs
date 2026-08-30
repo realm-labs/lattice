@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use lattice_core::actor_ref::PlacementDomainId;
+use lattice_core::actor_address::PlacementDomainId;
 use lattice_core::trace::{TelemetryResource, TraceContext};
 use serde::Serialize;
 use tokio::sync::Mutex;

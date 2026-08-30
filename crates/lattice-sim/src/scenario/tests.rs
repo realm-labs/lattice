@@ -245,7 +245,7 @@ fn production_watch_registry_honours_a_dropped_terminal_notification() {
 
 fn terminal_notifications() -> usize {
     let source = node("source", 1, 28001);
-    let actor = actor_ref(&source);
+    let actor = actor_address(&source);
     let mut registry = WatchRegistry::new(4, 4).unwrap();
     let (registered_watch, _) = registry
         .watch(AssociationId::new(1).unwrap(), &actor)

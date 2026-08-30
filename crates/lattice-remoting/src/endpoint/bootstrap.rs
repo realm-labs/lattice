@@ -66,7 +66,7 @@ impl RemotingEndpoint {
 
     pub(super) async fn probe_request_inner(
         &self,
-        address: lattice_core::actor_ref::NodeAddress,
+        address: lattice_core::actor_address::NodeAddress,
         tls_server_name: Option<String>,
         request: BootstrapRequest,
     ) -> Result<BootstrapResponse, EndpointError> {

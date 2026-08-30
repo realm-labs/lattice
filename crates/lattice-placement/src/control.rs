@@ -2,7 +2,7 @@ use std::{collections::BTreeMap, sync::RwLock, time::Duration};
 
 use bytes::Bytes;
 use lattice_core::{
-    actor_ref::{EntityType, NodeIncarnation, PlacementDomainId, SingletonKind},
+    actor_address::{EntityType, NodeIncarnation, PlacementDomainId, SingletonKind},
     coordinator::CoordinatorScope,
 };
 use lattice_remoting::{
@@ -935,7 +935,7 @@ pub enum PlacementControlError {
 mod tests {
     use std::collections::BTreeSet;
 
-    use lattice_core::actor_ref::{NodeAddress, ProtocolId};
+    use lattice_core::actor_address::{NodeAddress, ProtocolId};
 
     use super::*;
     use crate::region::EntityConfig;

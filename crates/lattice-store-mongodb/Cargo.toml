@@ -11,7 +11,8 @@ categories = ["database"]
 
 [dependencies]
 async-trait.workspace = true
-lattice-actor = { workspace = true, features = ["distributed"] }
+lattice-actor.workspace = true
+lattice-actor-distributed.workspace = true
 lattice-store-mongodb-macros.workspace = true
 mongodb.workspace = true
 serde.workspace = true

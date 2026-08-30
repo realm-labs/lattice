@@ -18,7 +18,7 @@ pub const MAX_LOGICAL_KIND_BYTES: usize = 128;
 pub const MAX_PLACEMENT_DOMAIN_ID_BYTES: usize = 128;
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
-pub enum ReferenceError {
+pub enum AddressError {
     #[error("{field} must not be empty")]
     Empty { field: &'static str },
     #[error("{field} exceeds its {limit}-byte limit")]
@@ -31,7 +31,7 @@ pub enum ReferenceError {
     ReservedSystemPath,
     #[error("protocol ID zero is reserved")]
     ReservedProtocolId,
-    #[error("reference protocol ID {actual} does not match expected protocol ID {expected}")]
+    #[error("address protocol ID {actual} does not match expected protocol ID {expected}")]
     ProtocolMismatch { expected: u64, actual: u64 },
     #[error("activation local sequence zero is reserved")]
     ReservedActivationSequence,
@@ -42,7 +42,7 @@ pub enum ReferenceError {
 pub struct ClusterId(Arc<str>);
 
 impl ClusterId {
-    pub fn new(value: impl Into<String>) -> Result<Self, ReferenceError> {
+    pub fn new(value: impl Into<String>) -> Result<Self, AddressError> {
         Ok(Self(
             validate_token(value.into(), "cluster ID", MAX_CLUSTER_ID_BYTES)?.into(),
         ))
@@ -66,7 +66,7 @@ pub struct NodeAddress {
 }
 
 impl NodeAddress {
-    pub fn new(host: impl Into<String>, port: u16) -> Result<Self, ReferenceError> {
+    pub fn new(host: impl Into<String>, port: u16) -> Result<Self, AddressError> {
         let host = validate_token(host.into(), "node host", MAX_NODE_HOST_BYTES)?;
         let is_ip = host.parse::<IpAddr>().is_ok();
         if port == 0
@@ -76,7 +76,7 @@ impl NodeAddress {
             || host.ends_with(']')
             || host.chars().any(char::is_whitespace)
         {
-            return Err(ReferenceError::NonCanonical {
+            return Err(AddressError::NonCanonical {
                 field: "node address",
             });
         }
@@ -110,9 +110,9 @@ impl fmt::Display for NodeAddress {
 pub struct NodeIncarnation(u128);
 
 impl NodeIncarnation {
-    pub fn new(value: u128) -> Result<Self, ReferenceError> {
+    pub fn new(value: u128) -> Result<Self, AddressError> {
         if value == 0 {
-            return Err(ReferenceError::NonCanonical {
+            return Err(AddressError::NonCanonical {
                 field: "node incarnation",
             });
         }
@@ -138,9 +138,9 @@ impl ActivationId {
     pub fn new(
         node_incarnation: NodeIncarnation,
         local_sequence: u64,
-    ) -> Result<Self, ReferenceError> {
+    ) -> Result<Self, AddressError> {
         if local_sequence == 0 {
-            return Err(ReferenceError::ReservedActivationSequence);
+            return Err(AddressError::ReservedActivationSequence);
         }
         Ok(Self {
             node_incarnation,
@@ -163,7 +163,7 @@ pub struct ActorPath {
 }
 
 impl ActorPath {
-    pub fn user<I, S>(segments: I) -> Result<Self, ReferenceError>
+    pub fn user<I, S>(segments: I) -> Result<Self, AddressError>
     where
         I: IntoIterator<Item = S>,
         S: Into<String>,
@@ -171,7 +171,7 @@ impl ActorPath {
         Self::from_segments(segments, false)
     }
 
-    pub fn child(&self, segment: impl Into<String>) -> Result<Self, ReferenceError> {
+    pub fn child(&self, segment: impl Into<String>) -> Result<Self, AddressError> {
         Self::from_segments(
             self.segments
                 .iter()
@@ -191,19 +191,19 @@ impl ActorPath {
             .is_some_and(|segment| segment == "system")
     }
 
-    fn from_segments<I, S>(segments: I, allow_system: bool) -> Result<Self, ReferenceError>
+    fn from_segments<I, S>(segments: I, allow_system: bool) -> Result<Self, AddressError>
     where
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
         let segments = segments.into_iter().map(Into::into).collect::<Vec<_>>();
         if segments.is_empty() {
-            return Err(ReferenceError::Empty {
+            return Err(AddressError::Empty {
                 field: "actor path",
             });
         }
         if segments.len() > MAX_ACTOR_PATH_DEPTH {
-            return Err(ReferenceError::PathTooDeep {
+            return Err(AddressError::PathTooDeep {
                 limit: MAX_ACTOR_PATH_DEPTH,
             });
         }
@@ -211,7 +211,7 @@ impl ActorPath {
             validate_path_segment(segment)?;
         }
         if !allow_system && segments[0] == "system" {
-            return Err(ReferenceError::ReservedSystemPath);
+            return Err(AddressError::ReservedSystemPath);
         }
         let encoded_len = 1 + segments
             .iter()
@@ -219,7 +219,7 @@ impl ActorPath {
             .sum::<usize>()
             - 1;
         if encoded_len > MAX_ACTOR_PATH_BYTES {
-            return Err(ReferenceError::TooLong {
+            return Err(AddressError::TooLong {
                 field: "actor path",
                 limit: MAX_ACTOR_PATH_BYTES,
             });
@@ -240,11 +240,11 @@ impl fmt::Display for ActorPath {
 }
 
 impl TryFrom<String> for ActorPath {
-    type Error = ReferenceError;
+    type Error = AddressError;
 
     fn try_from(value: String) -> Result<Self, Self::Error> {
         if !value.starts_with('/') || value.ends_with('/') || value.contains("//") {
-            return Err(ReferenceError::NonCanonical {
+            return Err(AddressError::NonCanonical {
                 field: "actor path",
             });
         }
@@ -283,9 +283,9 @@ impl<'de> Deserialize<'de> for ActorPath {
 pub struct ProtocolId(u64);
 
 impl ProtocolId {
-    pub fn new(value: u64) -> Result<Self, ReferenceError> {
+    pub fn new(value: u64) -> Result<Self, AddressError> {
         if value == 0 {
-            return Err(ReferenceError::ReservedProtocolId);
+            return Err(AddressError::ReservedProtocolId);
         }
         Ok(Self(value))
     }
@@ -295,11 +295,11 @@ impl ProtocolId {
     }
 }
 
-/// A zero-sized type tag carried by typed actor references.
+/// A zero-sized type tag carried by typed actor addresses.
 ///
 /// Concrete protocol tags declare their stable wire protocol ID. The erased
 /// tag deliberately accepts every valid protocol ID so infrastructure can
-/// route and observe references without knowing their application protocol.
+/// route and observe addresses without knowing their application protocol.
 pub trait ProtocolTag: fmt::Debug + Clone + PartialEq + Eq + Hash + Send + Sync + 'static {
     const PROTOCOL_ID: Option<u64>;
 }
@@ -316,13 +316,13 @@ impl ProtocolTag for ErasedProtocol {
 pub struct EntityId(Vec<u8>);
 
 impl EntityId {
-    pub fn new(value: impl Into<Vec<u8>>) -> Result<Self, ReferenceError> {
+    pub fn new(value: impl Into<Vec<u8>>) -> Result<Self, AddressError> {
         let value = value.into();
         if value.is_empty() {
-            return Err(ReferenceError::Empty { field: "entity ID" });
+            return Err(AddressError::Empty { field: "entity ID" });
         }
         if value.len() > MAX_ENTITY_ID_BYTES {
-            return Err(ReferenceError::TooLong {
+            return Err(AddressError::TooLong {
                 field: "entity ID",
                 limit: MAX_ENTITY_ID_BYTES,
             });
@@ -336,7 +336,7 @@ impl EntityId {
 }
 
 impl TryFrom<Vec<u8>> for EntityId {
-    type Error = ReferenceError;
+    type Error = AddressError;
 
     fn try_from(value: Vec<u8>) -> Result<Self, Self::Error> {
         Self::new(value)
@@ -356,7 +356,7 @@ macro_rules! bounded_kind {
         pub struct $name(String);
 
         impl $name {
-            pub fn new(value: impl Into<String>) -> Result<Self, ReferenceError> {
+            pub fn new(value: impl Into<String>) -> Result<Self, AddressError> {
                 Ok(Self(validate_token(
                     value.into(),
                     $field,
@@ -379,7 +379,7 @@ bounded_kind!(SingletonKind, "singleton kind");
 pub struct PlacementDomainId(String);
 
 impl PlacementDomainId {
-    pub fn new(value: impl Into<String>) -> Result<Self, ReferenceError> {
+    pub fn new(value: impl Into<String>) -> Result<Self, AddressError> {
         Ok(Self(validate_token(
             value.into(),
             "placement domain ID",
@@ -430,31 +430,31 @@ fn validate_token(
     value: String,
     field: &'static str,
     limit: usize,
-) -> Result<String, ReferenceError> {
+) -> Result<String, AddressError> {
     if value.is_empty() {
-        return Err(ReferenceError::Empty { field });
+        return Err(AddressError::Empty { field });
     }
     if value.len() > limit {
-        return Err(ReferenceError::TooLong { field, limit });
+        return Err(AddressError::TooLong { field, limit });
     }
     if value == "."
         || value == ".."
         || value.contains(['/', '\\', '\0'])
         || value.chars().any(char::is_control)
     {
-        return Err(ReferenceError::NonCanonical { field });
+        return Err(AddressError::NonCanonical { field });
     }
     Ok(value)
 }
 
-fn validate_path_segment(segment: &str) -> Result<(), ReferenceError> {
+fn validate_path_segment(segment: &str) -> Result<(), AddressError> {
     validate_token(
         segment.to_owned(),
         "actor path segment",
         MAX_ACTOR_PATH_SEGMENT_BYTES,
     )?;
     if segment.contains('%') {
-        return Err(ReferenceError::NonCanonical {
+        return Err(AddressError::NonCanonical {
             field: "actor path segment",
         });
     }
@@ -469,7 +469,7 @@ mod tests {
     fn path_rejects_reserved_and_noncanonical_segments() {
         assert_eq!(
             ActorPath::user(["system", "coordinator"]),
-            Err(ReferenceError::ReservedSystemPath)
+            Err(AddressError::ReservedSystemPath)
         );
         assert!(ActorPath::user(["user", ".."]).is_err());
         assert!(ActorPath::user(["user", "child/name"]).is_err());

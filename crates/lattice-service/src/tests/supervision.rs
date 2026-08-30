@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use lattice_core::actor_ref::{ClusterId, NodeIncarnation};
+use lattice_core::actor_address::{ClusterId, NodeIncarnation};
 
 use super::support::node_config;
 use crate::{

@@ -24,8 +24,6 @@ mod deferred;
 mod handlers;
 mod lifecycle;
 mod mailbox;
-#[cfg(feature = "distributed")]
-mod registry;
 mod runtime;
 mod tasks;
 mod turn_budget;

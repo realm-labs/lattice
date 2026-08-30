@@ -8,7 +8,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use lattice_core::actor_ref::{ClusterId, NodeIncarnation};
+use lattice_core::actor_address::{ClusterId, NodeIncarnation};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
@@ -403,7 +403,7 @@ fn validate_ttl(ttl: Duration) -> Result<(), WorkerIdStoreError> {
 mod tests {
     use std::time::Duration;
 
-    use lattice_core::actor_ref::{ClusterId, NodeIncarnation};
+    use lattice_core::actor_address::{ClusterId, NodeIncarnation};
 
     use super::{
         InMemoryWorkerIdLeaseStore, WorkerIdAcquisition, WorkerIdLeaseStore, WorkerIdOwner,

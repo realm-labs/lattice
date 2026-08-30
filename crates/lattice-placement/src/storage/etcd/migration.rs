@@ -7,7 +7,7 @@ use std::{
 use etcd_client::{
     Client, Compare, CompareOp, GetOptions, PutOptions, SortOrder, SortTarget, Txn, TxnOp,
 };
-use lattice_core::{actor_ref::PlacementDomainId, failpoint::Failpoint};
+use lattice_core::{actor_address::PlacementDomainId, failpoint::Failpoint};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -1035,7 +1035,7 @@ fn parse_usize(value: &[u8]) -> Result<usize, MigrationError> {
 
 #[cfg(test)]
 mod tests {
-    use lattice_core::actor_ref::{
+    use lattice_core::actor_address::{
         ConfigFingerprint, EntityType, NodeAddress, NodeIncarnation, PlacementDomainId,
     };
 

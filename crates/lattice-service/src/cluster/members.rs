@@ -3,7 +3,7 @@ use std::{
     sync::Mutex,
 };
 
-use lattice_core::actor_ref::NodeIncarnation;
+use lattice_core::actor_address::NodeIncarnation;
 use lattice_placement::{
     coordinator::{MemberChange, MemberEvent, MemberRecord, MemberStatus},
     types::{MembershipVersion, NodeKey},
@@ -175,7 +175,7 @@ pub enum MemberDirectoryError {
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
 
-    use lattice_core::actor_ref::{NodeAddress, NodeIncarnation};
+    use lattice_core::actor_address::{NodeAddress, NodeIncarnation};
     use lattice_placement::{
         coordinator::{
             MemberChange, MemberEvent, MemberHello, MemberRecord, MemberRemovalReason, MemberStatus,

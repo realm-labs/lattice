@@ -1,8 +1,8 @@
 //! Admission control for traffic entering the actor world from outside the cluster mesh.
 //!
 //! Everything else that reaches a node is vouched for by something the node can check on its own:
-//! an exact `ActorRef` carries the incarnation and `ActivationId` it is bound to, and a logical
-//! reference is resolved against a placement claim with its own deadline. Traffic arriving from a
+//! an exact `ActorAddress` carries the incarnation and `ActivationId` it is bound to, and a logical
+//! address is resolved against a placement claim with its own deadline. Traffic arriving from a
 //! gateway, an HTTP handler, or any other process edge carries none of that, so the only thing
 //! that says the node should still be taking it is the node's own membership in the cluster.
 //!
@@ -17,12 +17,12 @@
 
 use std::time::Duration;
 
-use lattice_actor::{
+use lattice_actor::traits::{Message, Request};
+use lattice_actor_distributed::{
     protocol::{SupportsAsk, SupportsTell},
     recipient::{ActorSystem, RecipientError},
-    traits::{Message, Request},
 };
-use lattice_core::actor_ref::RecipientRef;
+use lattice_core::actor_address::RecipientAddress;
 use lattice_remoting::messaging::error::{AskError, RemoteMessageError, TellError};
 use thiserror::Error;
 
@@ -77,7 +77,7 @@ impl ExternalIngress {
     /// placement-claim admission on the way to its target.
     pub async fn tell<P, M>(
         &self,
-        target: impl Into<RecipientRef<P>>,
+        target: impl Into<RecipientAddress<P>>,
         message: M,
     ) -> Result<(), RecipientError>
     where
@@ -91,7 +91,7 @@ impl ExternalIngress {
     /// Sends a request on behalf of an external caller and waits for its typed response.
     pub async fn ask<P, R>(
         &self,
-        target: impl Into<RecipientRef<P>>,
+        target: impl Into<RecipientAddress<P>>,
         request: R,
         timeout: Duration,
     ) -> Result<R::Response, RecipientError>

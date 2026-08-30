@@ -6,7 +6,7 @@ use std::{
 
 use bytes::Bytes;
 use lattice_core::{
-    actor_ref::{EntityType, NodeIncarnation, PlacementDomainId, SingletonKind},
+    actor_address::{EntityType, NodeIncarnation, PlacementDomainId, SingletonKind},
     coordinator::CoordinatorScope,
 };
 use lattice_remoting::association::{

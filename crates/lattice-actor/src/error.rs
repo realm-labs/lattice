@@ -1,4 +1,4 @@
-use std::{error::Error as StdError, fmt, time::Duration};
+use std::{error::Error as StdError, fmt};
 
 use thiserror::Error;
 
@@ -177,22 +177,6 @@ impl<M> From<ActorTellError<M>> for ActorError {
     fn from(value: ActorTellError<M>) -> Self {
         Self::new(value.to_string())
     }
-}
-
-#[derive(Debug, Clone, Error)]
-pub enum ActorActivationError {
-    #[error("actor is already running or activating")]
-    AlreadyExists,
-    #[error("activation waiter capacity exceeded")]
-    WaiterCapacityExceeded,
-    #[error("timed out waiting {timeout:?} for actor activation")]
-    WaiterTimeout { timeout: Duration },
-    #[error("actor activation failed: {0}")]
-    ActivationFailed(ActorError),
-    #[error("actor activation is retained after stopping persistence failed")]
-    RetainedStopFailure,
-    #[error("actor activation is quarantined after external authority loss")]
-    Quarantined,
 }
 
 #[derive(Debug, Clone, Error)]

@@ -2,21 +2,21 @@
 //! termination path still has to refuse.
 //!
 //! Losing a membership session used to close the node's single admission gate, which cut local
-//! actor traffic and exact `ActorRef` traffic that membership never vouched for in the first
+//! actor traffic and exact `ActorAddress` traffic that membership never vouched for in the first
 //! place. These tests hold the line in both directions: the cluster-internal scopes survive a
 //! membership session loss, and no termination path is allowed to inherit that leniency.
 
 use std::{collections::BTreeSet, sync::Arc, time::Duration};
 
-use lattice_actor::{
-    registry::{ActorRefConfig, ActorRegistry, ActorRegistryConfig},
+use lattice_actor_distributed::{
+    registry::{ActorAddressConfig, ActorRegistry, ActorRegistryConfig},
     traits::StopReason,
 };
 use lattice_core::{
-    actor_kind,
-    actor_ref::{
-        ActorRef, ClusterId, EntityId, EntityType, NodeAddress, NodeIncarnation, ProtocolId,
+    actor_address::{
+        ActorAddress, ClusterId, EntityId, EntityType, NodeAddress, NodeIncarnation, ProtocolId,
     },
+    actor_kind,
     coordinator::CoordinatorScope,
     id::ActorId,
 };
@@ -43,7 +43,7 @@ fn join_config() -> ClusterJoinConfig {
     }
 }
 
-/// A node hosting one exact activation, wired so that its `ActorRef` can be addressed from
+/// A node hosting one exact activation, wired so that its `ActorAddress` can be addressed from
 /// another process.
 fn hosted_ping(
     cluster_id: &ClusterId,
@@ -51,13 +51,13 @@ fn hosted_ping(
     incarnation: NodeIncarnation,
 ) -> (
     Arc<ActorRegistry<PingActor>>,
-    Arc<lattice_actor::protocol::ActorProtocolBinding<PingActor, PingProtocol>>,
+    Arc<lattice_actor_distributed::protocol::ActorProtocolBinding<PingActor, PingProtocol>>,
 ) {
     let binding = Arc::new(PingProtocol::bind::<PingActor>().unwrap());
     let registry = Arc::new(ActorRegistry::new_bound(
         actor_kind!("AdmissionPing"),
         ActorRegistryConfig {
-            actor_ref: Some(ActorRefConfig {
+            address: Some(ActorAddressConfig {
                 cluster_id: cluster_id.clone(),
                 node_address: address.clone(),
                 node_incarnation: incarnation,
@@ -89,7 +89,7 @@ async fn await_lifecycle(service: &LatticeService, expected: NodeLifecycleState)
 /// The regression this split exists for.
 ///
 /// A membership session is lost and regained. Throughout the gap the node keeps answering both
-/// process-local asks and exact `ActorRef` asks arriving from another process, because neither
+/// process-local asks and exact `ActorAddress` asks arriving from another process, because neither
 /// depends on membership to be safe: the reference names one incarnation and one activation, and
 /// a stale reference resolves to nothing rather than to a replacement. Only the external edge —
 /// the traffic nothing but membership vouches for — is shed, and it comes back when the node is a
@@ -140,7 +140,7 @@ async fn membership_loss_sheds_the_edge_while_local_and_exact_traffic_keep_servi
 
     let (registry, binding) = hosted_ping(&cluster_id, &member_address, member_incarnation);
     let handle = registry.start(ActorId::U64(1), PingActor).await.unwrap();
-    let target: ActorRef<PingProtocol> = handle.typed_actor_ref().unwrap().unwrap();
+    let target: ActorAddress<PingProtocol> = registry.address(&ActorId::U64(1)).unwrap().unwrap();
     let member = LatticeService::builder(node_config(
         cluster_id.clone(),
         "member",
@@ -203,7 +203,7 @@ async fn membership_loss_sheds_the_edge_while_local_and_exact_traffic_keep_servi
     );
     assert!(
         admission.exact,
-        "an exact ActorRef is fenced by its own incarnation and activation, not by membership"
+        "an exact ActorAddress is fenced by its own incarnation and activation, not by membership"
     );
     assert!(
         admission.logical,
@@ -237,7 +237,7 @@ async fn membership_loss_sheds_the_edge_while_local_and_exact_traffic_keep_servi
             .await
             .unwrap(),
         Pong(21),
-        "an exact remote ActorRef must survive the membership gap"
+        "an exact remote ActorAddress must survive the membership gap"
     );
 
     let second_coordinator = coordinator_service_for_domains(
@@ -265,7 +265,7 @@ async fn membership_loss_sheds_the_edge_while_local_and_exact_traffic_keep_servi
         Pong(31)
     );
 
-    handle.stop(StopReason::Requested).await.unwrap();
+    handle.stop(StopReason::Requested).unwrap();
     client.force_shutdown().await.unwrap();
     member.force_shutdown().await.unwrap();
     second_coordinator.force_shutdown().await.unwrap();
@@ -411,8 +411,8 @@ async fn cordon_closes_every_admission_scope_including_local_dispatch() {
     let address = unused_address().await;
     let incarnation = NodeIncarnation::new(903).unwrap();
     let (registry, binding) = hosted_ping(&cluster_id, &address, incarnation);
-    let handle = registry.start(ActorId::U64(1), PingActor).await.unwrap();
-    let target: ActorRef<PingProtocol> = handle.typed_actor_ref().unwrap().unwrap();
+    registry.start(ActorId::U64(1), PingActor).await.unwrap();
+    let target: ActorAddress<PingProtocol> = registry.address(&ActorId::U64(1)).unwrap().unwrap();
     let service = LatticeService::builder(node_config(cluster_id, "drained", address, incarnation))
         .unwrap()
         .register_actor(registry, binding)
@@ -470,8 +470,8 @@ async fn force_stop_closes_every_admission_scope() {
     let address = unused_address().await;
     let incarnation = NodeIncarnation::new(904).unwrap();
     let (registry, binding) = hosted_ping(&cluster_id, &address, incarnation);
-    let handle = registry.start(ActorId::U64(1), PingActor).await.unwrap();
-    let target: ActorRef<PingProtocol> = handle.typed_actor_ref().unwrap().unwrap();
+    registry.start(ActorId::U64(1), PingActor).await.unwrap();
+    let target: ActorAddress<PingProtocol> = registry.address(&ActorId::U64(1)).unwrap().unwrap();
     let service = LatticeService::builder(node_config(cluster_id, "forced", address, incarnation))
         .unwrap()
         .register_actor(registry, binding)

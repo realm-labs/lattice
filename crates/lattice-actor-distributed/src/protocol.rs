@@ -10,12 +10,12 @@ use std::{
 
 use bytes::{Bytes, BytesMut};
 #[doc(hidden)]
-pub use lattice_core::actor_ref::ProtocolTag as __ProtocolTag;
-use lattice_core::actor_ref::{ProtocolId, ProtocolTag};
+pub use lattice_core::actor_address::ProtocolTag as __ProtocolTag;
+use lattice_core::actor_address::{ProtocolId, ProtocolTag};
 use lattice_remoting::protocol::{ProtocolDescriptor, ProtocolFingerprint};
 use thiserror::Error;
 
-use crate::{
+use lattice_actor::{
     error::ActorCallError,
     handle::ActorHandle,
     traits::{Actor, Message, MessageKind, Request, Responder},
@@ -27,7 +27,20 @@ use tell::ProtocolTellDispatch;
 
 mod helpers;
 
-use helpers::{bounded_error, canonical_descriptor, protocol_failure};
+use helpers::{bounded_error, canonical_descriptor, observe_protocol_failure};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProtocolFailure {
+    UnknownMessage,
+    ModeMismatch,
+    PayloadTooLarge,
+    DecodeFailed,
+    EncodeFailed,
+    MissingDeadline,
+    MailboxRejected,
+    ActorFailed,
+    ReplyTypeMismatch,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct CodecDescriptor {
@@ -480,8 +493,6 @@ impl<A: Actor, P: Protocol> ActorProtocolBinding<A, P> {
                 ProtocolTellDispatch::Rejected(error) => Err(error),
             };
         }
-        let observer = handle.observer().clone();
-        let actor = handle.observation_metadata().clone();
         let payload_size = payload.len();
         let kind = MessageKind::Request;
         let result = async {
@@ -505,19 +516,15 @@ impl<A: Actor, P: Protocol> ActorProtocolBinding<A, P> {
                 .get(&message_id)
                 .ok_or(DispatchError::UnknownMessage(message_id))?;
             match dispatch {
-                ServerDispatch::Async(dispatch) => dispatch(handle, payload, deadline).await,
+                ServerDispatch::Async(dispatch) => {
+                    dispatch(handle.clone(), payload, deadline).await
+                }
                 ServerDispatch::Tell(_) => Err(DispatchError::ModeMismatch),
             }
         }
         .await;
         if let Err(error) = &result {
-            observer.protocol_failed(
-                &actor,
-                message_id,
-                kind,
-                payload_size,
-                protocol_failure(error),
-            );
+            observe_protocol_failure(&handle, message_id, kind, payload_size, error);
         }
         result
     }
@@ -545,7 +552,7 @@ impl<A: Actor, P: Protocol> ActorProtocolBindingBuilder<A, P> {
     ) -> Self
     where
         A: Responder<Q>,
-        <A as crate::traits::Actor>::Behavior: crate::state_machine::Accepts<Q>,
+        <A as lattice_actor::traits::Actor>::Behavior: lattice_actor::state_machine::Accepts<Q>,
         Q: Request,
         C: WireCodec<Q>,
         RC: WireCodec<Q::Response>,
@@ -646,7 +653,7 @@ pub enum DispatchError {
 pub enum ProtocolBuildError {
     #[error("protocol ID zero is reserved")]
     ReservedProtocolId,
-    #[error("protocol marker ID does not match its reference tag ID")]
+    #[error("protocol marker ID does not match its address tag ID")]
     ProtocolTagMismatch,
     #[error("actor protocol name is empty, oversized, or contains control characters")]
     InvalidName,
@@ -718,7 +725,7 @@ macro_rules! actor_protocol {
 
         impl<A> $crate::protocol::ActorProtocolBinder<A> for $name
         where
-            A: $crate::traits::Actor,
+            A: ::lattice_actor::traits::Actor,
             $($bounds)*
         {
             fn bind_actor() -> Result<
@@ -745,7 +752,7 @@ macro_rules! actor_protocol {
                 $crate::protocol::ProtocolBuildError,
             >
             where
-                A: $crate::traits::Actor,
+                A: ::lattice_actor::traits::Actor,
                 $($bounds)*
             {
                 <Self as $crate::protocol::ActorProtocolBinder<A>>::bind_actor()
@@ -768,9 +775,9 @@ macro_rules! actor_protocol {
             [$($bindings)*]
             [
                 $($bounds)*
-                A: $crate::traits::Handler<$message>,
-                <A as $crate::traits::Actor>::Behavior:
-                    $crate::state_machine::Accepts<$message>,
+                A: ::lattice_actor::traits::Handler<$message>,
+                <A as ::lattice_actor::traits::Actor>::Behavior:
+                    ::lattice_actor::state_machine::Accepts<$message>,
             ]
             [$($remaining)*]
         );
@@ -789,9 +796,9 @@ macro_rules! actor_protocol {
             [$($bindings)*]
             [
                 $($bounds)*
-                A: $crate::traits::Responder<$message>,
-                <A as $crate::traits::Actor>::Behavior:
-                    $crate::state_machine::Accepts<$message>,
+                A: ::lattice_actor::traits::Responder<$message>,
+                <A as ::lattice_actor::traits::Actor>::Behavior:
+                    ::lattice_actor::state_machine::Accepts<$message>,
             ]
             [$($remaining)*]
         );
@@ -896,7 +903,9 @@ pub fn __protocol_id(value: u64) -> Result<ProtocolId, ProtocolBuildError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{context::HandlerContext, error::ActorError, reply::ReplyTo, traits::Handler};
+    use lattice_actor::{
+        context::HandlerContext, error::ActorError, reply::ReplyTo, traits::Handler,
+    };
 
     struct TestActor;
 
@@ -905,10 +914,10 @@ mod tests {
         type Behavior = ::lattice_actor::state_machine::Stateless;
     }
 
-    #[derive(Clone, crate::Message)]
+    #[derive(Clone, lattice_actor::Message)]
     struct Tell(u64);
 
-    #[derive(Clone, crate::Request)]
+    #[derive(Clone, lattice_actor::Request)]
     #[request(response = u64)]
     struct Ask(u64);
 

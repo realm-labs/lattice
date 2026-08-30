@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 
 use lattice_core::{
-    actor_ref::{EntityType, PlacementDomainId, SingletonKind},
+    actor_address::{EntityType, PlacementDomainId, SingletonKind},
     failpoint::Failpoint,
 };
 

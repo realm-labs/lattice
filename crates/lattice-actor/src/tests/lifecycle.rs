@@ -24,7 +24,7 @@ async fn stop_uses_system_lane_and_closes_actor() {
     };
     let handle = spawn_actor(actor, MailboxConfig::bounded(8));
 
-    handle.stop(StopReason::Requested).await.unwrap();
+    handle.stop(StopReason::Requested).unwrap();
     stopped.acquire().await.unwrap().forget();
 
     let result = handle.ask(Ping("after-stop"), ASK_TIMEOUT).await;

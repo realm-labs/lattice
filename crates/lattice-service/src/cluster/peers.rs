@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use lattice_core::actor_ref::ClusterId;
+use lattice_core::actor_address::ClusterId;
 use lattice_placement::{
     coordinator::{MemberChange, MemberEvent, MemberRecord},
     types::{MembershipVersion, NodeKey},

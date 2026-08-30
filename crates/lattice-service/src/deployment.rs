@@ -1,6 +1,6 @@
 use std::{collections::BTreeSet, sync::Arc, time::Duration};
 
-use lattice_core::{actor_ref::PlacementDomainId, coordinator::CoordinatorScope};
+use lattice_core::{actor_address::PlacementDomainId, coordinator::CoordinatorScope};
 use lattice_discovery::static_provider::{StaticDiscovery, StaticEndpoint};
 use lattice_placement::{
     control::{DEFAULT_MAX_CONTROL_PAYLOAD, PlacementControlRouter},
@@ -334,7 +334,7 @@ where
 mod tests {
     use std::{collections::BTreeSet, net::TcpListener, sync::Arc, time::Duration};
 
-    use lattice_core::actor_ref::{ClusterId, NodeAddress, NodeIncarnation};
+    use lattice_core::actor_address::{ClusterId, NodeAddress, NodeIncarnation};
     use lattice_placement::{
         runtime::host::CoordinatorHostConfig, storage::InMemoryPlacementStore,
     };

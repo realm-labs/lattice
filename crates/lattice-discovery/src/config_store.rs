@@ -2,7 +2,7 @@ use std::{fmt::Display, pin::Pin, time::Duration};
 
 use futures_util::Stream;
 use lattice_config::store::ConfigStore;
-use lattice_core::{actor_ref::NodeAddress, coordinator::CoordinatorScope};
+use lattice_core::{actor_address::NodeAddress, coordinator::CoordinatorScope};
 use serde::Deserialize;
 
 use crate::provider::{

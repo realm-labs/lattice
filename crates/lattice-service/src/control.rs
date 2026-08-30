@@ -2,7 +2,8 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use lattice_actor::{handle::ActorTerminationSubscription, host::ProtocolHostRegistry};
+use lattice_actor::handle::ActorTerminationSubscription;
+use lattice_actor_distributed::host::ProtocolHostRegistry;
 use lattice_remoting::{
     association::{Association, AssociationError, AssociationKey, AssociationManager},
     control::{

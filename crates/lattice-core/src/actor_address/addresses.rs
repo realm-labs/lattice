@@ -2,15 +2,15 @@ use std::marker::PhantomData;
 
 use serde::{Deserialize, Serialize, de::Error as SerdeDeError};
 
-use crate::actor_ref::identity::{
-    ActivationId, ActorPath, ClusterId, ConfigFingerprint, EntityId, EntityType, ErasedProtocol,
-    NodeAddress, NodeIncarnation, PlacementDomainId, ProtocolId, ProtocolTag, ReferenceError,
+use crate::actor_address::identity::{
+    ActivationId, ActorPath, AddressError, ClusterId, ConfigFingerprint, EntityId, EntityType,
+    ErasedProtocol, NodeAddress, NodeIncarnation, PlacementDomainId, ProtocolId, ProtocolTag,
     SingletonKind,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 #[serde(bound = "")]
-pub struct ActorRef<P: ProtocolTag = ErasedProtocol> {
+pub struct ActorAddress<P: ProtocolTag = ErasedProtocol> {
     cluster_id: ClusterId,
     node_address: NodeAddress,
     node_incarnation: NodeIncarnation,
@@ -21,7 +21,7 @@ pub struct ActorRef<P: ProtocolTag = ErasedProtocol> {
     protocol: PhantomData<fn() -> P>,
 }
 
-impl<P: ProtocolTag> ActorRef<P> {
+impl<P: ProtocolTag> ActorAddress<P> {
     fn from_parts(
         cluster_id: ClusterId,
         node_address: NodeAddress,
@@ -29,9 +29,9 @@ impl<P: ProtocolTag> ActorRef<P> {
         actor_path: ActorPath,
         activation_id: ActivationId,
         protocol_id: ProtocolId,
-    ) -> Result<Self, ReferenceError> {
+    ) -> Result<Self, AddressError> {
         if activation_id.node_incarnation() != node_incarnation {
-            return Err(ReferenceError::NonCanonical {
+            return Err(AddressError::NonCanonical {
                 field: "activation node incarnation",
             });
         }
@@ -71,8 +71,8 @@ impl<P: ProtocolTag> ActorRef<P> {
         self.protocol_id
     }
 
-    pub fn try_typed<Q: ProtocolTag>(&self) -> Result<ActorRef<Q>, ReferenceError> {
-        ActorRef::from_parts(
+    pub fn try_typed<Q: ProtocolTag>(&self) -> Result<ActorAddress<Q>, AddressError> {
+        ActorAddress::from_parts(
             self.cluster_id.clone(),
             self.node_address.clone(),
             self.node_incarnation,
@@ -82,8 +82,8 @@ impl<P: ProtocolTag> ActorRef<P> {
         )
     }
 
-    pub fn erase(&self) -> ActorRef<ErasedProtocol> {
-        ActorRef {
+    pub fn erase(&self) -> ActorAddress<ErasedProtocol> {
+        ActorAddress {
             cluster_id: self.cluster_id.clone(),
             node_address: self.node_address.clone(),
             node_incarnation: self.node_incarnation,
@@ -94,7 +94,7 @@ impl<P: ProtocolTag> ActorRef<P> {
         }
     }
 
-    pub fn same_activation<Q: ProtocolTag>(&self, other: &ActorRef<Q>) -> bool {
+    pub fn same_activation<Q: ProtocolTag>(&self, other: &ActorAddress<Q>) -> bool {
         self.cluster_id == other.cluster_id
             && self.node_address == other.node_address
             && self.node_incarnation == other.node_incarnation
@@ -104,7 +104,7 @@ impl<P: ProtocolTag> ActorRef<P> {
     }
 }
 
-impl ActorRef<ErasedProtocol> {
+impl ActorAddress<ErasedProtocol> {
     pub fn new(
         cluster_id: ClusterId,
         node_address: NodeAddress,
@@ -112,7 +112,7 @@ impl ActorRef<ErasedProtocol> {
         actor_path: ActorPath,
         activation_id: ActivationId,
         protocol_id: ProtocolId,
-    ) -> Result<Self, ReferenceError> {
+    ) -> Result<Self, AddressError> {
         Self::from_parts(
             cluster_id,
             node_address,
@@ -125,7 +125,7 @@ impl ActorRef<ErasedProtocol> {
 }
 
 #[derive(Deserialize)]
-struct ActorRefData {
+struct ActorAddressData {
     cluster_id: ClusterId,
     node_address: NodeAddress,
     node_incarnation: NodeIncarnation,
@@ -134,12 +134,12 @@ struct ActorRefData {
     protocol_id: ProtocolId,
 }
 
-impl<'de, P: ProtocolTag> Deserialize<'de> for ActorRef<P> {
+impl<'de, P: ProtocolTag> Deserialize<'de> for ActorAddress<P> {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
-        let data = ActorRefData::deserialize(deserializer)?;
+        let data = ActorAddressData::deserialize(deserializer)?;
         Self::from_parts(
             data.cluster_id,
             data.node_address,
@@ -154,7 +154,7 @@ impl<'de, P: ProtocolTag> Deserialize<'de> for ActorRef<P> {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 #[serde(bound = "")]
-pub struct EntityRef<P: ProtocolTag = ErasedProtocol> {
+pub struct EntityAddress<P: ProtocolTag = ErasedProtocol> {
     cluster_id: ClusterId,
     domain: PlacementDomainId,
     entity_type: EntityType,
@@ -165,7 +165,7 @@ pub struct EntityRef<P: ProtocolTag = ErasedProtocol> {
     protocol: PhantomData<fn() -> P>,
 }
 
-impl<P: ProtocolTag> EntityRef<P> {
+impl<P: ProtocolTag> EntityAddress<P> {
     fn from_parts(
         cluster_id: ClusterId,
         domain: PlacementDomainId,
@@ -173,7 +173,7 @@ impl<P: ProtocolTag> EntityRef<P> {
         entity_id: EntityId,
         protocol_id: ProtocolId,
         entity_config_fingerprint: ConfigFingerprint,
-    ) -> Result<Self, ReferenceError> {
+    ) -> Result<Self, AddressError> {
         validate_protocol::<P>(protocol_id)?;
         Ok(Self {
             cluster_id,
@@ -210,8 +210,8 @@ impl<P: ProtocolTag> EntityRef<P> {
         self.entity_config_fingerprint
     }
 
-    pub fn try_typed<Q: ProtocolTag>(&self) -> Result<EntityRef<Q>, ReferenceError> {
-        EntityRef::from_parts(
+    pub fn try_typed<Q: ProtocolTag>(&self) -> Result<EntityAddress<Q>, AddressError> {
+        EntityAddress::from_parts(
             self.cluster_id.clone(),
             self.domain.clone(),
             self.entity_type.clone(),
@@ -221,8 +221,8 @@ impl<P: ProtocolTag> EntityRef<P> {
         )
     }
 
-    pub fn erase(&self) -> EntityRef<ErasedProtocol> {
-        EntityRef {
+    pub fn erase(&self) -> EntityAddress<ErasedProtocol> {
+        EntityAddress {
             cluster_id: self.cluster_id.clone(),
             domain: self.domain.clone(),
             entity_type: self.entity_type.clone(),
@@ -234,7 +234,7 @@ impl<P: ProtocolTag> EntityRef<P> {
     }
 }
 
-impl EntityRef<ErasedProtocol> {
+impl EntityAddress<ErasedProtocol> {
     pub fn new(
         cluster_id: ClusterId,
         domain: PlacementDomainId,
@@ -242,7 +242,7 @@ impl EntityRef<ErasedProtocol> {
         entity_id: EntityId,
         protocol_id: ProtocolId,
         entity_config_fingerprint: ConfigFingerprint,
-    ) -> Result<Self, ReferenceError> {
+    ) -> Result<Self, AddressError> {
         Self::from_parts(
             cluster_id,
             domain,
@@ -255,7 +255,7 @@ impl EntityRef<ErasedProtocol> {
 }
 
 #[derive(Deserialize)]
-struct EntityRefData {
+struct EntityAddressData {
     cluster_id: ClusterId,
     domain: PlacementDomainId,
     entity_type: EntityType,
@@ -264,12 +264,12 @@ struct EntityRefData {
     entity_config_fingerprint: ConfigFingerprint,
 }
 
-impl<'de, P: ProtocolTag> Deserialize<'de> for EntityRef<P> {
+impl<'de, P: ProtocolTag> Deserialize<'de> for EntityAddress<P> {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
-        let data = EntityRefData::deserialize(deserializer)?;
+        let data = EntityAddressData::deserialize(deserializer)?;
         Self::from_parts(
             data.cluster_id,
             data.domain,
@@ -284,7 +284,7 @@ impl<'de, P: ProtocolTag> Deserialize<'de> for EntityRef<P> {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 #[serde(bound = "")]
-pub struct SingletonRef<P: ProtocolTag = ErasedProtocol> {
+pub struct SingletonAddress<P: ProtocolTag = ErasedProtocol> {
     cluster_id: ClusterId,
     domain: PlacementDomainId,
     singleton_kind: SingletonKind,
@@ -294,14 +294,14 @@ pub struct SingletonRef<P: ProtocolTag = ErasedProtocol> {
     protocol: PhantomData<fn() -> P>,
 }
 
-impl<P: ProtocolTag> SingletonRef<P> {
+impl<P: ProtocolTag> SingletonAddress<P> {
     fn from_parts(
         cluster_id: ClusterId,
         domain: PlacementDomainId,
         singleton_kind: SingletonKind,
         protocol_id: ProtocolId,
         singleton_config_fingerprint: ConfigFingerprint,
-    ) -> Result<Self, ReferenceError> {
+    ) -> Result<Self, AddressError> {
         validate_protocol::<P>(protocol_id)?;
         Ok(Self {
             cluster_id,
@@ -333,8 +333,8 @@ impl<P: ProtocolTag> SingletonRef<P> {
         self.singleton_config_fingerprint
     }
 
-    pub fn try_typed<Q: ProtocolTag>(&self) -> Result<SingletonRef<Q>, ReferenceError> {
-        SingletonRef::from_parts(
+    pub fn try_typed<Q: ProtocolTag>(&self) -> Result<SingletonAddress<Q>, AddressError> {
+        SingletonAddress::from_parts(
             self.cluster_id.clone(),
             self.domain.clone(),
             self.singleton_kind.clone(),
@@ -343,8 +343,8 @@ impl<P: ProtocolTag> SingletonRef<P> {
         )
     }
 
-    pub fn erase(&self) -> SingletonRef<ErasedProtocol> {
-        SingletonRef {
+    pub fn erase(&self) -> SingletonAddress<ErasedProtocol> {
+        SingletonAddress {
             cluster_id: self.cluster_id.clone(),
             domain: self.domain.clone(),
             singleton_kind: self.singleton_kind.clone(),
@@ -355,14 +355,14 @@ impl<P: ProtocolTag> SingletonRef<P> {
     }
 }
 
-impl SingletonRef<ErasedProtocol> {
+impl SingletonAddress<ErasedProtocol> {
     pub fn new(
         cluster_id: ClusterId,
         domain: PlacementDomainId,
         singleton_kind: SingletonKind,
         protocol_id: ProtocolId,
         singleton_config_fingerprint: ConfigFingerprint,
-    ) -> Result<Self, ReferenceError> {
+    ) -> Result<Self, AddressError> {
         Self::from_parts(
             cluster_id,
             domain,
@@ -374,7 +374,7 @@ impl SingletonRef<ErasedProtocol> {
 }
 
 #[derive(Deserialize)]
-struct SingletonRefData {
+struct SingletonAddressData {
     cluster_id: ClusterId,
     domain: PlacementDomainId,
     singleton_kind: SingletonKind,
@@ -382,12 +382,12 @@ struct SingletonRefData {
     singleton_config_fingerprint: ConfigFingerprint,
 }
 
-impl<'de, P: ProtocolTag> Deserialize<'de> for SingletonRef<P> {
+impl<'de, P: ProtocolTag> Deserialize<'de> for SingletonAddress<P> {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
-        let data = SingletonRefData::deserialize(deserializer)?;
+        let data = SingletonAddressData::deserialize(deserializer)?;
         Self::from_parts(
             data.cluster_id,
             data.domain,
@@ -402,63 +402,63 @@ impl<'de, P: ProtocolTag> Deserialize<'de> for SingletonRef<P> {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(bound = "P: ProtocolTag")]
 #[doc(hidden)]
-pub enum RecipientRef<P: ProtocolTag = ErasedProtocol> {
-    Actor(ActorRef<P>),
-    Entity(EntityRef<P>),
-    Singleton(SingletonRef<P>),
+pub enum RecipientAddress<P: ProtocolTag = ErasedProtocol> {
+    Actor(ActorAddress<P>),
+    Entity(EntityAddress<P>),
+    Singleton(SingletonAddress<P>),
 }
 
-impl<P: ProtocolTag> RecipientRef<P> {
-    pub fn erase(&self) -> RecipientRef<ErasedProtocol> {
+impl<P: ProtocolTag> RecipientAddress<P> {
+    pub fn erase(&self) -> RecipientAddress<ErasedProtocol> {
         match self {
-            Self::Actor(reference) => RecipientRef::Actor(reference.erase()),
-            Self::Entity(reference) => RecipientRef::Entity(reference.erase()),
-            Self::Singleton(reference) => RecipientRef::Singleton(reference.erase()),
+            Self::Actor(reference) => RecipientAddress::Actor(reference.erase()),
+            Self::Entity(reference) => RecipientAddress::Entity(reference.erase()),
+            Self::Singleton(reference) => RecipientAddress::Singleton(reference.erase()),
         }
     }
 }
 
-impl<P: ProtocolTag> From<ActorRef<P>> for RecipientRef<P> {
-    fn from(reference: ActorRef<P>) -> Self {
+impl<P: ProtocolTag> From<ActorAddress<P>> for RecipientAddress<P> {
+    fn from(reference: ActorAddress<P>) -> Self {
         Self::Actor(reference)
     }
 }
 
-impl<P: ProtocolTag> From<&ActorRef<P>> for RecipientRef<P> {
-    fn from(reference: &ActorRef<P>) -> Self {
+impl<P: ProtocolTag> From<&ActorAddress<P>> for RecipientAddress<P> {
+    fn from(reference: &ActorAddress<P>) -> Self {
         Self::Actor(reference.clone())
     }
 }
 
-impl<P: ProtocolTag> From<EntityRef<P>> for RecipientRef<P> {
-    fn from(reference: EntityRef<P>) -> Self {
+impl<P: ProtocolTag> From<EntityAddress<P>> for RecipientAddress<P> {
+    fn from(reference: EntityAddress<P>) -> Self {
         Self::Entity(reference)
     }
 }
 
-impl<P: ProtocolTag> From<&EntityRef<P>> for RecipientRef<P> {
-    fn from(reference: &EntityRef<P>) -> Self {
+impl<P: ProtocolTag> From<&EntityAddress<P>> for RecipientAddress<P> {
+    fn from(reference: &EntityAddress<P>) -> Self {
         Self::Entity(reference.clone())
     }
 }
 
-impl<P: ProtocolTag> From<SingletonRef<P>> for RecipientRef<P> {
-    fn from(reference: SingletonRef<P>) -> Self {
+impl<P: ProtocolTag> From<SingletonAddress<P>> for RecipientAddress<P> {
+    fn from(reference: SingletonAddress<P>) -> Self {
         Self::Singleton(reference)
     }
 }
 
-impl<P: ProtocolTag> From<&SingletonRef<P>> for RecipientRef<P> {
-    fn from(reference: &SingletonRef<P>) -> Self {
+impl<P: ProtocolTag> From<&SingletonAddress<P>> for RecipientAddress<P> {
+    fn from(reference: &SingletonAddress<P>) -> Self {
         Self::Singleton(reference.clone())
     }
 }
 
-fn validate_protocol<P: ProtocolTag>(protocol_id: ProtocolId) -> Result<(), ReferenceError> {
+fn validate_protocol<P: ProtocolTag>(protocol_id: ProtocolId) -> Result<(), AddressError> {
     if let Some(expected) = P::PROTOCOL_ID
         && expected != protocol_id.get()
     {
-        return Err(ReferenceError::ProtocolMismatch {
+        return Err(AddressError::ProtocolMismatch {
             expected,
             actual: protocol_id.get(),
         });
@@ -485,10 +485,10 @@ mod tests {
     }
 
     #[test]
-    fn actor_reference_requires_activation_from_the_named_node() {
+    fn actor_address_requires_activation_from_the_named_node() {
         let node = NodeIncarnation::new(1).unwrap();
         let other = NodeIncarnation::new(2).unwrap();
-        let result = ActorRef::new(
+        let result = ActorAddress::new(
             ClusterId::new("test").unwrap(),
             NodeAddress::new("127.0.0.1", 25520).unwrap(),
             node,
@@ -496,13 +496,13 @@ mod tests {
             ActivationId::new(other, 1).unwrap(),
             ProtocolId::new(7).unwrap(),
         );
-        assert!(matches!(result, Err(ReferenceError::NonCanonical { .. })));
+        assert!(matches!(result, Err(AddressError::NonCanonical { .. })));
     }
 
     #[test]
-    fn typed_reference_conversion_and_deserialization_validate_protocol_id() {
+    fn typed_address_conversion_and_deserialization_validate_protocol_id() {
         let incarnation = NodeIncarnation::new(3).unwrap();
-        let erased = ActorRef::new(
+        let erased = ActorAddress::new(
             ClusterId::new("test").unwrap(),
             NodeAddress::new("127.0.0.1", 25520).unwrap(),
             incarnation,
@@ -516,22 +516,22 @@ mod tests {
         assert!(typed.same_activation(&erased));
         assert!(matches!(
             erased.try_typed::<OtherProtocol>(),
-            Err(ReferenceError::ProtocolMismatch {
+            Err(AddressError::ProtocolMismatch {
                 expected: 8,
                 actual: 7
             })
         ));
 
         let encoded = serde_json::to_vec(&typed).unwrap();
-        let decoded: ActorRef<TestProtocol> = serde_json::from_slice(&encoded).unwrap();
+        let decoded: ActorAddress<TestProtocol> = serde_json::from_slice(&encoded).unwrap();
         assert!(decoded.same_activation(&typed));
-        assert!(serde_json::from_slice::<ActorRef<OtherProtocol>>(&encoded).is_err());
+        assert!(serde_json::from_slice::<ActorAddress<OtherProtocol>>(&encoded).is_err());
         assert_eq!(
             serde_json::to_value(&typed).unwrap(),
             serde_json::to_value(&erased).unwrap()
         );
 
-        let entity = EntityRef::new(
+        let entity = EntityAddress::new(
             ClusterId::new("test").unwrap(),
             PlacementDomainId::new("world").unwrap(),
             EntityType::new("world").unwrap(),
@@ -543,10 +543,10 @@ mod tests {
         .try_typed::<TestProtocol>()
         .unwrap();
         let encoded = serde_json::to_vec(&entity).unwrap();
-        assert!(serde_json::from_slice::<EntityRef<TestProtocol>>(&encoded).is_ok());
-        assert!(serde_json::from_slice::<EntityRef<OtherProtocol>>(&encoded).is_err());
+        assert!(serde_json::from_slice::<EntityAddress<TestProtocol>>(&encoded).is_ok());
+        assert!(serde_json::from_slice::<EntityAddress<OtherProtocol>>(&encoded).is_err());
 
-        let singleton = SingletonRef::new(
+        let singleton = SingletonAddress::new(
             ClusterId::new("test").unwrap(),
             PlacementDomainId::new("control").unwrap(),
             SingletonKind::new("leader").unwrap(),
@@ -557,7 +557,7 @@ mod tests {
         .try_typed::<TestProtocol>()
         .unwrap();
         let encoded = serde_json::to_vec(&singleton).unwrap();
-        assert!(serde_json::from_slice::<SingletonRef<TestProtocol>>(&encoded).is_ok());
-        assert!(serde_json::from_slice::<SingletonRef<OtherProtocol>>(&encoded).is_err());
+        assert!(serde_json::from_slice::<SingletonAddress<TestProtocol>>(&encoded).is_ok());
+        assert!(serde_json::from_slice::<SingletonAddress<OtherProtocol>>(&encoded).is_err());
     }
 }

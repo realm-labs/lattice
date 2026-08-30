@@ -548,7 +548,7 @@ mod tests {
     use async_trait::async_trait;
     use bytes::Bytes;
     use lattice_core::{
-        actor_ref::{ClusterId, NodeAddress, NodeIncarnation},
+        actor_address::{ClusterId, NodeAddress, NodeIncarnation},
         coordinator::CoordinatorScope,
     };
     use lattice_discovery::static_provider::{StaticDiscovery, StaticEndpoint};

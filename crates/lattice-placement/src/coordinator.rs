@@ -5,7 +5,7 @@ use std::{
 
 use bytes::Bytes;
 use lattice_core::{
-    actor_ref::{
+    actor_address::{
         ConfigFingerprint, EntityType, NodeIncarnation, PlacementDomainId, ProtocolId,
         SingletonKind,
     },

@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
-use lattice_core::actor_ref::{
+use lattice_core::actor_address::{
     ConfigFingerprint, EntityType, NodeAddress, NodeIncarnation, PlacementDomainId, ProtocolId,
     SingletonKind,
 };

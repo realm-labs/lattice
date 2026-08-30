@@ -2,17 +2,18 @@
 
 use std::{sync::Arc, time::Duration};
 
-use lattice_actor::{
+use lattice_actor_distributed::{
+    activation::DistributedActorContextExt,
     context::{ActorContext, HandlerContext},
     error::ActorError,
-    registry::{ActorRefConfig, ActorRegistry, ActorRegistryConfig},
+    registry::{ActorAddressConfig, ActorRegistry, ActorRegistryConfig},
     reply::ReplyTo,
     traits::{Actor, Handler, Responder, StopReason},
-    watch::{ActorTerminated, TerminatedReason, TerminatedTarget, WatchId, WatchStatus},
+    watch::{ActorTerminated, TerminatedReason, WatchId, WatchStatus},
 };
 use lattice_core::{
+    actor_address::{ActorAddress, ClusterId, NodeIncarnation},
     actor_kind,
-    actor_ref::{ActorRef, ClusterId, NodeIncarnation},
     id::ActorId,
 };
 use lattice_remoting::handshake::NodeIdentity;
@@ -25,7 +26,7 @@ use crate::{
 };
 
 struct RemoteWatcherActor {
-    target: ActorRef<PingProtocol>,
+    target: ActorAddress<PingProtocol>,
     events: Arc<Mutex<Vec<ActorTerminated>>>,
     ready: Arc<Semaphore>,
     notified: Arc<Semaphore>,
@@ -37,7 +38,10 @@ impl Actor for RemoteWatcherActor {
     type Behavior = ::lattice_actor::state_machine::Stateless;
 
     async fn started(&mut self, ctx: &mut ActorContext<Self>) -> Result<(), Self::Error> {
-        let watch_id = ctx.watch(&self.target).await?;
+        let target = ctx
+            .bind_actor(self.target.clone())
+            .map_err(|error| ActorError::new(error.to_string()))?;
+        let watch_id = ctx.watch(&target).await?;
         *self.watch_id.lock().await = Some(watch_id);
         self.ready.add_permits(1);
         Ok(())
@@ -69,7 +73,7 @@ impl Responder<Ping> for RemoteWatcherActor {
 }
 
 #[tokio::test]
-async fn typed_actor_ref_asks_exact_remote_activation_over_tcp() {
+async fn bound_actor_ref_asks_exact_remote_activation_over_tcp() {
     let _network = network_test_guard().await;
     let cluster_id = ClusterId::new("service-test").unwrap();
     let first_address = unused_address().await;
@@ -85,7 +89,7 @@ async fn typed_actor_ref_asks_exact_remote_activation_over_tcp() {
     let registry = Arc::new(ActorRegistry::new_bound(
         actor_kind!("Ping"),
         ActorRegistryConfig {
-            actor_ref: Some(ActorRefConfig {
+            address: Some(ActorAddressConfig {
                 cluster_id: cluster_id.clone(),
                 node_address: server_address.clone(),
                 node_incarnation: server_incarnation,
@@ -95,7 +99,7 @@ async fn typed_actor_ref_asks_exact_remote_activation_over_tcp() {
         binding.as_ref(),
     ));
     let handle = registry.start(ActorId::U64(1), PingActor).await.unwrap();
-    let target: ActorRef<PingProtocol> = handle.typed_actor_ref().unwrap().unwrap();
+    let target: ActorAddress<PingProtocol> = registry.address(&ActorId::U64(1)).unwrap().unwrap();
     let server = LatticeService::builder(node_config(
         cluster_id.clone(),
         "server",
@@ -147,16 +151,14 @@ async fn typed_actor_ref_asks_exact_remote_activation_over_tcp() {
     })
     .await
     .unwrap();
-    handle.stop(StopReason::Requested).await.unwrap();
+    handle.stop(StopReason::Requested).unwrap();
     let terminated = tokio::time::timeout(Duration::from_secs(2), watch.recv())
         .await
         .unwrap()
         .unwrap();
     assert_eq!(terminated.reason, TerminatedReason::Stopped);
     assert_eq!(terminated.watch_id, watch_id);
-    assert!(
-        matches!(terminated.target, TerminatedTarget::Exact(reference) if reference == target.erase())
-    );
+    assert_eq!(terminated.target, target.clone().erase());
     let local_terminated = tokio::time::timeout(Duration::from_secs(2), local_watch.recv())
         .await
         .unwrap()
@@ -176,7 +178,7 @@ async fn local_exact_watch_uses_the_same_subscription_and_drop_cancels_it() {
     let registry = Arc::new(ActorRegistry::new_bound(
         actor_kind!("Ping"),
         ActorRegistryConfig {
-            actor_ref: Some(ActorRefConfig {
+            address: Some(ActorAddressConfig {
                 cluster_id: cluster_id.clone(),
                 node_address: address.clone(),
                 node_incarnation: incarnation,
@@ -186,7 +188,7 @@ async fn local_exact_watch_uses_the_same_subscription_and_drop_cancels_it() {
         binding.as_ref(),
     ));
     let handle = registry.start(ActorId::U64(1), PingActor).await.unwrap();
-    let target: ActorRef<PingProtocol> = handle.typed_actor_ref().unwrap().unwrap();
+    let target: ActorAddress<PingProtocol> = registry.address(&ActorId::U64(1)).unwrap().unwrap();
     let mut config = node_config(cluster_id, "local", address, incarnation);
     config.maximum_watches = 1;
     let service = LatticeService::builder(config)
@@ -213,16 +215,14 @@ async fn local_exact_watch_uses_the_same_subscription_and_drop_cancels_it() {
     let mut second = service.watch(&target).await.unwrap();
     let second_id = second.id();
     assert_eq!(second.status(), WatchStatus::Active);
-    handle.stop(StopReason::Requested).await.unwrap();
+    handle.stop(StopReason::Requested).unwrap();
     let terminated = tokio::time::timeout(Duration::from_secs(2), second.recv())
         .await
         .unwrap()
         .unwrap();
     assert_eq!(terminated.reason, TerminatedReason::Stopped);
     assert_eq!(terminated.watch_id, second_id);
-    assert!(
-        matches!(terminated.target, TerminatedTarget::Exact(reference) if reference == target.erase())
-    );
+    assert_eq!(terminated.target, target.clone().erase());
 
     service.shutdown().await.unwrap();
 }
@@ -245,7 +245,7 @@ async fn actor_context_watch_delivers_a_remote_termination_to_the_system_mailbox
     let target_registry = Arc::new(ActorRegistry::new_bound(
         actor_kind!("RemoteWatchTarget"),
         ActorRegistryConfig {
-            actor_ref: Some(ActorRefConfig {
+            address: Some(ActorAddressConfig {
                 cluster_id: cluster_id.clone(),
                 node_address: server_address.clone(),
                 node_incarnation: server_incarnation,
@@ -258,7 +258,8 @@ async fn actor_context_watch_delivers_a_remote_termination_to_the_system_mailbox
         .start(ActorId::U64(1), PingActor)
         .await
         .unwrap();
-    let target: ActorRef<PingProtocol> = target_handle.typed_actor_ref().unwrap().unwrap();
+    let target: ActorAddress<PingProtocol> =
+        target_registry.address(&ActorId::U64(1)).unwrap().unwrap();
     let server = LatticeService::builder(node_config(
         cluster_id.clone(),
         "server",
@@ -275,7 +276,7 @@ async fn actor_context_watch_delivers_a_remote_termination_to_the_system_mailbox
     let watcher_registry = Arc::new(ActorRegistry::new_bound(
         actor_kind!("RemoteWatcher"),
         ActorRegistryConfig {
-            actor_ref: Some(ActorRefConfig {
+            address: Some(ActorAddressConfig {
                 cluster_id: cluster_id.clone(),
                 node_address: client_address.clone(),
                 node_incarnation: client_incarnation,
@@ -338,7 +339,7 @@ async fn actor_context_watch_delivers_a_remote_termination_to_the_system_mailbox
         .unwrap()
         .forget();
 
-    target_handle.stop(StopReason::Requested).await.unwrap();
+    target_handle.stop(StopReason::Requested).unwrap();
     tokio::time::timeout(Duration::from_secs(2), notified.acquire())
         .await
         .unwrap()
@@ -351,9 +352,6 @@ async fn actor_context_watch_delivers_a_remote_termination_to_the_system_mailbox
         observed[0].reason,
         TerminatedReason::Stopped | TerminatedReason::ActivationChanged
     ));
-    assert!(
-        matches!(&observed[0].target, TerminatedTarget::Exact(reference) if reference == &target.clone().erase())
-    );
     drop(observed);
 
     client.shutdown().await.unwrap();

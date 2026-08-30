@@ -1,5 +1,5 @@
 use etcd_client::{GetOptions, SortOrder, SortTarget, Txn, TxnOp, TxnOpResponse};
-use lattice_core::actor_ref::PlacementDomainId;
+use lattice_core::actor_address::PlacementDomainId;
 
 use super::{EtcdPlacementStore, decode, prefix_range_end};
 use crate::{

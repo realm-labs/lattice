@@ -61,9 +61,7 @@ fn reject_command<A>(
                 );
             }
         }
-        ActorCommand::RetryStop(result)
-        | ActorCommand::Quarantine(result)
-        | ActorCommand::ForceStop { result, .. } => {
+        ActorCommand::RetryStop(result) | ActorCommand::ForceStop { result, .. } => {
             let _ = result.send(Err(ActorAdminError::MailboxClosed));
         }
         ActorCommand::Stop(_) => {}

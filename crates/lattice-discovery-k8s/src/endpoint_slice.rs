@@ -14,7 +14,7 @@ use kube::{
     config::KubeConfigOptions,
     runtime::{WatchStreamExt, watcher},
 };
-use lattice_core::{actor_ref::NodeAddress, coordinator::CoordinatorScope};
+use lattice_core::{actor_address::NodeAddress, coordinator::CoordinatorScope};
 use lattice_discovery::provider::{
     CoordinatorDirectorySnapshot, CoordinatorDiscovery, DiscoveryError, DiscoveryOrigin,
     DiscoverySource, DiscoveryTarget,

@@ -1,14 +1,16 @@
 # Tab-separated columns: relative path, exact declaration line, justification.
 # Keep this file empty unless a public re-export is required by the API design.
 crates/lattice-actor/src/lib.rs	pub use lattice_actor_macros::{Message, Request, actor_behavior};	Actor macros are intentionally available from the lattice-actor facade.
-crates/lattice-actor/src/context.rs	pub use messaging::TellTarget;	The context facade exposes the common typed tell capability while local and distributed implementations remain grouped with messaging behavior.
-crates/lattice-actor/src/context.rs	pub use tasks::ContextWatchTarget;	The context facade exposes the target accepted by its unified DeathWatch API while the implementation remains split by responsibility.
+crates/lattice-actor-distributed/src/lib.rs	pub use lattice_actor::{	The distributed facade exposes the complete local Actor API plus distributed addressing and protocols from one dependency.
+crates/lattice-actor-distributed/src/lib.rs	pub use reference::{ActorRef, EntityRef, Recipient, SingletonRef};	Bound distributed references are the primary location-transparent messaging API.
+crates/lattice-actor-distributed/src/lib.rs	pub use entity::{EntityActivationState, EntityKey, EntityKeyDecodeError, ShardedActor};	Distributed entity identity and activation traits are exposed from the distributed facade.
+crates/lattice-actor/src/context.rs	pub use messaging::{AskTarget, TellTarget};	The context facade exposes transport-independent typed messaging capabilities while implementations remain grouped with messaging behavior.
 crates/lattice-actor/src/watch.rs	pub use lattice_core::watch::{TerminatedReason, WatchId, WatchStatus};	Actor-facing DeathWatch uses the shared core identities and states without defining a second public model.
-crates/lattice-actor/src/protocol.rs	pub use lattice_core::actor_ref::ProtocolTag as __ProtocolTag;	The public derive expansion requires a stable hidden facade path.
+crates/lattice-actor-distributed/src/protocol.rs	pub use lattice_core::actor_address::ProtocolTag as __ProtocolTag;	The public protocol macro expansion requires a stable hidden facade path.
 crates/lattice-store-mongodb/src/lib.rs	pub use lattice_store_mongodb_macros::{MongoDocument, MongoDocumentSet, MongoScan};	Derive macros are intentionally available from the lattice-store-mongodb facade.
 crates/lattice-service/src/builder.rs	pub use service::LatticeService;	The service implementation is split into its own module; the builder facade keeps the published path.
 crates/lattice-store-mongodb/src/lib.rs	pub use tokio::try_join;	Generated document-set loads join their queries without forcing callers to depend on tokio.
 crates/lattice-store-mongodb/src/store/mod.rs	pub use write::{ActivationFence, ActivationFenceSummary};	Activation fencing results are part of the store API and are defined next to the write path.
 crates/lattice-sim/src/fault.rs	pub use lattice_core::failpoint::FailpointAction as FailAction;	The simulator names the shared injection decision rather than defining a second enum that could drift.
-crates/lattice-core/src/actor_ref/mod.rs	pub use identity::*;	The addressing module is split into identity primitives and reference types; the facade keeps the published path.
-crates/lattice-core/src/actor_ref/mod.rs	pub use refs::*;	The addressing module is split into identity primitives and reference types; the facade keeps the published path.
+crates/lattice-core/src/actor_address/mod.rs	pub use identity::*;	The addressing module is split into identity primitives and address types; the facade keeps the published path.
+crates/lattice-core/src/actor_address/mod.rs	pub use addresses::*;	The addressing module is split into identity primitives and address types; the facade keeps the published path.

@@ -430,7 +430,7 @@ mod tests {
     };
 
     use lattice_core::{
-        actor_ref::{NodeAddress, NodeIncarnation},
+        actor_address::{NodeAddress, NodeIncarnation},
         release::{ReleaseError, ReleaseManifest},
     };
 

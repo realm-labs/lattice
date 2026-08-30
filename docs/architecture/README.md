@@ -30,6 +30,7 @@ and [generation-4-to-5 migration](../operations/placement-generation-4-migration
 | [05-gateway-ops.md](05-gateway-ops.md) | Gateway routing, security, observability, config, common call flows, and forbidden patterns |
 | [06-appendix.md](06-appendix.md) | Recommended defaults, tradeoffs, framework/business boundary, summary |
 | [07-api-examples.md](07-api-examples.md) | Target APIs for protocols, service bootstrap, ActorRef, EntityRef, SingletonRef, watch, Gateway, EventBus, config, and scheduler |
+| [09-actor-api-boundaries.md](09-actor-api-boundaries.md) | Canonical post-hard-switch local kernel, address, bound-ref, sender-free reply, and DeathWatch model |
 | [08-distributed-testing.md](08-distributed-testing.md) | Deterministic simulation, invariants, Docker multi-process testing, fault injection, chaos, and release evidence |
 
 ## Maintenance Rules

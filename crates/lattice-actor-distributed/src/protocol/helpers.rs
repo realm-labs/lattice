@@ -1,8 +1,31 @@
 use std::collections::BTreeMap;
 
-use crate::observation::ProtocolFailure;
+use lattice_actor::{
+    handle::ActorHandle,
+    traits::{Actor, MessageKind},
+};
 
-use super::{ClientBinding, CodecDescriptor, DispatchError, DispatchMode, ProtocolId};
+use super::{
+    ClientBinding, CodecDescriptor, DispatchError, DispatchMode, ProtocolFailure, ProtocolId,
+};
+
+pub(super) fn observe_protocol_failure<A: Actor>(
+    handle: &ActorHandle<A>,
+    message_id: u64,
+    kind: MessageKind,
+    payload_size: usize,
+    error: &DispatchError,
+) {
+    tracing::warn!(
+        actor.type = std::any::type_name::<A>(),
+        actor.local_ref = handle.local_ref().id(),
+        protocol.message_id = message_id,
+        message.kind = ?kind,
+        payload.size = payload_size,
+        failure = ?protocol_failure(error),
+        "distributed protocol dispatch failed"
+    );
+}
 
 pub(super) fn bounded_error(mut message: String) -> String {
     message.truncate(256);

@@ -11,7 +11,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use lattice_actor::{
+use lattice_actor_distributed::{
     actor_protocol,
     error::ActorError,
     mailbox::MailboxConfig,
@@ -22,11 +22,11 @@ use lattice_actor::{
 };
 use lattice_config::source::ConfigSource;
 use lattice_core::{
-    actor_kind,
-    actor_ref::{
-        ClusterId, EntityId, EntityRef, EntityType, NodeAddress, NodeIncarnation,
-        PlacementDomainId, ProtocolId, RecipientRef, SingletonKind, SingletonRef,
+    actor_address::{
+        ClusterId, EntityAddress, EntityId, EntityType, NodeAddress, NodeIncarnation,
+        PlacementDomainId, ProtocolId, RecipientAddress, SingletonAddress, SingletonKind,
     },
+    actor_kind,
     instance::InstanceId,
     service_kind,
     trace::{TelemetryResource, TraceContext},
@@ -217,14 +217,14 @@ fn node_config(
 
 async fn eventually_enter(
     service: &LatticeService,
-    target: EntityRef<WorldProtocol>,
+    target: EntityAddress<WorldProtocol>,
     player_id: u64,
 ) -> Result<EnterWorldReply, Box<dyn StdError>> {
+    let target = service.bind_entity(target)?;
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        match service
+        match target
             .ask(
-                &target,
                 EnterWorldRequest {
                     world_id: 1,
                     player_id,
@@ -245,14 +245,12 @@ async fn eventually_enter(
 
 async fn eventually_tick(
     service: &LatticeService,
-    target: SingletonRef<ClockProtocol>,
+    target: SingletonAddress<ClockProtocol>,
 ) -> Result<GetClockReply, Box<dyn StdError>> {
+    let target = service.bind_singleton(target)?;
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        match service
-            .ask(&target, GetClockRequest {}, Duration::from_secs(1))
-            .await
-        {
+        match target.ask(GetClockRequest {}, Duration::from_secs(1)).await {
             Ok(reply) => return Ok(reply),
             Err(error) if Instant::now() < deadline => {
                 let _ = error;
@@ -291,7 +289,7 @@ async fn main() -> Result<(), Box<dyn StdError>> {
     let singleton_config = singleton_options.build(ProtocolId::new(CLOCK_PROTOCOL_ID)?);
     let world_ref = entity_config
         .entity_ref::<WorldProtocol>(cluster_id.clone(), EntityId::new(b"world-1".to_vec())?)?;
-    let clock_ref: SingletonRef<ClockProtocol> = SingletonRef::new(
+    let clock_ref: SingletonAddress<ClockProtocol> = SingletonAddress::new(
         cluster_id.clone(),
         domain.clone(),
         singleton_config.kind.clone(),
@@ -359,7 +357,7 @@ async fn main() -> Result<(), Box<dyn StdError>> {
         event_type: "player-entered".to_owned(),
         source_service: service_kind!("World"),
         source_instance: InstanceId::new("world-a"),
-        recipient: Some(RecipientRef::from(&world_ref).erase()),
+        recipient: Some(RecipientAddress::from(&world_ref).erase()),
         correlation_id: Some("minimal-world-run".to_owned()),
         trace: TraceContext::default(),
         occurred_unix_ms: 1,

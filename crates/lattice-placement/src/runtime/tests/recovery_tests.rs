@@ -1,4 +1,4 @@
-use lattice_core::actor_ref::{ProtocolId, SingletonKind};
+use lattice_core::actor_address::{ProtocolId, SingletonKind};
 use lattice_remoting::protocol::{ProtocolDescriptor, ProtocolFingerprint};
 
 use super::*;

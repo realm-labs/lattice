@@ -6,8 +6,8 @@ use std::{
 };
 
 use async_trait::async_trait;
-use lattice_actor::host::ProtocolHostRegistry;
-use lattice_core::actor_ref::{ClusterId, NodeIncarnation};
+use lattice_actor_distributed::host::ProtocolHostRegistry;
+use lattice_core::actor_address::{ClusterId, NodeIncarnation};
 use lattice_placement::session::{
     LogicCoordinatorConfig, LogicCoordinatorHandle, LogicPlacementEffect, PlacementDomainSession,
 };
@@ -32,7 +32,7 @@ struct PendingDrainRouter;
 impl LogicalRouter for PendingDrainRouter {
     async fn tell_entity(
         &self,
-        _target: EntityRef,
+        _target: EntityAddress,
         _fingerprint: ProtocolFingerprint,
         _message_id: u64,
         _payload: Bytes,
@@ -42,7 +42,7 @@ impl LogicalRouter for PendingDrainRouter {
 
     async fn ask_entity(
         &self,
-        _target: EntityRef,
+        _target: EntityAddress,
         _fingerprint: ProtocolFingerprint,
         _message_id: u64,
         _payload: Bytes,
@@ -53,7 +53,7 @@ impl LogicalRouter for PendingDrainRouter {
 
     async fn tell_singleton(
         &self,
-        _target: SingletonRef,
+        _target: SingletonAddress,
         _fingerprint: ProtocolFingerprint,
         _message_id: u64,
         _payload: Bytes,
@@ -63,7 +63,7 @@ impl LogicalRouter for PendingDrainRouter {
 
     async fn ask_singleton(
         &self,
-        _target: SingletonRef,
+        _target: SingletonAddress,
         _fingerprint: ProtocolFingerprint,
         _message_id: u64,
         _payload: Bytes,
@@ -74,15 +74,15 @@ impl LogicalRouter for PendingDrainRouter {
 
     async fn resolve_entity_current(
         &self,
-        _target: EntityRef,
-    ) -> Result<Option<ActorRef>, WatchError> {
+        _target: EntityAddress,
+    ) -> Result<Option<ActorAddress>, WatchError> {
         Err(WatchError::Unavailable)
     }
 
     async fn resolve_singleton_current(
         &self,
-        _target: SingletonRef,
-    ) -> Result<Option<ActorRef>, WatchError> {
+        _target: SingletonAddress,
+    ) -> Result<Option<ActorAddress>, WatchError> {
         Err(WatchError::Unavailable)
     }
 

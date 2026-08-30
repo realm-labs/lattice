@@ -3,9 +3,9 @@ use std::{
     sync::Arc,
 };
 
-use lattice_actor::host::ProtocolHostRegistry;
+use lattice_actor_distributed::host::ProtocolHostRegistry;
 use lattice_core::{
-    actor_ref::{ClusterId, NodeIncarnation},
+    actor_address::{ClusterId, NodeIncarnation},
     release::ReleaseManifest,
 };
 use lattice_placement::{

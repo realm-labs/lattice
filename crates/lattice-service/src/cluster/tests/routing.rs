@@ -6,10 +6,10 @@ use std::{
     time::Duration,
 };
 
-use lattice_actor::registry::{ActorRefConfig, ActorRegistryConfig};
+use lattice_actor_distributed::registry::{ActorAddressConfig, ActorRegistryConfig};
 use lattice_core::{
+    actor_address::{ClusterId, EntityId, EntityType, NodeAddress, NodeIncarnation, ProtocolId},
     actor_kind,
-    actor_ref::{ClusterId, EntityId, EntityType, NodeAddress, NodeIncarnation, ProtocolId},
     coordinator::CoordinatorScope,
 };
 use lattice_placement::{
@@ -290,7 +290,7 @@ async fn unavailable_resolution_fails_fast_and_clears_route_single_flight() {
         Err(RemoteMessageError::ShardUnavailable)
     );
 
-    let singleton = SingletonRef::new(
+    let singleton = SingletonAddress::new(
         cluster_id,
         domain(),
         singleton_config.kind.clone(),
@@ -485,7 +485,7 @@ async fn stale_generation_never_reaches_entity_loader() {
     let registry = Arc::new(ActorRegistry::new_bound(
         actor_kind!("Entity"),
         ActorRegistryConfig {
-            actor_ref: Some(ActorRefConfig {
+            address: Some(ActorAddressConfig {
                 cluster_id: cluster_id.clone(),
                 node_address: local_address.clone(),
                 node_incarnation: local_incarnation,

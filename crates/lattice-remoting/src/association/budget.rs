@@ -189,7 +189,7 @@ mod tests {
     use std::{sync::Arc, time::Duration};
 
     use bytes::Bytes;
-    use lattice_core::actor_ref::{ClusterId, NodeAddress, NodeIncarnation};
+    use lattice_core::actor_address::{ClusterId, NodeAddress, NodeIncarnation};
 
     use super::*;
     use crate::{

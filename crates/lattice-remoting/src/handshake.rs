@@ -1,4 +1,4 @@
-use lattice_core::actor_ref::{ClusterId, NodeAddress, NodeIncarnation};
+use lattice_core::actor_address::{ClusterId, NodeAddress, NodeIncarnation};
 use prost::Message;
 use thiserror::Error;
 

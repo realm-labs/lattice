@@ -5,12 +5,12 @@ use lattice_placement::{control::PlacementControlCommand, types::ShardId};
 use lattice_remoting::association::Association;
 
 use super::{
-    ActorRef, AskError, AssociationKey, AssociationManager, AssociationState, Bytes, EntityConfig,
-    EntityRef, Instant, LOGICAL_RESOLVE_MESSAGE_ID, LogicPlacementState, LogicalEntityTarget,
-    Mutex, NodeKey, OutboundMessage, OutboundMessaging, PlacementSlot, PlacementSlotKey,
-    PlacementSlotState, ProtocolFingerprint, RemoteMessageError, RouteBuffer, ShardMapperBinding,
-    WatchError, async_trait, decode_resolved_actor, entity::EntityRoute, map_tell,
-    next_logical_resolution, peers::PeerReconciler,
+    ActorAddress, AskError, AssociationKey, AssociationManager, AssociationState, Bytes,
+    EntityAddress, EntityConfig, Instant, LOGICAL_RESOLVE_MESSAGE_ID, LogicPlacementState,
+    LogicalEntityTarget, Mutex, NodeKey, OutboundMessage, OutboundMessaging, PlacementSlot,
+    PlacementSlotKey, PlacementSlotState, ProtocolFingerprint, RemoteMessageError, RouteBuffer,
+    ShardMapperBinding, WatchError, async_trait, decode_resolved_actor, entity::EntityRoute,
+    map_tell, next_logical_resolution, peers::PeerReconciler,
 };
 
 pub(super) struct EntityProxyRoute {
@@ -27,7 +27,7 @@ pub(super) struct EntityProxyRoute {
 }
 
 impl EntityProxyRoute {
-    fn slot_key(&self, target: &EntityRef) -> Result<PlacementSlotKey, RemoteMessageError> {
+    fn slot_key(&self, target: &EntityAddress) -> Result<PlacementSlotKey, RemoteMessageError> {
         if target.protocol_id() != self.config.protocol_id
             || target.domain() != &self.config.domain
             || target.config_fingerprint() != self.config.fingerprint()
@@ -46,7 +46,7 @@ impl EntityProxyRoute {
 
     fn running_slot(
         &self,
-        target: &EntityRef,
+        target: &EntityAddress,
     ) -> Result<(PlacementSlotKey, PlacementSlot), RemoteMessageError> {
         let key = self.slot_key(target)?;
         let slot = self
@@ -113,7 +113,7 @@ impl EntityProxyRoute {
 
     async fn await_running_slot(
         &self,
-        target: &EntityRef,
+        target: &EntityAddress,
         payload_bytes: usize,
         requested_deadline: Option<Instant>,
     ) -> Result<(PlacementSlotKey, PlacementSlot), RemoteMessageError> {
@@ -163,7 +163,7 @@ impl EntityProxyRoute {
 
     async fn remote_association(
         &self,
-        target: &EntityRef,
+        target: &EntityAddress,
         owner: &NodeKey,
     ) -> Result<Arc<Association>, RemoteMessageError> {
         if owner == &self.local_node {
@@ -195,7 +195,7 @@ impl EntityProxyRoute {
 impl EntityRoute for EntityProxyRoute {
     async fn tell(
         &self,
-        target: EntityRef,
+        target: EntityAddress,
         fingerprint: ProtocolFingerprint,
         message_id: u64,
         payload: Bytes,
@@ -225,7 +225,7 @@ impl EntityRoute for EntityProxyRoute {
 
     async fn ask(
         &self,
-        target: EntityRef,
+        target: EntityAddress,
         fingerprint: ProtocolFingerprint,
         message_id: u64,
         payload: Bytes,
@@ -281,7 +281,10 @@ impl EntityRoute for EntityProxyRoute {
         Err(RemoteMessageError::Unauthorized)
     }
 
-    async fn resolve_current(&self, target: EntityRef) -> Result<Option<ActorRef>, WatchError> {
+    async fn resolve_current(
+        &self,
+        target: EntityAddress,
+    ) -> Result<Option<ActorAddress>, WatchError> {
         let (_, slot) = self
             .running_slot(&target)
             .map_err(|_| WatchError::NotActive)?;

@@ -12,7 +12,7 @@ mod state;
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
-use lattice_actor::{context::PipeTaskHandle, registry::ActorCreateContext};
+use lattice_actor_distributed::{context::PipeTaskHandle, registry::ActorCreateContext};
 
 use crate::document::tracked::{Tracked, TrackedMutationSignal};
 use crate::error::MongoStoreError;

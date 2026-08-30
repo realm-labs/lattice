@@ -7,7 +7,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use lattice_core::actor_ref::{ClusterId, NodeAddress, NodeIncarnation};
+use lattice_core::actor_address::{ClusterId, NodeAddress, NodeIncarnation};
 use thiserror::Error;
 use tokio::sync::{Notify, mpsc};
 

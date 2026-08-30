@@ -1,6 +1,6 @@
 use std::{collections::BTreeSet, sync::Arc, time::Duration};
 
-use lattice_core::actor_ref::{ClusterId, NodeIncarnation};
+use lattice_core::actor_address::{ClusterId, NodeIncarnation};
 use lattice_id::{
     service::{DistributedIdConfig, DistributedIdService, DistributedIdState},
     worker::{

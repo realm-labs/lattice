@@ -1,5 +1,5 @@
-use lattice_actor::actor_protocol;
-use lattice_actor::protocol::ProstCodec;
+use lattice_actor_distributed::actor_protocol;
+use lattice_actor_distributed::protocol::ProstCodec;
 use lattice_actor::traits::Message;
 
 #[derive(Clone, PartialEq, prost::Message)]

@@ -5,7 +5,9 @@ use std::{
 };
 
 use lattice_core::{
-    actor_ref::{ConfigFingerprint, EntityType, NodeAddress, NodeIncarnation, PlacementDomainId},
+    actor_address::{
+        ConfigFingerprint, EntityType, NodeAddress, NodeIncarnation, PlacementDomainId,
+    },
     coordinator::CoordinatorScope,
 };
 use lattice_remoting::{association::AssociationManager, config::RemotingConfig};

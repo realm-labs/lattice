@@ -11,7 +11,7 @@ use std::{
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::{StreamExt as _, stream::FuturesUnordered};
-use lattice_actor::{
+use lattice_actor_distributed::{
     error::{ActorCallError, ActorError},
     handle::ActorHandle,
     registry::{ActorRegistry, ActorRegistryConfig},
@@ -19,10 +19,10 @@ use lattice_actor::{
     traits::{Actor, Handler, Request, Responder},
 };
 use lattice_core::{
-    actor_kind,
-    actor_ref::{
-        ActivationId, ActorPath, ActorRef, ClusterId, NodeAddress, NodeIncarnation, ProtocolId,
+    actor_address::{
+        ActivationId, ActorAddress, ActorPath, ClusterId, NodeAddress, NodeIncarnation, ProtocolId,
     },
+    actor_kind,
     id::ActorId,
 };
 use lattice_remoting::{
@@ -213,7 +213,7 @@ pub struct RemoteActorTopology {
     messaging: Arc<OutboundMessaging>,
     association: Arc<Association>,
     inbound_association: Arc<Association>,
-    target: ActorRef,
+    target: ActorAddress,
     fingerprint: ProtocolFingerprint,
     prepared_tell: PreparedExactTellRoute,
     tell_completion: Arc<TellCompletion>,
@@ -290,7 +290,7 @@ impl RemoteActorTopology {
                 client_identity.incarnation,
             )
             .ok_or("server did not register the inbound benchmark association")?;
-        let target = ActorRef::new(
+        let target = ActorAddress::new(
             cluster_id,
             server_identity.address,
             server_identity.incarnation,

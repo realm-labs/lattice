@@ -1,8 +1,8 @@
 //! Process-local typed Actor runtime.
 //!
-//! The default build contains local handles, mailboxes, scheduling, supervision, timers, and
-//! lifecycle management. Enable the `distributed` feature for serializable Actor references,
-//! protocol dispatch, registries, remote recipients, and remoting integration.
+//! This crate contains local handles, mailboxes, scheduling, supervision,
+//! timers, and lifecycle management. Serializable addresses, protocols,
+//! registries, and remoting live in `lattice-actor-distributed`.
 
 #![cfg_attr(not(test), deny(clippy::wildcard_imports))]
 
@@ -11,21 +11,12 @@ extern crate self as lattice_actor;
 pub use lattice_actor_macros::{Message, Request, actor_behavior};
 
 pub mod context;
-#[cfg(feature = "distributed")]
-pub mod directory;
 pub mod error;
 pub mod handle;
-#[cfg(feature = "distributed")]
-pub mod host;
 pub mod mailbox;
 pub mod observation;
-#[cfg(feature = "distributed")]
-pub mod protocol;
-#[cfg(feature = "distributed")]
-pub mod recipient;
-#[cfg(feature = "distributed")]
-pub mod registry;
 pub mod reply;
+pub mod resources;
 pub mod runtime;
 pub mod state_machine;
 pub mod traits;

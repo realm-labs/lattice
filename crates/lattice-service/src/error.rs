@@ -1,4 +1,4 @@
-use lattice_actor::{
+use lattice_actor_distributed::{
     host::{HostAdminError, HostRegistryError},
     protocol::ProtocolBuildError,
     recipient::ProtocolRegistrationError,

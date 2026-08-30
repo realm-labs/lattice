@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 
-use lattice_core::actor_ref::{EntityType, NodeIncarnation, PlacementDomainId};
+use lattice_core::actor_address::{EntityType, NodeIncarnation, PlacementDomainId};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 

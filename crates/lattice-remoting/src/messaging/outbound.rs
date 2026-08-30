@@ -3,7 +3,7 @@ use std::{cmp::Ordering as CmpOrdering, collections::BinaryHeap};
 use tokio::{sync::Notify, time::Instant as TokioInstant};
 
 use super::{
-    ActorRef, Arc, Association, AssociationId, AtomicU64, Bytes, CatalogueDecision, Duration,
+    ActorAddress, Arc, Association, AssociationId, AtomicU64, Bytes, CatalogueDecision, Duration,
     Frame, FrameKind, HashMap, Instant, Mutex, Ordering, ProtocolFingerprint, ProtocolId,
     ProtocolTag,
     codec::{AskWire, EntityAskWire, SingletonAskWire},
@@ -206,7 +206,7 @@ impl OutboundMessaging {
     pub fn tell<A: ProtocolTag>(
         &self,
         association: &Association,
-        target: &ActorRef<A>,
+        target: &ActorAddress<A>,
         message: OutboundMessage,
     ) -> Result<usize, TellError> {
         self.try_tell_retained(association, target, message)
@@ -217,7 +217,7 @@ impl OutboundMessaging {
     pub fn try_tell_retained<A: ProtocolTag>(
         &self,
         association: &Association,
-        target: &ActorRef<A>,
+        target: &ActorAddress<A>,
         message: OutboundMessage,
     ) -> Result<usize, (TellError, Bytes)> {
         if let Err(error) = check_protocol(
@@ -245,7 +245,7 @@ impl OutboundMessaging {
     pub async fn tell_wait<A: ProtocolTag>(
         &self,
         association: &Association,
-        target: &ActorRef<A>,
+        target: &ActorAddress<A>,
         message: OutboundMessage,
     ) -> Result<usize, TellError> {
         check_protocol(
@@ -277,7 +277,7 @@ impl OutboundMessaging {
     pub fn prepare_exact_tell_route<A: ProtocolTag>(
         &self,
         association: Arc<Association>,
-        target: &ActorRef<A>,
+        target: &ActorAddress<A>,
         expected_fingerprint: ProtocolFingerprint,
     ) -> Result<PreparedExactTellRoute, TellError> {
         check_protocol(&association, target.protocol_id(), expected_fingerprint)
@@ -347,7 +347,7 @@ impl OutboundMessaging {
     pub async fn ask<A: ProtocolTag>(
         &self,
         association: &Association,
-        target: &ActorRef<A>,
+        target: &ActorAddress<A>,
         message: OutboundMessage,
         deadline: Instant,
     ) -> Result<Bytes, AskError> {

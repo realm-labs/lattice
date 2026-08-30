@@ -5,13 +5,13 @@ use std::{
     time::Duration,
 };
 
-use lattice_actor::{
+use lattice_actor_distributed::{
     host::ProtocolHostRegistry,
-    registry::{ActorRefConfig, ActorRegistryConfig},
+    registry::{ActorAddressConfig, ActorRegistryConfig},
 };
 use lattice_core::{
+    actor_address::{ClusterId, EntityId, EntityType, NodeAddress, NodeIncarnation, ProtocolId},
     actor_kind,
-    actor_ref::{ClusterId, EntityId, EntityType, NodeAddress, NodeIncarnation, ProtocolId},
 };
 use lattice_placement::{
     control::PlacementControlRouter,
@@ -163,7 +163,7 @@ async fn remote_entity_ask_reaches_only_claimed_owner() {
         Arc::new(ActorRegistry::new_bound(
             actor_kind!("RemoteEntity"),
             ActorRegistryConfig {
-                actor_ref: Some(ActorRefConfig {
+                address: Some(ActorAddressConfig {
                     cluster_id: cluster_id.clone(),
                     node_address: address,
                     node_incarnation: incarnation,
@@ -326,7 +326,7 @@ async fn remote_entity_ask_reaches_only_claimed_owner() {
         .unwrap();
     assert_eq!(current.node_address(), &owner_node.address);
     assert_eq!(current.node_incarnation(), owner_node.incarnation);
-    let singleton = SingletonRef::new(
+    let singleton = SingletonAddress::new(
         cluster_id,
         domain(),
         singleton_kind,

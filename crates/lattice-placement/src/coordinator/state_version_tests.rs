@@ -1,4 +1,4 @@
-use lattice_core::{actor_ref::NodeAddress, coordinator::CoordinatorScope};
+use lattice_core::{actor_address::NodeAddress, coordinator::CoordinatorScope};
 
 use super::*;
 use crate::control::{

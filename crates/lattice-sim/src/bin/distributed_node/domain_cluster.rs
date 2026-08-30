@@ -248,7 +248,7 @@ async fn domain_logic(
         let registry = Arc::new(ActorRegistry::new_bound(
             actor_kind!("DistributedScaleFixture"),
             ActorRegistryConfig {
-                actor_ref: Some(ActorRefConfig {
+                address: Some(ActorAddressConfig {
                     cluster_id: cluster.clone(),
                     node_address: address,
                     node_incarnation: incarnation,
@@ -258,17 +258,11 @@ async fn domain_logic(
             },
             protocol.as_ref(),
         ));
-        let handle = registry
-            .start(
-                ActorId::U64(1),
-                PingActor {
-                    child_reference: None,
-                },
-            )
-            .await?;
-        let reference: ActorRef<FixtureProtocol> = handle
-            .typed_actor_ref()?
-            .ok_or("scale actor is missing its ActorRef")?;
+        let actor_id = ActorId::U64(1);
+        registry.start(actor_id.clone(), PingActor).await?;
+        let reference: ActorAddress<FixtureProtocol> = registry
+            .address(&actor_id)?
+            .ok_or("scale actor is missing its ActorAddress")?;
         scale_actor = Some(reference);
         builder = builder.register_actor(registry, protocol)?;
     }
@@ -390,7 +384,7 @@ async fn domain_logic(
 fn write_scale_actor_artifact(
     artifact: &Path,
     node_id: &str,
-    reference: &ActorRef<FixtureProtocol>,
+    reference: &ActorAddress<FixtureProtocol>,
 ) -> Result<(), Box<dyn Error>> {
     let directory = artifact
         .parent()
@@ -410,7 +404,7 @@ fn write_scale_actor_artifact(
 async fn run_scale_ring(
     artifact: &Path,
     node_id: &str,
-    local_reference: &ActorRef<FixtureProtocol>,
+    local_reference: &ActorAddress<FixtureProtocol>,
     service: &LatticeService,
     membership: &MemberSnapshot,
 ) -> Result<RingArtifact, Box<dyn Error>> {
@@ -459,7 +453,7 @@ async fn run_scale_ring(
                 }
                 _ => {
                     return Err(IoError::other(format!(
-                        "scale peer ActorRef {} did not appear within 30s",
+                        "scale peer ActorAddress {} did not appear within 30s",
                         peer.node.node_id
                     ))
                     .into());

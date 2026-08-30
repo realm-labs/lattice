@@ -1,6 +1,6 @@
 use async_trait::async_trait;
-use lattice_core::actor_ref::{
-    ActivationId, ActorPath, ActorRef, ClusterId, NodeAddress, NodeIncarnation, ProtocolId,
+use lattice_core::actor_address::{
+    ActivationId, ActorAddress, ActorPath, ClusterId, NodeAddress, NodeIncarnation, ProtocolId,
 };
 use tokio::net::{TcpListener, TcpStream};
 
@@ -218,7 +218,7 @@ async fn interactive_lane_stays_awake_while_ask_is_in_flight() {
             .await
         })
     };
-    let target = ActorRef::new(
+    let target = ActorAddress::new(
         ClusterId::new("lane-test").unwrap(),
         server_address,
         server_incarnation,
@@ -283,8 +283,8 @@ fn lane_target(
     address: &NodeAddress,
     incarnation: NodeIncarnation,
     protocol_id: ProtocolId,
-) -> ActorRef {
-    ActorRef::new(
+) -> ActorAddress {
+    ActorAddress::new(
         ClusterId::new("lane-test").unwrap(),
         address.clone(),
         incarnation,
@@ -509,7 +509,7 @@ async fn a_queued_compact_tell_is_expanded_after_the_stripe_reconnects() {
     assert_eq!(client_lane.await.unwrap().unwrap(), LaneExit::Shutdown);
     assert_eq!(server_lane.await.unwrap().unwrap(), LaneExit::Shutdown);
     let dispatched = dispatch.tells.lock().expect("recording dispatch poisoned");
-    let dispatched: ActorRef = dispatched[0].actor_ref().unwrap();
+    let dispatched: ActorAddress = dispatched[0].actor_address().unwrap();
     assert!(dispatched.same_activation(&target));
     assert_eq!(server_association.metrics().dropped_inbound_frames, 0);
 }

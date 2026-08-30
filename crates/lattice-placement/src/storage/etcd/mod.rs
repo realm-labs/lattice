@@ -4,7 +4,7 @@ use etcd_client::{
     Client, Compare, CompareOp, ConnectOptions, GetOptions, SortOrder, SortTarget, Txn, TxnOp,
 };
 use lattice_core::{
-    actor_ref::{EntityType, PlacementDomainId, SingletonKind},
+    actor_address::{EntityType, PlacementDomainId, SingletonKind},
     coordinator::CoordinatorScope,
 };
 use serde::{Serialize, de::DeserializeOwned};

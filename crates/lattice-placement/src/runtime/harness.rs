@@ -13,7 +13,7 @@ use std::{
 };
 
 use lattice_core::{
-    actor_ref::{
+    actor_address::{
         ClusterId, EntityType, NodeAddress, NodeIncarnation, PlacementDomainId, ProtocolId,
     },
     coordinator::CoordinatorScope,

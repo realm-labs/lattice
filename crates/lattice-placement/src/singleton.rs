@@ -1,9 +1,9 @@
 use std::{collections::VecDeque, time::Duration};
 
 use bytes::Bytes;
-use lattice_core::actor_ref::{
-    ClusterId, ConfigFingerprint, PlacementDomainId, ProtocolId, ProtocolTag, ReferenceError,
-    SingletonKind, SingletonRef,
+use lattice_core::actor_address::{
+    AddressError, ClusterId, ConfigFingerprint, PlacementDomainId, ProtocolId, ProtocolTag,
+    SingletonAddress, SingletonKind,
 };
 use thiserror::Error;
 
@@ -113,8 +113,8 @@ impl SingletonProxy {
     pub fn singleton_ref<P: ProtocolTag>(
         &self,
         cluster_id: ClusterId,
-    ) -> Result<SingletonRef<P>, ReferenceError> {
-        SingletonRef::new(
+    ) -> Result<SingletonAddress<P>, AddressError> {
+        SingletonAddress::new(
             cluster_id,
             self.domain.clone(),
             self.kind.clone(),

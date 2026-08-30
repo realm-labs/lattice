@@ -16,11 +16,6 @@ use std::{
     time::Instant,
 };
 
-#[cfg(feature = "distributed")]
-use std::sync::OnceLock;
-
-#[cfg(feature = "distributed")]
-use lattice_core::actor_ref::ActorRef;
 use lattice_core::service_context::ServiceContext;
 use tokio::task::{JoinHandle, JoinSet};
 
@@ -28,13 +23,11 @@ use crate::{
     error::ActorError,
     handle::ActorHandle,
     reply::PendingReply,
+    resources::ActorResources,
     runtime::spawner::ActorSpawner,
     traits::{Actor, ChildActorKey, PassivationReason, StopReason},
     watch::WatchId,
 };
-
-#[cfg(feature = "distributed")]
-use crate::recipient::ActorSystem;
 
 mod children;
 mod deferred;
@@ -42,8 +35,7 @@ mod extensions;
 mod messaging;
 mod tasks;
 
-pub use messaging::TellTarget;
-pub use tasks::ContextWatchTarget;
+pub use messaging::{AskTarget, TellTarget};
 
 use children::ChildStop;
 
@@ -58,21 +50,6 @@ pub struct PipeTaskHandle {
     abort: tokio::task::AbortHandle,
 }
 
-/// Owned, message-scoped capability for typed Actor messaging.
-///
-/// This is the narrow owned counterpart of [`ActorContext::tell`] and
-/// [`ActorContext::ask`]. It snapshots only the current Actor system and
-/// request deadline, so an
-/// adapter may retain it across an async call without retaining or erasing an
-/// [`ActorContext`] borrow. The target protocol and message types remain
-/// statically checked at each call site.
-#[cfg(feature = "distributed")]
-#[derive(Clone, Debug)]
-pub struct ActorTurnMessaging {
-    actor_system: ActorSystem,
-    deadline: Option<Instant>,
-}
-
 /// Type-indexed state owned by one actor activation.
 ///
 /// Values are retained for the lifetime of the surrounding [`ActorContext`]. They are not shared,
@@ -84,11 +61,8 @@ pub struct ActorLocalExtensions {
 
 pub struct ActorContext<A: Actor> {
     handle: ActorHandle<A>,
-    #[cfg(feature = "distributed")]
-    self_ref: Option<ActorRef>,
-    #[cfg(feature = "distributed")]
-    actor_system: Option<Arc<OnceLock<ActorSystem>>>,
     service: ServiceContext,
+    resources: ActorResources,
     local_extensions: ActorLocalExtensions,
     spawner: ActorSpawner,
     lifecycle_request: Option<StopReason>,
@@ -106,16 +80,9 @@ impl<A: Actor> fmt::Debug for ActorContext<A> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut debug = formatter.debug_struct("ActorContext");
         debug.field("handle", &self.handle);
-        #[cfg(feature = "distributed")]
-        debug.field(
-            "self_ref",
-            &self
-                .self_ref
-                .as_ref()
-                .map(|actor_ref| actor_ref.actor_path()),
-        );
         debug
             .field("service", &self.service)
+            .field("resources", &self.resources)
             .field("local_extensions", &self.local_extensions)
             .field("lifecycle_request", &self.lifecycle_request)
             .field("task_count", &self.tasks.len())
@@ -137,19 +104,15 @@ impl<A: Actor> fmt::Debug for ActorContext<A> {
 impl<A: Actor> ActorContext<A> {
     pub(crate) fn new(
         handle: ActorHandle<A>,
-        #[cfg(feature = "distributed")] self_ref: Option<ActorRef>,
-        #[cfg(feature = "distributed")] actor_system: Option<Arc<OnceLock<ActorSystem>>>,
         service: ServiceContext,
+        resources: ActorResources,
         spawner: ActorSpawner,
         deferred_capacity: usize,
     ) -> Self {
         Self {
             handle,
-            #[cfg(feature = "distributed")]
-            self_ref,
-            #[cfg(feature = "distributed")]
-            actor_system,
             service,
+            resources,
             local_extensions: ActorLocalExtensions::new(),
             spawner,
             lifecycle_request: None,
@@ -164,16 +127,6 @@ impl<A: Actor> ActorContext<A> {
         }
     }
 
-    /// Returns this actor's exact activation reference when one was assigned.
-    ///
-    /// Clone the reference before putting it in a message or retaining it. The
-    /// reference remains bound to this activation and becomes stale after the
-    /// actor stops or is replaced.
-    #[cfg(feature = "distributed")]
-    pub fn self_ref(&self) -> Option<&ActorRef> {
-        self.self_ref.as_ref()
-    }
-
     pub fn self_handle(&self) -> ActorHandle<A> {
         self.handle.clone()
     }
@@ -182,19 +135,20 @@ impl<A: Actor> ActorContext<A> {
         &self.service
     }
 
+    /// Returns an immutable capability installed for this activation.
+    pub fn resource<T>(&self) -> Option<Arc<T>>
+    where
+        T: Send + Sync + 'static,
+    {
+        self.resources.get::<T>()
+    }
+
     pub fn local_extensions(&self) -> &ActorLocalExtensions {
         &self.local_extensions
     }
 
     pub fn local_extensions_mut(&mut self) -> &mut ActorLocalExtensions {
         &mut self.local_extensions
-    }
-
-    #[cfg(feature = "distributed")]
-    pub fn require_self_ref(&self) -> Result<&ActorRef, ActorError> {
-        self.self_ref
-            .as_ref()
-            .ok_or_else(|| ActorError::new("actor self ref is not available"))
     }
 
     /// Returns the absolute deadline attached to the current request, if any.

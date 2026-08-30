@@ -2,7 +2,7 @@ use std::{collections::BTreeMap, sync::Arc, time::Instant};
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use lattice_core::actor_ref::{ActorRef, ProtocolId};
+use lattice_core::actor_address::{ActorAddress, ProtocolId};
 use lattice_remoting::messaging::{
     error::RemoteMessageError,
     inbound::{ImmediateTellDispatch, InboundDispatch},
@@ -10,13 +10,16 @@ use lattice_remoting::messaging::{
 };
 use thiserror::Error;
 
-use crate::{
+use lattice_actor::{
     error::ActorCallError,
     handle::{ActorHandle, ActorTerminationSubscription},
-    protocol::{ActorProtocolBinding, DispatchError, DispatchMode, DispatchReply, Protocol},
-    registry::{ActorCellDiagnostics, ActorQuarantineError, ActorRegistry},
     traits::Actor,
     watch::LocalActorRef,
+};
+
+use crate::{
+    protocol::{ActorProtocolBinding, DispatchError, DispatchMode, DispatchReply, Protocol},
+    registry::{ActorCellDiagnostics, ActorQuarantineError, ActorRegistry},
 };
 
 #[async_trait]
@@ -70,7 +73,7 @@ impl<A: Actor, P: Protocol> ActorHost<A, P> {
     }
 
     fn resolve(&self, target: &ExactActorTarget) -> Result<ActorHandle<A>, RemoteMessageError> {
-        let reference = ActorRef::new(
+        let reference = ActorAddress::new(
             target.cluster_id.clone(),
             target.node_address.clone(),
             target.node_incarnation,

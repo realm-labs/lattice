@@ -18,14 +18,6 @@ impl ActorSpawner {
         }
     }
 
-    #[cfg(feature = "distributed")]
-    pub(crate) fn task_per_actor() -> Self {
-        Self::new(
-            ActorScheduler::default(),
-            ActorExecutionPolicy::TaskPerActor,
-        )
-    }
-
     pub(super) fn spawn<A>(
         &self,
         actor: A,

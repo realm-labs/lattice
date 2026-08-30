@@ -10,12 +10,7 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-#[cfg(feature = "distributed")]
-use std::sync::OnceLock;
-
 use futures_util::FutureExt;
-#[cfg(feature = "distributed")]
-use lattice_core::actor_ref::{ActivationId, ActorRef, NodeIncarnation};
 use lattice_core::service_context::ServiceContext;
 use tokio::sync::{broadcast, oneshot, watch};
 use tracing::{Instrument, debug, error, info};
@@ -29,12 +24,10 @@ use crate::{
         channel::{self, Receiver},
     },
     observation::{ActorLifecycleEvent, ActorObserverHandle},
+    resources::ActorResources,
     traits::{Actor, ActorLifecycleState, StopReason},
     watch::{ActorTermination, LocalActorRef, TerminatedReason},
 };
-
-#[cfg(feature = "distributed")]
-use crate::recipient::ActorSystem;
 
 mod dispatch;
 mod panic;
@@ -51,17 +44,9 @@ use spawner::ActorSpawner;
 use worker_pool::{ActorWorkerPool, WorkerPoolKind};
 
 static NEXT_LOCAL_ACTOR_ID: AtomicU64 = AtomicU64::new(1);
-#[cfg(feature = "distributed")]
-static NEXT_ACTIVATION_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 // Match the default turn budget so the common saturated path releases mailbox capacity once per
 // turn instead of once per message. Smaller turn budgets still cap the prefetch.
 const NORMAL_RECEIVE_BATCH_SIZE: usize = 64;
-
-#[cfg(feature = "distributed")]
-pub(crate) fn next_activation_id(node_incarnation: NodeIncarnation) -> ActivationId {
-    let sequence = NEXT_ACTIVATION_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    ActivationId::new(node_incarnation, sequence).expect("process activation sequence is nonzero")
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActorExecutionPolicy {
@@ -130,8 +115,6 @@ pub struct ActorSpawnOptions {
     pub execution: Option<ActorExecutionPolicy>,
     pub scheduler_key: Option<SchedulerKey>,
     pub passivation: PassivationPolicy,
-    #[cfg(feature = "distributed")]
-    pub self_ref: Option<ActorRef>,
     pub service: ServiceContext,
 }
 
@@ -140,14 +123,6 @@ pub enum PassivationPolicy {
     #[default]
     Disabled,
     IdleTimeout(Duration),
-}
-
-#[cfg(feature = "distributed")]
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum ShardMigrationPolicy {
-    #[default]
-    BlockRunningActors,
-    PassivateRunningActors,
 }
 
 #[derive(Debug, Clone)]
@@ -176,15 +151,33 @@ impl ActorRuntime {
     where
         A: Actor,
     {
+        self.spawn_managed_actor(actor, options, ActorResources::empty(), None)
+    }
+
+    /// Spawns an Actor with immutable integration capabilities and a terminal hook.
+    ///
+    /// Runtime integrations use this boundary to associate external routing or
+    /// persistence state without adding those concepts to the local Actor
+    /// runtime.
+    #[doc(hidden)]
+    pub fn spawn_managed_actor<A>(
+        &self,
+        actor: A,
+        options: ActorSpawnOptions,
+        resources: ActorResources,
+        terminal_hook: Option<Box<dyn FnOnce(LocalActorRef) + Send + 'static>>,
+    ) -> Result<ActorHandle<A>, ActorSpawnError>
+    where
+        A: Actor,
+    {
         let spawner = ActorSpawner::new(self.scheduler.clone(), self.config.default_execution);
         spawner.spawn(
             actor,
             ActorSpawnContext {
                 options,
-                #[cfg(feature = "distributed")]
-                actor_system: None,
                 observer: self.config.observer.clone(),
-                terminal_hook: None,
+                terminal_hook,
+                resources,
                 spawner: spawner.clone(),
             },
         )
@@ -408,8 +401,6 @@ where
                 execution: Some(ActorExecutionPolicy::TaskPerActor),
                 scheduler_key: None,
                 passivation: PassivationPolicy::Disabled,
-                #[cfg(feature = "distributed")]
-                self_ref: None,
                 service: ServiceContext::empty(),
             },
         )
@@ -432,8 +423,6 @@ where
                 execution: Some(ActorExecutionPolicy::TaskPerActor),
                 scheduler_key: None,
                 passivation: PassivationPolicy::Disabled,
-                #[cfg(feature = "distributed")]
-                self_ref: None,
                 service,
             },
         )
@@ -442,10 +431,9 @@ where
 
 pub(crate) struct ActorSpawnContext {
     pub(crate) options: ActorSpawnOptions,
-    #[cfg(feature = "distributed")]
-    pub(crate) actor_system: Option<Arc<OnceLock<ActorSystem>>>,
     pub(crate) observer: ActorObserverHandle,
     pub(crate) terminal_hook: Option<TerminalHook>,
+    pub(crate) resources: ActorResources,
     pub(crate) spawner: ActorSpawner,
 }
 
@@ -462,17 +450,14 @@ impl ActorSpawnContext {
     {
         let ActorSpawnContext {
             options,
-            #[cfg(feature = "distributed")]
-            actor_system,
             observer,
             terminal_hook,
+            resources,
             spawner,
         } = self;
         let ActorSpawnOptions {
             mailbox,
             passivation,
-            #[cfg(feature = "distributed")]
-            self_ref,
             service,
             scheduler_key,
             execution: _,
@@ -480,13 +465,10 @@ impl ActorSpawnContext {
         (
             create_actor_parts(
                 mailbox,
-                #[cfg(feature = "distributed")]
-                self_ref,
-                #[cfg(feature = "distributed")]
-                actor_system,
                 service,
                 observer,
                 terminal_hook,
+                resources,
                 spawner,
             ),
             passivation,
@@ -495,7 +477,7 @@ impl ActorSpawnContext {
     }
 }
 
-pub(crate) fn spawn_actor_with_self_ref<A>(
+pub(crate) fn spawn_actor_from_context<A>(
     actor: A,
     context: ActorSpawnContext,
 ) -> Result<ActorHandle<A>, ActorSpawnError>
@@ -518,11 +500,8 @@ struct ActorRuntimeParts<A: Actor> {
     handle: ActorHandle<A>,
     normal_rx: Receiver<ActorCommand<A>>,
     system_rx: Receiver<ActorCommand<A>>,
-    #[cfg(feature = "distributed")]
-    self_ref: Option<ActorRef>,
-    #[cfg(feature = "distributed")]
-    actor_system: Option<Arc<OnceLock<ActorSystem>>>,
     service: ServiceContext,
+    resources: ActorResources,
     spawner: ActorSpawner,
     deferred_capacity: usize,
     turn_budget: usize,
@@ -530,11 +509,10 @@ struct ActorRuntimeParts<A: Actor> {
 
 fn create_actor_parts<A>(
     mailbox: MailboxConfig,
-    #[cfg(feature = "distributed")] self_ref: Option<ActorRef>,
-    #[cfg(feature = "distributed")] actor_system: Option<Arc<OnceLock<ActorSystem>>>,
     service: ServiceContext,
     observer: ActorObserverHandle,
     terminal_hook: Option<TerminalHook>,
+    resources: ActorResources,
     spawner: ActorSpawner,
 ) -> ActorRuntimeParts<A>
 where
@@ -557,8 +535,6 @@ where
         terminal_hook,
         normal_tx,
         system_tx,
-        #[cfg(feature = "distributed")]
-        actor_ref: self_ref.clone(),
         observer,
     });
 
@@ -566,11 +542,8 @@ where
         handle,
         normal_rx,
         system_rx,
-        #[cfg(feature = "distributed")]
-        self_ref,
-        #[cfg(feature = "distributed")]
-        actor_system,
         service,
+        resources,
         spawner,
         deferred_capacity: mailbox.deferred_capacity(),
         turn_budget: mailbox.turn_budget(),
@@ -635,22 +608,16 @@ where
         handle,
         mut normal_rx,
         mut system_rx,
-        #[cfg(feature = "distributed")]
-        self_ref,
-        #[cfg(feature = "distributed")]
-        actor_system,
         service,
+        resources,
         spawner,
         deferred_capacity,
         turn_budget,
     } = parts;
     let mut ctx = ActorContext::new(
         handle.clone(),
-        #[cfg(feature = "distributed")]
-        self_ref,
-        #[cfg(feature = "distributed")]
-        actor_system,
         service,
+        resources,
         spawner,
         deferred_capacity,
     );
@@ -697,9 +664,7 @@ where
             true
         }
         Ok(Ok(())) => {
-            if handle.lifecycle_state() != ActorLifecycleState::Quarantined {
-                handle.set_lifecycle_state(ActorLifecycleState::Running);
-            }
+            handle.set_lifecycle_state(ActorLifecycleState::Running);
             handle
                 .observer()
                 .lifecycle(handle.observation_metadata(), ActorLifecycleEvent::Started);
@@ -723,11 +688,8 @@ where
         }
     };
 
-    let externally_fenced = handle.lifecycle_state() == ActorLifecycleState::Quarantined;
     let mut stop_reason = if startup_failure {
         Some(StopReason::StartFailed)
-    } else if externally_fenced {
-        Some(StopReason::AuthorityLost)
     } else {
         None
     };
@@ -886,10 +848,9 @@ where
     ctx.stop_all_children(reason);
     let previous_phase = match reason {
         StopReason::Passivated(_) => ActorLifecycleState::Passivating,
-        StopReason::Requested
-        | StopReason::MailboxClosed
-        | StopReason::StartFailed
-        | StopReason::AuthorityLost => ActorLifecycleState::Stopping,
+        StopReason::Requested | StopReason::MailboxClosed | StopReason::StartFailed => {
+            ActorLifecycleState::Stopping
+        }
     };
 
     let (forced, terminal_completion) = match run_stopping_phase(
@@ -981,14 +942,8 @@ where
     let local_ref = handle.local_ref().id();
     let mut failure: Option<StopFailureRecord> = None;
     let mut retry_result: Option<oneshot::Sender<Result<(), ActorAdminError>>> = None;
-    let mut quarantined = handle.lifecycle_state() == ActorLifecycleState::Quarantined;
-
     loop {
-        handle.set_lifecycle_state(if quarantined {
-            ActorLifecycleState::Quarantined
-        } else {
-            previous_phase
-        });
+        handle.set_lifecycle_state(previous_phase);
         if failure.is_some() {
             handle.observer().lifecycle(
                 handle.observation_metadata(),
@@ -1031,7 +986,6 @@ where
                             first_failure_time: now,
                             latest_attempt_time: now,
                             attempt_count: 1,
-                            authoritative: !quarantined,
                         }
                     }
                 };
@@ -1045,11 +999,7 @@ where
                 );
                 handle.record_stop_failure(record.clone());
                 failure = Some(record);
-                handle.set_lifecycle_state(if quarantined {
-                    ActorLifecycleState::Quarantined
-                } else {
-                    ActorLifecycleState::StopFailed
-                });
+                handle.set_lifecycle_state(ActorLifecycleState::StopFailed);
                 handle.observer().lifecycle(
                     handle.observation_metadata(),
                     ActorLifecycleEvent::StopFailed(reason),
@@ -1072,12 +1022,6 @@ where
                 Some(ActorCommand::RetryStop(result)) => {
                     retry_result = Some(result);
                     break;
-                }
-                Some(ActorCommand::Quarantine(result)) => {
-                    quarantined = true;
-                    handle.mark_stop_failure_quarantined();
-                    handle.set_lifecycle_state(ActorLifecycleState::Quarantined);
-                    let _ = result.send(Ok(()));
                 }
                 Some(ActorCommand::ForceStop {
                     authorization,

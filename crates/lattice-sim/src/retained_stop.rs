@@ -1,4 +1,10 @@
-use lattice_actor::traits::ActorLifecycleState;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetainedCellState {
+    Running,
+    StopFailed,
+    Quarantined,
+    Stopped,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RetainedStopEvent {
@@ -12,7 +18,7 @@ pub enum RetainedStopEvent {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RetainedStopState {
-    pub cell: ActorLifecycleState,
+    pub cell: RetainedCellState,
     pub instance_id: u64,
     pub in_memory_value: u64,
     pub authoritative: bool,
@@ -27,7 +33,7 @@ pub struct RetainedStopState {
 impl Default for RetainedStopState {
     fn default() -> Self {
         Self {
-            cell: ActorLifecycleState::Running,
+            cell: RetainedCellState::Running,
             instance_id: 1,
             in_memory_value: 42,
             authoritative: true,
@@ -44,23 +50,21 @@ impl Default for RetainedStopState {
 impl RetainedStopState {
     pub fn apply(&mut self, event: RetainedStopEvent) {
         match event {
-            RetainedStopEvent::BeginVoluntaryDrain if self.cell == ActorLifecycleState::Running => {
-                self.cell = ActorLifecycleState::StopFailed;
+            RetainedStopEvent::BeginVoluntaryDrain if self.cell == RetainedCellState::Running => {
+                self.cell = RetainedCellState::StopFailed;
                 self.business_admitted = false;
                 self.drain_blocked = true;
             }
             RetainedStopEvent::RetryPersistenceFails
                 if matches!(
                     self.cell,
-                    ActorLifecycleState::StopFailed | ActorLifecycleState::Quarantined
+                    RetainedCellState::StopFailed | RetainedCellState::Quarantined
                 ) => {}
-            RetainedStopEvent::ExternalAuthorityLost
-                if self.cell != ActorLifecycleState::Stopped =>
-            {
+            RetainedStopEvent::ExternalAuthorityLost if self.cell != RetainedCellState::Stopped => {
                 self.authoritative = false;
                 self.business_admitted = false;
                 self.replacement_allowed = true;
-                self.cell = ActorLifecycleState::Quarantined;
+                self.cell = RetainedCellState::Quarantined;
                 self.drain_blocked = false;
             }
             RetainedStopEvent::MembershipLost => {
@@ -70,20 +74,20 @@ impl RetainedStopState {
             RetainedStopEvent::RetryPersistenceSucceeds
                 if matches!(
                     self.cell,
-                    ActorLifecycleState::StopFailed | ActorLifecycleState::Quarantined
+                    RetainedCellState::StopFailed | RetainedCellState::Quarantined
                 ) =>
             {
-                self.cell = ActorLifecycleState::Stopped;
+                self.cell = RetainedCellState::Stopped;
                 self.drain_blocked = false;
                 self.terminal_notifications = 1;
             }
             RetainedStopEvent::ForceDiscard
                 if matches!(
                     self.cell,
-                    ActorLifecycleState::StopFailed | ActorLifecycleState::Quarantined
+                    RetainedCellState::StopFailed | RetainedCellState::Quarantined
                 ) =>
             {
-                self.cell = ActorLifecycleState::Stopped;
+                self.cell = RetainedCellState::Stopped;
                 self.drain_blocked = false;
                 self.terminal_notifications = 1;
                 self.forced_data_loss_events = 1;
@@ -99,22 +103,22 @@ impl RetainedStopState {
     pub fn check_invariants(&self) -> Result<(), &'static str> {
         if matches!(
             self.cell,
-            ActorLifecycleState::StopFailed | ActorLifecycleState::Quarantined
+            RetainedCellState::StopFailed | RetainedCellState::Quarantined
         ) && self.business_admitted
         {
             return Err("retained actor admitted business traffic");
         }
-        if self.cell == ActorLifecycleState::StopFailed
+        if self.cell == RetainedCellState::StopFailed
             && (!self.authoritative || self.replacement_allowed || !self.drain_blocked)
         {
             return Err("voluntary StopFailed did not retain its authority reservation");
         }
-        if self.cell == ActorLifecycleState::Quarantined
+        if self.cell == RetainedCellState::Quarantined
             && (self.authoritative || !self.replacement_allowed)
         {
             return Err("quarantined actor retained authority or delayed replacement");
         }
-        if self.cell != ActorLifecycleState::Stopped && self.terminal_notifications != 0 {
+        if self.cell != RetainedCellState::Stopped && self.terminal_notifications != 0 {
             return Err("nonterminal retained actor emitted termination");
         }
         if self.terminal_notifications > 1 || self.forced_data_loss_events > 1 {
@@ -156,11 +160,11 @@ mod tests {
         let second = replay_retained_stop(events).unwrap();
 
         assert_eq!(first, second);
-        assert_eq!(first[2].cell, ActorLifecycleState::StopFailed);
+        assert_eq!(first[2].cell, RetainedCellState::StopFailed);
         assert_eq!(first[2].instance_id, 1);
         assert_eq!(first[2].in_memory_value, 42);
         assert_eq!(first[2].terminal_notifications, 0);
-        assert_eq!(first[4].cell, ActorLifecycleState::Quarantined);
+        assert_eq!(first[4].cell, RetainedCellState::Quarantined);
         assert!(first[4].replacement_allowed);
         assert_eq!(first.last().unwrap().terminal_notifications, 1);
         assert_eq!(first.last().unwrap().forced_data_loss_events, 0);
@@ -175,7 +179,7 @@ mod tests {
         ])
         .unwrap();
         let final_state = trace.last().unwrap();
-        assert_eq!(final_state.cell, ActorLifecycleState::Stopped);
+        assert_eq!(final_state.cell, RetainedCellState::Stopped);
         assert_eq!(final_state.terminal_notifications, 1);
         assert_eq!(final_state.forced_data_loss_events, 1);
     }
@@ -189,7 +193,7 @@ mod tests {
         assert_eq!(
             retained
                 .iter()
-                .filter(|state| state.cell == ActorLifecycleState::Quarantined)
+                .filter(|state| state.cell == RetainedCellState::Quarantined)
                 .count(),
             capacity
         );
@@ -197,12 +201,12 @@ mod tests {
         retained[1].apply(RetainedStopEvent::BeginVoluntaryDrain);
         let overflow = retained
             .iter()
-            .filter(|state| state.cell == ActorLifecycleState::Quarantined)
+            .filter(|state| state.cell == RetainedCellState::Quarantined)
             .count()
             >= capacity;
         assert!(overflow, "capacity exhaustion must be an explicit result");
         assert_eq!(retained[0].in_memory_value, 42);
-        assert_eq!(retained[1].cell, ActorLifecycleState::StopFailed);
+        assert_eq!(retained[1].cell, RetainedCellState::StopFailed);
         assert_eq!(retained[1].in_memory_value, 42);
     }
 }

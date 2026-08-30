@@ -8,7 +8,7 @@ use std::{
 
 use bytes::Bytes;
 use futures_util::{StreamExt as _, stream::FuturesUnordered};
-use lattice_actor::{
+use lattice_actor_distributed::{
     error::{ActorError, ActorTellError},
     mailbox::MailboxConfig,
     observation::{ActorMetadata, ActorObserver, ActorObserverHandle},

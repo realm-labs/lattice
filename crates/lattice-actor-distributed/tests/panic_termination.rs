@@ -1,5 +1,3 @@
-#![cfg(feature = "distributed")]
-
 use lattice_actor::context::HandlerContext;
 use std::{
     any::type_name,
@@ -10,7 +8,7 @@ use std::{
     time::Duration,
 };
 
-use lattice_actor::{
+use lattice_actor_distributed::{
     context::ActorContext,
     error::{ActorCallError, ActorError, ActorStopError},
     handle::ActorHandle,
@@ -618,7 +616,7 @@ impl Actor for StoppingPanicActor {
 async fn stopping_panic_terminates_without_entering_stop_failed() {
     let handle = lattice_actor::runtime::spawn_actor(StoppingPanicActor, MailboxConfig::bounded(8));
     let mut terminated = handle.subscribe_terminated();
-    handle.stop(StopReason::Requested).await.unwrap();
+    handle.stop(StopReason::Requested).unwrap();
     assert_eq!(
         tokio::time::timeout(TIMEOUT, terminated.recv())
             .await
@@ -648,7 +646,7 @@ impl Drop for DropPanicActor {
 async fn actor_drop_panic_still_publishes_termination() {
     let handle = lattice_actor::runtime::spawn_actor(DropPanicActor, MailboxConfig::bounded(8));
     let mut terminated = handle.subscribe_terminated();
-    handle.stop(StopReason::Requested).await.unwrap();
+    handle.stop(StopReason::Requested).unwrap();
     assert_eq!(
         tokio::time::timeout(TIMEOUT, terminated.recv())
             .await
@@ -707,7 +705,6 @@ impl Actor for SupervisingParent {
             ChildActorOptions {
                 mailbox: MailboxConfig::bounded(8),
                 supervision: self.supervision,
-                protocol_id: None,
                 ..ChildActorOptions::default()
             },
         )?);

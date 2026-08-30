@@ -1,4 +1,4 @@
-use lattice_core::actor_ref::{
+use lattice_core::actor_address::{
     ClusterId, ConfigFingerprint, EntityType, NodeAddress, NodeIncarnation,
 };
 use lattice_remoting::{

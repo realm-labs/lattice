@@ -13,7 +13,7 @@ use hickory_resolver::{
     TokioResolver,
     proto::rr::{RData, RecordType},
 };
-use lattice_core::{actor_ref::NodeAddress, coordinator::CoordinatorScope};
+use lattice_core::{actor_address::NodeAddress, coordinator::CoordinatorScope};
 
 use crate::provider::{
     CoordinatorDirectorySnapshot, CoordinatorDiscovery, DiscoveryError, DiscoveryOrigin,

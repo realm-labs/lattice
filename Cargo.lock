@@ -1051,6 +1051,7 @@ dependencies = [
  "clap",
  "http",
  "lattice-actor",
+ "lattice-actor-distributed",
  "lattice-codegen",
  "lattice-core",
  "lattice-gateway",
@@ -2125,16 +2126,30 @@ dependencies = [
 name = "lattice-actor"
 version = "0.1.0"
 dependencies = [
- "async-trait",
- "bytes",
  "concurrent-queue",
- "dashmap",
  "event-listener",
  "futures-util",
  "lattice-actor-macros",
  "lattice-core",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "trybuild",
+]
+
+[[package]]
+name = "lattice-actor-distributed"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "dashmap",
+ "futures-util",
+ "lattice-actor",
+ "lattice-core",
  "lattice-remoting",
  "prost",
+ "serde",
  "thiserror",
  "tokio",
  "tracing",
@@ -2247,6 +2262,7 @@ dependencies = [
  "base64 0.23.0",
  "futures-util",
  "lattice-actor",
+ "lattice-actor-distributed",
  "lattice-core",
  "prost",
  "serde",
@@ -2264,6 +2280,7 @@ dependencies = [
  "async-trait",
  "dashmap",
  "lattice-actor",
+ "lattice-actor-distributed",
  "lattice-core",
  "lattice-remoting",
  "prost",
@@ -2379,6 +2396,7 @@ dependencies = [
  "dashmap",
  "futures-util",
  "lattice-actor",
+ "lattice-actor-distributed",
  "lattice-core",
  "lattice-discovery",
  "lattice-placement",
@@ -2402,6 +2420,7 @@ dependencies = [
  "clap",
  "futures-util",
  "lattice-actor",
+ "lattice-actor-distributed",
  "lattice-config",
  "lattice-config-etcd",
  "lattice-core",
@@ -2426,6 +2445,7 @@ dependencies = [
  "async-trait",
  "criterion",
  "lattice-actor",
+ "lattice-actor-distributed",
  "lattice-store-mongodb-macros",
  "mongodb",
  "serde",
@@ -2598,6 +2618,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "lattice-actor",
+ "lattice-actor-distributed",
  "lattice-codegen",
  "lattice-config",
  "lattice-core",
@@ -3478,6 +3499,7 @@ dependencies = [
  "criterion",
  "futures-util",
  "lattice-actor",
+ "lattice-actor-distributed",
  "lattice-codegen",
  "lattice-core",
  "lattice-gateway",

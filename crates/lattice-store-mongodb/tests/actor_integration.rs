@@ -789,7 +789,6 @@ async fn stopping_actor_cancels_in_flight_store_future() {
         .forget();
     handle
         .stop(StopReason::Requested)
-        .await
         .expect("actor stop should enqueue");
     tokio::time::timeout(Duration::from_secs(2), dropped.acquire())
         .await
@@ -869,7 +868,6 @@ async fn actor_stopping_replays_and_awaits_the_cancelled_in_flight_flush() {
         .forget();
     handle
         .stop(StopReason::Requested)
-        .await
         .expect("stop should enqueue");
     tokio::time::timeout(Duration::from_secs(2), dropped.acquire())
         .await
@@ -920,7 +918,6 @@ async fn retry_stop_resumes_a_timed_out_drain_without_losing_dirty_state() {
 
     handle
         .stop(StopReason::Requested)
-        .await
         .expect("stop should enqueue");
     tokio::time::timeout(Duration::from_secs(2), async {
         while *lifecycle.borrow() != ActorLifecycleState::StopFailed {

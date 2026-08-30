@@ -1,14 +1,16 @@
 use std::any::Any;
 
 use dashmap::DashMap;
-use lattice_core::actor_ref::{ActorPath, ActorRef, ProtocolTag};
+use lattice_core::actor_address::{ActorAddress, ActorPath, ProtocolTag};
 use thiserror::Error;
 
-use crate::handle::ActorHandle;
-use crate::traits::{Actor, ActorLifecycleState};
+use lattice_actor::{
+    handle::ActorHandle,
+    traits::{Actor, ActorLifecycleState},
+};
 
 struct DirectoryEntry {
-    reference: ActorRef,
+    reference: ActorAddress,
     handle: Box<dyn Any + Send + Sync>,
 }
 
@@ -30,11 +32,9 @@ impl ActivationDirectory {
 
     pub fn register<A: Actor>(
         &self,
+        reference: &ActorAddress,
         handle: &ActorHandle<A>,
     ) -> Result<(), ActivationDirectoryError> {
-        let Some(reference) = handle.actor_ref() else {
-            return Ok(());
-        };
         if self.entries.len() == self.maximum && !self.entries.contains_key(reference.actor_path())
         {
             return Err(ActivationDirectoryError::Capacity);
@@ -42,7 +42,7 @@ impl ActivationDirectory {
         self.entries.insert(
             reference.actor_path().clone(),
             DirectoryEntry {
-                reference: reference.erase(),
+                reference: reference.clone(),
                 handle: Box::new(handle.clone()),
             },
         );
@@ -51,7 +51,7 @@ impl ActivationDirectory {
 
     pub fn resolve<A: Actor, P: ProtocolTag>(
         &self,
-        reference: &ActorRef<P>,
+        reference: &ActorAddress<P>,
     ) -> Option<ActorHandle<A>> {
         let entry = self.entries.get(reference.actor_path())?;
         if !entry.reference.same_activation(&reference.erase()) {
@@ -67,7 +67,7 @@ impl ActivationDirectory {
         Some(handle.clone())
     }
 
-    pub fn remove(&self, reference: &ActorRef) -> bool {
+    pub fn remove(&self, reference: &ActorAddress) -> bool {
         self.entries
             .remove_if(reference.actor_path(), |_, entry| {
                 entry.reference.same_activation(reference)

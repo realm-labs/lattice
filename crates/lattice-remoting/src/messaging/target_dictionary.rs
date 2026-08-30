@@ -48,16 +48,16 @@ impl ExactTargetDictionary {
 
 #[cfg(test)]
 mod tests {
-    use lattice_core::actor_ref::{
-        ActivationId, ActorPath, ActorRef, ClusterId, NodeAddress, NodeIncarnation, ProtocolId,
+    use lattice_core::actor_address::{
+        ActivationId, ActorAddress, ActorPath, ClusterId, NodeAddress, NodeIncarnation, ProtocolId,
     };
 
     use super::*;
     use crate::messaging::codec::target_to_wire;
 
-    fn actor(sequence: u64) -> ActorRef {
+    fn actor(sequence: u64) -> ActorAddress {
         let incarnation = NodeIncarnation::new(1).unwrap();
-        ActorRef::new(
+        ActorAddress::new(
             ClusterId::new("dictionary-test").unwrap(),
             NodeAddress::new("127.0.0.1", 25520).unwrap(),
             incarnation,

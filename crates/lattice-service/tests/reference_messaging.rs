@@ -4,15 +4,15 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::BytesMut;
-use lattice_actor::actor_protocol;
 use lattice_actor::error::ActorError;
-use lattice_actor::protocol::{
+use lattice_actor::traits::{Actor, Handler, StopReason};
+use lattice_actor_distributed::protocol::{
     ActorProtocolBinding, CodecDescriptor, DecodeError, EncodeError, Protocol, WireCodec,
 };
-use lattice_actor::registry::{ActorRefConfig, ActorRegistry, ActorRegistryConfig};
-use lattice_actor::traits::{Actor, Handler, StopReason};
+use lattice_actor_distributed::registry::{ActorAddressConfig, ActorRegistry, ActorRegistryConfig};
+use lattice_actor_distributed::{activation::DistributedActorContextExt, actor_protocol};
+use lattice_core::actor_address::{ActorAddress, ClusterId, NodeAddress, NodeIncarnation};
 use lattice_core::actor_kind;
-use lattice_core::actor_ref::{ActorRef, ClusterId, NodeAddress, NodeIncarnation};
 use lattice_core::id::ActorId;
 use lattice_core::kind::ActorKind;
 use lattice_remoting::config::RemotingConfig;
@@ -28,7 +28,7 @@ type DeliveryObserver = Arc<Mutex<Option<oneshot::Sender<()>>>>;
 #[derive(Debug, Serialize, Deserialize, lattice_actor::Message)]
 #[serde(bound = "")]
 struct SendTo {
-    target: ActorRef<SinkProtocol>,
+    target: ActorAddress<SinkProtocol>,
 }
 
 #[derive(Debug, lattice_actor::Message)]
@@ -84,7 +84,12 @@ impl Handler<SendTo> for SourceActor {
         ctx: &mut HandlerContext<'_, Self>,
         message: SendTo,
     ) -> Result<(), ActorError> {
-        ctx.tell(&message.target, Delivered).await?;
+        let target = ctx
+            .bind_actor(message.target)
+            .map_err(|error| ActorError::new(error.to_string()))?;
+        ctx.tell(&target, Delivered)
+            .await
+            .map_err(|error| ActorError::new(error.to_string()))?;
         Ok(())
     }
 }
@@ -144,7 +149,7 @@ fn registry<A: Actor, P: Protocol>(
     Arc::new(ActorRegistry::new_bound(
         kind,
         ActorRegistryConfig {
-            actor_ref: Some(ActorRefConfig {
+            address: Some(ActorAddressConfig {
                 cluster_id: cluster_id.clone(),
                 node_address: address.clone(),
                 node_incarnation: incarnation,
@@ -156,7 +161,7 @@ fn registry<A: Actor, P: Protocol>(
 }
 
 #[tokio::test]
-async fn deserialized_actor_ref_sends_without_binding() {
+async fn deserialized_actor_address_is_bound_at_the_actor_boundary() {
     let cluster_id = ClusterId::new("reference-messaging").unwrap();
     let address = NodeAddress::new("127.0.0.1", 25261).unwrap();
     let incarnation = NodeIncarnation::new(1).unwrap();
@@ -190,9 +195,11 @@ async fn deserialized_actor_ref_sends_without_binding() {
         .start(ActorId::U64(1), SourceActor)
         .await
         .unwrap();
-    let sink_ref: ActorRef<SinkProtocol> = sink_handle.typed_actor_ref().unwrap().unwrap();
-    let source_ref: ActorRef<SourceProtocol> = source_handle.typed_actor_ref().unwrap().unwrap();
-    let decoded_sink: ActorRef<SinkProtocol> =
+    let sink_ref: ActorAddress<SinkProtocol> =
+        sink_registry.address(&ActorId::U64(1)).unwrap().unwrap();
+    let source_ref: ActorAddress<SourceProtocol> =
+        source_registry.address(&ActorId::U64(1)).unwrap().unwrap();
+    let decoded_sink: ActorAddress<SinkProtocol> =
         serde_json::from_slice(&serde_json::to_vec(&sink_ref).unwrap()).unwrap();
 
     let service = LatticeService::builder(NodeConfig {
@@ -229,7 +236,7 @@ async fn deserialized_actor_ref_sends_without_binding() {
 
     observed_rx.await.unwrap();
 
-    source_handle.stop(StopReason::Requested).await.unwrap();
-    sink_handle.stop(StopReason::Requested).await.unwrap();
+    source_handle.stop(StopReason::Requested).unwrap();
+    sink_handle.stop(StopReason::Requested).unwrap();
     service.shutdown().await.unwrap();
 }

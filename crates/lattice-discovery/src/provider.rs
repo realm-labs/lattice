@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 use std::pin::Pin;
 
 use futures_util::Stream;
-use lattice_core::actor_ref::NodeAddress;
+use lattice_core::actor_address::NodeAddress;
 use lattice_core::coordinator::CoordinatorScope;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]

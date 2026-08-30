@@ -417,3 +417,9 @@ All DeathWatch registrations are activation-scoped; EntityRef/SingletonRef use w
 Reliable control delivery is Association-scoped and shared by DeathWatch, membership, placement-domain, Shard, and Singleton protocols; it never replays uncertain business messages.
 Business code never manually opens or owns node transport links.
 ```
+# Hard-switch API note
+
+The Actor messaging examples in this chapter predate the address/bound-ref hard
+switch. Use [`09-actor-api-boundaries.md`](09-actor-api-boundaries.md) as the
+canonical API: there is no implicit sender, serializable values are
+`*Address`, and messaging capabilities are bound `*Ref` values.

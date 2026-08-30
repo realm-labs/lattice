@@ -1,4 +1,4 @@
-use lattice_core::actor_ref::{NodeAddress, NodeIncarnation};
+use lattice_core::actor_address::{NodeAddress, NodeIncarnation};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ProcessState {

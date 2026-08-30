@@ -1,6 +1,6 @@
 use std::fs::OpenOptions;
 
-use lattice_core::actor_ref::ConfigFingerprint;
+use lattice_core::actor_address::ConfigFingerprint;
 
 #[derive(Debug, Serialize)]
 struct RawRecord {

@@ -1,5 +1,5 @@
 #[cfg(test)]
-use super::ActorRef;
+use super::ActorAddress;
 use super::error::{RemoteFailureCode, RemoteMessageError};
 use super::target::{
     CorrelationId, ExactActorTarget, InboundAsk, InboundEntityAsk, InboundEntityTell,
@@ -9,9 +9,9 @@ use super::target::{
 use super::target_cache::ExactTargetCache;
 use super::target_dictionary::ExactTargetDictionary;
 use super::{
-    ActivationId, ActorPath, Bytes, ClusterId, ConfigFingerprint, Duration, EntityId, EntityRef,
-    EntityType, Frame, FrameKind, Message, NodeAddress, NodeIncarnation, PlacementDomainId,
-    ProtocolId, SingletonKind, SingletonRef,
+    ActivationId, ActorPath, Bytes, ClusterId, ConfigFingerprint, Duration, EntityAddress,
+    EntityId, EntityType, Frame, FrameKind, Message, NodeAddress, NodeIncarnation,
+    PlacementDomainId, ProtocolId, SingletonAddress, SingletonKind,
 };
 
 pub fn ask_correlation(frame: &Frame) -> Option<CorrelationId> {
@@ -397,8 +397,8 @@ pub(super) struct FailureWire {
 }
 
 #[cfg(test)]
-pub(super) fn target_to_wire<A: lattice_core::actor_ref::ProtocolTag>(
-    target: &ActorRef<A>,
+pub(super) fn target_to_wire<A: lattice_core::actor_address::ProtocolTag>(
+    target: &ActorAddress<A>,
 ) -> ExactActorTargetWire {
     ExactActorTargetWire {
         cluster_id: Bytes::copy_from_slice(target.cluster_id().as_str().as_bytes()),
@@ -474,7 +474,7 @@ pub(super) fn entity_target_from_wire(
         return Err(RemoteMessageError::InvalidPayload);
     }
     Ok(LogicalEntityTarget {
-        reference: EntityRef::new(
+        reference: EntityAddress::new(
             ClusterId::new(wire.cluster_id).map_err(|_| RemoteMessageError::InvalidPayload)?,
             PlacementDomainId::new(wire.domain).map_err(|_| RemoteMessageError::InvalidPayload)?,
             EntityType::new(wire.entity_type).map_err(|_| RemoteMessageError::InvalidPayload)?,
@@ -523,7 +523,7 @@ pub(super) fn singleton_target_from_wire(
         return Err(RemoteMessageError::InvalidPayload);
     }
     Ok(LogicalSingletonTarget {
-        reference: SingletonRef::new(
+        reference: SingletonAddress::new(
             ClusterId::new(wire.cluster_id).map_err(|_| RemoteMessageError::InvalidPayload)?,
             PlacementDomainId::new(wire.domain).map_err(|_| RemoteMessageError::InvalidPayload)?,
             SingletonKind::new(wire.singleton_kind)

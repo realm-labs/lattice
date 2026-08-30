@@ -17,8 +17,8 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use lattice_core::actor_ref::{
-    ActivationId, ActorPath, ActorRef, ClusterId, NodeAddress, NodeIncarnation, ProtocolId,
+use lattice_core::actor_address::{
+    ActivationId, ActorAddress, ActorPath, ClusterId, NodeAddress, NodeIncarnation, ProtocolId,
 };
 
 use crate::{
@@ -777,7 +777,7 @@ async fn real_tcp_endpoint_establishes_all_lanes_and_delivers_ask() {
     server.bind().await.unwrap();
     let association = client.connect_peer(server_identity.clone()).await.unwrap();
     assert_eq!(association.state(), AssociationState::Active);
-    let target = ActorRef::new(
+    let target = ActorAddress::new(
         cluster_id,
         server_identity.address.clone(),
         server_identity.incarnation,

@@ -1,6 +1,6 @@
 use std::sync::Barrier;
 
-use lattice_core::actor_ref::ProtocolId;
+use lattice_core::actor_address::ProtocolId;
 
 use super::*;
 use crate::protocol::{CatalogueDecision, ProtocolDescriptor, ProtocolFingerprint};

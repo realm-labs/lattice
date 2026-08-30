@@ -2,7 +2,7 @@
 //!
 //! These names belong to the same unvalidated, node-local vocabulary as
 //! [`crate::id`]; see that module for the boundary between them and the
-//! canonical, length-bounded names in [`crate::actor_ref`].
+//! canonical, length-bounded names in [`crate::actor_address`].
 
 use std::borrow::Cow;
 use std::fmt;

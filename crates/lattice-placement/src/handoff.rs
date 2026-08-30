@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 
-use lattice_core::actor_ref::NodeIncarnation;
+use lattice_core::actor_address::NodeIncarnation;
 use thiserror::Error;
 
 use crate::types::{
@@ -234,7 +234,9 @@ pub enum HandoffError {
 
 #[cfg(test)]
 mod tests {
-    use lattice_core::actor_ref::{EntityType, NodeAddress, NodeIncarnation, PlacementDomainId};
+    use lattice_core::actor_address::{
+        EntityType, NodeAddress, NodeIncarnation, PlacementDomainId,
+    };
 
     use super::*;
     use crate::types::{CoordinatorTerm, Revision, ShardId};

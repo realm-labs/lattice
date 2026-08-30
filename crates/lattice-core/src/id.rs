@@ -6,19 +6,19 @@
 //!   [`RouteKey`] and [`crate::kind::ActorKind`] are application-shaped keys used for
 //!   registry lookups and gateway routing. They are deliberately unvalidated and
 //!   unbounded so applications can key actors by whatever their domain uses.
-//! - [`crate::actor_ref`] holds the *boundary* vocabulary. [`crate::actor_ref::EntityId`],
-//!   [`crate::actor_ref::EntityType`] and friends are canonical and length-bounded
+//! - [`crate::actor_address`] holds the *boundary* vocabulary. [`crate::actor_address::EntityId`],
+//!   [`crate::actor_address::EntityType`] and friends are canonical and length-bounded
 //!   because they are serialized into references that cross nodes.
 //!
 //! The two meet at exactly two conversion points, and both bound the local value:
 //!
-//! - `lattice_actor::registry` encodes an [`ActorId`] and an
-//!   [`crate::kind::ActorKind`] into [`crate::actor_ref::ActorPath`] segments. The
+//! - `lattice_actor_distributed::registry` encodes an [`ActorId`] and an
+//!   [`crate::kind::ActorKind`] into [`crate::actor_address::ActorPath`] segments. The
 //!   hex encoding doubles the byte length, so identities above
 //!   `MAX_ACTOR_PATH_SEGMENT_BYTES / 2` produce no addressable reference and the
 //!   activation stays node-local.
 //! - `lattice_service::cluster` maps `ActorId::Bytes` to
-//!   [`crate::actor_ref::EntityId`] through its checked constructor, so oversized
+//!   [`crate::actor_address::EntityId`] through its checked constructor, so oversized
 //!   or empty payloads never reach a placement route.
 
 use serde::{Deserialize, Serialize};

@@ -5,7 +5,7 @@ use std::{
     time::Duration,
 };
 
-use lattice_core::{actor_ref::NodeIncarnation, coordinator::CoordinatorScope};
+use lattice_core::{actor_address::NodeIncarnation, coordinator::CoordinatorScope};
 use lattice_remoting::{
     association::{AssociationKey, AssociationManager, AssociationState},
     control::ControlDispatchError,

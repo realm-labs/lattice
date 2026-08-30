@@ -1,4 +1,4 @@
-use lattice_core::{actor_ref::NodeIncarnation, coordinator::CoordinatorScope};
+use lattice_core::{actor_address::NodeIncarnation, coordinator::CoordinatorScope};
 use lattice_remoting::{
     association::AssociationKey,
     control::{ControlDispatchError, ControlRetryReason},
@@ -380,7 +380,7 @@ fn complete_route_error(error: mpsc::error::TrySendError<PlacementControlEvent>)
 
 #[cfg(test)]
 mod routing_backpressure_tests {
-    use lattice_core::actor_ref::{NodeAddress, NodeIncarnation};
+    use lattice_core::actor_address::{NodeAddress, NodeIncarnation};
 
     use super::*;
     use crate::types::NodeKey;

@@ -1,4 +1,4 @@
-use lattice_actor::registry::ActorQuarantineError;
+use lattice_actor_distributed::registry::ActorQuarantineError;
 use lattice_core::coordinator::CoordinatorScope;
 use lattice_placement::{
     control::PlacementControlCommand, types::PlacementSlot as PlacementSlotRecord,
@@ -6,12 +6,12 @@ use lattice_placement::{
 use lattice_remoting::messaging::error::RemoteFailureCode;
 
 use super::{
-    Actor, ActorHandle, ActorId, ActorLoader, ActorProtocolBinding, ActorRef, ActorRegistry, Arc,
-    AskError, AssociationKey, AssociationManager, AssociationState, Bytes, ConfigFingerprint,
+    Actor, ActorAddress, ActorHandle, ActorId, ActorLoader, ActorProtocolBinding, ActorRegistry,
+    Arc, AskError, AssociationKey, AssociationManager, AssociationState, Bytes, ConfigFingerprint,
     DispatchMode, DispatchReply, Instant, LOGICAL_RESOLVE_MESSAGE_ID, LogicPlacementState,
     LogicalSingletonTarget, Mutex, NodeKey, OutboundMessage, OutboundMessaging, PlacementDomainId,
     PlacementSlot, PlacementSlotKey, PlacementSlotState, Protocol, ProtocolFingerprint, ProtocolId,
-    RemoteMessageError, RouteBuffer, SingletonKind, SingletonRef, WatchError, async_trait,
+    RemoteMessageError, RouteBuffer, SingletonAddress, SingletonKind, WatchError, async_trait,
     decode_resolved_actor, drain_actor_ids, map_ask, map_dispatch, map_tell,
     next_logical_resolution,
 };
@@ -20,14 +20,14 @@ use super::{
 pub(super) trait SingletonRoute: Send + Sync {
     async fn tell(
         &self,
-        target: SingletonRef,
+        target: SingletonAddress,
         fingerprint: ProtocolFingerprint,
         message_id: u64,
         payload: Bytes,
     ) -> Result<(), RemoteMessageError>;
     async fn ask(
         &self,
-        target: SingletonRef,
+        target: SingletonAddress,
         fingerprint: ProtocolFingerprint,
         message_id: u64,
         payload: Bytes,
@@ -46,7 +46,10 @@ pub(super) trait SingletonRoute: Send + Sync {
         payload: Bytes,
         deadline: Instant,
     ) -> Result<Bytes, RemoteMessageError>;
-    async fn resolve_current(&self, target: SingletonRef) -> Result<Option<ActorRef>, WatchError>;
+    async fn resolve_current(
+        &self,
+        target: SingletonAddress,
+    ) -> Result<Option<ActorAddress>, WatchError>;
     async fn receive_resolve(
         &self,
         target: LogicalSingletonTarget,
@@ -77,7 +80,7 @@ pub(super) struct SingletonRouteHost<A: Actor, L: ActorLoader<A>, P: Protocol> {
 }
 
 impl<A: Actor, L: ActorLoader<A>, P: Protocol> SingletonRouteHost<A, L, P> {
-    fn slot(&self, target: &SingletonRef) -> Result<PlacementSlotRecord, RemoteMessageError> {
+    fn slot(&self, target: &SingletonAddress) -> Result<PlacementSlotRecord, RemoteMessageError> {
         if target.protocol_id() != self.protocol_id
             || target.domain() != &self.domain
             || target.config_fingerprint() != self.config_fingerprint
@@ -95,7 +98,7 @@ impl<A: Actor, L: ActorLoader<A>, P: Protocol> SingletonRouteHost<A, L, P> {
             .ok_or(RemoteMessageError::StaleAuthority)
     }
 
-    fn running_slot(&self, target: &SingletonRef) -> Result<PlacementSlot, RemoteMessageError> {
+    fn running_slot(&self, target: &SingletonAddress) -> Result<PlacementSlot, RemoteMessageError> {
         let slot = self.slot(target)?;
         if slot.state != PlacementSlotState::Running || slot.owner.is_none() {
             return Err(RemoteMessageError::ShardUnavailable);
@@ -141,7 +144,7 @@ impl<A: Actor, L: ActorLoader<A>, P: Protocol> SingletonRouteHost<A, L, P> {
 
     async fn await_running_slot(
         &self,
-        target: &SingletonRef,
+        target: &SingletonAddress,
         payload_bytes: usize,
         requested_deadline: Option<Instant>,
     ) -> Result<PlacementSlot, RemoteMessageError> {
@@ -247,7 +250,7 @@ impl<A: Actor, L: ActorLoader<A>, P: Protocol> SingletonRouteHost<A, L, P> {
 impl<A: Actor, L: ActorLoader<A>, P: Protocol> SingletonRoute for SingletonRouteHost<A, L, P> {
     async fn tell(
         &self,
-        target: SingletonRef,
+        target: SingletonAddress,
         fingerprint: ProtocolFingerprint,
         message_id: u64,
         payload: Bytes,
@@ -288,7 +291,7 @@ impl<A: Actor, L: ActorLoader<A>, P: Protocol> SingletonRoute for SingletonRoute
 
     async fn ask(
         &self,
-        target: SingletonRef,
+        target: SingletonAddress,
         fingerprint: ProtocolFingerprint,
         message_id: u64,
         payload: Bytes,
@@ -382,7 +385,10 @@ impl<A: Actor, L: ActorLoader<A>, P: Protocol> SingletonRoute for SingletonRoute
         }
     }
 
-    async fn resolve_current(&self, target: SingletonRef) -> Result<Option<ActorRef>, WatchError> {
+    async fn resolve_current(
+        &self,
+        target: SingletonAddress,
+    ) -> Result<Option<ActorAddress>, WatchError> {
         let key = PlacementSlotKey::Singleton {
             domain: self.domain.clone(),
             kind: self.kind.clone(),
@@ -443,8 +449,7 @@ impl<A: Actor, L: ActorLoader<A>, P: Protocol> SingletonRoute for SingletonRoute
         }
         Ok(self
             .registry
-            .get_running(&ActorId::Str(self.kind.as_str().to_owned()))
-            .and_then(|handle| handle.actor_ref().map(ActorRef::erase)))
+            .exact_address(&ActorId::Str(self.kind.as_str().to_owned())))
     }
 
     async fn receive_resolve(
@@ -454,8 +459,7 @@ impl<A: Actor, L: ActorLoader<A>, P: Protocol> SingletonRoute for SingletonRoute
         self.validate_local(&target)?;
         let actor = self
             .registry
-            .get_running(&ActorId::Str(self.kind.as_str().to_owned()))
-            .and_then(|handle| handle.actor_ref().map(ActorRef::erase))
+            .exact_address(&ActorId::Str(self.kind.as_str().to_owned()))
             .ok_or(RemoteMessageError::StaleActivation)?;
         serde_json::to_vec(&actor)
             .map(Bytes::from)

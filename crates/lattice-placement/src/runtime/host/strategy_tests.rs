@@ -1,6 +1,6 @@
 use std::{collections::BTreeSet, sync::Arc, time::Duration};
 
-use lattice_core::actor_ref::{
+use lattice_core::actor_address::{
     EntityType, NodeAddress, NodeIncarnation, PlacementDomainId, ProtocolId,
 };
 use lattice_remoting::{association::AssociationManager, config::RemotingConfig};

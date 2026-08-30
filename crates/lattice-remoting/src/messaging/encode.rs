@@ -1,5 +1,5 @@
 use bytes::{BufMut, Bytes, BytesMut};
-use lattice_core::actor_ref::{ActorPath, ActorRef, ProtocolTag};
+use lattice_core::actor_address::{ActorAddress, ActorPath, ProtocolTag};
 use std::sync::Arc;
 
 use super::target::{CorrelationId, LogicalEntityTarget, LogicalSingletonTarget};
@@ -13,7 +13,10 @@ pub(super) struct PreparedExactTellEnvelope {
 }
 
 impl PreparedExactTellEnvelope {
-    pub(super) fn new<A: ProtocolTag>(target: &ActorRef<A>, dictionary_id: Option<u64>) -> Self {
+    pub(super) fn new<A: ProtocolTag>(
+        target: &ActorAddress<A>,
+        dictionary_id: Option<u64>,
+    ) -> Self {
         let suffix = prepared_tell_suffix(dictionary_id);
         Self {
             full: Arc::new(FrameEnvelope::new(
@@ -58,7 +61,7 @@ fn prepared_tell_suffix(dictionary_id: Option<u64>) -> Bytes {
     encoded.freeze()
 }
 
-fn encode_exact_target_field<A: ProtocolTag>(tag: u32, target: &ActorRef<A>) -> Bytes {
+fn encode_exact_target_field<A: ProtocolTag>(tag: u32, target: &ActorAddress<A>) -> Bytes {
     let target_len = exact_target_len(target);
     let mut encoded = BytesMut::with_capacity(nested_len(tag, target_len));
     encode_nested_prefix(tag, target_len, &mut encoded);
@@ -67,7 +70,7 @@ fn encode_exact_target_field<A: ProtocolTag>(tag: u32, target: &ActorRef<A>) -> 
 }
 
 pub(super) fn tell_frame<A: ProtocolTag>(
-    target: &ActorRef<A>,
+    target: &ActorAddress<A>,
     message_id: u64,
     payload: Bytes,
 ) -> Frame {
@@ -82,7 +85,7 @@ pub(super) fn tell_frame<A: ProtocolTag>(
 }
 
 pub(super) fn tell_frame_len<A: ProtocolTag>(
-    target: &ActorRef<A>,
+    target: &ActorAddress<A>,
     message_id: u64,
     payload_len: usize,
 ) -> usize {
@@ -127,7 +130,7 @@ pub(super) fn prepared_tell_frame_len(
 }
 
 pub(super) fn ask_frame<A: ProtocolTag>(
-    target: &ActorRef<A>,
+    target: &ActorAddress<A>,
     correlation: CorrelationId,
     timeout_nanos: u64,
     message_id: u64,
@@ -279,7 +282,7 @@ fn encode_frame(kind: FrameKind, encoded_len: usize, encode: impl FnOnce(&mut By
     Frame::encode_payload(kind, encoded_len, encode)
 }
 
-fn exact_target_len<A: ProtocolTag>(target: &ActorRef<A>) -> usize {
+fn exact_target_len<A: ProtocolTag>(target: &ActorAddress<A>) -> usize {
     string_field_len(1, target.cluster_id().as_str())
         + string_field_len(2, target.node_address().host())
         + varint_field_len(3, u64::from(target.node_address().port()))
@@ -289,7 +292,7 @@ fn exact_target_len<A: ProtocolTag>(target: &ActorRef<A>) -> usize {
         + varint_field_len(7, target.protocol_id().get())
 }
 
-fn encode_exact_target<A: ProtocolTag>(target: &ActorRef<A>, output: &mut impl BufMut) {
+fn encode_exact_target<A: ProtocolTag>(target: &ActorAddress<A>, output: &mut impl BufMut) {
     encode_string_field(1, target.cluster_id().as_str(), output);
     encode_string_field(2, target.node_address().host(), output);
     encode_varint_field(3, u64::from(target.node_address().port()), output);
@@ -458,9 +461,10 @@ const fn encoded_varint_len(value: u64) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use lattice_core::actor_ref::{
-        ActivationId, ClusterId, ConfigFingerprint, EntityId, EntityRef, EntityType, NodeAddress,
-        NodeIncarnation, PlacementDomainId, ProtocolId, SingletonKind, SingletonRef,
+    use lattice_core::actor_address::{
+        ActivationId, ClusterId, ConfigFingerprint, EntityAddress, EntityId, EntityType,
+        NodeAddress, NodeIncarnation, PlacementDomainId, ProtocolId, SingletonAddress,
+        SingletonKind,
     };
 
     use super::*;
@@ -470,9 +474,9 @@ mod tests {
         target_to_wire,
     };
 
-    fn actor(host: &str, incarnation: u128, sequence: u64) -> ActorRef {
+    fn actor(host: &str, incarnation: u128, sequence: u64) -> ActorAddress {
         let incarnation = NodeIncarnation::new(incarnation).unwrap();
-        ActorRef::new(
+        ActorAddress::new(
             ClusterId::new("test-cluster").unwrap(),
             NodeAddress::new(host, 25520).unwrap(),
             incarnation,
@@ -485,7 +489,7 @@ mod tests {
 
     fn entity_target() -> LogicalEntityTarget {
         LogicalEntityTarget {
-            reference: EntityRef::new(
+            reference: EntityAddress::new(
                 ClusterId::new("test-cluster").unwrap(),
                 PlacementDomainId::new("world").unwrap(),
                 EntityType::new("player").unwrap(),
@@ -502,7 +506,7 @@ mod tests {
 
     fn singleton_target() -> LogicalSingletonTarget {
         LogicalSingletonTarget {
-            reference: SingletonRef::new(
+            reference: SingletonAddress::new(
                 ClusterId::new("test-cluster").unwrap(),
                 PlacementDomainId::new("world").unwrap(),
                 SingletonKind::new("ranking").unwrap(),

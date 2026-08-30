@@ -15,8 +15,8 @@ pub mod suite;
 use std::{sync::Arc, time::Instant};
 
 use bytes::Bytes;
-use lattice_core::actor_ref::{
-    ActivationId, ActorPath, ActorRef, ClusterId, NodeAddress, NodeIncarnation, ProtocolId,
+use lattice_core::actor_address::{
+    ActivationId, ActorAddress, ActorPath, ClusterId, NodeAddress, NodeIncarnation, ProtocolId,
 };
 use lattice_remoting::{
     association::{Association, AssociationKey, LaneAttachment, LaneKind},
@@ -61,7 +61,7 @@ impl BenchmarkConfig {
 pub struct RemotingTopology {
     association: Arc<Association>,
     messaging: OutboundMessaging,
-    target: ActorRef,
+    target: ActorAddress,
     fingerprint: ProtocolFingerprint,
     prepared: PreparedExactTellRoute,
     drains: Vec<JoinHandle<()>>,
@@ -116,7 +116,7 @@ impl RemotingTopology {
             protocol_id,
             fingerprint,
         }])?;
-        let target = ActorRef::new(
+        let target = ActorAddress::new(
             cluster_id,
             remote_address,
             remote_incarnation,

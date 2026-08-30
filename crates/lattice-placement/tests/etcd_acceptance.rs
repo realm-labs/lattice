@@ -11,7 +11,7 @@ use etcd_client::Client;
 #[cfg(feature = "test-failpoints")]
 use lattice_core::failpoint::Failpoint;
 use lattice_core::{
-    actor_ref::{
+    actor_address::{
         ConfigFingerprint, EntityType, NodeAddress, NodeIncarnation, PlacementDomainId, ProtocolId,
         SingletonKind,
     },

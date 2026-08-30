@@ -1,5 +1,3 @@
-#![cfg(feature = "distributed")]
-
 use lattice_actor::context::HandlerContext;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -7,10 +5,10 @@ use std::time::Duration;
 
 use lattice_actor::context::ActorContext;
 use lattice_actor::error::{ActorCallError, ActorError, ActorStopError};
-use lattice_actor::registry::ActorRegistry;
-use lattice_actor::registry::ActorRegistryConfig;
 use lattice_actor::reply::ReplyTo;
 use lattice_actor::traits::{Actor, ActorLifecycleState, PassivationReason, Responder, StopReason};
+use lattice_actor_distributed::registry::ActorRegistry;
+use lattice_actor_distributed::registry::ActorRegistryConfig;
 use lattice_core::actor_kind;
 use lattice_core::id::ActorId;
 use tokio::sync::Semaphore;

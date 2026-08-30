@@ -123,12 +123,6 @@ where
                 state: handle.lifecycle_state(),
             }));
         }
-        ActorCommand::Quarantine(result) => {
-            let _ = result.send(Err(ActorAdminError::InvalidState {
-                operation: "quarantine_after_authority_loss",
-                state: handle.lifecycle_state(),
-            }));
-        }
         ActorCommand::ForceStop { result, .. } => {
             let _ = result.send(Err(ActorAdminError::InvalidState {
                 operation: "force_stop",

@@ -1,6 +1,6 @@
 use std::sync::{Arc, atomic::Ordering};
 
-use lattice_core::{actor_ref::PlacementDomainId, coordinator::CoordinatorScope};
+use lattice_core::{actor_address::PlacementDomainId, coordinator::CoordinatorScope};
 use tokio::{sync::Notify, time::Instant};
 
 use super::{LocalAuthorityEvent, LogicCoordinatorHandle, LogicSessionError};

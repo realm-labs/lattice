@@ -1,12 +1,12 @@
-use lattice_actor::registry::ActorQuarantineError;
-use lattice_core::{actor_ref::EntityId, coordinator::CoordinatorScope};
+use lattice_actor_distributed::registry::ActorQuarantineError;
+use lattice_core::{actor_address::EntityId, coordinator::CoordinatorScope};
 use lattice_placement::{control::PlacementControlCommand, types::ShardId};
 use lattice_remoting::messaging::error::RemoteFailureCode;
 
 use super::{
-    Actor, ActorHandle, ActorId, ActorLoader, ActorProtocolBinding, ActorRef, ActorRegistry, Arc,
-    AskError, AssociationKey, AssociationManager, AssociationState, Bytes, DispatchMode,
-    DispatchReply, EntityConfig, EntityRef, Instant, LOGICAL_RESOLVE_MESSAGE_ID,
+    Actor, ActorAddress, ActorHandle, ActorId, ActorLoader, ActorProtocolBinding, ActorRegistry,
+    Arc, AskError, AssociationKey, AssociationManager, AssociationState, Bytes, DispatchMode,
+    DispatchReply, EntityAddress, EntityConfig, Instant, LOGICAL_RESOLVE_MESSAGE_ID,
     LogicPlacementState, LogicalEntityTarget, Mutex, NodeKey, OutboundMessage, OutboundMessaging,
     PlacementSlot, PlacementSlotKey, PlacementSlotState, Protocol, ProtocolFingerprint,
     RemoteMessageError, RouteBuffer, ShardMapperBinding, WatchError, async_trait,
@@ -18,14 +18,14 @@ use super::{
 pub(super) trait EntityRoute: Send + Sync {
     async fn tell(
         &self,
-        target: EntityRef,
+        target: EntityAddress,
         fingerprint: ProtocolFingerprint,
         message_id: u64,
         payload: Bytes,
     ) -> Result<(), RemoteMessageError>;
     async fn ask(
         &self,
-        target: EntityRef,
+        target: EntityAddress,
         fingerprint: ProtocolFingerprint,
         message_id: u64,
         payload: Bytes,
@@ -44,7 +44,10 @@ pub(super) trait EntityRoute: Send + Sync {
         payload: Bytes,
         deadline: Instant,
     ) -> Result<Bytes, RemoteMessageError>;
-    async fn resolve_current(&self, target: EntityRef) -> Result<Option<ActorRef>, WatchError>;
+    async fn resolve_current(
+        &self,
+        target: EntityAddress,
+    ) -> Result<Option<ActorAddress>, WatchError>;
     async fn receive_resolve(
         &self,
         target: LogicalEntityTarget,
@@ -108,7 +111,7 @@ pub(super) struct EntityRouteHost<A: Actor, L: ActorLoader<A>, P: Protocol> {
 }
 
 impl<A: Actor, L: ActorLoader<A>, P: Protocol> EntityRouteHost<A, L, P> {
-    fn slot_key(&self, target: &EntityRef) -> Result<PlacementSlotKey, RemoteMessageError> {
+    fn slot_key(&self, target: &EntityAddress) -> Result<PlacementSlotKey, RemoteMessageError> {
         if target.protocol_id() != self.config.protocol_id
             || target.domain() != &self.config.domain
             || target.config_fingerprint() != self.config.fingerprint()
@@ -127,7 +130,7 @@ impl<A: Actor, L: ActorLoader<A>, P: Protocol> EntityRouteHost<A, L, P> {
 
     fn route_slot(
         &self,
-        target: &EntityRef,
+        target: &EntityAddress,
     ) -> Result<(PlacementSlotKey, PlacementSlot), RemoteMessageError> {
         let key = self.slot_key(target)?;
         let slot = self
@@ -142,7 +145,7 @@ impl<A: Actor, L: ActorLoader<A>, P: Protocol> EntityRouteHost<A, L, P> {
 
     fn running_slot(
         &self,
-        target: &EntityRef,
+        target: &EntityAddress,
     ) -> Result<(PlacementSlotKey, PlacementSlot), RemoteMessageError> {
         let (key, slot) = self.route_slot(target)?;
         if slot.state != PlacementSlotState::Running || slot.owner.is_none() {
@@ -202,7 +205,7 @@ impl<A: Actor, L: ActorLoader<A>, P: Protocol> EntityRouteHost<A, L, P> {
 
     async fn await_running_slot(
         &self,
-        target: &EntityRef,
+        target: &EntityAddress,
         payload_bytes: usize,
         requested_deadline: Option<Instant>,
     ) -> Result<(PlacementSlotKey, PlacementSlot), RemoteMessageError> {
@@ -306,7 +309,7 @@ where
 {
     async fn tell(
         &self,
-        target: EntityRef,
+        target: EntityAddress,
         fingerprint: ProtocolFingerprint,
         message_id: u64,
         payload: Bytes,
@@ -347,7 +350,7 @@ where
 
     async fn ask(
         &self,
-        target: EntityRef,
+        target: EntityAddress,
         fingerprint: ProtocolFingerprint,
         message_id: u64,
         payload: Bytes,
@@ -487,7 +490,10 @@ where
         }
     }
 
-    async fn resolve_current(&self, target: EntityRef) -> Result<Option<ActorRef>, WatchError> {
+    async fn resolve_current(
+        &self,
+        target: EntityAddress,
+    ) -> Result<Option<ActorAddress>, WatchError> {
         let (key, slot) = self
             .route_slot(&target)
             .map_err(|_| WatchError::NotActive)?;
@@ -546,8 +552,7 @@ where
         }
         Ok(self
             .registry
-            .get_running(&ActorId::Bytes(target.entity_id().as_bytes().to_vec()))
-            .and_then(|handle| handle.actor_ref().map(ActorRef::erase)))
+            .exact_address(&ActorId::Bytes(target.entity_id().as_bytes().to_vec())))
     }
 
     async fn receive_resolve(
@@ -557,10 +562,9 @@ where
         self.validate_local(&target)?;
         let actor = self
             .registry
-            .get_running(&ActorId::Bytes(
+            .exact_address(&ActorId::Bytes(
                 target.reference.entity_id().as_bytes().to_vec(),
             ))
-            .and_then(|handle| handle.actor_ref().map(ActorRef::erase))
             .ok_or(RemoteMessageError::StaleActivation)?;
         serde_json::to_vec(&actor)
             .map(Bytes::from)

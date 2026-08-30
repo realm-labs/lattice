@@ -1,10 +1,10 @@
-error[E0277]: the trait bound `MissingHandlerActor: lattice_actor::traits::Handler<Ping>` is not satisfied
+error[E0277]: the trait bound `MissingHandlerActor: lattice_actor_distributed::traits::Handler<Ping>` is not satisfied
   --> tests/ui/missing_protocol_handler.rs:30:36
    |
 30 |     let _ = ServerProtocol::bind::<MissingHandlerActor>();
    |                                    ^^^^^^^^^^^^^^^^^^^ unsatisfied trait bound
    |
-help: the trait `lattice_actor::traits::Handler<Ping>` is not implemented for `MissingHandlerActor`
+help: the trait `lattice_actor_distributed::traits::Handler<Ping>` is not implemented for `MissingHandlerActor`
   --> tests/ui/missing_protocol_handler.rs:22:1
    |
 22 | struct MissingHandlerActor;

@@ -7,7 +7,9 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use bytes::Bytes;
 use lattice_core::{
-    actor_ref::{ActorRef, EntityRef, ProtocolId, ProtocolTag, RecipientRef, SingletonRef},
+    actor_address::{
+        ActorAddress, EntityAddress, ProtocolId, ProtocolTag, RecipientAddress, SingletonAddress,
+    },
     watch::{WatchId, WatchStatus},
 };
 use lattice_remoting::messaging::error::{AskError, TellError};
@@ -15,19 +17,29 @@ use lattice_remoting::protocol::ProtocolFingerprint;
 use lattice_remoting::watch::{RegisteredWatch, WatchError};
 use thiserror::Error;
 
-use crate::error::ActorError;
+use lattice_actor::{
+    error::ActorError,
+    traits::{Message, Request},
+    watch::{TerminatedReason, TerminationSubscription},
+};
+
 use crate::protocol::{
     ActorProtocol, DispatchError, DispatchMode, Protocol, SupportsAsk, SupportsTell,
 };
-use crate::traits::{Message, Request};
-use crate::watch::{ActorTerminated, TerminatedTarget};
 
 #[doc(hidden)]
 pub struct RecipientTell {
-    pub target: RecipientRef,
+    pub target: RecipientAddress,
     pub protocol_fingerprint: ProtocolFingerprint,
     pub message_id: u64,
     pub payload: Bytes,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActorTerminated {
+    pub watch_id: WatchId,
+    pub target: ActorAddress,
+    pub reason: TerminatedReason,
 }
 
 #[doc(hidden)]
@@ -45,7 +57,7 @@ pub trait RecipientBackend: Send + Sync + 'static {
 
     async fn tell(
         &self,
-        target: RecipientRef,
+        target: RecipientAddress,
         protocol_fingerprint: ProtocolFingerprint,
         message_id: u64,
         payload: Bytes,
@@ -53,20 +65,23 @@ pub trait RecipientBackend: Send + Sync + 'static {
 
     async fn ask(
         &self,
-        target: RecipientRef,
+        target: RecipientAddress,
         protocol_fingerprint: ProtocolFingerprint,
         message_id: u64,
         payload: Bytes,
         deadline: Instant,
     ) -> Result<Bytes, AskError>;
 
-    async fn watch_actor(&self, target: ActorRef) -> Result<RegisteredWatch, WatchError>;
+    async fn watch_actor(&self, target: ActorAddress) -> Result<RegisteredWatch, WatchError>;
 
-    async fn watch_entity_current(&self, target: EntityRef) -> Result<RegisteredWatch, WatchError>;
+    async fn watch_entity_current(
+        &self,
+        target: EntityAddress,
+    ) -> Result<RegisteredWatch, WatchError>;
 
     async fn watch_singleton_current(
         &self,
-        target: SingletonRef,
+        target: SingletonAddress,
     ) -> Result<RegisteredWatch, WatchError>;
 
     fn unwatch(&self, watch_id: WatchId) -> Result<(), WatchError>;
@@ -75,25 +90,25 @@ pub trait RecipientBackend: Send + Sync + 'static {
 pub struct WatchTarget(WatchTargetKind);
 
 enum WatchTargetKind {
-    Exact(ActorRef),
-    EntityCurrent(EntityRef),
-    SingletonCurrent(SingletonRef),
+    Exact(ActorAddress),
+    EntityCurrent(EntityAddress),
+    SingletonCurrent(SingletonAddress),
 }
 
-impl<P: ProtocolTag> From<&ActorRef<P>> for WatchTarget {
-    fn from(target: &ActorRef<P>) -> Self {
+impl<P: ProtocolTag> From<&ActorAddress<P>> for WatchTarget {
+    fn from(target: &ActorAddress<P>) -> Self {
         Self(WatchTargetKind::Exact(target.erase()))
     }
 }
 
-impl<P: ProtocolTag> From<&EntityRef<P>> for WatchTarget {
-    fn from(target: &EntityRef<P>) -> Self {
+impl<P: ProtocolTag> From<&EntityAddress<P>> for WatchTarget {
+    fn from(target: &EntityAddress<P>) -> Self {
         Self(WatchTargetKind::EntityCurrent(target.erase()))
     }
 }
 
-impl<P: ProtocolTag> From<&SingletonRef<P>> for WatchTarget {
-    fn from(target: &SingletonRef<P>) -> Self {
+impl<P: ProtocolTag> From<&SingletonAddress<P>> for WatchTarget {
+    fn from(target: &SingletonAddress<P>) -> Self {
         Self(WatchTargetKind::SingletonCurrent(target.erase()))
     }
 }
@@ -138,13 +153,13 @@ impl WatchSubscription {
             .await
             .map_err(RecipientError::Watch)?;
         self.completed = true;
-        let target: ActorRef = terminated
+        let target: ActorAddress = terminated
             .target
-            .actor_ref()
+            .actor_address()
             .map_err(|_| RecipientError::Watch(WatchError::InvalidCommand))?;
         Ok(ActorTerminated {
             watch_id: terminated.watch_id,
-            target: TerminatedTarget::Exact(target),
+            target,
             reason: terminated.reason,
         })
     }
@@ -159,6 +174,19 @@ impl WatchSubscription {
     }
 }
 
+impl TerminationSubscription for WatchSubscription {
+    fn id(&self) -> WatchId {
+        self.id()
+    }
+
+    async fn recv(&mut self) -> Option<TerminatedReason> {
+        WatchSubscription::recv(self)
+            .await
+            .ok()
+            .map(|event| event.reason)
+    }
+}
+
 impl Drop for WatchSubscription {
     fn drop(&mut self) {
         if !self.completed {
@@ -170,8 +198,8 @@ impl Drop for WatchSubscription {
 
 /// Process-level actor messaging capability.
 ///
-/// Applications normally access this through `LatticeService` or
-/// `ActorContext`; actor references themselves remain plain serializable data.
+/// Applications normally bind a serializable address once, then retain the
+/// resulting `ActorRef`, `EntityRef`, or `SingletonRef` capability.
 #[derive(Clone)]
 pub struct ActorSystem {
     backend: Arc<dyn RecipientBackend>,
@@ -208,6 +236,41 @@ impl ActorSystem {
         })
     }
 
+    pub fn bind_actor<P: Protocol>(
+        &self,
+        address: ActorAddress<P>,
+    ) -> Result<crate::reference::ActorRef<P>, RecipientError> {
+        self.protocol::<P>(address.protocol_id())?;
+        Ok(crate::reference::ActorRef::new(address, self.clone()))
+    }
+
+    pub fn bind_entity<P: Protocol>(
+        &self,
+        address: EntityAddress<P>,
+    ) -> Result<crate::reference::EntityRef<P>, RecipientError> {
+        self.protocol::<P>(address.protocol_id())?;
+        Ok(crate::reference::EntityRef::new(address, self.clone()))
+    }
+
+    pub fn bind_singleton<P: Protocol>(
+        &self,
+        address: SingletonAddress<P>,
+    ) -> Result<crate::reference::SingletonRef<P>, RecipientError> {
+        self.protocol::<P>(address.protocol_id())?;
+        Ok(crate::reference::SingletonRef::new(address, self.clone()))
+    }
+
+    pub fn bind<P: Protocol>(
+        &self,
+        address: RecipientAddress<P>,
+    ) -> Result<crate::reference::Recipient<P>, RecipientError> {
+        match address {
+            RecipientAddress::Actor(address) => self.bind_actor(address).map(Into::into),
+            RecipientAddress::Entity(address) => self.bind_entity(address).map(Into::into),
+            RecipientAddress::Singleton(address) => self.bind_singleton(address).map(Into::into),
+        }
+    }
+
     /// Sends a one-way message from process code.
     ///
     /// Remote exact-actor delivery waits for bounded outbound queue and byte
@@ -215,7 +278,7 @@ impl ActorSystem {
     /// protocol, or Association failures are returned without waiting.
     pub async fn tell<P, M>(
         &self,
-        target: impl Into<RecipientRef<P>>,
+        target: impl Into<RecipientAddress<P>>,
         message: M,
     ) -> Result<(), RecipientError>
     where
@@ -256,7 +319,7 @@ impl ActorSystem {
     /// retries and remote hops share the same time budget.
     pub async fn ask<P, R>(
         &self,
-        target: impl Into<RecipientRef<P>>,
+        target: impl Into<RecipientAddress<P>>,
         request: R,
         timeout: Duration,
     ) -> Result<R::Response, RecipientError>
@@ -270,7 +333,7 @@ impl ActorSystem {
 
     pub(crate) async fn ask_until<P, R>(
         &self,
-        target: RecipientRef<P>,
+        target: RecipientAddress<P>,
         request: R,
         deadline: Instant,
     ) -> Result<R::Response, RecipientError>
@@ -343,11 +406,11 @@ impl ActorSystem {
     }
 }
 
-fn target_protocol_id<P: Protocol>(target: &RecipientRef<P>) -> ProtocolId {
+fn target_protocol_id<P: Protocol>(target: &RecipientAddress<P>) -> ProtocolId {
     match target {
-        RecipientRef::Actor(reference) => reference.protocol_id(),
-        RecipientRef::Entity(reference) => reference.protocol_id(),
-        RecipientRef::Singleton(reference) => reference.protocol_id(),
+        RecipientAddress::Actor(reference) => reference.protocol_id(),
+        RecipientAddress::Entity(reference) => reference.protocol_id(),
+        RecipientAddress::Singleton(reference) => reference.protocol_id(),
     }
 }
 
@@ -410,6 +473,8 @@ pub enum ProtocolRegistrationError {
 
 #[derive(Debug, Error)]
 pub enum RecipientError {
+    #[error("actor address is invalid for the requested protocol")]
+    Address(#[from] lattice_core::actor_address::AddressError),
     #[error("actor ask timeout cannot be represented as a deadline")]
     InvalidTimeout,
     #[error("actor protocol {protocol_id} is not registered with this actor system")]

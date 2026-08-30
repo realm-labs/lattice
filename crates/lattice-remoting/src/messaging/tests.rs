@@ -55,9 +55,9 @@ fn active_association(
     association
 }
 
-fn target(protocol_id: ProtocolId) -> ActorRef {
+fn target(protocol_id: ProtocolId) -> ActorAddress {
     let node = NodeIncarnation::new(2).unwrap();
-    ActorRef::new(
+    ActorAddress::new(
         ClusterId::new("test").unwrap(),
         NodeAddress::new("remote", 25520).unwrap(),
         node,
@@ -113,9 +113,9 @@ async fn real_tcp_tell_and_ask_dispatch_exact_activation() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let protocol_id = ProtocolId::new(7).unwrap();
-    let actor_ref = target(protocol_id);
+    let actor_address = target(protocol_id);
     let dispatch = Arc::new(RecordingDispatch {
-        activation: actor_ref.activation_id(),
+        activation: actor_address.activation_id(),
         tells: AtomicUsize::new(0),
     });
     let server_dispatch = dispatch.clone();
@@ -135,7 +135,7 @@ async fn real_tcp_tell_and_ask_dispatch_exact_activation() {
         .write_frame(&Frame::encode_message(
             FrameKind::Tell,
             &TellWire {
-                target: Some(target_to_wire(&actor_ref)),
+                target: Some(target_to_wire(&actor_address)),
                 message_id: 1,
                 payload: Bytes::from_static(b"tell"),
                 target_id: 0,
@@ -148,7 +148,7 @@ async fn real_tcp_tell_and_ask_dispatch_exact_activation() {
         .write_frame(&Frame::encode_message(
             FrameKind::Ask,
             &AskWire {
-                target: Some(target_to_wire(&actor_ref)),
+                target: Some(target_to_wire(&actor_address)),
                 correlation_id: Bytes::copy_from_slice(&correlation.to_bytes()),
                 timeout_nanos: Duration::from_secs(1).as_nanos() as u64,
                 message_id: 2,
@@ -167,7 +167,7 @@ async fn real_tcp_tell_and_ask_dispatch_exact_activation() {
         .write_frame(&Frame::encode_message(
             FrameKind::Ask,
             &AskWire {
-                target: Some(target_to_wire(&actor_ref)),
+                target: Some(target_to_wire(&actor_address)),
                 correlation_id: Bytes::copy_from_slice(&panic_correlation.to_bytes()),
                 timeout_nanos: Duration::from_secs(1).as_nanos() as u64,
                 message_id: 2,
@@ -205,7 +205,7 @@ async fn outbound_tell_encodes_the_exact_target() {
 
     let frame = receivers.bulk[stripe].recv().await.unwrap();
     let decoded = decode_tell(&frame).unwrap();
-    let decoded_target: ActorRef = decoded.target.actor_ref().unwrap();
+    let decoded_target: ActorAddress = decoded.target.actor_address().unwrap();
     assert!(decoded_target.same_activation(&recipient));
 }
 
@@ -230,8 +230,8 @@ async fn prepared_exact_tell_is_bound_to_association() {
     let mut dictionary = ExactTargetDictionary::new();
     let decoded = decode_tell_cached(&registration, &mut cache, &mut dictionary).unwrap();
     let compact_decoded = decode_tell_cached(&compact, &mut cache, &mut dictionary).unwrap();
-    let decoded_target: ActorRef = decoded.target.actor_ref().unwrap();
-    let compact_target: ActorRef = compact_decoded.target.actor_ref().unwrap();
+    let decoded_target: ActorAddress = decoded.target.actor_address().unwrap();
+    let compact_target: ActorAddress = compact_decoded.target.actor_address().unwrap();
     assert!(decoded_target.same_activation(&recipient));
     assert!(compact_target.same_activation(&recipient));
 
@@ -254,12 +254,12 @@ async fn disconnect_result_changes_only_at_socket_write_boundary() {
         let messaging = Arc::new(OutboundMessaging::new(4).unwrap());
         let task_messaging = messaging.clone();
         let task_association = association.clone();
-        let actor_ref = target(protocol_id);
+        let actor_address = target(protocol_id);
         let task = tokio::spawn(async move {
             task_messaging
                 .ask(
                     &task_association,
-                    &actor_ref,
+                    &actor_address,
                     OutboundMessage::new(fingerprint, 1, Bytes::new()),
                     Instant::now() + Duration::from_secs(5),
                 )
@@ -284,12 +284,12 @@ async fn expired_queued_ask_is_dropped_before_socket_write() {
     let messaging = Arc::new(OutboundMessaging::new(4).unwrap());
     let task_messaging = messaging.clone();
     let task_association = association.clone();
-    let actor_ref = target(protocol_id);
+    let actor_address = target(protocol_id);
     let task = tokio::spawn(async move {
         task_messaging
             .ask(
                 &task_association,
-                &actor_ref,
+                &actor_address,
                 OutboundMessage::new(fingerprint, 1, Bytes::new()),
                 Instant::now() + Duration::from_millis(10),
             )
@@ -309,12 +309,12 @@ async fn cancelling_an_ask_removes_it_from_the_shared_deadline_driver() {
     let messaging = Arc::new(OutboundMessaging::new(4).unwrap());
     let task_messaging = messaging.clone();
     let task_association = association.clone();
-    let actor_ref = target(protocol_id);
+    let actor_address = target(protocol_id);
     let task = tokio::spawn(async move {
         task_messaging
             .ask(
                 &task_association,
-                &actor_ref,
+                &actor_address,
                 OutboundMessage::new(fingerprint, 1, Bytes::new()),
                 Instant::now() + Duration::from_secs(30),
             )
@@ -379,10 +379,10 @@ fn one_protocol_mismatch_does_not_close_the_association() {
     let fingerprint = ProtocolFingerprint::digest(b"test/v1");
     let association = active_association(protocol_id, fingerprint);
     let messaging = OutboundMessaging::new(4).unwrap();
-    let actor_ref = target(protocol_id);
+    let actor_address = target(protocol_id);
     let mismatch = messaging.tell(
         &association,
-        &actor_ref,
+        &actor_address,
         OutboundMessage::new(ProtocolFingerprint::digest(b"other"), 1, Bytes::new()),
     );
     assert!(matches!(
@@ -396,7 +396,7 @@ fn one_protocol_mismatch_does_not_close_the_association() {
         messaging
             .tell(
                 &association,
-                &actor_ref,
+                &actor_address,
                 OutboundMessage::new(fingerprint, 1, Bytes::new()),
             )
             .is_ok()

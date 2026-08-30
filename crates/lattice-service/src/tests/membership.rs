@@ -12,12 +12,12 @@ use std::{
 };
 
 use futures_util::Stream;
-use lattice_actor::registry::{ActorRefConfig, ActorRegistry, ActorRegistryConfig};
+use lattice_actor_distributed::registry::{ActorAddressConfig, ActorRegistry, ActorRegistryConfig};
 use lattice_core::{
-    actor_kind,
-    actor_ref::{
-        ClusterId, EntityId, EntityRef, EntityType, NodeAddress, NodeIncarnation, ProtocolId,
+    actor_address::{
+        ClusterId, EntityAddress, EntityId, EntityType, NodeAddress, NodeIncarnation, ProtocolId,
     },
+    actor_kind,
     coordinator::CoordinatorScope,
     failpoint::Failpoint,
 };
@@ -99,7 +99,7 @@ fn discovery_snapshot(
 
 async fn ping(
     service: &LatticeService,
-    target: EntityRef<PingProtocol>,
+    target: EntityAddress<PingProtocol>,
     value: u64,
     phase: &str,
 ) -> Pong {
@@ -118,7 +118,7 @@ async fn ping(
 
 async fn ping_other(
     service: &LatticeService,
-    target: EntityRef<OtherPingProtocol>,
+    target: EntityAddress<OtherPingProtocol>,
     value: u64,
     phase: &str,
 ) -> Pong {
@@ -509,7 +509,7 @@ async fn coordinator_rollover_recovers_after_blocked_session_registration() {
     let registry = Arc::new(ActorRegistry::new_bound(
         actor_kind!("RolloverPing"),
         ActorRegistryConfig {
-            actor_ref: Some(ActorRefConfig {
+            address: Some(ActorAddressConfig {
                 cluster_id: cluster_id.clone(),
                 node_address: member_address.clone(),
                 node_incarnation: member_incarnation,
@@ -726,7 +726,7 @@ async fn an_active_shard_recovers_after_a_transient_association_loss() {
     let primary_registry = Arc::new(ActorRegistry::new_bound(
         actor_kind!("AssociationRecoveryPrimary"),
         ActorRegistryConfig {
-            actor_ref: Some(ActorRefConfig {
+            address: Some(ActorAddressConfig {
                 cluster_id: cluster_id.clone(),
                 node_address: member_address.clone(),
                 node_incarnation: member_incarnation,
@@ -739,7 +739,7 @@ async fn an_active_shard_recovers_after_a_transient_association_loss() {
     let secondary_registry = Arc::new(ActorRegistry::new_bound(
         actor_kind!("AssociationRecoverySecondary"),
         ActorRegistryConfig {
-            actor_ref: Some(ActorRefConfig {
+            address: Some(ActorAddressConfig {
                 cluster_id: cluster_id.clone(),
                 node_address: member_address.clone(),
                 node_incarnation: member_incarnation,
@@ -946,7 +946,7 @@ async fn a_member_hosting_a_shard_leaves_by_handing_it_over_rather_than_timing_o
         let registry = Arc::new(ActorRegistry::new_bound(
             actor_kind!("DrainedPing"),
             ActorRegistryConfig {
-                actor_ref: Some(ActorRefConfig {
+                address: Some(ActorAddressConfig {
                     cluster_id: cluster_id.clone(),
                     node_address: address.clone(),
                     node_incarnation: incarnation,

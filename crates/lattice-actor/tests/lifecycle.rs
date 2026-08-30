@@ -74,7 +74,7 @@ async fn local_actor_watch_sends_typed_termination_notification() {
     );
 
     tokio::time::sleep(Duration::from_millis(10)).await;
-    target.stop(StopReason::Requested).await.unwrap();
+    target.stop(StopReason::Requested).unwrap();
     notified.acquire().await.unwrap().forget();
 
     assert_eq!(*events.lock().await, vec![TerminatedReason::Stopped]);
@@ -125,9 +125,9 @@ async fn watcher_stop_auto_unwatches_local_target() {
     );
 
     tokio::time::sleep(Duration::from_millis(10)).await;
-    watcher.stop(StopReason::Requested).await.unwrap();
+    watcher.stop(StopReason::Requested).unwrap();
     tokio::time::sleep(Duration::from_millis(10)).await;
-    target.stop(StopReason::Requested).await.unwrap();
+    target.stop(StopReason::Requested).unwrap();
     tokio::time::sleep(Duration::from_millis(30)).await;
 
     assert!(events.lock().await.is_empty());
@@ -182,7 +182,7 @@ async fn local_child_actor_stops_with_parent_lifecycle() {
     );
 
     tokio::time::sleep(Duration::from_millis(10)).await;
-    parent.stop(StopReason::Requested).await.unwrap();
+    parent.stop(StopReason::Requested).unwrap();
 
     tokio::time::timeout(Duration::from_millis(100), child_stopped.acquire())
         .await
@@ -260,8 +260,6 @@ async fn child_supervision_stop_parent_stops_parent_when_child_stops() {
                 ChildActorKey::new("child"),
                 ChildActor,
                 ChildActorOptions {
-                    #[cfg(feature = "distributed")]
-                    protocol_id: None,
                     mailbox: MailboxConfig::bounded(8),
                     supervision: ChildSupervision::StopParent,
                     ..ChildActorOptions::default()
@@ -292,7 +290,6 @@ async fn child_supervision_stop_parent_stops_parent_when_child_stops() {
                 .as_ref()
                 .expect("child should be available")
                 .stop(StopReason::Requested)
-                .await
                 .map_err(|error| ActorError::new(error.to_string()))?;
             Ok(())
         }
@@ -344,8 +341,6 @@ async fn child_supervision_restart_child_recreates_child_from_factory() {
                     ChildActor
                 },
                 ChildActorOptions {
-                    #[cfg(feature = "distributed")]
-                    protocol_id: None,
                     mailbox: MailboxConfig::bounded(8),
                     supervision: ChildSupervision::RestartChild,
                     ..ChildActorOptions::default()
@@ -365,7 +360,6 @@ async fn child_supervision_restart_child_recreates_child_from_factory() {
                 .as_ref()
                 .expect("child should be available")
                 .stop(StopReason::Requested)
-                .await
                 .map_err(|error| ActorError::new(error.to_string()))?;
             Ok(())
         }
@@ -458,7 +452,7 @@ async fn stopping_failure_enters_stop_failed_state() {
     let handle = spawn_actor(FailingStopActor, MailboxConfig::bounded(8));
     let mut lifecycle = handle.subscribe_lifecycle();
 
-    handle.stop(StopReason::Requested).await.unwrap();
+    handle.stop(StopReason::Requested).unwrap();
     tokio::time::timeout(Duration::from_millis(100), async {
         loop {
             lifecycle.changed().await.unwrap();
@@ -564,7 +558,7 @@ async fn stopping_failure_retains_actor_state_and_retry_terminates_once() {
     );
     watcher_ready.acquire().await.unwrap().forget();
 
-    handle.stop(StopReason::Requested).await.unwrap();
+    handle.stop(StopReason::Requested).unwrap();
     tokio::time::timeout(Duration::from_secs(1), async {
         while *lifecycle.borrow() != ActorLifecycleState::StopFailed {
             lifecycle.changed().await.unwrap();
@@ -642,7 +636,7 @@ async fn stop_failed_rejects_business_traffic_but_accepts_force_stop() {
     let handle = spawn_actor(RetainedActor, MailboxConfig::bounded(8));
     let mut lifecycle = handle.subscribe_lifecycle();
     let mut data_loss = handle.subscribe_forced_data_loss();
-    handle.stop(StopReason::Requested).await.unwrap();
+    handle.stop(StopReason::Requested).unwrap();
     tokio::time::timeout(Duration::from_secs(1), async {
         while *lifecycle.borrow() != ActorLifecycleState::StopFailed {
             lifecycle.changed().await.unwrap();
@@ -709,8 +703,6 @@ async fn passivation_policy_idle_timeout_stops_idle_actor() {
                 execution: None,
                 scheduler_key: None,
                 passivation: PassivationPolicy::IdleTimeout(Duration::from_millis(10)),
-                #[cfg(feature = "distributed")]
-                self_ref: None,
                 service: ServiceContext::empty(),
             },
         )
@@ -809,7 +801,7 @@ async fn watch_notification_is_delivered_while_the_normal_mailbox_is_full() {
         assert!(queued < 64, "normal lane never reported backpressure");
     }
 
-    target.stop(StopReason::Requested).await.unwrap();
+    target.stop(StopReason::Requested).unwrap();
     tokio::time::sleep(Duration::from_millis(20)).await;
     assert!(
         watcher.try_tell(Block).is_err(),
@@ -1000,7 +992,7 @@ async fn watch_capacity_is_bounded_and_reclaimed() {
     );
     assert_eq!(watcher.ask(AddWatches(1), ASK_TIMEOUT).await, Ok(0));
 
-    target.stop(StopReason::Requested).await.unwrap();
+    target.stop(StopReason::Requested).unwrap();
     tokio::time::timeout(Duration::from_secs(10), async {
         while watcher.ask(TerminatedCount, ASK_TIMEOUT).await != Ok(WATCH_LIMIT) {
             tokio::task::yield_now().await;

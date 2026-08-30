@@ -688,3 +688,9 @@ termination exactly once, and the current activation is never resumed. A parent 
 `RestartChild` supervision directive may construct a replacement child, but that replacement has a
 new activation identity. Panics in independently spawned scoped or pipe tasks remain isolated from
 the Actor and are harvested by the runtime as task failures.
+# Hard-switch API note
+
+The address/reference, sender, distributed child, messaging and DeathWatch API
+sections in this older design chapter are superseded by
+[`09-actor-api-boundaries.md`](09-actor-api-boundaries.md). The local runtime no
+longer contains distributed state or an implicit sender model.

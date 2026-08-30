@@ -5,7 +5,7 @@ use std::{
     num::NonZeroU64,
     sync::{
         Arc, OnceLock, RwLock,
-        atomic::{AtomicU8, Ordering},
+        atomic::{AtomicU8, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -13,8 +13,9 @@ use std::{
 use async_trait::async_trait;
 use dashmap::{DashMap, mapref::entry::Entry};
 use lattice_core::{
-    actor_ref::{
-        ActivationId, ActorPath, ActorRef, ClusterId, NodeAddress, NodeIncarnation, ProtocolId,
+    actor_address::{
+        ActivationId, ActorAddress, ActorPath, AddressError, ClusterId, NodeAddress,
+        NodeIncarnation, ProtocolId, ProtocolTag,
     },
     id::ActorId,
     kind::ActorKind,
@@ -23,23 +24,49 @@ use lattice_core::{
 use thiserror::Error;
 use tokio::sync::{Semaphore, watch};
 
-use crate::{
-    directory::ActivationDirectory,
-    error::{ActorActivationError, ActorAdminError, ActorError},
+use lattice_actor::{
+    error::{ActorAdminError, ActorError},
     handle::{ActorHandle, StopFailureRecord},
     mailbox::MailboxConfig,
     observation::ActorObserverHandle,
-    protocol::{ActorProtocolBinding, Protocol},
-    recipient::ActorSystem,
-    runtime::{
-        ActorSpawnContext, ActorSpawnOptions, PassivationPolicy, ShardMigrationPolicy,
-        spawn_actor_with_self_ref, spawner::ActorSpawner,
-    },
-    traits::{Actor, ActorLifecycleState, EntityActivationState, PassivationReason, StopReason},
+    resources::ActorResources,
+    runtime::{ActorRuntime, ActorRuntimeConfig, ActorSpawnOptions, PassivationPolicy},
+    traits::{Actor, ActorLifecycleState, PassivationReason, StopReason},
     watch::LocalActorRef,
 };
 
+use crate::{
+    activation::DistributedActorContext,
+    directory::ActivationDirectory,
+    entity::EntityActivationState,
+    protocol::{ActorProtocolBinding, Protocol},
+    recipient::ActorSystem,
+};
+
 mod quarantine;
+
+#[derive(Debug, Clone, Error)]
+pub enum ActorActivationError {
+    #[error("actor is already running or activating")]
+    AlreadyExists,
+    #[error("activation waiter capacity exceeded")]
+    WaiterCapacityExceeded,
+    #[error("timed out waiting {timeout:?} for actor activation")]
+    WaiterTimeout { timeout: Duration },
+    #[error("actor activation failed: {0}")]
+    ActivationFailed(ActorError),
+    #[error("actor activation is retained after stopping persistence failed")]
+    RetainedStopFailure,
+}
+
+static NEXT_ACTIVATION_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ShardMigrationPolicy {
+    #[default]
+    BlockRunningActors,
+    PassivateRunningActors,
+}
 
 #[derive(Debug, Clone)]
 pub struct ActorRegistryConfig {
@@ -49,12 +76,12 @@ pub struct ActorRegistryConfig {
     pub waiter_capacity: usize,
     pub waiter_timeout: Duration,
     pub quarantine_capacity: usize,
-    pub actor_ref: Option<ActorRefConfig>,
+    pub address: Option<ActorAddressConfig>,
     pub service: ServiceContext,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ActorRefConfig {
+pub struct ActorAddressConfig {
     pub cluster_id: ClusterId,
     pub node_address: NodeAddress,
     pub node_incarnation: NodeIncarnation,
@@ -69,7 +96,7 @@ impl Default for ActorRegistryConfig {
             waiter_capacity: 1024,
             waiter_timeout: Duration::from_secs(5),
             quarantine_capacity: 1024,
-            actor_ref: None,
+            address: None,
             service: ServiceContext::empty(),
         }
     }
@@ -85,7 +112,7 @@ pub struct ActorRegistry<A: Actor> {
     actor_system: Arc<OnceLock<ActorSystem>>,
     fencing_token_resolvers: Arc<RwLock<BTreeMap<String, ActorFencingTokenResolver>>>,
     observer: ActorObserverHandle,
-    spawner: ActorSpawner,
+    runtime: ActorRuntime,
 }
 
 type ActorFencingTokenResolver = Arc<dyn Fn(&ActorId) -> Option<u64> + Send + Sync + 'static>;
@@ -119,6 +146,7 @@ pub struct ValidatedActorAuthority {
 }
 
 struct ExactRegistryEntry<A: Actor> {
+    reference: ActorAddress,
     handle: ActorHandle<A>,
     local_ref: LocalActorRef,
 }
@@ -169,7 +197,7 @@ pub struct RegistryDrainResult {
 pub struct QuarantineDiagnostics {
     pub actor_id: ActorId,
     pub local_ref: LocalActorRef,
-    pub actor_ref: Option<ActorRef>,
+    pub actor_address: Option<ActorAddress>,
     pub failure: StopFailureRecord,
 }
 
@@ -229,8 +257,8 @@ where
 impl<A: Actor> ActorRegistry<A> {
     pub fn new(kind: ActorKind, config: ActorRegistryConfig) -> Self {
         assert!(
-            config.actor_ref.is_none(),
-            "registries with exact ActorRefs must be constructed with ActorRegistry::new_bound"
+            config.address.is_none(),
+            "registries with exact ActorAddresses must be constructed with ActorRegistry::new_bound"
         );
         assert!(
             config.quarantine_capacity > 0,
@@ -246,12 +274,12 @@ impl<A: Actor> ActorRegistry<A> {
             actor_system: Arc::new(OnceLock::new()),
             fencing_token_resolvers: Arc::new(RwLock::new(BTreeMap::new())),
             observer: ActorObserverHandle::default(),
-            spawner: ActorSpawner::task_per_actor(),
+            runtime: ActorRuntime::default(),
         }
     }
 
-    /// Constructs a registry whose exact activation references are bound to
-    /// the supplied server protocol. The reference protocol ID is derived from
+    /// Constructs a registry whose exact activation addresses are bound to
+    /// the supplied server protocol. The address protocol ID is derived from
     /// the binding and cannot drift from the registered dispatcher.
     pub fn new_bound<P: Protocol>(
         kind: ActorKind,
@@ -272,12 +300,16 @@ impl<A: Actor> ActorRegistry<A> {
             actor_system: Arc::new(OnceLock::new()),
             fencing_token_resolvers: Arc::new(RwLock::new(BTreeMap::new())),
             observer: ActorObserverHandle::default(),
-            spawner: ActorSpawner::task_per_actor(),
+            runtime: ActorRuntime::default(),
         }
     }
 
     pub fn with_observer(mut self, observer: ActorObserverHandle) -> Self {
-        self.observer = observer;
+        self.observer = observer.clone();
+        self.runtime = ActorRuntime::new(ActorRuntimeConfig {
+            observer,
+            ..ActorRuntimeConfig::default()
+        });
         self
     }
 
@@ -338,10 +370,7 @@ impl<A: Actor> ActorRegistry<A> {
         self.entries
             .iter()
             .filter_map(|entry| match entry.value() {
-                RegistryEntry::Running(handle)
-                    if !is_terminal(handle.lifecycle_state())
-                        && handle.lifecycle_state() != ActorLifecycleState::Quarantined =>
-                {
+                RegistryEntry::Running(handle) if !is_terminal(handle.lifecycle_state()) => {
                     Some(entry.key().clone())
                 }
                 RegistryEntry::Running(_) | RegistryEntry::Activating(_) => None,
@@ -372,26 +401,37 @@ impl<A: Actor> ActorRegistry<A> {
         }
     }
 
-    pub fn get_exact(&self, actor_ref: &ActorRef) -> Option<ActorHandle<A>> {
-        if self.config.actor_ref.as_ref().is_none_or(|config| {
-            config.cluster_id != *actor_ref.cluster_id()
-                || config.node_address != *actor_ref.node_address()
-                || config.node_incarnation != actor_ref.node_incarnation()
-                || self.protocol_id != Some(actor_ref.protocol_id())
+    pub fn exact_address(&self, actor_id: &ActorId) -> Option<ActorAddress> {
+        let handle = self.get_running(actor_id)?;
+        self.exact_reference(&handle)
+    }
+
+    pub fn address<P: ProtocolTag>(
+        &self,
+        actor_id: &ActorId,
+    ) -> Result<Option<ActorAddress<P>>, AddressError> {
+        self.exact_address(actor_id)
+            .map(|address| address.try_typed::<P>())
+            .transpose()
+    }
+
+    pub fn get_exact(&self, address: &ActorAddress) -> Option<ActorHandle<A>> {
+        if self.config.address.as_ref().is_none_or(|config| {
+            config.cluster_id != *address.cluster_id()
+                || config.node_address != *address.node_address()
+                || config.node_incarnation != address.node_incarnation()
+                || self.protocol_id != Some(address.protocol_id())
         }) {
             return None;
         }
         if let Some(directory) = self.config.service.extension::<ActivationDirectory>()
-            && let Some(handle) = directory.resolve(actor_ref)
+            && let Some(handle) = directory.resolve(address)
         {
             return Some(handle);
         }
-        let exact = self.exact_entries.get(&actor_ref.activation_id())?;
+        let exact = self.exact_entries.get(&address.activation_id())?;
         if is_business_admitted(exact.handle.lifecycle_state())
-            && exact
-                .handle
-                .actor_ref()
-                .is_some_and(|current| current.same_activation(actor_ref))
+            && exact.reference.same_activation(address)
         {
             Some(exact.handle.clone())
         } else {
@@ -402,7 +442,7 @@ impl<A: Actor> ActorRegistry<A> {
     pub async fn remove(&self, actor_id: &ActorId) -> Option<ActorHandle<A>> {
         let handle = self.entry_handle(actor_id)?;
         if is_business_admitted(handle.lifecycle_state()) {
-            let _ = handle.stop(StopReason::Requested).await;
+            let _ = handle.stop(StopReason::Requested);
         }
         Some(handle)
     }
@@ -433,20 +473,9 @@ impl<A: Actor> ActorRegistry<A> {
             .quarantined
             .iter()
             .map(|entry| entry.value().handle.clone())
-            .chain(self.entries.iter().filter_map(|entry| match entry.value() {
-                RegistryEntry::Running(handle)
-                    if handle.lifecycle_state() == ActorLifecycleState::Quarantined =>
-                {
-                    Some(handle.clone())
-                }
-                RegistryEntry::Running(_) | RegistryEntry::Activating(_) => None,
-            }))
             .collect::<Vec<_>>();
         for handle in quarantined {
-            if matches!(
-                handle.lifecycle_state(),
-                ActorLifecycleState::StopFailed | ActorLifecycleState::Quarantined
-            ) {
+            if handle.lifecycle_state() == ActorLifecycleState::StopFailed {
                 let _ = handle
                     .force_stop(reason.to_owned(), ticket.to_owned())
                     .await;
@@ -476,12 +505,11 @@ impl<A: Actor> ActorRegistry<A> {
                     }
                     continue;
                 }
-                ActorLifecycleState::Stopped | ActorLifecycleState::Quarantined => continue,
+                ActorLifecycleState::Stopped => continue,
                 ActorLifecycleState::Starting | ActorLifecycleState::Running => {
                     result.requested += 1;
                     if handle
                         .stop(StopReason::Passivated(PassivationReason::Drain))
-                        .await
                         .is_err()
                     {
                         result.request_failures.push(actor_id);
@@ -520,7 +548,7 @@ impl<A: Actor> ActorRegistry<A> {
     }
 
     /// Waits until the selected active Actor cells are actually gone.
-    /// StopFailed and Quarantined are deliberately nonterminal and keep this future pending.
+    /// StopFailed is deliberately nonterminal and keeps this future pending.
     pub async fn wait_actor_ids_terminal<I>(&self, actor_ids: I)
     where
         I: IntoIterator<Item = ActorId>,
@@ -549,7 +577,7 @@ impl<A: Actor> ActorRegistry<A> {
                 && is_business_admitted(handle.lifecycle_state())
             {
                 let mut lifecycle = handle.subscribe_lifecycle();
-                if handle.stop(StopReason::Passivated(reason)).await.is_err() {
+                if handle.stop(StopReason::Passivated(reason)).is_err() {
                     continue;
                 }
                 let stopped = tokio::time::timeout(self.config.waiter_timeout, async {
@@ -585,7 +613,6 @@ impl<A: Actor> ActorRegistry<A> {
                     .spawn_actor(actor_id.clone(), actor)
                     .map_err(ActorActivationError::ActivationFailed)?;
                 entry.insert(RegistryEntry::Running(handle.clone()));
-                self.register_exact(&handle);
                 if handle.terminal_cleanup_started() || is_terminal(handle.lifecycle_state()) {
                     self.remove_stopped_running_entry(&actor_id);
                 }
@@ -610,11 +637,6 @@ impl<A: Actor> ActorRegistry<A> {
                     if handle.lifecycle_state() == ActorLifecycleState::StopFailed =>
                 {
                     return Err(ActorActivationError::RetainedStopFailure);
-                }
-                RegistryEntry::Running(handle)
-                    if handle.lifecycle_state() == ActorLifecycleState::Quarantined =>
-                {
-                    return Err(ActorActivationError::Quarantined);
                 }
                 RegistryEntry::Running(handle) => return Ok(handle.clone()),
                 RegistryEntry::Activating(activation) => RegistryLookup::Wait(activation.clone()),
@@ -656,7 +678,6 @@ impl<A: Actor> ActorRegistry<A> {
                 };
                 match spawned {
                     Ok(handle) => {
-                        self.register_exact(&handle);
                         if handle.terminal_cleanup_started()
                             || is_terminal(handle.lifecycle_state())
                         {
@@ -860,35 +881,30 @@ impl<A: Actor> ActorRegistry<A> {
                     if is_terminal(handle.lifecycle_state())
             )
         });
-        if let Some((_, RegistryEntry::Running(handle))) = removed {
-            self.remove_exact(&handle);
-            if let Some(directory) = self.config.service.extension::<ActivationDirectory>()
-                && let Some(reference) = handle.actor_ref()
-            {
-                directory.remove(&reference.erase());
-            }
+        if let Some((_, RegistryEntry::Running(handle))) = removed
+            && let Some(reference) = self.remove_exact(&handle)
+            && let Some(directory) = self.config.service.extension::<ActivationDirectory>()
+        {
+            directory.remove(&reference);
         }
     }
 
-    fn register_exact(&self, handle: &ActorHandle<A>) {
-        if let Some(reference) = handle.actor_ref() {
-            self.exact_entries.insert(
-                reference.activation_id(),
-                ExactRegistryEntry {
-                    handle: handle.clone(),
-                    local_ref: handle.local_ref(),
-                },
-            );
-        }
+    fn remove_exact(&self, handle: &ActorHandle<A>) -> Option<ActorAddress> {
+        let activation_id = self
+            .exact_entries
+            .iter()
+            .find_map(|entry| (entry.local_ref == handle.local_ref()).then_some(*entry.key()))?;
+        self.exact_entries
+            .remove_if(&activation_id, |_, entry| {
+                entry.local_ref == handle.local_ref()
+            })
+            .map(|(_, entry)| entry.reference)
     }
 
-    fn remove_exact(&self, handle: &ActorHandle<A>) {
-        if let Some(reference) = handle.actor_ref() {
-            self.exact_entries
-                .remove_if(&reference.activation_id(), |_, entry| {
-                    entry.local_ref == handle.local_ref()
-                });
-        }
+    fn exact_reference(&self, handle: &ActorHandle<A>) -> Option<ActorAddress> {
+        self.exact_entries.iter().find_map(|entry| {
+            (entry.local_ref == handle.local_ref()).then(|| entry.reference.clone())
+        })
     }
 
     fn entry_handle(&self, actor_id: &ActorId) -> Option<ActorHandle<A>> {
@@ -915,16 +931,16 @@ impl<A: Actor> ActorRegistry<A> {
     }
 
     fn spawn_actor(&self, actor_id: ActorId, actor: A) -> Result<ActorHandle<A>, ActorError> {
-        let self_ref = self
-            .actor_ref_for(actor_id.clone())
-            .map(|actor_ref| actor_ref.erase());
+        let self_address = self
+            .actor_address_for(actor_id.clone())
+            .map(|address| address.erase());
         let entries = self.entries.clone();
         let exact_entries = self.exact_entries.clone();
         let quarantined = self.quarantined.clone();
         let terminal_actor_id = actor_id.clone();
         let directory = self.config.service.extension::<ActivationDirectory>();
-        let terminal_reference = self_ref.clone();
-        let terminal_activation = self_ref.as_ref().map(ActorRef::activation_id);
+        let terminal_reference = self_address.clone();
+        let terminal_activation = self_address.as_ref().map(ActorAddress::activation_id);
         let terminal_hook = Box::new(move |local_ref| {
             entries.remove_if(&terminal_actor_id, |_, entry| {
                 matches!(entry, RegistryEntry::Running(handle) if handle.local_ref() == local_ref)
@@ -939,41 +955,59 @@ impl<A: Actor> ActorRegistry<A> {
                 directory.remove(reference);
             }
         });
-        let handle = spawn_actor_with_self_ref(
-            actor,
-            ActorSpawnContext {
-                options: ActorSpawnOptions {
+        let mut resources = ActorResources::builder();
+        resources
+            .insert(DistributedActorContext::new(
+                self_address.clone(),
+                self.actor_system.clone(),
+            ))
+            .map_err(|error| ActorError::new(error.to_string()))?;
+        let handle = self
+            .runtime
+            .spawn_managed_actor(
+                actor,
+                ActorSpawnOptions {
                     mailbox: self.config.mailbox,
                     execution: None,
                     scheduler_key: None,
                     passivation: self.config.passivation,
-                    self_ref,
                     service: self.config.service.clone(),
                 },
-                actor_system: Some(self.actor_system.clone()),
-                observer: self.observer.clone(),
-                terminal_hook: Some(terminal_hook),
-                spawner: self.spawner.clone(),
-            },
-        )
-        .map_err(|error| ActorError::new(error.to_string()))?;
-        if let Some(directory) = self.config.service.extension::<ActivationDirectory>()
-            && let Err(error) = directory.register(&handle)
+                resources.build(),
+                Some(terminal_hook),
+            )
+            .map_err(|error| ActorError::new(error.to_string()))?;
+        if let (Some(directory), Some(reference)) = (
+            self.config.service.extension::<ActivationDirectory>(),
+            self_address.as_ref(),
+        ) && let Err(error) = directory.register(reference, &handle)
         {
             let _ = handle.try_stop_internal(StopReason::StartFailed);
             return Err(ActorError::new(error.to_string()));
         }
         if is_terminal(handle.lifecycle_state())
             && let Some(directory) = self.config.service.extension::<ActivationDirectory>()
-            && let Some(reference) = handle.actor_ref()
+            && let Some(reference) = self_address.as_ref()
         {
-            directory.remove(&reference.erase());
+            directory.remove(reference);
+        }
+        if !is_terminal(handle.lifecycle_state())
+            && let Some(reference) = self_address
+        {
+            self.exact_entries.insert(
+                reference.activation_id(),
+                ExactRegistryEntry {
+                    reference,
+                    handle: handle.clone(),
+                    local_ref: handle.local_ref(),
+                },
+            );
         }
         Ok(handle)
     }
 
-    fn actor_ref_for(&self, actor_id: ActorId) -> Option<ActorRef> {
-        let config = self.config.actor_ref.as_ref()?;
+    fn actor_address_for(&self, actor_id: ActorId) -> Option<ActorAddress> {
+        let config = self.config.address.as_ref()?;
         let protocol_id = self.protocol_id?;
         let path = ActorPath::user([
             "user".to_owned(),
@@ -988,12 +1022,12 @@ impl<A: Actor> ActorRegistry<A> {
             );
         })
         .ok()?;
-        ActorRef::new(
+        ActorAddress::new(
             config.cluster_id.clone(),
             config.node_address.clone(),
             config.node_incarnation,
             path,
-            crate::runtime::next_activation_id(config.node_incarnation),
+            next_activation_id(config.node_incarnation),
             protocol_id,
         )
         .ok()
@@ -1007,6 +1041,11 @@ fn encode_actor_id(actor_id: &ActorId) -> String {
         ActorId::I64(value) => format!("i-{value}"),
         ActorId::Bytes(value) => format!("b-{}", encode_segment(value)),
     }
+}
+
+fn next_activation_id(node_incarnation: NodeIncarnation) -> ActivationId {
+    let sequence = NEXT_ACTIVATION_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    ActivationId::new(node_incarnation, sequence).expect("process activation sequence is nonzero")
 }
 
 fn encode_segment(bytes: &[u8]) -> String {

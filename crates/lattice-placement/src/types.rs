@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 use std::time::Duration;
 
-use lattice_core::actor_ref::{
+use lattice_core::actor_address::{
     ConfigFingerprint, EntityType, NodeAddress, NodeIncarnation, PlacementDomainId, SingletonKind,
 };
 use serde::{Deserialize, Serialize};

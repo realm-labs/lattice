@@ -3,11 +3,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use lattice_actor::handle::ActorHandle;
-use lattice_actor::protocol::SupportsTell;
-use lattice_actor::recipient::ActorSystem;
 use lattice_actor::state_machine::Accepts;
 use lattice_actor::traits::{Actor, Handler, Message};
-use lattice_core::actor_ref::ActorRef;
+use lattice_actor_distributed::protocol::SupportsTell;
+use lattice_actor_distributed::recipient::ActorSystem;
+use lattice_core::actor_address::ActorAddress;
 use lattice_core::instance::InstanceId;
 use lattice_core::kind::ServiceKind;
 use lattice_core::trace::TraceContext;
@@ -44,7 +44,7 @@ where
         &self,
         subscription: EventSubscription,
         actor_system: ActorSystem,
-        recipient: ActorRef<P>,
+        recipient: ActorAddress<P>,
     ) -> Result<EventSubscriptionHandle, EventBusError>
     where
         P: SupportsTell<M>,
@@ -74,7 +74,7 @@ where
         &self,
         subscription: EventSubscription,
         actor_system: ActorSystem,
-        recipient: ActorRef<P>,
+        recipient: ActorAddress<P>,
         map: F,
     ) -> Result<EventSubscriptionHandle, EventBusError>
     where
@@ -218,7 +218,7 @@ fn now_unix_ms() -> u64 {
 mod tests {
     use std::{io::Error as IoError, time::Duration};
 
-    use lattice_actor::{
+    use lattice_actor_distributed::{
         context::HandlerContext,
         mailbox::MailboxConfig,
         runtime::spawn_actor,
@@ -341,7 +341,7 @@ mod tests {
         );
 
         assert!(subscription.shutdown(Duration::from_secs(1)).await);
-        actor.stop(StopReason::Requested).await.unwrap();
+        actor.stop(StopReason::Requested).unwrap();
     }
 
     #[tokio::test]
@@ -371,6 +371,6 @@ mod tests {
         );
 
         assert!(subscription.shutdown(Duration::from_secs(1)).await);
-        actor.stop(StopReason::Requested).await.unwrap();
+        actor.stop(StopReason::Requested).unwrap();
     }
 }

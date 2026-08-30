@@ -7,7 +7,7 @@ use std::{
     time::Instant,
 };
 
-use lattice_core::{actor_ref::PlacementDomainId, coordinator::CoordinatorScope};
+use lattice_core::{actor_address::PlacementDomainId, coordinator::CoordinatorScope};
 use lattice_placement::types::PlacementSlotKey;
 use thiserror::Error;
 use tokio::sync::watch::Sender;
@@ -129,14 +129,14 @@ pub enum AdmissionScope {
     /// Nothing outside the node vouches for this traffic, so membership is the only thing that
     /// says the node should still be taking new work on the cluster's behalf.
     External,
-    /// Logical destinations (`EntityRef`, `SingletonRef`) resolved through placement.
+    /// Logical destinations (`EntityAddress`, `SingletonAddress`) resolved through placement.
     ///
     /// Governed by the placement domain session plus the installed claim deadline, which fences
     /// itself without any membership input.
     Logical,
-    /// Exact activations addressed by a fully bound `ActorRef`.
+    /// Exact activations addressed by a fully bound `ActorAddress`.
     ///
-    /// Governed by the `(node incarnation, actor path, ActivationId)` binding: a stale reference
+    /// Governed by the `(node incarnation, actor path, ActivationId)` binding: a stale address
     /// resolves to nothing rather than to a replacement.
     Exact,
 }
@@ -867,7 +867,7 @@ mod tests {
         );
         assert!(
             admission.exact,
-            "an ActorRef is fenced by the incarnation and activation it names"
+            "an ActorAddress is fenced by the incarnation and activation it names"
         );
         assert!(admission.serves_cluster_traffic());
         assert!(

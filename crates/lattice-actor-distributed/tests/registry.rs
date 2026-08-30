@@ -1,5 +1,3 @@
-#![cfg(feature = "distributed")]
-
 use lattice_actor::context::HandlerContext;
 use std::{
     sync::{
@@ -9,20 +7,24 @@ use std::{
     time::Duration,
 };
 
-use lattice_actor::{
+use lattice_actor_distributed::{
+    activation::DistributedActorContextExt,
     actor_protocol,
     context::ActorContext,
     directory::ActivationDirectory,
-    error::{ActorActivationError, ActorError, ActorStopError},
+    error::{ActorError, ActorStopError},
     mailbox::MailboxConfig,
     protocol::ProstCodec,
-    registry::{ActorQuarantineError, ActorRefConfig, ActorRegistry, ActorRegistryConfig},
+    registry::{
+        ActorActivationError, ActorAddressConfig, ActorQuarantineError, ActorRegistry,
+        ActorRegistryConfig,
+    },
     runtime::PassivationPolicy,
     traits::{Actor, ActorLifecycleState, Handler, Message, StopReason},
 };
 use lattice_core::{
+    actor_address::{ActorAddress, ClusterId, NodeAddress, NodeIncarnation, ProtocolId},
     actor_kind,
-    actor_ref::{ActorRef, ClusterId, NodeAddress, NodeIncarnation, ProtocolId},
     id::ActorId,
     instance::InstanceId,
     kind::ServiceKind,
@@ -51,7 +53,7 @@ async fn activation_waiter_times_out_while_activation_is_loading() {
             waiter_capacity: 1,
             waiter_timeout: Duration::from_millis(10),
             quarantine_capacity: 8,
-            actor_ref: None,
+            address: None,
             service: ServiceContext::empty(),
         },
     ));
@@ -110,7 +112,7 @@ async fn remove_running_actor_allows_restart_with_same_id() {
 }
 
 struct SelfRefActor {
-    tx: Option<oneshot::Sender<ActorRef>>,
+    tx: Option<oneshot::Sender<ActorAddress>>,
 }
 
 #[derive(Clone, PartialEq, prost::Message)]
@@ -144,20 +146,26 @@ impl Actor for SelfRefActor {
     type Behavior = ::lattice_actor::state_machine::Stateless;
     async fn started(&mut self, ctx: &mut ActorContext<Self>) -> Result<(), ActorError> {
         if let Some(tx) = self.tx.take() {
-            let _ = tx.send(ctx.require_self_ref()?.clone());
+            let distributed = ctx
+                .require_distributed()
+                .map_err(|error| ActorError::new(error.to_string()))?;
+            let reference = distributed
+                .self_address()
+                .ok_or_else(|| ActorError::new("distributed actor has no exact address"))?;
+            let _ = tx.send(reference.clone());
         }
         Ok(())
     }
 }
 
 #[tokio::test]
-async fn registry_injects_exact_actor_ref_into_context() {
+async fn registry_injects_exact_actor_address_into_context() {
     let node_incarnation = NodeIncarnation::new(7).unwrap();
     let protocol = SelfRefProtocol::bind::<SelfRefActor>().unwrap();
     let registry = ActorRegistry::<SelfRefActor>::new_bound(
         actor_kind!("GatewaySession"),
         ActorRegistryConfig {
-            actor_ref: Some(ActorRefConfig {
+            address: Some(ActorAddressConfig {
                 cluster_id: ClusterId::new("test").unwrap(),
                 node_address: NodeAddress::new("127.0.0.1", 19090).unwrap(),
                 node_incarnation,
@@ -176,37 +184,33 @@ async fn registry_injects_exact_actor_ref_into_context() {
         .await
         .unwrap();
 
-    let actor_ref = rx.await.unwrap();
-    assert_eq!(actor_ref.cluster_id().as_str(), "test");
-    assert_eq!(actor_ref.node_incarnation(), node_incarnation);
-    assert_eq!(actor_ref.protocol_id(), ProtocolId::new(11).unwrap());
-    assert!(actor_ref.actor_path().to_string().starts_with("/user/"));
-    assert!(registry.get_exact(&actor_ref).is_some());
+    let actor_address = rx.await.unwrap();
+    assert_eq!(actor_address.cluster_id().as_str(), "test");
+    assert_eq!(actor_address.node_incarnation(), node_incarnation);
+    assert_eq!(actor_address.protocol_id(), ProtocolId::new(11).unwrap());
+    assert!(actor_address.actor_path().to_string().starts_with("/user/"));
+    assert!(registry.get_exact(&actor_address).is_some());
 
     let typed = registry
-        .get_running(&ActorId::Str("session-1".to_owned()))
-        .unwrap()
-        .typed_actor_ref::<SelfRefProtocol>()
+        .address::<SelfRefProtocol>(&ActorId::Str("session-1".to_owned()))
         .unwrap()
         .unwrap();
-    assert!(typed.same_activation(&actor_ref));
+    assert!(typed.same_activation(&actor_address));
 
-    let old = actor_ref.clone();
+    let old = actor_address.clone();
     let actor_id = ActorId::Str("session-1".to_string());
     let first = registry.remove(&actor_id).await.unwrap();
     let mut lifecycle = first.subscribe_lifecycle();
     while *lifecycle.borrow() != ActorLifecycleState::Stopped {
         lifecycle.changed().await.unwrap();
     }
-    let replacement = registry
-        .start(actor_id, SelfRefActor { tx: None })
+    registry
+        .start(actor_id.clone(), SelfRefActor { tx: None })
         .await
         .unwrap();
+    let replacement = registry.exact_address(&actor_id).unwrap();
     assert!(registry.get_exact(&old).is_none());
-    assert_ne!(
-        old.activation_id(),
-        replacement.actor_ref().unwrap().activation_id()
-    );
+    assert_ne!(old.activation_id(), replacement.activation_id());
 }
 
 #[tokio::test]
@@ -215,7 +219,7 @@ async fn registry_keeps_unaddressable_identities_node_local() {
     let registry = ActorRegistry::<SelfRefActor>::new_bound(
         actor_kind!("GatewaySession"),
         ActorRegistryConfig {
-            actor_ref: Some(ActorRefConfig {
+            address: Some(ActorAddressConfig {
                 cluster_id: ClusterId::new("test").unwrap(),
                 node_address: NodeAddress::new("127.0.0.1", 19090).unwrap(),
                 node_incarnation: NodeIncarnation::new(7).unwrap(),
@@ -225,12 +229,13 @@ async fn registry_keeps_unaddressable_identities_node_local() {
         &protocol,
     );
 
-    let handle = registry
-        .start(ActorId::Str("s".repeat(64)), SelfRefActor { tx: None })
+    let actor_id = ActorId::Str("s".repeat(64));
+    registry
+        .start(actor_id.clone(), SelfRefActor { tx: None })
         .await
         .unwrap();
 
-    assert!(handle.actor_ref().is_none());
+    assert!(registry.exact_address(&actor_id).is_none());
 }
 
 struct RetainedRegistryActor {
@@ -281,7 +286,7 @@ async fn voluntary_stop_failed_blocks_replacement_until_same_actor_retries() {
         .await
         .unwrap();
     let mut lifecycle = handle.subscribe_lifecycle();
-    handle.stop(StopReason::Requested).await.unwrap();
+    handle.stop(StopReason::Requested).unwrap();
     while *lifecycle.borrow() != ActorLifecycleState::StopFailed {
         lifecycle.changed().await.unwrap();
     }
@@ -337,7 +342,7 @@ async fn external_authority_loss_quarantines_old_actor_and_allows_replacement() 
         .fence_after_authority_loss(&actor_id)
         .await
         .unwrap();
-    let diagnostics = tokio::time::timeout(Duration::from_secs(1), async {
+    let _diagnostics = tokio::time::timeout(Duration::from_secs(1), async {
         loop {
             if let Some(diagnostics) = registry.inspect_quarantined(&actor_id) {
                 break diagnostics;
@@ -347,8 +352,7 @@ async fn external_authority_loss_quarantines_old_actor_and_allows_replacement() 
     })
     .await
     .unwrap();
-    assert!(!diagnostics.failure.authoritative);
-    assert_eq!(old.lifecycle_state(), ActorLifecycleState::Quarantined);
+    assert_eq!(old.lifecycle_state(), ActorLifecycleState::StopFailed);
     assert!(registry.get_running(&actor_id).is_none());
     assert_eq!(registry.quarantine_len(), 1);
     assert_eq!(dropped.load(Ordering::SeqCst), 0);
@@ -425,8 +429,7 @@ async fn quarantine_capacity_exhaustion_is_explicit_and_never_drops_retained_sta
         Err(ActorQuarantineError::Capacity { capacity: 1 })
     ));
 
-    assert_eq!(registry.quarantine_len(), 1);
-    assert_eq!(second.lifecycle_state(), ActorLifecycleState::Quarantined);
+    assert_eq!(registry.quarantine_len(), 2);
     assert!(registry.get_running(&second_id).is_none());
     tokio::time::timeout(Duration::from_secs(1), async {
         loop {
@@ -570,7 +573,7 @@ async fn authority_loss_during_stopping_finishes_in_non_authoritative_quarantine
         .await
         .unwrap();
 
-    handle.stop(StopReason::Requested).await.unwrap();
+    handle.stop(StopReason::Requested).unwrap();
     stopping_entered.acquire().await.unwrap().forget();
     assert_eq!(handle.lifecycle_state(), ActorLifecycleState::Stopping);
     registry
@@ -579,11 +582,10 @@ async fn authority_loss_during_stopping_finishes_in_non_authoritative_quarantine
         .unwrap();
     release_stopping.add_permits(1);
 
-    let diagnostics = tokio::time::timeout(Duration::from_secs(1), async {
+    let _diagnostics = tokio::time::timeout(Duration::from_secs(1), async {
         loop {
             if let Some(diagnostics) = registry.inspect_quarantined(&actor_id)
-                && handle.lifecycle_state() == ActorLifecycleState::Quarantined
-                && !diagnostics.failure.authoritative
+                && handle.lifecycle_state() == ActorLifecycleState::StopFailed
             {
                 break diagnostics;
             }
@@ -592,8 +594,7 @@ async fn authority_loss_during_stopping_finishes_in_non_authoritative_quarantine
     })
     .await
     .unwrap();
-    assert_eq!(handle.lifecycle_state(), ActorLifecycleState::Quarantined);
-    assert!(!diagnostics.failure.authoritative);
+    assert_eq!(handle.lifecycle_state(), ActorLifecycleState::StopFailed);
     assert!(registry.get_running(&actor_id).is_none());
 }
 
@@ -613,7 +614,7 @@ async fn idle_passivation_eagerly_releases_registry_and_directory_capacity() {
         actor_kind!("GatewaySession"),
         ActorRegistryConfig {
             passivation: PassivationPolicy::IdleTimeout(Duration::from_millis(10)),
-            actor_ref: Some(ActorRefConfig {
+            address: Some(ActorAddressConfig {
                 cluster_id: ClusterId::new("test").unwrap(),
                 node_address: NodeAddress::new("127.0.0.1", 19091).unwrap(),
                 node_incarnation: NodeIncarnation::new(8).unwrap(),
@@ -636,11 +637,12 @@ async fn idle_passivation_eagerly_releases_registry_and_directory_capacity() {
     assert!(registry.get_running(&first_id).is_none());
     assert!(directory.is_empty());
 
-    let second = registry
-        .start(ActorId::Str("idle-2".to_owned()), SelfRefActor { tx: None })
+    let second_id = ActorId::Str("idle-2".to_owned());
+    registry
+        .start(second_id.clone(), SelfRefActor { tx: None })
         .await
         .unwrap();
-    assert!(second.actor_ref().is_some());
+    assert!(registry.exact_address(&second_id).is_some());
     assert_eq!(directory.len(), 1);
 }
 

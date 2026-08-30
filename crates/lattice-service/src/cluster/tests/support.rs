@@ -8,7 +8,7 @@ use std::{
 
 use async_trait::async_trait;
 use bytes::BytesMut;
-use lattice_actor::{
+use lattice_actor_distributed::{
     actor_protocol,
     context::HandlerContext,
     error::ActorError,
@@ -18,7 +18,7 @@ use lattice_actor::{
     traits::Responder,
 };
 use lattice_core::{
-    actor_ref::{ClusterId, EntityType, NodeAddress, NodeIncarnation, SingletonKind},
+    actor_address::{ClusterId, EntityType, NodeAddress, NodeIncarnation, SingletonKind},
     coordinator::CoordinatorScope,
 };
 use lattice_placement::{

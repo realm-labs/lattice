@@ -1,6 +1,9 @@
-use crate::traits::{PassivationReason, StopReason};
-#[cfg(feature = "distributed")]
-use lattice_core::actor_ref::ActorRef;
+use std::{convert::Infallible, future::Future};
+
+use crate::{
+    handle::{ActorHandle, ActorTerminationSubscription},
+    traits::{Actor, PassivationReason, StopReason},
+};
 
 pub use lattice_core::watch::{TerminatedReason, WatchId, WatchStatus};
 
@@ -19,13 +22,6 @@ impl LocalActorRef {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum TerminatedTarget {
-    Local(LocalActorRef),
-    #[cfg(feature = "distributed")]
-    Exact(ActorRef),
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActorTermination {
     pub target: LocalActorRef,
@@ -35,8 +31,55 @@ pub struct ActorTermination {
 #[derive(Debug, Clone, PartialEq, Eq, crate::Message)]
 pub struct ActorTerminated {
     pub watch_id: WatchId,
-    pub target: TerminatedTarget,
     pub reason: TerminatedReason,
+}
+
+/// A target whose lifetime can be observed without exposing how it is reached.
+pub trait WatchTarget: Send + Sync {
+    type Error: std::fmt::Display;
+    type Subscription: TerminationSubscription;
+
+    fn watch(&self) -> impl Future<Output = Result<Self::Subscription, Self::Error>> + Send;
+}
+
+/// One DeathWatch subscription normalized across local and distributed targets.
+pub trait TerminationSubscription: Send + 'static {
+    fn id(&self) -> WatchId;
+
+    fn recv(&mut self) -> impl Future<Output = Option<TerminatedReason>> + Send;
+}
+
+pub struct LocalWatchSubscription {
+    id: WatchId,
+    inner: ActorTerminationSubscription,
+}
+
+impl LocalWatchSubscription {
+    pub(crate) fn new(inner: ActorTerminationSubscription) -> Self {
+        Self {
+            id: WatchId::random(),
+            inner,
+        }
+    }
+}
+
+impl TerminationSubscription for LocalWatchSubscription {
+    fn id(&self) -> WatchId {
+        self.id
+    }
+
+    async fn recv(&mut self) -> Option<TerminatedReason> {
+        self.inner.recv().await.ok().map(|event| event.reason)
+    }
+}
+
+impl<A: Actor> WatchTarget for ActorHandle<A> {
+    type Error = Infallible;
+    type Subscription = LocalWatchSubscription;
+
+    fn watch(&self) -> impl Future<Output = Result<Self::Subscription, Self::Error>> + Send {
+        ActorHandle::watch(self)
+    }
 }
 
 impl From<StopReason> for TerminatedReason {
@@ -45,8 +88,6 @@ impl From<StopReason> for TerminatedReason {
             StopReason::Passivated(PassivationReason::BusinessIdle)
             | StopReason::Passivated(PassivationReason::IdleTimeout)
             | StopReason::Passivated(PassivationReason::Drain) => Self::Passivated,
-            StopReason::Passivated(PassivationReason::Migrate) => Self::Migrated,
-            StopReason::AuthorityLost => Self::Fenced,
             StopReason::Requested | StopReason::MailboxClosed | StopReason::StartFailed => {
                 Self::Stopped
             }

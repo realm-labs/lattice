@@ -2,14 +2,14 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 
-use crate::{
+use lattice_actor::{
     handle::ActorHandle,
     traits::{Actor, Handler, Message, MessageKind},
 };
 
 use super::{
     ActorProtocolBinding, ActorProtocolBindingBuilder, DispatchError, DispatchFuture, DispatchMode,
-    DispatchReply, Protocol, ServerDispatch, SharedCodec, WireCodec, protocol_failure,
+    DispatchReply, Protocol, ServerDispatch, SharedCodec, WireCodec, observe_protocol_failure,
 };
 
 pub(crate) enum ProtocolTellDispatch {
@@ -54,13 +54,7 @@ impl<A: Actor, P: Protocol> ActorProtocolBinding<A, P> {
             }
         };
         if let ProtocolTellDispatch::Rejected(error) = &result {
-            handle.observer().protocol_failed(
-                handle.observation_metadata(),
-                message_id,
-                MessageKind::Tell,
-                payload_size,
-                protocol_failure(error),
-            );
+            observe_protocol_failure(handle, message_id, MessageKind::Tell, payload_size, error);
         }
         result
     }
@@ -70,7 +64,7 @@ impl<A: Actor, P: Protocol> ActorProtocolBindingBuilder<A, P> {
     pub fn tell<M, C>(mut self, message_id: u64, schema_version: u32, codec: C) -> Self
     where
         A: Handler<M>,
-        <A as crate::traits::Actor>::Behavior: crate::state_machine::Accepts<M>,
+        <A as lattice_actor::traits::Actor>::Behavior: lattice_actor::state_machine::Accepts<M>,
         M: Message,
         C: WireCodec<M>,
     {
@@ -89,10 +83,8 @@ impl<A: Actor, P: Protocol> ActorProtocolBindingBuilder<A, P> {
                 };
                 match handle.try_tell(message) {
                     Ok(()) => ProtocolTellDispatch::Accepted,
-                    Err(crate::error::ActorTellError::MailboxFull(message)) => {
+                    Err(lattice_actor::error::ActorTellError::MailboxFull(message)) => {
                         let handle = handle.clone();
-                        let observer = handle.observer().clone();
-                        let actor = handle.observation_metadata().clone();
                         let payload_size = payload.len();
                         let completion = Box::pin(async move {
                             let result = handle
@@ -101,12 +93,12 @@ impl<A: Actor, P: Protocol> ActorProtocolBindingBuilder<A, P> {
                                 .map(|()| DispatchReply::TellAccepted)
                                 .map_err(|_| DispatchError::MailboxRejected);
                             if let Err(error) = &result {
-                                observer.protocol_failed(
-                                    &actor,
+                                observe_protocol_failure(
+                                    &handle,
                                     message_id,
                                     MessageKind::Tell,
                                     payload_size,
-                                    protocol_failure(error),
+                                    error,
                                 );
                             }
                             result

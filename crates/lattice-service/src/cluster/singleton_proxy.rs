@@ -5,10 +5,10 @@ use lattice_placement::control::PlacementControlCommand;
 use lattice_remoting::{association::Association, messaging::error::RemoteFailureCode};
 
 use super::{
-    ActorRef, AskError, AssociationKey, AssociationManager, AssociationState, Bytes, Instant,
+    ActorAddress, AskError, AssociationKey, AssociationManager, AssociationState, Bytes, Instant,
     LOGICAL_RESOLVE_MESSAGE_ID, LogicPlacementState, LogicalSingletonTarget, Mutex, NodeKey,
     OutboundMessage, OutboundMessaging, PlacementSlot, PlacementSlotKey, PlacementSlotState,
-    ProtocolFingerprint, RemoteMessageError, RouteBuffer, SingletonConfig, SingletonRef,
+    ProtocolFingerprint, RemoteMessageError, RouteBuffer, SingletonAddress, SingletonConfig,
     WatchError, async_trait, decode_resolved_actor, map_tell, next_logical_resolution,
     peers::PeerReconciler, singleton::SingletonRoute,
 };
@@ -26,7 +26,7 @@ pub(super) struct SingletonProxyRoute {
 }
 
 impl SingletonProxyRoute {
-    fn slot(&self, target: &SingletonRef) -> Result<PlacementSlot, RemoteMessageError> {
+    fn slot(&self, target: &SingletonAddress) -> Result<PlacementSlot, RemoteMessageError> {
         if target.protocol_id() != self.config.protocol_id
             || target.domain() != &self.config.domain
             || target.config_fingerprint() != self.config.fingerprint()
@@ -44,7 +44,7 @@ impl SingletonProxyRoute {
             .ok_or(RemoteMessageError::StaleAuthority)
     }
 
-    fn running_slot(&self, target: &SingletonRef) -> Result<PlacementSlot, RemoteMessageError> {
+    fn running_slot(&self, target: &SingletonAddress) -> Result<PlacementSlot, RemoteMessageError> {
         let slot = self.slot(target)?;
         if slot.state != PlacementSlotState::Running || slot.owner.is_none() {
             return Err(RemoteMessageError::ShardUnavailable);
@@ -90,7 +90,7 @@ impl SingletonProxyRoute {
 
     async fn await_running_slot(
         &self,
-        target: &SingletonRef,
+        target: &SingletonAddress,
         payload_bytes: usize,
         requested_deadline: Option<Instant>,
     ) -> Result<PlacementSlot, RemoteMessageError> {
@@ -143,7 +143,7 @@ impl SingletonProxyRoute {
 
     async fn remote_association(
         &self,
-        target: &SingletonRef,
+        target: &SingletonAddress,
         owner: &NodeKey,
     ) -> Result<Arc<Association>, RemoteMessageError> {
         if owner == &self.local_node {
@@ -169,7 +169,7 @@ impl SingletonProxyRoute {
 impl SingletonRoute for SingletonProxyRoute {
     async fn tell(
         &self,
-        target: SingletonRef,
+        target: SingletonAddress,
         fingerprint: ProtocolFingerprint,
         message_id: u64,
         payload: Bytes,
@@ -199,7 +199,7 @@ impl SingletonRoute for SingletonProxyRoute {
 
     async fn ask(
         &self,
-        target: SingletonRef,
+        target: SingletonAddress,
         fingerprint: ProtocolFingerprint,
         message_id: u64,
         payload: Bytes,
@@ -255,7 +255,10 @@ impl SingletonRoute for SingletonProxyRoute {
         Err(RemoteMessageError::Unauthorized)
     }
 
-    async fn resolve_current(&self, target: SingletonRef) -> Result<Option<ActorRef>, WatchError> {
+    async fn resolve_current(
+        &self,
+        target: SingletonAddress,
+    ) -> Result<Option<ActorAddress>, WatchError> {
         let slot = self.slot(&target).map_err(|_| WatchError::Unavailable)?;
         if slot.state != PlacementSlotState::Running {
             return Ok(None);

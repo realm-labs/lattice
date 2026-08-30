@@ -103,7 +103,7 @@ mod tests {
             }],
         };
         let generated = render_actor_protocol(&spec).unwrap();
-        assert!(generated.contains("lattice_actor::actor_protocol!"));
+        assert!(generated.contains("lattice_actor_distributed::actor_protocol!"));
         assert!(!generated.contains("tonic"));
         assert!(!generated.contains("DirectLink"));
     }

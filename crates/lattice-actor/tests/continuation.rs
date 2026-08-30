@@ -324,7 +324,7 @@ async fn actor_stop_cancels_pending_continuation_work() {
         .unwrap()
         .forget();
 
-    handle.stop(StopReason::Requested).await.unwrap();
+    handle.stop(StopReason::Requested).unwrap();
     tokio::time::timeout(TIMEOUT, terminated.recv())
         .await
         .expect("actor should stop")

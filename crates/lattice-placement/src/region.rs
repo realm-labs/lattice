@@ -5,9 +5,9 @@ use std::{
 };
 
 use bytes::Bytes;
-use lattice_core::actor_ref::{
-    ClusterId, ConfigFingerprint, EntityId, EntityRef, EntityType, NodeIncarnation,
-    PlacementDomainId, ProtocolId, ProtocolTag, ReferenceError,
+use lattice_core::actor_address::{
+    AddressError, ClusterId, ConfigFingerprint, EntityAddress, EntityId, EntityType,
+    NodeIncarnation, PlacementDomainId, ProtocolId, ProtocolTag,
 };
 use thiserror::Error;
 
@@ -218,8 +218,8 @@ impl EntityConfig {
         &self,
         cluster_id: ClusterId,
         entity_id: EntityId,
-    ) -> Result<EntityRef<P>, ReferenceError> {
-        EntityRef::new(
+    ) -> Result<EntityAddress<P>, AddressError> {
+        EntityAddress::new(
             cluster_id,
             self.domain.clone(),
             self.entity_type.clone(),
@@ -603,7 +603,7 @@ pub enum RegionError {
 
 #[cfg(test)]
 mod tests {
-    use lattice_core::actor_ref::{NodeAddress, ProtocolId};
+    use lattice_core::actor_address::{NodeAddress, ProtocolId};
 
     use super::*;
 
