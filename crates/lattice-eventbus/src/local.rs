@@ -3,21 +3,19 @@ use std::{
     fmt,
     future::Future,
     sync::{
-        Arc, Mutex as SyncMutex, Weak,
+        Arc, Weak,
         atomic::{AtomicU64, Ordering},
     },
     time::Duration,
 };
 
 use async_trait::async_trait;
-use tokio::{
-    sync::{Mutex, watch},
-    task::JoinHandle,
-};
+use tokio::{sync::Mutex, time::Instant};
 use tracing::{Instrument, warn};
 
 use crate::{
     error::EventBusError,
+    lifecycle::{Activity, SubscriptionState, drain},
     types::{EventEnvelope, EventSubscription},
 };
 
@@ -47,88 +45,11 @@ pub trait EventBus: Clone + Send + Sync + 'static {
     ) -> Result<EventSubscriptionHandle, EventBusError>
     where
         H: EventHandler;
-    /// Cancels every live subscription and waits up to `deadline` for in-flight handlers to
-    /// finish. Returns `false` when a subscription task had to be aborted at the deadline.
+    /// Permanently rejects new publishes and subscriptions, cancels live subscriptions, and waits
+    /// up to `deadline` for admitted operations and handlers to finish. A `false` result leaves
+    /// unfinished work tracked for a later call; timing out or cancelling this future does not
+    /// abort handlers. Already-admitted publishes may skip handlers that have not started yet.
     async fn shutdown(&self, deadline: Duration) -> bool;
-}
-
-#[derive(Debug)]
-pub(crate) struct SubscriptionState {
-    cancel: watch::Sender<bool>,
-    task: SyncMutex<Option<JoinHandle<()>>>,
-}
-
-impl SubscriptionState {
-    pub(crate) fn new() -> Arc<Self> {
-        Arc::new(Self {
-            cancel: watch::channel(false).0,
-            task: SyncMutex::new(None),
-        })
-    }
-
-    pub(crate) fn attach(&self, task: JoinHandle<()>) {
-        if let Ok(mut slot) = self.task.lock() {
-            *slot = Some(task);
-        }
-    }
-
-    pub(crate) fn cancellation(&self) -> Cancellation {
-        Cancellation {
-            receiver: self.cancel.subscribe(),
-        }
-    }
-
-    pub(crate) fn is_cancelled(&self) -> bool {
-        *self.cancel.borrow()
-    }
-
-    pub(crate) fn cancel(&self) {
-        let _ = self.cancel.send(true);
-    }
-
-    pub(crate) async fn shutdown(&self, deadline: Duration) -> bool {
-        self.cancel();
-        let Some(task) = self.take_task() else {
-            return true;
-        };
-        let abort = task.abort_handle();
-        match tokio::time::timeout(deadline, task).await {
-            Ok(_) => true,
-            Err(_) => {
-                abort.abort();
-                false
-            }
-        }
-    }
-
-    fn take_task(&self) -> Option<JoinHandle<()>> {
-        self.task.lock().ok().and_then(|mut slot| slot.take())
-    }
-}
-
-impl Drop for SubscriptionState {
-    fn drop(&mut self) {
-        if let Some(task) = self.task.get_mut().ok().and_then(Option::take) {
-            task.abort();
-        }
-    }
-}
-
-pub(crate) struct Cancellation {
-    receiver: watch::Receiver<bool>,
-}
-
-impl Cancellation {
-    pub(crate) async fn cancelled(&mut self) {
-        loop {
-            if *self.receiver.borrow_and_update() {
-                return;
-            }
-            if self.receiver.changed().await.is_err() {
-                return;
-            }
-        }
-    }
 }
 
 /// Control handle of a live subscription. Every backend keeps the subscription running until it is
@@ -149,16 +70,10 @@ impl EventSubscriptionHandle {
         self.state.cancel();
     }
 
-    /// Cancels the subscription and waits up to `deadline` for its background task to observe the
-    /// cancellation. Returns `false` when the task had to be aborted at the deadline.
+    /// Cancels the subscription and waits up to `deadline` for its handlers and background task.
+    /// Returns `false` while work remains; a later call can continue waiting for the same work.
     pub async fn shutdown(&self, deadline: Duration) -> bool {
         self.state.shutdown(deadline).await
-    }
-
-    /// Releases the background task from subscription lifetime tracking so it outlives the bus
-    /// that spawned it.
-    pub fn detach(self) {
-        self.state.take_task();
     }
 
     pub fn is_cancelled(&self) -> bool {
@@ -180,6 +95,7 @@ impl LocalEventBus {
         Self {
             inner: Arc::new(LocalEventBusInner {
                 next_id: AtomicU64::new(1),
+                activity: Arc::default(),
                 subscribers: Mutex::new(HashMap::new()),
             }),
         }
@@ -198,6 +114,7 @@ impl Default for LocalEventBus {
 
 struct LocalEventBusInner {
     next_id: AtomicU64,
+    activity: Arc<Activity>,
     subscribers: Mutex<HashMap<u64, LocalSubscriber>>,
 }
 
@@ -228,6 +145,7 @@ impl EventBus for LocalEventBus {
             source.instance = event.source_instance.as_str()
         );
         async {
+            let _publishing = self.inner.activity.enter()?;
             let handlers = {
                 let subscribers = self.inner.subscribers.lock().await;
                 subscribers
@@ -236,12 +154,15 @@ impl EventBus for LocalEventBus {
                         !subscriber.state.is_cancelled()
                             && subscriber.subscription.filter.matches(&event.subject)
                     })
-                    .map(|subscriber| subscriber.handler.clone())
+                    .map(|subscriber| (subscriber.handler.clone(), subscriber.state.clone()))
                     .collect::<Vec<_>>()
             };
 
             let mut failures = 0usize;
-            for handler in handlers {
+            for (handler, state) in handlers {
+                let Ok(_handling) = state.activity.enter() else {
+                    continue;
+                };
                 let consumer_span = tracing::info_span!(
                     "eventbus.consume",
                     otel.kind = "consumer",
@@ -284,7 +205,10 @@ impl EventBus for LocalEventBus {
     {
         let id = self.inner.next_id.fetch_add(1, Ordering::SeqCst);
         let state = SubscriptionState::new();
-        self.inner.subscribers.lock().await.insert(
+        let setup = state.setup();
+        let mut subscribers = self.inner.subscribers.lock().await;
+        let _subscribing = self.inner.activity.enter()?;
+        subscribers.insert(
             id,
             LocalSubscriber {
                 subscription,
@@ -292,25 +216,35 @@ impl EventBus for LocalEventBus {
                 state: state.clone(),
             },
         );
+        drop(subscribers);
 
         let inner = Arc::downgrade(&self.inner);
         let mut cancellation = state.cancellation();
-        tokio::spawn(async move {
+        let activity = state.activity.clone();
+        state.attach(tokio::spawn(async move {
             cancellation.cancelled().await;
+            activity.wait_idle().await;
             if let Some(inner) = Weak::upgrade(&inner) {
                 inner.subscribers.lock().await.remove(&id);
             }
-        });
+        }));
 
+        setup.complete()?;
         Ok(EventSubscriptionHandle::new(id, state))
     }
 
-    async fn shutdown(&self, _deadline: Duration) -> bool {
-        let subscribers = std::mem::take(&mut *self.inner.subscribers.lock().await);
-        for subscriber in subscribers.values() {
-            subscriber.state.cancel();
-        }
-        true
+    async fn shutdown(&self, deadline: Duration) -> bool {
+        let deadline = Instant::now() + deadline;
+        self.inner.activity.close();
+        let states = self
+            .inner
+            .subscribers
+            .lock()
+            .await
+            .values()
+            .map(|subscriber| subscriber.state.clone())
+            .collect();
+        drain(&self.inner.activity, states, deadline).await
     }
 }
 
@@ -408,12 +342,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shutdown_aborts_a_task_that_ignores_cancellation() {
+    async fn shutdown_retains_a_task_that_ignores_cancellation_until_it_finishes() {
         let state = SubscriptionState::new();
-        state.attach(tokio::spawn(std::future::pending::<()>()));
+        let (release, waiting) = tokio::sync::oneshot::channel();
+        state.attach(tokio::spawn(async move {
+            waiting.await.unwrap();
+        }));
         let handle = EventSubscriptionHandle::new(1, state);
 
-        assert!(!handle.shutdown(Duration::from_millis(50)).await);
+        assert!(!handle.shutdown(Duration::ZERO).await);
+        assert!(!handle.shutdown(Duration::ZERO).await);
+        release.send(()).expect("shutdown must not abort the task");
+        assert!(handle.shutdown(Duration::from_secs(1)).await);
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_shutdown_waiter_does_not_detach_the_task() {
+        let state = SubscriptionState::new();
+        let (release, waiting) = tokio::sync::oneshot::channel();
+        state.attach(tokio::spawn(async move {
+            waiting.await.unwrap();
+        }));
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(20),
+                state.shutdown(Duration::from_secs(1)),
+            )
+            .await
+            .is_err()
+        );
+        assert!(!state.shutdown(Duration::ZERO).await);
+        release.send(()).expect("cancelled waiter must retain task");
+        assert!(state.shutdown(Duration::from_secs(1)).await);
     }
 
     #[tokio::test]

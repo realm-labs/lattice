@@ -279,6 +279,80 @@ fn lane_services(
     LaneServices::new(messaging, dispatch, Arc::new(RejectControlDispatch))
 }
 
+#[tokio::test]
+async fn cancelling_a_blocked_write_releases_the_entire_dequeued_batch() {
+    use tokio::io::AsyncReadExt;
+
+    let association = Arc::new(
+        Association::new(
+            AssociationKey {
+                cluster_id: ClusterId::new("cancel-write").unwrap(),
+                local_incarnation: NodeIncarnation::new(1).unwrap(),
+                remote_address: NodeAddress::new("remote", 25520).unwrap(),
+                remote_incarnation: NodeIncarnation::new(2).unwrap(),
+            },
+            RemotingConfig {
+                max_outbound_bytes_per_association: 16,
+                max_outbound_bytes_per_node: 16,
+                ..RemotingConfig::default()
+            },
+        )
+        .unwrap(),
+    );
+    for (lane, nonce) in [
+        (LaneKind::Control, 1),
+        (LaneKind::Interactive, 2),
+        (LaneKind::Bulk(0), 3),
+    ] {
+        association
+            .attach(LaneAttachment {
+                association_id: association.id(),
+                key: association.key().clone(),
+                lane,
+                connection_nonce: nonce,
+            })
+            .unwrap();
+    }
+    for _ in 0..2 {
+        association
+            .try_admit_interactive(Frame::new(
+                FrameKind::Backpressure,
+                Bytes::from_static(b"12345678"),
+            ))
+            .unwrap();
+    }
+    let mut receiver = association
+        .take_lane_receiver(LaneKind::Interactive)
+        .unwrap();
+    let (stream, mut peer) = tokio::io::duplex(1);
+    let (_shutdown_tx, mut shutdown) = watch::channel(false);
+    let lane = BidirectionalLane::new(
+        association.clone(),
+        LaneKind::Interactive,
+        2,
+        lane_services(
+            Arc::new(OutboundMessaging::new(8).unwrap()),
+            Arc::new(EchoDispatch {
+                delay: Duration::ZERO,
+            }),
+        ),
+        duplex_lane_config(),
+    );
+    let sending = tokio::spawn(async move { lane.run(&mut receiver, stream, &mut shutdown).await });
+    // A one-byte duplex buffer cannot finish either frame: seeing the first byte
+    // proves cancellation happens inside the write, after dequeue and batching.
+    tokio::time::timeout(Duration::from_secs(1), peer.read_u8())
+        .await
+        .unwrap()
+        .unwrap();
+    sending.abort();
+    assert!(sending.await.unwrap_err().is_cancelled());
+    let reservation = association
+        .try_reserve_prepared_bulk(0, 16)
+        .expect("cancelled write must release both frame reservations");
+    drop(reservation);
+}
+
 fn lane_target(
     address: &NodeAddress,
     incarnation: NodeIncarnation,
@@ -444,7 +518,7 @@ async fn a_queued_compact_tell_is_expanded_after_the_stripe_reconnects() {
     route.tell(1, Bytes::from_static(b"registration")).unwrap();
     let registration = client_bulk.recv().await.unwrap();
     route.tell(1, Bytes::from_static(b"compact")).unwrap();
-    client_association.release_queued_bytes(registration.payload_len());
+    drop(registration);
 
     client_association.detach(LaneKind::Bulk(0), 3);
     client_association

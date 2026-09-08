@@ -5,6 +5,11 @@
 > Compatibility policy: hard switch; no mixed-version cluster support
 > Behavioral references: Apache Pekko discovery and cluster lifecycle, without Gossip or SBR
 
+> This completed plan records the original implementation. Its shutdown budgeting and automatic
+> force-fallback descriptions are superseded by the 2026-09-08
+> [drain contract](architecture/03-placement.md#11-drain-and-shutdown) and
+> [lifecycle runbook](operations/cluster-lifecycle-runbook.md#drain-timeout).
+
 ---
 
 ## 0. Goal Prompt

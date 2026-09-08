@@ -126,9 +126,18 @@ impl LogicEffectApplier {
                     return Err(());
                 }
                 handle
-                    .complete_member_drain(operation_id.clone())
+                    .request_member_drain(&operation_id)
                     .await
                     .map_err(|_| ())?;
+                Ok(())
+            }
+            LogicPlacementEffect::DrainCommitted {
+                operation_id,
+                incarnation,
+            } => {
+                if incarnation != self.incarnation {
+                    return Err(());
+                }
                 self.drain_ready.send_modify(|ready| {
                     ready.insert(self.domain.clone(), operation_id);
                 });
@@ -251,6 +260,16 @@ impl LogicJoinRuntime {
                     leader,
                     association,
                 } => {
+                    // Once this domain's durable removal is confirmed, coordinator replacement
+                    // must not register it again while the remaining domains/membership leave.
+                    if self.lifecycle_driver.state() == NodeLifecycleState::Draining
+                        && self
+                            .drain_ready
+                            .borrow()
+                            .contains_key(&self.domain_hello.domain)
+                    {
+                        continue;
+                    }
                     let recovering_membership = self
                         .lifecycle
                         .lock()
@@ -340,7 +359,7 @@ impl LogicJoinRuntime {
                                     session,
                                     controls: receiver,
                                     effects,
-                                    handle,
+                                    handle: handle.clone(),
                                 },
                                 &mut join_events,
                                 &mut shutdown,
@@ -352,6 +371,15 @@ impl LogicJoinRuntime {
                             .remove(&self.domain_hello.domain);
                         self.router.clear(&self.domain_hello.domain);
                         receiver = returned.controls;
+                        if self.lifecycle_driver.state() == NodeLifecycleState::Draining
+                            && let Some(operation_id) = handle.committed_member_drain()
+                        {
+                            self.drain_ready.send_modify(|ready| {
+                                ready.insert(self.domain_hello.domain.clone(), operation_id);
+                            });
+                            controls = Some(receiver);
+                            break;
+                        }
                         if !returned.retry {
                             controls = Some(receiver);
                             break;

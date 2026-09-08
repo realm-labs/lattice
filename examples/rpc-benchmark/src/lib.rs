@@ -131,10 +131,9 @@ impl RemotingTopology {
             .bulk
             .into_iter()
             .map(|mut receiver| {
-                let association = association.clone();
                 tokio::spawn(async move {
                     while let Some(frame) = receiver.recv().await {
-                        association.release_queued_bytes(frame.payload_len());
+                        drop(frame);
                     }
                 })
             })

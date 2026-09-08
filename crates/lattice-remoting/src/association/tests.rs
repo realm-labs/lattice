@@ -595,7 +595,7 @@ fn a_rejected_attachment_does_not_leave_the_lane_marked_attached() {
         Err(AssociationError::Closed)
     ));
     assert_eq!(association.attached_lane_count(), 0);
-    assert!(association.lane_receiver_available(LaneKind::Control));
+    assert!(!association.lane_receiver_available(LaneKind::Control));
 }
 
 #[test]
@@ -724,11 +724,83 @@ fn node_byte_budget_is_shared_across_associations() {
         Err(AssociationError::NodeByteBudgetExceeded)
     ));
     assert_eq!(second.metrics().node_byte_budget_rejections, 1);
-    first.release_queued_bytes(8);
+    let mut interactive = first.take_lane_receiver(LaneKind::Interactive).unwrap();
+    drop(interactive.try_recv().unwrap());
     second
         .try_admit_interactive(Frame::new(
             FrameKind::Backpressure,
             bytes::Bytes::from_static(b"12345678"),
         ))
         .unwrap();
+}
+
+#[test]
+fn removing_an_association_returns_queued_bytes_to_the_node() {
+    let manager = manager_with_config(RemotingConfig {
+        max_outbound_bytes_per_association: 8,
+        max_outbound_bytes_per_node: 8,
+        ..RemotingConfig::default()
+    });
+    let old = accept(&manager, AssociationId::generate());
+    attach_lane_group(&old);
+    old.try_admit_interactive(Frame::new(
+        FrameKind::Backpressure,
+        bytes::Bytes::from_static(b"12345678"),
+    ))
+    .unwrap();
+
+    assert!(manager.remove(old.key(), old.id()));
+    assert_eq!(old.state(), AssociationState::Closed);
+    // Holding a diagnostic Arc must not keep an abandoned queue's budget alive.
+    let replacement = accept(&manager, AssociationId::generate());
+    attach_lane_group(&replacement);
+    replacement
+        .try_admit_interactive(Frame::new(
+            FrameKind::Backpressure,
+            bytes::Bytes::from_static(b"abcdefgh"),
+        ))
+        .unwrap();
+    drop(old);
+    assert!(matches!(
+        replacement.try_admit_interactive(Frame::new(
+            FrameKind::Backpressure,
+            bytes::Bytes::from_static(b"x"),
+        )),
+        Err(AssociationError::ByteBudgetExceeded)
+    ));
+}
+
+#[test]
+fn dequeued_frames_keep_their_reservation_until_discarded() {
+    let manager = manager_with_config(RemotingConfig {
+        max_outbound_bytes_per_association: 8,
+        max_outbound_bytes_per_node: 8,
+        ..RemotingConfig::default()
+    });
+    let old = accept(&manager, AssociationId::generate());
+    attach_lane_group(&old);
+    let mut receiver = old.take_lane_receiver(LaneKind::Interactive).unwrap();
+    old.try_admit_interactive(Frame::new(
+        FrameKind::Backpressure,
+        bytes::Bytes::from_static(b"12345678"),
+    ))
+    .unwrap();
+    let queued = receiver.try_recv().unwrap();
+    drop(queued.clone());
+    assert!(manager.remove(old.key(), old.id()));
+    drop(old);
+    let replacement = accept(&manager, AssociationId::generate());
+    attach_lane_group(&replacement);
+    let frame = || {
+        Frame::new(
+            FrameKind::Backpressure,
+            bytes::Bytes::from_static(b"abcdefgh"),
+        )
+    };
+    assert!(matches!(
+        replacement.try_admit_interactive(frame()),
+        Err(AssociationError::NodeByteBudgetExceeded)
+    ));
+    drop(queued);
+    replacement.try_admit_interactive(frame()).unwrap();
 }

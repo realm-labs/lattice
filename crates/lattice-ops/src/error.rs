@@ -12,6 +12,4 @@ pub enum OpsError {
     HighCardinalityMetricLabel { label: String },
     #[error("admin query failed: {message}")]
     Admin { message: String },
-    #[error("drain failed: {message}")]
-    Drain { message: String },
 }

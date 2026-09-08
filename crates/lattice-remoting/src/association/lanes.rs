@@ -9,6 +9,18 @@ use super::{
 use crate::{control::control_envelope_frame, wire::Frame};
 
 impl Association {
+    pub(super) fn discard_unowned_receivers(&self) {
+        let mut slots = self
+            .receivers
+            .lock()
+            .expect("association receivers poisoned");
+        slots.control.take();
+        slots.interactive.take();
+        for receiver in &mut slots.bulk {
+            receiver.take();
+        }
+    }
+
     pub fn take_receivers(&self) -> Option<AssociationReceivers> {
         let mut slots = self
             .receivers
@@ -70,6 +82,12 @@ impl Association {
             .receivers
             .lock()
             .expect("association receivers poisoned");
+        if matches!(
+            self.state(),
+            AssociationState::Closing | AssociationState::Closed
+        ) {
+            return Ok(());
+        }
         let slot = match lane {
             LaneKind::Control => &mut slots.control,
             LaneKind::Interactive => &mut slots.interactive,
@@ -158,6 +176,12 @@ impl Association {
         &self,
         attachment: LaneAttachment,
     ) -> Result<mpsc::Receiver<Frame>, AssociationError> {
+        if matches!(
+            self.state(),
+            AssociationState::Closing | AssociationState::Closed
+        ) {
+            return Err(AssociationError::Closed);
+        }
         let lane = attachment.lane;
         let connection_nonce = attachment.connection_nonce;
         let receiver = self

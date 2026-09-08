@@ -90,6 +90,9 @@ pub struct Frame {
     pub kind: FrameKind,
     payload: FramePayload,
     coalesced: OnceLock<Bytes>,
+    // Local ownership only: never encoded, and a cloned frame must acquire its
+    // own reservation when it is admitted again.
+    pub(crate) outbound_budget: Option<crate::association::budget::QueuedBytes>,
 }
 
 #[derive(Debug, Clone)]
@@ -136,6 +139,7 @@ impl Frame {
             kind,
             payload: FramePayload::Contiguous(payload),
             coalesced: OnceLock::new(),
+            outbound_budget: None,
         }
     }
 
@@ -159,6 +163,7 @@ impl Frame {
                 len,
             }),
             coalesced: OnceLock::new(),
+            outbound_budget: None,
         }
     }
 
@@ -294,6 +299,7 @@ impl Clone for Frame {
             kind: self.kind,
             payload: self.payload.clone(),
             coalesced: OnceLock::new(),
+            outbound_budget: None,
         }
     }
 }

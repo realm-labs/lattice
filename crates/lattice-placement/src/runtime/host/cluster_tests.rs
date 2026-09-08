@@ -57,6 +57,85 @@ fn config() -> CoordinatorHostConfig {
 }
 
 #[tokio::test(start_paused = true)]
+async fn panicked_domain_is_unadvertised_and_recampaigned_without_losing_other_scopes() {
+    let store = Arc::new(InMemoryPlacementStore::new(32, 32).unwrap());
+    let local = node("panic-host", 90, 33190);
+    let failed = PlacementDomainId::new("failed-domain").unwrap();
+    let healthy = PlacementDomainId::new("healthy-domain").unwrap();
+    let mut host = CoordinatorHost::elect(
+        store.clone(),
+        associations(&local),
+        local,
+        BTreeSet::from([failed.clone(), healthy.clone()]),
+        CoordinatorHostConfig {
+            election_interval: Duration::from_millis(50),
+            maximum_candidate_jitter: Duration::ZERO,
+            ..config()
+        },
+    )
+    .await
+    .unwrap();
+    let failed_scope = CoordinatorScope::Placement(failed.clone());
+    let healthy_scope = CoordinatorScope::Placement(healthy);
+    let initial_directory = host.subscribe_directory().borrow().clone();
+    let initial_term = initial_directory[&failed_scope].term;
+    let failed_lease = host.domains[&failed]
+        .leader
+        .as_ref()
+        .unwrap()
+        .leader_lease_id;
+    // Inject a panic in this task's interval construction after election. The host's
+    // configuration stays valid, so a replacement leader can run normally.
+    host.domains
+        .get_mut(&failed)
+        .unwrap()
+        .leader
+        .as_mut()
+        .unwrap()
+        .config
+        .rebalance_interval = Duration::ZERO;
+    let mut directory = host.subscribe_directory();
+    let (_controls, receiver) = mpsc::channel(8);
+    let (stop, stop_rx) = watch::channel(false);
+    let task = tokio::spawn(host.run(receiver, stop_rx));
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            directory.changed().await.unwrap();
+            let entries = directory.borrow_and_update();
+            assert_eq!(
+                entries.get(&healthy_scope),
+                initial_directory.get(&healthy_scope)
+            );
+            assert_eq!(
+                entries.get(&CoordinatorScope::Membership),
+                initial_directory.get(&CoordinatorScope::Membership)
+            );
+            if !entries.contains_key(&failed_scope) {
+                break;
+            }
+        }
+        // InMemoryPlacementStore does not expire leases with Tokio's clock. After
+        // observing withdrawal, explicitly model expiry of the panicked leader's lease.
+        store.revoke_lease(failed_lease).await.unwrap();
+        loop {
+            directory.changed().await.unwrap();
+            if directory
+                .borrow_and_update()
+                .get(&failed_scope)
+                .is_some_and(|record| record.term > initial_term)
+            {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("failed domain must leave the directory and recover");
+    stop.send(true).unwrap();
+    task.await.unwrap().unwrap();
+}
+
+#[tokio::test(start_paused = true)]
 async fn placement_domain_campaigns_run_concurrently_off_the_host_loop() {
     let store = Arc::new(InMemoryPlacementStore::new(64, 64).unwrap());
     let holder = node("campaign-holder", 40, 33140);

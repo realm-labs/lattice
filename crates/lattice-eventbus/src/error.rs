@@ -1,5 +1,7 @@
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum EventBusError {
+    #[error("event bus is shutting down")]
+    Closed,
     #[error("event handler failed: {0}")]
     Handler(String),
     #[error("failed to decode event payload as {message_type}: {reason}")]

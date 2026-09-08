@@ -4,6 +4,7 @@ pub mod allocation;
 pub mod authority;
 pub mod control;
 pub mod coordinator;
+mod drain;
 pub mod handoff;
 pub mod mapping;
 pub mod membership_session;

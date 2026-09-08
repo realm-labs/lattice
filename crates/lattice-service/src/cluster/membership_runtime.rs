@@ -60,7 +60,7 @@ impl MembershipJoinRuntime {
                 .run(join_events_tx, shutdown.clone()),
         );
         let mut controls = self.controls.take();
-        while let Some(event) = next_join_event(&mut join_events, &mut shutdown).await {
+        'joining: while let Some(event) = next_join_event(&mut join_events, &mut shutdown).await {
             match event {
                 JoinEvent::Coordinator {
                     leader,
@@ -89,7 +89,8 @@ impl MembershipJoinRuntime {
                             controls = Some(receiver);
                             break;
                         };
-                        *self.handle.lock().expect("membership handle poisoned") = Some(handle);
+                        *self.handle.lock().expect("membership handle poisoned") =
+                            Some(handle.clone());
                         let state = session.state();
                         let session_started = Instant::now();
                         let returned = self
@@ -105,6 +106,12 @@ impl MembershipJoinRuntime {
                                 &mut shutdown,
                             )
                             .await;
+                        if handle.committed_drain().is_some() {
+                            // Retain the authority proof for leave's retry even if the session
+                            // closed before its caller observed the response. Rejoining would
+                            // recreate the very incarnation whose removal was confirmed.
+                            break 'joining;
+                        }
                         *self.handle.lock().expect("membership handle poisoned") = None;
                         receiver = returned.controls;
                         if !returned.retry {
@@ -141,7 +148,15 @@ impl MembershipJoinRuntime {
             }
         }
         controller.abort();
-        *self.handle.lock().expect("membership handle poisoned") = None;
+        {
+            let mut handle = self.handle.lock().expect("membership handle poisoned");
+            if handle
+                .as_ref()
+                .is_none_or(|handle| handle.committed_drain().is_none())
+            {
+                *handle = None;
+            }
+        }
         let _ = controller.await;
     }
 
@@ -313,9 +328,9 @@ impl MembershipJoinRuntime {
                 }
                 self.peers.apply(*event).await.map_err(|_| ())
             }
-            LogicPlacementEffect::Authority { .. } | LogicPlacementEffect::DrainReady { .. } => {
-                Err(())
-            }
+            LogicPlacementEffect::Authority { .. }
+            | LogicPlacementEffect::DrainReady { .. }
+            | LogicPlacementEffect::DrainCommitted { .. } => Err(()),
         }
     }
 

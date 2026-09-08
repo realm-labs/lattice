@@ -11,6 +11,11 @@ use crate::{
 };
 
 impl LogicCoordinatorHandle {
+    /// The operation for which this session accepted an authenticated coordinator commit response.
+    pub fn committed_member_drain(&self) -> Option<String> {
+        self.drain_confirmation.committed_operation()
+    }
+
     pub fn domain(&self) -> &PlacementDomainId {
         &self.domain
     }
@@ -69,56 +74,118 @@ impl LogicCoordinatorHandle {
         self.send_ephemeral(PlacementControlCommand::ShardLoad(report))
     }
 
+    /// Starts or resumes this operation at the last locally confirmed drain stage.
     pub fn begin_drain(&self, operation_id: String) -> Result<(), LogicSessionError> {
-        let incarnation = self
+        if self.committed_member_drain().as_deref() == Some(&operation_id) {
+            return Ok(());
+        }
+        let node = self
             .state
             .lock()
             .expect("logic placement state poisoned")
             .local_node
-            .incarnation;
-        self.send_reliable(PlacementControlCommand::BeginDrain {
-            operation_id,
-            expected_incarnation: incarnation,
-        })
+            .clone();
+        let command = if self.drain_confirmation.requested() {
+            self.drain_confirmation
+                .request(&operation_id, self.coordinator_term.load(Ordering::Acquire))?;
+            // The coordinator may already have removed its session after committing. It can
+            // replay that durable outcome, but cannot send DrainReady for a new BeginDrain.
+            PlacementControlCommand::DrainComplete {
+                operation_id,
+                node_id: node.node_id,
+                expected_incarnation: node.incarnation,
+            }
+        } else {
+            PlacementControlCommand::BeginDrain {
+                operation_id,
+                expected_incarnation: node.incarnation,
+            }
+        };
+        self.send_reliable(command)
     }
 
     pub async fn complete_member_drain(
         &self,
         operation_id: String,
     ) -> Result<(), LogicSessionError> {
-        let incarnation = self
+        self.complete_member_drain_until(
+            operation_id,
+            Instant::now() + self.drain_acknowledgement_timeout,
+        )
+        .await
+    }
+
+    pub async fn complete_member_drain_until(
+        &self,
+        operation_id: String,
+        deadline: Instant,
+    ) -> Result<(), LogicSessionError> {
+        if self.committed_member_drain().as_deref() == Some(&operation_id) {
+            return Ok(());
+        }
+        let term = self
+            .request_member_drain_until(&operation_id, deadline)
+            .await?;
+        self.drain_confirmation
+            .wait(&operation_id, term, deadline)
+            .await
+    }
+
+    /// Enqueues completion without blocking the effect consumer that applies its later commit
+    /// notification. The service's leave loop owns the absolute operation deadline.
+    pub async fn request_member_drain(&self, operation_id: &str) -> Result<(), LogicSessionError> {
+        self.request_member_drain_until(
+            operation_id,
+            Instant::now() + super::CONTROL_ADMISSION_TIMEOUT,
+        )
+        .await
+        .map(|_| ())
+    }
+
+    async fn request_member_drain_until(
+        &self,
+        operation_id: &str,
+        deadline: Instant,
+    ) -> Result<u64, LogicSessionError> {
+        if Instant::now() >= deadline {
+            return Err(LogicSessionError::DrainNotAcknowledged);
+        }
+        let node = self
             .state
             .lock()
             .expect("logic placement state poisoned")
             .local_node
-            .incarnation;
+            .clone();
+        let term = self.coordinator_term.load(Ordering::Acquire);
+        self.drain_confirmation.request(operation_id, term)?;
+        if self.drain_confirmation.committed_operation().as_deref() == Some(operation_id) {
+            return Ok(term);
+        }
         let association = self
             .associations
             .get(&self.coordinator)
             .ok_or(LogicSessionError::AssociationUnavailable)?;
-        let command_id = association.admit_control_command_in(
-            control_stream_id(&CoordinatorScope::Placement(self.domain.clone())),
-            encode_control_command_for_term(
-                &CoordinatorScope::Placement(self.domain.clone()),
-                self.coordinator_term.load(Ordering::Acquire),
-                &PlacementControlCommand::DrainComplete {
-                    operation_id,
-                    expected_incarnation: incarnation,
-                },
-                self.maximum_control_payload,
-            )
-            .map_err(LogicSessionError::Control)?,
-        )?;
-        // Reliable control has no completion signal, so the acknowledgement is polled. The wait is
-        // bounded: an unbounded poll turns a lost Coordinator into a drain that never returns.
-        let deadline = Instant::now() + self.drain_acknowledgement_timeout;
-        while association.control_command_pending(command_id) {
-            if Instant::now() >= deadline {
-                return Err(LogicSessionError::DrainNotAcknowledged);
-            }
-            tokio::time::sleep(self.drain_poll_interval).await;
-        }
-        Ok(())
+        tokio::time::timeout_at(
+            deadline,
+            association.admit_control_command_in_wait(
+                control_stream_id(&CoordinatorScope::Placement(self.domain.clone())),
+                encode_control_command_for_term(
+                    &CoordinatorScope::Placement(self.domain.clone()),
+                    term,
+                    &PlacementControlCommand::DrainComplete {
+                        operation_id: operation_id.to_owned(),
+                        node_id: node.node_id,
+                        expected_incarnation: node.incarnation,
+                    },
+                    self.maximum_control_payload,
+                )
+                .map_err(LogicSessionError::Control)?,
+                super::CONTROL_ADMISSION_TIMEOUT,
+            ),
+        )
+        .await
+        .map_err(|_| LogicSessionError::DrainNotAcknowledged)??;
+        Ok(term)
     }
 
     fn send_ephemeral(&self, command: PlacementControlCommand) -> Result<(), LogicSessionError> {

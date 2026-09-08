@@ -47,7 +47,7 @@ async fn supervised_task_panic_stops_the_node() {
 }
 
 #[tokio::test]
-async fn shutdown_completes_after_aborting_a_stuck_supervised_task() {
+async fn graceful_shutdown_retains_a_stuck_task_until_explicit_force_shutdown() {
     let _network = network_test_guard().await;
     let config = node_config(
         ClusterId::new("stuck-task-test").unwrap(),
@@ -67,7 +67,13 @@ async fn shutdown_completes_after_aborting_a_stuck_supervised_task() {
     service.start().await.unwrap();
     service.supervisor().spawn(std::future::pending()).unwrap();
 
-    service.shutdown().await.unwrap();
+    assert!(matches!(
+        service.shutdown().await,
+        Err(crate::error::ServiceError::LeaveTimeout)
+    ));
+    assert_eq!(service.node_lifecycle_state(), NodeLifecycleState::Stopping);
+    assert_eq!(service.supervisor().active_tasks(), 1);
+    service.force_shutdown().await.unwrap();
 
     assert_eq!(
         service.node_lifecycle_state(),

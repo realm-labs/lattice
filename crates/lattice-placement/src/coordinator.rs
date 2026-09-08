@@ -24,7 +24,7 @@ use crate::{
     },
 };
 
-pub const COORDINATOR_PROTOCOL_GENERATION: u64 = 9;
+pub const COORDINATOR_PROTOCOL_GENERATION: u64 = 10;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SingletonConfig {

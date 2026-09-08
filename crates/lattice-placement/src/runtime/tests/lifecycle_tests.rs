@@ -1,6 +1,107 @@
 use super::*;
 use crate::runtime::membership_plane::{MembershipLeader, MembershipLeaderConfig};
 
+#[tokio::test]
+async fn placement_drain_commit_replays_from_durable_absence_after_leader_replacement() {
+    let cluster = ClusterId::new("placement-drain-replay").unwrap();
+    let (coordinator, _) = node(&cluster, "coordinator", 34901, 1);
+    let (departing, _) = node(&cluster, "departing", 34902, 2);
+    let associations = Arc::new(
+        AssociationManager::new(
+            coordinator.address.clone(),
+            coordinator.incarnation,
+            RemotingConfig::default(),
+        )
+        .unwrap(),
+    );
+    let key = attach_test_session(
+        &associations,
+        &cluster,
+        coordinator.incarnation,
+        &departing,
+        100,
+    );
+    let store = Arc::new(InMemoryPlacementStore::new(16, 16).unwrap());
+    let mut membership = MembershipLeader::elect(
+        store.clone(),
+        coordinator.clone(),
+        CoordinatorTerm::new(1).unwrap(),
+        MembershipLeaderConfig::default(),
+    )
+    .await
+    .unwrap();
+    let hello = empty_hello(departing.clone());
+    membership.join(hello.member).await.unwrap();
+    membership.mark_up(&departing).await.unwrap();
+    let mut leader = PlacementDomainLeader::elect(
+        store.clone(),
+        associations.clone(),
+        coordinator.clone(),
+        CoordinatorScope::Placement(domain()),
+        CoordinatorTerm::new(1).unwrap(),
+        PlacementDomainLeaderConfig::default(),
+    )
+    .await
+    .unwrap();
+    leader.register(hello.domain, key.clone()).await.unwrap();
+    leader
+        .mark_member_up(departing.incarnation, leader.membership_version, &key)
+        .await
+        .unwrap();
+    leader
+        .begin_member_drain(
+            departing.incarnation,
+            "leave".to_owned(),
+            departing.incarnation,
+        )
+        .await
+        .unwrap();
+    let request = |term| {
+        PlacementControlEventKind::Command(Box::new(InboundPlacementControl {
+            association: key.clone(),
+            command_id: CommandId::generate(),
+            scope: CoordinatorScope::Placement(domain()),
+            coordinator_term: Some(term),
+            command: PlacementControlCommand::DrainComplete {
+                operation_id: "leave".to_owned(),
+                node_id: departing.node_id.clone(),
+                expected_incarnation: departing.incarnation,
+            },
+        }))
+    };
+    leader.handle_control(request(1)).await.unwrap();
+    assert!(
+        store
+            .get_domain_member(&domain(), &departing.node_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    leader.handle_control(request(1)).await.unwrap();
+    let old_lease = leader.leader_lease_id;
+    drop(leader);
+    store.revoke_lease(old_lease).await.unwrap();
+    let mut replacement = PlacementDomainLeader::elect(
+        store,
+        associations.clone(),
+        coordinator,
+        CoordinatorScope::Placement(domain()),
+        CoordinatorTerm::new(2).unwrap(),
+        PlacementDomainLeaderConfig::default(),
+    )
+    .await
+    .unwrap();
+    replacement.handle_control(request(2)).await.unwrap();
+    let peer = associations.get(&key).unwrap();
+    let confirmations = peer.replay_control_frames().into_iter().filter_map(|frame| {
+        let envelope = decode_control_envelope(&frame).ok()?;
+        decode_control_command(&envelope.payload, DEFAULT_MAX_CONTROL_PAYLOAD).ok()
+    }).filter(|command| matches!(&command.command, PlacementControlCommand::DrainCommitted { operation_id, expected_incarnation } if operation_id == "leave" && *expected_incarnation == departing.incarnation)).collect::<Vec<_>>();
+    assert_eq!(confirmations.len(), 3);
+    assert_eq!(confirmations.last().unwrap().coordinator_term, Some(2));
+    membership.shutdown().await.unwrap();
+}
+
 /// A member that hosts nothing drains for free, so the drain that matters is the one that has to
 /// hand a shard over first. Marking the member `Leaving` must not take it out of the placement view
 /// the drain rebalance reads: the shard it still owns would then have an owner no node in the view

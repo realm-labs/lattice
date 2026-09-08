@@ -12,7 +12,7 @@ use lattice_remoting::{
 };
 use tokio::{
     sync::{Notify, mpsc, watch},
-    time::MissedTickBehavior,
+    time::{Instant, MissedTickBehavior},
 };
 
 use crate::{
@@ -60,40 +60,76 @@ pub struct MembershipSession {
     coordinator_term: u64,
     shared_coordinator_term: Arc<AtomicU64>,
     hello_pending: bool,
+    origin: Instant,
+    drain_confirmation: crate::drain::DrainConfirmation,
 }
 
 #[derive(Clone)]
 pub struct MembershipCoordinatorHandle {
+    local_node_id: String,
     local_incarnation: NodeIncarnation,
     coordinator: AssociationKey,
     associations: Arc<AssociationManager>,
     maximum_control_payload: usize,
     coordinator_term: Arc<AtomicU64>,
+    drain_acknowledgement_timeout: Duration,
+    drain_confirmation: crate::drain::DrainConfirmation,
 }
 
 impl MembershipCoordinatorHandle {
     pub async fn complete_drain(&self, operation_id: String) -> Result<(), LogicSessionError> {
+        self.complete_drain_until(
+            operation_id,
+            Instant::now() + self.drain_acknowledgement_timeout,
+        )
+        .await
+    }
+
+    pub async fn complete_drain_until(
+        &self,
+        operation_id: String,
+        deadline: Instant,
+    ) -> Result<(), LogicSessionError> {
+        if Instant::now() >= deadline {
+            return Err(LogicSessionError::DrainNotAcknowledged);
+        }
+        if self.drain_confirmation.committed_operation().as_deref() == Some(&operation_id) {
+            return Ok(());
+        }
+        let term = self.coordinator_term.load(Ordering::Acquire);
+        self.drain_confirmation.request(&operation_id, term)?;
         let association = self
             .associations
             .get(&self.coordinator)
             .ok_or(LogicSessionError::AssociationUnavailable)?;
-        let command_id = association.admit_control_command_in(
-            control_stream_id(&CoordinatorScope::Membership),
-            encode_control_command_for_term(
-                &CoordinatorScope::Membership,
-                self.coordinator_term.load(Ordering::Acquire),
-                &PlacementControlCommand::MembershipDrainComplete {
-                    operation_id,
-                    expected_incarnation: self.local_incarnation,
-                },
-                self.maximum_control_payload,
-            )
-            .map_err(LogicSessionError::Control)?,
-        )?;
-        while association.control_command_pending(command_id) {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        Ok(())
+        tokio::time::timeout_at(
+            deadline,
+            association.admit_control_command_in_wait(
+                control_stream_id(&CoordinatorScope::Membership),
+                encode_control_command_for_term(
+                    &CoordinatorScope::Membership,
+                    term,
+                    &PlacementControlCommand::MembershipDrainComplete {
+                        operation_id: operation_id.clone(),
+                        node_id: self.local_node_id.clone(),
+                        expected_incarnation: self.local_incarnation,
+                    },
+                    self.maximum_control_payload,
+                )
+                .map_err(LogicSessionError::Control)?,
+                super::session::CONTROL_ADMISSION_TIMEOUT,
+            ),
+        )
+        .await
+        .map_err(|_| LogicSessionError::DrainNotAcknowledged)??;
+        self.drain_confirmation
+            .wait(&operation_id, term, deadline)
+            .await
+    }
+
+    /// An authenticated completion remains valid after the session carrying it closes.
+    pub fn committed_drain(&self) -> Option<String> {
+        self.drain_confirmation.committed_operation()
     }
 }
 
@@ -113,6 +149,7 @@ impl MembershipSession {
         ),
         LogicSessionError,
     > {
+        config.validate()?;
         if effect_capacity == 0
             || coordinator_term == 0
             || hello.node.incarnation != coordinator.local_incarnation
@@ -122,12 +159,16 @@ impl MembershipSession {
         }
         let (effects, receiver) = mpsc::channel(effect_capacity);
         let shared_coordinator_term = Arc::new(AtomicU64::new(coordinator_term));
+        let drain_confirmation = crate::drain::DrainConfirmation::default();
         let handle = MembershipCoordinatorHandle {
+            local_node_id: hello.node.node_id.clone(),
             local_incarnation: hello.node.incarnation,
             coordinator: coordinator.clone(),
             associations: associations.clone(),
             maximum_control_payload: config.maximum_control_payload,
             coordinator_term: shared_coordinator_term.clone(),
+            drain_acknowledgement_timeout: config.drain_acknowledgement_timeout,
+            drain_confirmation: drain_confirmation.clone(),
         };
         let local_node = hello.node.clone();
         Ok((
@@ -147,6 +188,8 @@ impl MembershipSession {
                 coordinator_term,
                 shared_coordinator_term,
                 hello_pending: true,
+                origin: Instant::now(),
+                drain_confirmation,
             },
             handle,
             receiver,
@@ -166,6 +209,7 @@ impl MembershipSession {
         mpsc::Receiver<PlacementControlEvent>,
     ) {
         let result = self.run_loop(&mut controls, &mut shutdown).await;
+        self.drain_confirmation.close();
         (result, controls)
     }
 
@@ -199,6 +243,9 @@ impl MembershipSession {
                     result?;
                 }
                 _ = heartbeat.tick() => {
+                    if self.drain_confirmation.requested() {
+                        continue;
+                    }
                     if self.hello_pending {
                         // The initial hello may race Coordinator election or membership
                         // recovery. Retry until a membership snapshot proves it was accepted.
@@ -226,6 +273,9 @@ impl MembershipSession {
             }
             PlacementControlEventKind::Reconcile { association, .. } => {
                 self.require_coordinator(&association)?;
+                if self.drain_confirmation.committed_operation().is_some() {
+                    return Ok(());
+                }
                 self.state
                     .lock()
                     .expect("membership session state poisoned")
@@ -251,24 +301,26 @@ impl MembershipSession {
                             SnapshotStager::begin(
                                 begin,
                                 self.config.snapshot_limits.clone(),
-                                MonotonicTime::from_millis(0),
+                                self.now(),
                             )
                             .map_err(LogicSessionError::Coordinator)?,
                         );
                         Ok(())
                     }
-                    PlacementControlCommand::SnapshotChunk(chunk) => self
-                        .stager
-                        .as_mut()
-                        .ok_or(LogicSessionError::SnapshotRequired)?
-                        .push(chunk, MonotonicTime::from_millis(0))
-                        .map_err(LogicSessionError::Coordinator),
+                    PlacementControlCommand::SnapshotChunk(chunk) => {
+                        let now = self.now();
+                        self.stager
+                            .as_mut()
+                            .ok_or(LogicSessionError::SnapshotRequired)?
+                            .push(chunk, now)
+                            .map_err(LogicSessionError::Coordinator)
+                    }
                     PlacementControlCommand::SnapshotEnd(end) => {
                         let install = self
                             .stager
                             .take()
                             .ok_or(LogicSessionError::SnapshotRequired)?
-                            .finish(end, MonotonicTime::from_millis(0))
+                            .finish(end, self.now())
                             .map_err(LogicSessionError::Coordinator)?;
                         let SnapshotVersion::Membership(version) = install.version.clone() else {
                             return Err(LogicSessionError::UnauthorizedCommand);
@@ -297,6 +349,16 @@ impl MembershipSession {
                     }
                     PlacementControlCommand::MemberDelta(event) => {
                         self.apply_member_event(event).await
+                    }
+                    PlacementControlCommand::DrainCommitted {
+                        operation_id,
+                        expected_incarnation,
+                    } => {
+                        if expected_incarnation != self.hello.node.incarnation {
+                            return Err(LogicSessionError::UnauthorizedCommand);
+                        }
+                        self.drain_confirmation
+                            .confirm(&operation_id, self.coordinator_term)
                     }
                     _ => Err(LogicSessionError::UnauthorizedCommand),
                 }
@@ -364,6 +426,12 @@ impl MembershipSession {
         }
     }
 
+    fn now(&self) -> MonotonicTime {
+        MonotonicTime::from_millis(
+            u64::try_from(self.origin.elapsed().as_millis()).unwrap_or(u64::MAX),
+        )
+    }
+
     fn require_coordinator_term(&self, term: Option<u64>) -> Result<(), LogicSessionError> {
         if term == Some(self.coordinator_term) {
             Ok(())
@@ -418,5 +486,92 @@ fn membership_dispatch_error(error: &LogicSessionError) -> ControlDispatchError 
         _ => ControlDispatchError::RetryLater(
             lattice_remoting::control::ControlRetryReason::AssociationStarting,
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        control::InboundPlacementControl,
+        coordinator::build_snapshot,
+        types::{CoordinatorTerm, MembershipVersion, Revision},
+    };
+    use lattice_core::{
+        actor_address::{ClusterId, NodeAddress},
+        release::ReleaseManifest,
+    };
+    use lattice_remoting::{config::RemotingConfig, control::CommandId};
+
+    #[tokio::test(start_paused = true)]
+    async fn membership_snapshot_staging_expires_on_the_real_monotonic_clock() {
+        let local = NodeKey {
+            node_id: "joining".to_owned(),
+            address: NodeAddress::new("127.0.0.1", 34601).unwrap(),
+            incarnation: NodeIncarnation::new(1).unwrap(),
+        };
+        let associations = Arc::new(
+            AssociationManager::new(
+                local.address.clone(),
+                local.incarnation,
+                RemotingConfig::default(),
+            )
+            .unwrap(),
+        );
+        let association = associations
+            .get_or_create(
+                ClusterId::new("snapshot-timeout").unwrap(),
+                NodeAddress::new("127.0.0.1", 34602).unwrap(),
+                NodeIncarnation::new(2).unwrap(),
+            )
+            .unwrap();
+        let hello = MemberHello {
+            node: local,
+            release: ReleaseManifest::development(1),
+            rollout_participant: true,
+            roles: Default::default(),
+            failure_domains: Default::default(),
+            protocols: Vec::new(),
+            remoting_capabilities: Default::default(),
+        };
+        let config = LogicCoordinatorConfig::default();
+        let (begin, _, end) = build_snapshot(
+            &CoordinatorScope::Membership,
+            1,
+            config.maximum_control_payload,
+            SnapshotVersion::Membership(MembershipVersion::new(
+                CoordinatorTerm::new(1).unwrap(),
+                Revision::new(1).unwrap(),
+            )),
+            Vec::new(),
+            &config.snapshot_limits,
+        )
+        .unwrap();
+        let timeout = Duration::from_millis(config.snapshot_limits.staging_timeout_millis);
+        let (mut session, _, _effects) =
+            MembershipSession::new(hello, association.key().clone(), associations, config, 8, 1)
+                .unwrap();
+        let event = |command| {
+            PlacementControlEventKind::Command(Box::new(InboundPlacementControl {
+                association: association.key().clone(),
+                scope: CoordinatorScope::Membership,
+                coordinator_term: Some(1),
+                command_id: CommandId::generate(),
+                command,
+            }))
+        };
+        session
+            .handle(event(PlacementControlCommand::SnapshotBegin(begin)))
+            .await
+            .unwrap();
+        tokio::time::advance(timeout + Duration::from_millis(1)).await;
+        assert!(matches!(
+            session
+                .handle(event(PlacementControlCommand::SnapshotEnd(end)))
+                .await,
+            Err(LogicSessionError::Coordinator(
+                crate::coordinator::CoordinatorError::SnapshotIntegrity
+            ))
+        ));
     }
 }

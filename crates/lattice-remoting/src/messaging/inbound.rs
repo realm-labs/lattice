@@ -1,12 +1,6 @@
-use super::codec::{
-    decode_ask, decode_failure, decode_reply, decode_tell, failure_frame, reply_frame,
-};
-use super::error::{AskError, InboundConnectionError, RemoteFailureCode, RemoteMessageError};
-use super::outbound::OutboundMessaging;
-use super::target::{
-    ExactActorTarget, InboundTell, LogicalEntityTarget, LogicalSingletonTarget, RemoteFailure,
-};
-use super::{Arc, Bytes, Frame, FrameKind, FramedConnection, Instant, RemotingIo, async_trait};
+use super::error::{RemoteFailureCode, RemoteMessageError};
+use super::target::{ExactActorTarget, InboundTell, LogicalEntityTarget, LogicalSingletonTarget};
+use super::{Bytes, Instant, async_trait};
 
 #[async_trait]
 pub trait InboundDispatch: Send + Sync + 'static {
@@ -83,65 +77,6 @@ pub(crate) async fn dispatch_tell<D: InboundDispatch + ?Sized>(
             dispatch
                 .tell(tell.target, tell.message_id, tell.payload)
                 .await
-        }
-    }
-}
-
-pub async fn serve_inbound_connection<S, D>(
-    mut connection: FramedConnection<S>,
-    dispatch: Arc<D>,
-    outbound: Option<Arc<OutboundMessaging>>,
-) -> Result<(), InboundConnectionError>
-where
-    S: RemotingIo,
-    D: InboundDispatch + ?Sized,
-{
-    loop {
-        let frame = connection.read_frame().await?;
-        match frame.kind {
-            FrameKind::Tell => {
-                let tell = decode_tell(&frame)?;
-                let _ = dispatch_tell(dispatch.as_ref(), tell).await;
-            }
-            FrameKind::Ask => {
-                let ask = decode_ask(&frame)?;
-                let deadline = Instant::now()
-                    .checked_add(ask.timeout_budget)
-                    .ok_or(RemoteMessageError::DeadlineExceeded)?;
-                let response = match dispatch
-                    .ask(ask.target, ask.message_id, ask.payload, deadline)
-                    .await
-                {
-                    Ok(payload) => reply_frame(ask.correlation_id, payload),
-                    Err(error) => failure_frame(&RemoteFailure {
-                        correlation_id: ask.correlation_id,
-                        code: failure_code(&error),
-                        safe_detail: None,
-                    }),
-                };
-                connection.write_frame(&response).await?;
-            }
-            FrameKind::Reply => {
-                let (correlation, payload) = decode_reply(&frame)?;
-                if let Some(outbound) = &outbound {
-                    outbound.complete_reply(correlation, payload);
-                }
-            }
-            FrameKind::Failure => {
-                let failure = decode_failure(&frame)?;
-                if let Some(outbound) = &outbound {
-                    outbound
-                        .complete_failure(failure.correlation_id, AskError::Remote(failure.code));
-                }
-            }
-            FrameKind::Heartbeat => {
-                connection
-                    .write_frame(&Frame::new(FrameKind::HeartbeatAck, Bytes::new()))
-                    .await?;
-            }
-            FrameKind::HeartbeatAck | FrameKind::Backpressure => {}
-            FrameKind::Close => return Ok(()),
-            _ => return Err(InboundConnectionError::UnexpectedFrame(frame.kind)),
         }
     }
 }

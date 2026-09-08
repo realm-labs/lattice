@@ -78,7 +78,7 @@ impl Default for LogicCoordinatorConfig {
 }
 
 impl LogicCoordinatorConfig {
-    fn validate(&self) -> Result<(), LogicSessionError> {
+    pub(crate) fn validate(&self) -> Result<(), LogicSessionError> {
         if self.maximum_control_payload == 0
             || self.tick_interval.is_zero()
             || self.heartbeat_interval.is_zero()
@@ -104,6 +104,10 @@ pub enum LogicPlacementEffect {
         members: Vec<MemberRecord>,
     },
     DrainReady {
+        operation_id: String,
+        incarnation: NodeIncarnation,
+    },
+    DrainCommitted {
         operation_id: String,
         incarnation: NodeIncarnation,
     },
@@ -217,6 +221,7 @@ pub struct PlacementDomainSession {
     coordinator_term: u64,
     shared_coordinator_term: Arc<AtomicU64>,
     hello_pending: bool,
+    drain_confirmation: crate::drain::DrainConfirmation,
 }
 
 const MAX_READY_REPLAYS_PER_HEARTBEAT: usize = 64;
@@ -235,8 +240,8 @@ pub struct LogicCoordinatorHandle {
     state: Arc<Mutex<LogicPlacementState>>,
     local_events: mpsc::Sender<LocalAuthorityEvent>,
     coordinator_term: Arc<AtomicU64>,
-    drain_poll_interval: Duration,
     drain_acknowledgement_timeout: Duration,
+    drain_confirmation: crate::drain::DrainConfirmation,
 }
 
 impl PlacementDomainSession {
@@ -288,6 +293,7 @@ impl PlacementDomainSession {
                 coordinator_term,
                 shared_coordinator_term,
                 hello_pending: true,
+                drain_confirmation: crate::drain::DrainConfirmation::default(),
             },
             receiver,
         ))
@@ -306,8 +312,8 @@ impl PlacementDomainSession {
             state: self.state.clone(),
             local_events: self.local_event_sender.clone(),
             coordinator_term: self.shared_coordinator_term.clone(),
-            drain_poll_interval: self.config.tick_interval,
             drain_acknowledgement_timeout: self.config.drain_acknowledgement_timeout,
+            drain_confirmation: self.drain_confirmation.clone(),
         }
     }
 
@@ -367,6 +373,7 @@ impl PlacementDomainSession {
         mpsc::Receiver<PlacementControlEvent>,
     ) {
         let result = self.run_loop(&mut controls, &mut shutdown).await;
+        self.drain_confirmation.close();
         if let Err(error) = &result {
             tracing::warn!(
                 target: "lattice.cluster.logic",
@@ -424,6 +431,9 @@ impl PlacementDomainSession {
                     self.tick_authorities().await?;
                 }
                 _ = heartbeat.tick() => {
+                    if self.drain_confirmation.requested() {
+                        continue;
+                    }
                     if self.hello_pending {
                         // Domain registration can race global membership recovery. Retry the
                         // idempotent hello until the Coordinator starts the placement snapshot.
@@ -621,6 +631,9 @@ impl PlacementDomainSession {
     }
 
     async fn reconcile_after_stale_control(&mut self, command: &'static str) {
+        if self.drain_confirmation.committed_operation().is_some() {
+            return;
+        }
         self.stager = None;
         self.state
             .lock()

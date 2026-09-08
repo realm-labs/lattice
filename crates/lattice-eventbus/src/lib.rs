@@ -1,6 +1,7 @@
 #![cfg_attr(not(test), deny(clippy::wildcard_imports))]
 
 pub mod error;
+mod lifecycle;
 pub mod local;
 pub mod nats;
 pub mod publisher;

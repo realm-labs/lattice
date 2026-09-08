@@ -15,10 +15,7 @@ use lattice_core::{
     release::{ClusterReleaseState, ReleaseError, ReleaseManifest},
 };
 use lattice_placement::{membership_session::MembershipCoordinatorHandle, types::PlacementSlotKey};
-use tokio::{
-    sync::broadcast::{Receiver, error::RecvError},
-    time::Instant,
-};
+use tokio::{sync::broadcast::Receiver, time::Instant};
 
 use crate::{
     cluster::api::Cluster,
@@ -55,6 +52,7 @@ pub struct LatticeService {
     pub(super) logic_runtime: Mutex<Option<LogicRuntimeAssembly>>,
     pub(super) join_runtimes: Mutex<Vec<LogicJoinRuntime>>,
     pub(super) membership_join_runtime: Mutex<Option<MembershipJoinRuntime>>,
+    pub(super) membership_required: bool,
     pub(super) membership_handle: Arc<Mutex<Option<MembershipCoordinatorHandle>>>,
     pub(super) logic_shutdown: Mutex<Option<watch::Sender<bool>>>,
     pub(super) join_shutdown: Mutex<Option<watch::Sender<bool>>>,
@@ -565,6 +563,15 @@ impl LatticeService {
     }
 
     pub async fn leave(&self, deadline: Instant) -> Result<(), ServiceError> {
+        // Component shutdown is retryable: actor cells and endpoint/supervisor join handles stay
+        // with their owners when this wait expires. The same absolute budget covers authority
+        // confirmation, local actor drain, and joining the remaining runtimes.
+        tokio::time::timeout_at(deadline, self.leave_until(deadline))
+            .await
+            .unwrap_or_else(|_| Err(self.drain_timeout_error()))
+    }
+
+    async fn leave_until(&self, deadline: Instant) -> Result<(), ServiceError> {
         match self.node_lifecycle_state() {
             NodeLifecycleState::Terminated => return Ok(()),
             NodeLifecycleState::Booting => {
@@ -593,21 +600,14 @@ impl LatticeService {
                 .get_or_insert_with(|| format!("leave-{}", uuid::Uuid::new_v4()))
                 .clone()
         };
-        let handles = self
-            .logic_handles
-            .lock()
-            .expect("logic handles poisoned")
-            .clone();
-        if handles.len() != self.configured_domains.len() {
-            return Err(ServiceError::CoordinatorUnavailable);
-        }
-        for handle in handles.values() {
-            handle
-                .begin_drain(operation_id.clone())
-                .map_err(|_| ServiceError::CoordinatorUnavailable)?;
-        }
+        self.redrive_drain(&operation_id);
         let mut ready = self.drain_ready.subscribe();
         loop {
+            if Instant::now() >= deadline {
+                return Err(self.drain_timeout_error());
+            }
+            let retry_at =
+                (Instant::now() + self.join_config.leadership_refresh_interval).min(deadline);
             if self.configured_domains.iter().all(|domain| {
                 ready
                     .borrow()
@@ -620,36 +620,28 @@ impl LatticeService {
                     .expect("membership handle poisoned")
                     .clone();
                 if let Some(membership) = membership {
-                    membership
-                        .complete_drain(operation_id.clone())
+                    match membership
+                        .complete_drain_until(operation_id.clone(), retry_at)
                         .await
-                        .map_err(|_| ServiceError::CoordinatorUnavailable)?;
-                    let local_incarnation = self.endpoint.local_identity().incarnation;
-                    self.members.fence_incarnation(local_incarnation);
-                    let mut membership_events = self.members.subscribe();
-                    while self
-                        .members
-                        .snapshot()
-                        .members
-                        .iter()
-                        .any(|member| member.node.incarnation == local_incarnation)
                     {
-                        match tokio::time::timeout_at(deadline, membership_events.recv()).await {
-                            Ok(Ok(_)) | Ok(Err(RecvError::Lagged(_))) => {}
-                            Ok(Err(RecvError::Closed)) => {
-                                return Err(ServiceError::CoordinatorUnavailable);
-                            }
-                            Err(_) => return Err(self.drain_timeout_error()),
+                        Ok(()) => {
+                            // DrainCommitted is the authority proof. This local fence only prevents
+                            // a snapshot already in flight from restoring the removed incarnation.
+                            self.members
+                                .fence_incarnation(self.endpoint.local_identity().incarnation);
+                            self.transition(ServiceLifecycleEvent::DrainComplete)?;
+                            return self.stop_components().await;
                         }
+                        Err(error) => tracing::debug!(
+                            target: "lattice.cluster.lifecycle", %error,
+                            "membership drain confirmation pending; retrying within the leave deadline"
+                        ),
                     }
-                } else if !self.configured_domains.is_empty() {
-                    return Err(ServiceError::CoordinatorUnavailable);
+                } else if !self.membership_required && self.configured_domains.is_empty() {
+                    self.transition(ServiceLifecycleEvent::DrainComplete)?;
+                    return self.stop_components().await;
                 }
-                self.transition(ServiceLifecycleEvent::DrainComplete)?;
-                return self.stop_components().await;
             }
-            let retry_at =
-                (Instant::now() + self.join_config.leadership_refresh_interval).min(deadline);
             match tokio::time::timeout_at(retry_at, ready.changed()).await {
                 Ok(Ok(())) => {}
                 Ok(Err(_)) => return Err(ServiceError::CoordinatorUnavailable),
@@ -853,5 +845,240 @@ impl LatticeService {
                 .record_blocked_drain_slots(report.blocked_slots.values().map(Vec::len).sum());
             ServiceError::InterventionRequired(report)
         }
+    }
+}
+
+#[cfg(test)]
+mod drain_deadline_tests {
+    use super::*;
+    use lattice_core::actor_address::{NodeAddress, NodeIncarnation};
+    use lattice_placement::{coordinator::MemberHello, membership_session::MembershipSession};
+    use lattice_remoting::config::RemotingConfig;
+
+    fn service() -> LatticeService {
+        let mut service = LatticeService::builder(NodeConfig {
+            cluster_id: ClusterId::new("leave-deadline").unwrap(),
+            node_id: "departing".to_owned(),
+            address: NodeAddress::new("127.0.0.1", 34801).unwrap(),
+            incarnation: NodeIncarnation::new(1).unwrap(),
+            release: ReleaseManifest::development(1),
+            roles: BTreeSet::new(),
+            remoting: RemotingConfig::default(),
+            maximum_actor_protocols: 8,
+            maximum_watches: 8,
+            maximum_supervised_tasks: 8,
+            shutdown_timeout: Duration::from_secs(2),
+        })
+        .unwrap()
+        .build()
+        .unwrap();
+        service.membership_required = true;
+        service.join_config.leadership_refresh_interval = Duration::from_millis(10);
+        service
+            .transition(ServiceLifecycleEvent::RemotingReady)
+            .unwrap();
+        service
+            .transition(ServiceLifecycleEvent::SnapshotInstalled)
+            .unwrap();
+        service
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn leave_deadline_covers_component_shutdown_and_retry_keeps_the_task() {
+        let mut service = service();
+        service.membership_required = false;
+        let (finish, finished) = tokio::sync::oneshot::channel();
+        service
+            .supervisor
+            .spawn(async move {
+                let _ = finished.await;
+            })
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_millis(100);
+        let outcome =
+            tokio::time::timeout_at(deadline + Duration::from_millis(1), service.leave(deadline))
+                .await
+                .expect("component shutdown ignored the leave deadline");
+        assert!(matches!(outcome, Err(ServiceError::LeaveTimeout)));
+        assert_eq!(service.node_lifecycle_state(), NodeLifecycleState::Stopping);
+        assert_eq!(service.supervisor.active_tasks(), 1);
+        finish
+            .send(())
+            .expect("the graceful deadline must not abort the task");
+        service
+            .leave(Instant::now() + Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert_eq!(service.supervisor.active_tasks(), 0);
+        assert_eq!(
+            service.node_lifecycle_state(),
+            NodeLifecycleState::Terminated
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn leave_does_not_outlive_its_deadline_while_membership_commit_is_missing() {
+        let service = service();
+        let association = service
+            .associations
+            .get_or_create(
+                service.cluster_id.clone(),
+                NodeAddress::new("127.0.0.1", 34802).unwrap(),
+                NodeIncarnation::new(2).unwrap(),
+            )
+            .unwrap();
+        let identity = service.endpoint.local_identity();
+        let hello = MemberHello {
+            node: NodeKey {
+                node_id: identity.node_id.clone(),
+                address: identity.address.clone(),
+                incarnation: identity.incarnation,
+            },
+            release: ReleaseManifest::development(1),
+            rollout_participant: true,
+            roles: Default::default(),
+            failure_domains: Default::default(),
+            protocols: Vec::new(),
+            remoting_capabilities: Default::default(),
+        };
+        let (_session, handle, _effects) = MembershipSession::new(
+            hello,
+            association.key().clone(),
+            service.associations.clone(),
+            Default::default(),
+            8,
+            1,
+        )
+        .unwrap();
+        *service.membership_handle.lock().unwrap() = Some(handle);
+        let deadline = Instant::now() + Duration::from_millis(100);
+        let outcome =
+            tokio::time::timeout_at(deadline + Duration::from_millis(1), service.leave(deadline))
+                .await
+                .expect("leave ignored its original deadline");
+        assert!(matches!(outcome, Err(ServiceError::LeaveTimeout)));
+        assert_eq!(service.node_lifecycle_state(), NodeLifecycleState::Draining);
+        assert!(!service.admission_snapshot().external);
+        assert!(!service.lifecycle_driver.runtime_stop_requested());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn membership_only_node_waits_for_a_replacement_handle_instead_of_leaving_as_standalone()
+    {
+        let service = service();
+        let deadline = Instant::now() + Duration::from_millis(100);
+        let outcome = service.leave(deadline).await;
+        assert!(matches!(outcome, Err(ServiceError::LeaveTimeout)));
+        assert_eq!(Instant::now(), deadline);
+        assert_eq!(service.node_lifecycle_state(), NodeLifecycleState::Draining);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn leave_retries_the_replacement_membership_session_with_the_same_operation_and_deadline()
+    {
+        use lattice_core::coordinator::CoordinatorScope;
+        use lattice_placement::control::{
+            PlacementControlCommand, PlacementControlRouter, control_stream_id,
+            decode_control_command, encode_control_command_for_term,
+        };
+        use lattice_remoting::control::{CommandId, ControlDispatch, decode_control_envelope};
+        let service = Arc::new(service());
+        let identity = service.endpoint.local_identity();
+        let hello = MemberHello {
+            node: NodeKey {
+                node_id: identity.node_id.clone(),
+                address: identity.address.clone(),
+                incarnation: identity.incarnation,
+            },
+            release: ReleaseManifest::development(1),
+            rollout_participant: true,
+            roles: Default::default(),
+            failure_domains: Default::default(),
+            protocols: Vec::new(),
+            remoting_capabilities: Default::default(),
+        };
+        let stale = service
+            .associations
+            .get_or_create(
+                service.cluster_id.clone(),
+                NodeAddress::new("127.0.0.1", 34802).unwrap(),
+                NodeIncarnation::new(2).unwrap(),
+            )
+            .unwrap();
+        let (_old_session, old_handle, _old_effects) = MembershipSession::new(
+            hello.clone(),
+            stale.key().clone(),
+            service.associations.clone(),
+            Default::default(),
+            8,
+            1,
+        )
+        .unwrap();
+        *service.membership_handle.lock().unwrap() = Some(old_handle);
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let leaving = service.clone();
+        let leave = tokio::spawn(async move { leaving.leave(deadline).await });
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        let operation_id = service.drain_operation.lock().unwrap().clone().unwrap();
+        let replacement = service
+            .associations
+            .get_or_create(
+                service.cluster_id.clone(),
+                NodeAddress::new("127.0.0.1", 34803).unwrap(),
+                NodeIncarnation::new(3).unwrap(),
+            )
+            .unwrap();
+        let (session, handle, _effects) = MembershipSession::new(
+            hello,
+            replacement.key().clone(),
+            service.associations.clone(),
+            Default::default(),
+            8,
+            2,
+        )
+        .unwrap();
+        let (controls, receiver) = PlacementControlRouter::bounded(8, 16 * 1024).unwrap();
+        let (shutdown, stopped) = watch::channel(false);
+        let session_task = tokio::spawn(session.run_recoverable(receiver, stopped));
+        *service.membership_handle.lock().unwrap() = Some(handle);
+        loop {
+            let sent = replacement.replay_control_frames().into_iter().any(|frame| {
+                let Ok(envelope) = decode_control_envelope(&frame) else { return false; };
+                let Ok(command) = decode_control_command(&envelope.payload, 16 * 1024) else { return false; };
+                matches!(command.command, PlacementControlCommand::MembershipDrainComplete { operation_id: current, .. } if current == operation_id) && command.coordinator_term == Some(2)
+            });
+            if sent {
+                break;
+            }
+            assert!(Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        let payload = encode_control_command_for_term(
+            &CoordinatorScope::Membership,
+            2,
+            &PlacementControlCommand::DrainCommitted {
+                operation_id,
+                expected_incarnation: service.endpoint.local_identity().incarnation,
+            },
+            16 * 1024,
+        )
+        .unwrap();
+        controls
+            .apply(
+                replacement.key().clone(),
+                control_stream_id(&CoordinatorScope::Membership),
+                CommandId::generate(),
+                payload,
+            )
+            .await
+            .unwrap();
+        leave.await.unwrap().unwrap();
+        assert!(Instant::now() < deadline);
+        assert_eq!(
+            service.node_lifecycle_state(),
+            NodeLifecycleState::Terminated
+        );
+        shutdown.send(true).unwrap();
+        session_task.await.unwrap().0.unwrap();
     }
 }

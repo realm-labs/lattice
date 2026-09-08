@@ -16,7 +16,7 @@ use tokio::sync::oneshot;
 
 use crate::association::{Association, AssociationError, AssociationId};
 use crate::protocol::{CatalogueDecision, ProtocolFingerprint};
-use crate::transport::{FramedConnection, RemotingIo};
+
 use crate::wire::{Frame, FrameKind};
 
 pub mod codec;
@@ -30,3 +30,6 @@ pub(crate) mod target_dictionary;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod test_support;

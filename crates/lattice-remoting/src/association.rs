@@ -19,7 +19,7 @@ use crate::{
 };
 
 mod admission;
-mod budget;
+pub(crate) mod budget;
 mod control_plane;
 mod lanes;
 mod manager;
@@ -27,6 +27,7 @@ pub mod metrics;
 mod wake;
 
 use budget::OutboundByteBudget;
+use budget::QueuedBytes;
 use metrics::{AssociationMetrics, AssociationMetricsSnapshot};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -136,7 +137,7 @@ pub struct Association {
     bulk_lane_epochs: Vec<AtomicU64>,
     next_outbound_exact_target_ids: Vec<AtomicU64>,
     receivers: Mutex<AssociationReceiverSlots>,
-    queued_bytes: OutboundByteBudget,
+    queued_bytes: Arc<OutboundByteBudget>,
     node_queued_bytes: Arc<OutboundByteBudget>,
     admission_changed: Notify,
     control_outbox_changed: Notify,
@@ -148,27 +149,15 @@ pub struct Association {
 }
 
 pub(crate) struct BulkAdmission<'a> {
-    association: &'a Association,
-    permit: Option<mpsc::Permit<'a, Frame>>,
-    reserved_bytes: usize,
+    permit: mpsc::Permit<'a, Frame>,
+    reservation: QueuedBytes,
 }
 
 impl BulkAdmission<'_> {
-    pub(crate) fn send(mut self, frame: Frame) {
-        debug_assert_eq!(frame.payload_len(), self.reserved_bytes);
-        self.permit
-            .take()
-            .expect("bulk admission permit is consumed once")
-            .send(frame);
-        self.reserved_bytes = 0;
-    }
-}
-
-impl Drop for BulkAdmission<'_> {
-    fn drop(&mut self) {
-        if self.reserved_bytes != 0 {
-            self.association.release_queued_bytes(self.reserved_bytes);
-        }
+    pub(crate) fn send(self, mut frame: Frame) {
+        debug_assert_eq!(frame.payload_len(), self.reservation.bytes);
+        frame.outbound_budget = Some(self.reservation);
+        self.permit.send(frame);
     }
 }
 
@@ -231,7 +220,7 @@ impl Association {
                 interactive: Some(interactive_rx),
                 bulk: bulk_rx.into_iter().map(Some).collect(),
             }),
-            queued_bytes: OutboundByteBudget::new(),
+            queued_bytes: Arc::new(OutboundByteBudget::new()),
             node_queued_bytes,
             admission_changed: Notify::new(),
             control_outbox_changed: Notify::new(),
@@ -315,6 +304,22 @@ impl Association {
         }
     }
 
+    /// Observes retirement even if it happened before this waiter was created.
+    pub(crate) async fn wait_closed(&self) {
+        loop {
+            let changed = self.state_changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if matches!(
+                self.state(),
+                AssociationState::Closing | AssociationState::Closed
+            ) {
+                return;
+            }
+            changed.await;
+        }
+    }
+
     pub fn begin_close(&self) {
         let mut inner = self.inner.lock().expect("association state poisoned");
         if self.state() != AssociationState::Closed {
@@ -327,6 +332,8 @@ impl Association {
             self.control_outbox_changed.notify_waiters();
             self.state_changed.notify_waiters();
         }
+        drop(inner);
+        self.discard_unowned_receivers();
     }
 
     pub fn finish_close(&self) {
@@ -339,18 +346,19 @@ impl Association {
         self.admission_changed.notify_waiters();
         self.control_outbox_changed.notify_waiters();
         self.state_changed.notify_waiters();
+        drop(inner);
+        self.discard_unowned_receivers();
     }
 
     fn try_admit(
         &self,
         sender: &mpsc::Sender<Frame>,
-        frame: Frame,
+        mut frame: Frame,
     ) -> Result<(), AssociationError> {
         self.ensure_active()?;
         let bytes = frame.payload_len();
-        self.reserve_bytes(bytes)?;
+        frame.outbound_budget = Some(self.reserve_bytes(bytes)?);
         if sender.try_send(frame).is_err() {
-            self.release_queued_bytes(bytes);
             return Err(AssociationError::QueueFull);
         }
         Ok(())

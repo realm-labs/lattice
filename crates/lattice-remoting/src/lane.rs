@@ -482,19 +482,15 @@ where
                 }
                 outbound_batch.clear();
                 outbound_correlations.clear();
-                let mut reserved_bytes = 0;
                 for mut frame in outbound_candidates.drain(..) {
-                    let frame_bytes = frame.payload_len();
                     if let Some(stripe) = bulk_stripe {
                         frame.expand_stale_compact_target(association.bulk_lane_epoch(stripe));
                     }
                     let Some(prepared) =
                         messaging.prepare_outbound_for_socket_write(&mut frame)
                     else {
-                        association.release_queued_bytes(frame_bytes);
                         continue;
                     };
-                    reserved_bytes += frame_bytes;
                     outbound_correlations.push(match prepared {
                         PreparedOutboundFrame::Other => None,
                         PreparedOutboundFrame::Ask(correlation) => Some(correlation),
@@ -535,7 +531,9 @@ where
                     )
                     .await
                 };
-                association.release_queued_bytes(reserved_bytes);
+                // Frames own their byte reservations through writes and cancellation.
+                // Drop completed batches now so parked producers can resume while idle.
+                outbound_batch.clear();
                 let outcome = result?;
                 association.record_outbound_write(frame_count, outcome.socket_writes);
                 idle.as_mut().reset(

@@ -1,3 +1,4 @@
+use super::test_support::serve_inbound_connection;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
 use tokio::net::{TcpListener, TcpStream};

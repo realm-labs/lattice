@@ -63,6 +63,8 @@ pub enum ServiceError {
     Lifecycle(#[source] ServiceLifecycleError),
     #[error("service supervised task capacity reached")]
     TaskCapacity,
+    #[error("service task supervisor is shutting down")]
+    ShuttingDown,
     #[error("service shutdown exceeded its deadline")]
     ShutdownTimeout,
     #[error("a supervised service task failed")]

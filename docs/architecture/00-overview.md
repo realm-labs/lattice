@@ -10,9 +10,9 @@
 lattice is a distributed actor service framework inspired by Akka/Pekko Cluster Sharding, Cluster Singleton, Remoting, DeathWatch, `tell`, and `ask`, with a deliberately smaller control plane.
 
 ```text
-Concrete actor:  ActorRef<A>     -> exact node incarnation / actor path / activation
-Sharded entity:  EntityRef<A>    -> local ShardRegion -> shard owner -> entity
-Singleton:       SingletonRef<A> -> local SingletonProxy -> current singleton owner
+Concrete actor:  ActorRef<P>     -> exact node incarnation / actor path / activation
+Sharded entity:  EntityRef<P>    -> local ShardRegion -> shard owner -> entity
+Singleton:       SingletonRef<P> -> local SingletonProxy -> current singleton owner
 
 All cross-node messages
   -> lattice-remoting association
@@ -51,7 +51,7 @@ The implementation reuses suitable Direct Link internals—framing, pooling, str
 
 1. One authoritative owner for each mutable actor state.
 2. Typed Rust `Message`/`Handler<M>` messages for both tells and asks.
-3. Serializable references to any live user actor or child actor.
+3. Serializable addresses for registry-hosted distributed activations, with process-local child ownership.
 4. Stable logical references to sharded entities and cluster singletons.
 5. Akka-style `tell`, `ask`, and DeathWatch semantics over one remoting runtime.
 6. Bounded buffering, explicit deadlines, backpressure, and observable failure modes.
@@ -79,9 +79,10 @@ No separate high-throughput Direct Link or stream transport for actor messages.
 |---|---|
 | `ActorPath` | Stable hierarchical path within one actor system, such as `/user/session/42/worker` |
 | `ActivationId` | Unique identity of one concrete actor lifetime; prevents a stale path from addressing a replacement |
-| `ActorRef<A>` | Serializable reference to one exact live actor activation on one node incarnation |
-| `EntityRef<A>` | Logical reference to a sharded entity, independent of its current activation and owner node |
-| `SingletonRef<A>` | Logical reference to one fixed singleton kind through a local proxy |
+| `ActorAddress<P>` | Serializable identity of one exact activation; remains stale after that activation terminates |
+| `EntityAddress<P>` / `SingletonAddress<P>` | Serializable logical identities independent of the current activation |
+| `ActorRef<P>` | Non-serializable sending and watch capability bound to an exact address and ActorSystem |
+| `EntityRef<P>` / `SingletonRef<P>` | Bound sending and watch capabilities for logical addresses |
 | `NodeIncarnation` | Identity of one process lifetime at a node address |
 | `ProtocolId` | Explicit stable `u64` identifying one actor protocol independently of Rust type names |
 | `ProtocolFingerprint` | BLAKE3 digest of the canonical protocol/message/codec/schema descriptor negotiated per ProtocolId after Association establishment |
@@ -192,7 +193,7 @@ still keep credentials and failure domains narrow.
 |---|---|---|
 | Base runtime | Actor system, protocol registry, mailboxes, supervision, remoting, membership session | Required on every lattice node |
 | Gateway | External connections, authentication, decode/encode, rate limits, recipient selection | Optional; no placement write access |
-| Concrete actor host | User guardian and arbitrary user/child actor paths | Local registry only |
+| Concrete actor host | Distributed activations owned by ActorRegistry; local children belong to their parent | No independent placement for local children |
 | Shard proxy | Creates `EntityRef`, hashes entity IDs, caches homes, forwards and buffers | Automatically present for each used entity type |
 | Shard host | Owns Shard tasks and activates entities for eligible entity types | Role/capacity eligibility plus valid shard claims |
 | Singleton proxy | Resolves `SingletonRef` and buffers briefly during failover | Present where a singleton is called |
@@ -694,10 +695,13 @@ etcd is control-plane storage, never a per-message routing database.
 
 ```text
 lattice-core
-  ids, paths, ActorRef/EntityRef/SingletonRef values, envelopes, errors
+  ids, paths, serializable ActorAddress/EntityAddress/SingletonAddress values, shared types
 
 lattice-actor
-  Actor, Handler<M>, Message, ActorContext, mailboxes, supervision, lifecycle, local registry
+  Actor, Handler<M>, Message, ActorHandle, ActorContext, mailboxes, supervision, local lifecycle
+
+lattice-actor-distributed
+  ActorRegistry, protocols, hosting, ActorSystem, bound ActorRef/EntityRef/SingletonRef capabilities
 
 lattice-remoting
   codec registry, wire frames, TCP/TLS associations, tell/ask/watch transport

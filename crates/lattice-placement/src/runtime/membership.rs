@@ -243,10 +243,16 @@ where
                     }
                     PlacementControlCommand::DrainComplete {
                         operation_id,
+                        node_id,
                         expected_incarnation,
                     } => {
-                        self.complete_member_drain(remote, &operation_id, expected_incarnation)
-                            .await?;
+                        self.confirm_member_drain(
+                            &inbound.association,
+                            &node_id,
+                            &operation_id,
+                            expected_incarnation,
+                        )
+                        .await?;
                     }
                     PlacementControlCommand::ResolveShard {
                         request_id,
@@ -339,6 +345,7 @@ where
                     | PlacementControlCommand::MemberDelta(_)
                     | PlacementControlCommand::DrainReady { .. }
                     | PlacementControlCommand::MembershipDrainComplete { .. }
+                    | PlacementControlCommand::DrainCommitted { .. }
                     | PlacementControlCommand::ForceRemove { .. }
                     | PlacementControlCommand::DrainSlot { .. } => {
                         return Err(CoordinatorRuntimeError::UnauthorizedCommand);

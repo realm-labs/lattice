@@ -72,6 +72,7 @@ impl RemotingEndpointBuilder {
             shutdown_tx,
             disconnect_tx,
             tasks: Mutex::new(Vec::new()),
+            shutdown_lock: tokio::sync::Mutex::new(()),
             #[cfg(feature = "tls")]
             security: self.security,
             connect_locks: Mutex::new(HashMap::new()),

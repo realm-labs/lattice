@@ -30,6 +30,8 @@ pub struct RemotingConfig {
     pub max_ready_read_batch_frames: usize,
     pub max_coalesced_write_batch_bytes: usize,
     pub connect_timeout: Duration,
+    /// Maximum initial association establishment time, and the absolute inbound
+    /// setup budget from TCP accept through TLS, handshake and catalogue/bootstrap.
     pub establishing_timeout: Duration,
     pub reconnect_backoff_min: Duration,
     pub reconnect_backoff_max: Duration,

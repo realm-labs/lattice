@@ -1,8 +1,9 @@
+use dashmap::mapref::entry::Entry;
 use lattice_core::id::ActorId;
 
 use lattice_actor::{
     handle::ActorHandle,
-    traits::{Actor, ActorLifecycleState, StopReason},
+    traits::{Actor, ActorLifecycleState},
     watch::LocalActorRef,
 };
 
@@ -19,7 +20,7 @@ impl<A: Actor> ActorRegistry<A> {
             .entries
             .iter()
             .filter_map(|entry| match entry.value() {
-                RegistryEntry::Running(handle)
+                RegistryEntry::Running(handle, _)
                     if handle.lifecycle_state() == ActorLifecycleState::StopFailed =>
                 {
                     handle
@@ -30,7 +31,7 @@ impl<A: Actor> ActorRegistry<A> {
                             failure,
                         })
                 }
-                RegistryEntry::Running(_) | RegistryEntry::Activating(_) => None,
+                RegistryEntry::Running(_, _) | RegistryEntry::Activating(_) => None,
             })
             .collect::<Vec<_>>();
         failures.sort_by(|left, right| left.actor_id.cmp(&right.actor_id));
@@ -54,7 +55,7 @@ impl<A: Actor> ActorRegistry<A> {
             .entries
             .iter()
             .filter_map(|entry| match entry.value() {
-                RegistryEntry::Running(handle) if !is_terminal(handle.lifecycle_state()) => {
+                RegistryEntry::Running(handle, _) if !is_terminal(handle.lifecycle_state()) => {
                     Some(ActorCellDiagnostics {
                         actor_id: entry.key().clone(),
                         local_ref: handle.local_ref(),
@@ -63,7 +64,7 @@ impl<A: Actor> ActorRegistry<A> {
                         stop_failure: handle.inspect_stop_failure(),
                     })
                 }
-                RegistryEntry::Running(_) | RegistryEntry::Activating(_) => None,
+                RegistryEntry::Running(_, _) | RegistryEntry::Activating(_) => None,
             })
             .chain(self.quarantined.iter().filter_map(|entry| {
                 let handle = &entry.value().handle;
@@ -143,13 +144,21 @@ impl<A: Actor> ActorRegistry<A> {
         &self,
         actor_id: &ActorId,
     ) -> Result<(), ActorQuarantineError> {
-        let handle = self
-            .entry_handle(actor_id)
-            .ok_or(ActorQuarantineError::NotRetained)?;
+        let Entry::Occupied(entry) = self.entries.entry(actor_id.clone()) else {
+            return Err(ActorQuarantineError::NotRetained);
+        };
+        let handle = match entry.get() {
+            RegistryEntry::Activating(activation) => {
+                activation.publish(Err(super::ActorActivationError::Cancelled));
+                entry.remove();
+                return Ok(());
+            }
+            RegistryEntry::Running(handle, _) => handle.clone(),
+        };
+        // Keep the entry locked until quarantine owns the handle. Terminal cleanup starts at
+        // this same entry lock, so even an immediately stopping cell cannot outrun the transfer.
+        handle.fence_business_admission();
         let capacity_exhausted = self.quarantined.len() >= self.config.quarantine_capacity;
-        self.entries.remove_if(actor_id, |_, entry| {
-            matches!(entry, RegistryEntry::Running(current) if current.local_ref() == handle.local_ref())
-        });
         let exact_reference = self.remove_exact(&handle);
         if let Some(directory) = self.config.service.extension::<ActivationDirectory>()
             && let Some(reference) = exact_reference.as_ref()
@@ -164,25 +173,7 @@ impl<A: Actor> ActorRegistry<A> {
                 handle: handle.clone(),
             },
         );
-        if matches!(
-            handle.lifecycle_state(),
-            ActorLifecycleState::Starting | ActorLifecycleState::Running
-        ) {
-            handle
-                .try_stop_internal(StopReason::Requested)
-                .map_err(|error| {
-                    let admin = match error {
-                        lattice_actor::error::ActorTellError::MailboxFull(_) => {
-                            lattice_actor::error::ActorAdminError::MailboxFull
-                        }
-                        lattice_actor::error::ActorTellError::MailboxClosed(_)
-                        | lattice_actor::error::ActorTellError::LifecycleUnavailable { .. } => {
-                            lattice_actor::error::ActorAdminError::MailboxClosed
-                        }
-                    };
-                    ActorQuarantineError::Admin(admin)
-                })?;
-        }
+        entry.remove();
         if capacity_exhausted {
             tracing::error!(
                 actor.id = ?actor_id,

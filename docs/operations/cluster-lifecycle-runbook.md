@@ -33,7 +33,8 @@ endpoints, and current membership/domain snapshots before taking a mutating acti
 
 ## Membership loss
 
-1. Verify new cluster/domain admission closed. Do not clear still-valid domain routes or claims.
+1. Verify external admission is closed. Preserve cluster-internal admission governed by still-valid
+   domain routes and claims.
 2. Compare the last membership term/revision with the membership leader. Same-term conflicting
    leaders are a safety incident; stop changes and preserve artifacts.
 3. Restore membership-scope discovery or its authenticated redirect path. Discovery is never a
@@ -70,11 +71,25 @@ Service.
 1. Inspect the aggregate drain operation, exact incarnation, and each joined domain's remaining
    authorities, handoff barriers, and actor stop failures.
 2. Confirm domain/external admission is closed. Global membership remains `Up` until every required
-   domain completion is acknowledged; only then may it pass through `Leaving` to removal.
-3. Resume each domain's persisted handoffs independently after leader failover. A completed domain
-   stays complete when another domain times out.
-4. At deadline, force/fence every unfinished domain independently. Record unfinished domains and
-   verify membership removal happens only after their authorities are resolved or fenced.
+   domain has an authenticated `DrainCommitted` response; only then does graceful leave request
+   membership removal and await its own scoped `DrainCommitted`. A transport ACK or local directory
+   fence is not a removal confirmation.
+3. Restore the affected Coordinator session and retry leave with the same service instance.
+   The service preserves its operation ID, replays pending completion requests, and resumes each
+   domain independently. Already-confirmed domains stay complete and are not rejoined. A leader
+   can confirm a lost response again from durable absence, including after leader replacement.
+4. At the caller's deadline, expect `LeaveTimeout` or `InterventionRequired`, never automatic force.
+   The deadline includes Actor stop hooks and endpoint/supervisor joins. `Draining` means authority
+   confirmation is pending; `Stopping` means local cleanup is still pending. Actor cells and task
+   handles remain owned for retry, and `Terminated` is published only after cleanup completes.
+5. Repair the blocker and call leave again with a new caller budget. If persistence cannot be
+   recovered, choose an explicitly authorized force action as described below; a timeout alone
+   does not authorize discarding Actor state.
+
+Coordinator control generation 10 is required for these completion semantics. Generation 9/10
+coexistence is unsupported; follow the
+[full-stop upgrade boundary](code-only-rolling-upgrade.md#full-stop-boundary). Storage remains
+generation 5.
 
 ## Actor StopFailed and quarantine
 

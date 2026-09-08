@@ -52,6 +52,8 @@ pub trait EventBus: Clone + Send + Sync + 'static {
     where
         E: Event,
         H: EventHandler<E>;
+
+    async fn shutdown(&self, deadline: std::time::Duration) -> bool;
 }
 ```
 
@@ -74,7 +76,11 @@ service.cluster_events()
 
 The subscription owns no `ActorHandle`. It obtains an `EntityRef` and sends through the local ShardRegion. Broker redelivery means handlers must deduplicate by event ID or a business key. EventBus delivery never inherits `ask` semantics.
 
-Subscriptions are service-scoped, cancelled during drain, and supervised with bounded concurrency and backoff. Durable replay depends on broker configuration and consumer identity.
+Subscriptions may belong to a service or an Actor activation. `ActorSubscriptions` owns activation-scoped handles and drains them from `stopping`; replacing or cancelling a subscription retains unfinished work for later shutdown calls. Durable replay depends on broker configuration and consumer identity.
+
+`EventBus::shutdown(deadline)` permanently closes publish and subscribe admission, cancels all subscriptions, and waits for admitted operations, handlers, and consumer tasks. Local and in-memory handlers execute in the publisher's future and are tracked through completion or caller cancellation. NATS subscriptions are registered before asynchronous setup, and durable handler tracking includes its acknowledgement. A successful drain means this bus has no remaining local handler work; it does not acknowledge business processing by other services. Already-admitted fan-out may skip handlers that have not started when cancellation arrives.
+
+If the deadline expires, shutdown returns `false` while retaining unfinished work; neither timeout nor cancellation of the shutdown future detaches or aborts handlers. Later calls continue waiting for that work. Subscription shutdown follows the same contract without closing the shared bus. Dropping a handle leaves its subscription running under backend ownership; the former `EventSubscriptionHandle::detach` escape hatch has been removed so it cannot bypass drain tracking.
 
 Recommended subjects:
 

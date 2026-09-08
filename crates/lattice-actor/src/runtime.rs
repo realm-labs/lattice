@@ -646,50 +646,56 @@ where
         actor.type = actor_type,
         actor.local_ref = local_ref
     );
-    let startup_failure = match AssertUnwindSafe(actor.started(&mut ctx).instrument(started_span))
-        .catch_unwind()
-        .await
-    {
-        Ok(Err(error)) => {
-            handle.observer().lifecycle(
-                handle.observation_metadata(),
-                ActorLifecycleEvent::StartFailed,
-            );
-            error!(
-                actor.type = actor_type,
-                actor.local_ref = local_ref,
-                %error,
-                "actor failed to start"
-            );
-            true
-        }
-        Ok(Ok(())) => {
-            handle.set_lifecycle_state(ActorLifecycleState::Running);
-            handle
-                .observer()
-                .lifecycle(handle.observation_metadata(), ActorLifecycleEvent::Started);
-            info!(
-                actor.type = actor_type,
-                actor.local_ref = local_ref,
-                "actor started"
-            );
-            false
-        }
-        Err(payload) => {
-            terminate_panicked_actor(
-                actor,
-                &mut ctx,
-                &handle,
-                &mut normal_rx,
-                &mut system_rx,
-                ActorPanic::new("started", payload),
-            );
-            return;
+    let startup_failure = if handle.business_admission_fenced() {
+        false
+    } else {
+        match AssertUnwindSafe(actor.started(&mut ctx).instrument(started_span))
+            .catch_unwind()
+            .await
+        {
+            Ok(Err(error)) => {
+                handle.observer().lifecycle(
+                    handle.observation_metadata(),
+                    ActorLifecycleEvent::StartFailed,
+                );
+                error!(
+                    actor.type = actor_type,
+                    actor.local_ref = local_ref,
+                    %error,
+                    "actor failed to start"
+                );
+                true
+            }
+            Ok(Ok(())) => {
+                handle.set_lifecycle_state(ActorLifecycleState::Running);
+                handle
+                    .observer()
+                    .lifecycle(handle.observation_metadata(), ActorLifecycleEvent::Started);
+                info!(
+                    actor.type = actor_type,
+                    actor.local_ref = local_ref,
+                    "actor started"
+                );
+                false
+            }
+            Err(payload) => {
+                terminate_panicked_actor(
+                    actor,
+                    &mut ctx,
+                    &handle,
+                    &mut normal_rx,
+                    &mut system_rx,
+                    ActorPanic::new("started", payload),
+                );
+                return;
+            }
         }
     };
 
     let mut stop_reason = if startup_failure {
         Some(StopReason::StartFailed)
+    } else if handle.business_admission_fenced() {
+        Some(StopReason::Requested)
     } else {
         None
     };
@@ -697,6 +703,10 @@ where
     let mut actor_panic = None;
     let mut normal_batch = Vec::with_capacity(NORMAL_RECEIVE_BATCH_SIZE.min(turn_budget));
     while stop_reason.is_none() && actor_panic.is_none() {
+        if handle.business_admission_fenced() {
+            stop_reason = Some(StopReason::Requested);
+            break;
+        }
         while let Ok(command) = system_rx.try_recv() {
             match handle_command(
                 command,
@@ -728,6 +738,9 @@ where
         tokio::select! {
             biased;
 
+            _ = handle.wait_business_fenced() => {
+                stop_reason = Some(StopReason::Requested);
+            }
             command = system_rx.recv() => {
                 match command {
                     Some(command) => {

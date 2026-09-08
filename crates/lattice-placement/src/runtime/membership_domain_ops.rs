@@ -155,19 +155,14 @@ where
     /// durable scan may release a member, because leader state that lags a commit would otherwise
     /// let a node leave a slot it still owns.
     fn tracks_owned_slot(&self, node: &NodeKey) -> bool {
-        self.claims
-            .values()
-            .any(|claim| &claim.grant.owner == node)
+        self.claims.values().any(|claim| &claim.grant.owner == node)
             || self
                 .slots
                 .values()
                 .any(|slot| slot.owner.as_ref() == Some(node))
     }
 
-    async fn owns_persisted_slot(
-        &self,
-        node: &NodeKey,
-    ) -> Result<bool, CoordinatorRuntimeError> {
+    async fn owns_persisted_slot(&self, node: &NodeKey) -> Result<bool, CoordinatorRuntimeError> {
         let mut cursor = None;
         loop {
             let page = self
@@ -213,6 +208,82 @@ where
         let member = session.record.clone();
         self.remove_member(member, MemberRemovalReason::GracefulLeave)
             .await
+    }
+
+    async fn confirm_member_drain(
+        &mut self,
+        association_key: &AssociationKey,
+        node_id: &str,
+        operation_id: &str,
+        incarnation: NodeIncarnation,
+    ) -> Result<(), CoordinatorRuntimeError> {
+        let node = NodeKey {
+            node_id: node_id.to_owned(),
+            address: association_key.remote_address.clone(),
+            incarnation,
+        };
+        if operation_id.is_empty()
+            || operation_id.len() > 256
+            || association_key.remote_incarnation != incarnation
+            || node.validate().is_err()
+        {
+            return Err(CoordinatorRuntimeError::StaleMember);
+        }
+        if let Some(session) = self.sessions.get(&incarnation) {
+            if session.hello.node != node || session.association != *association_key {
+                return Err(CoordinatorRuntimeError::StaleMember);
+            }
+            self.complete_member_drain(incarnation, operation_id, incarnation)
+                .await?;
+        }
+
+        // A commit may have succeeded before its response was lost, including across a leader
+        // restart. Re-read the desired durable state rather than retaining a volatile ACK cache.
+        if self
+            .store
+            .get_domain_member(&self.version.domain, node_id)
+            .await?
+            .is_some_and(|member| member.node.incarnation == incarnation)
+            || self.owns_persisted_slot(&node).await?
+        {
+            return Err(CoordinatorRuntimeError::DrainNotReady);
+        }
+        let mut cursor = None;
+        loop {
+            let page = self
+                .store
+                .list_claims_page(
+                    &self.version.domain,
+                    cursor.as_ref(),
+                    self.config.reconciliation_page_size,
+                )
+                .await?;
+            if page.records.iter().any(|claim| claim.grant.owner == node) {
+                return Err(CoordinatorRuntimeError::DrainNotReady);
+            }
+            let Some(next) = page.next_cursor else {
+                break;
+            };
+            cursor = Some(next);
+        }
+        if self.store.get_leader(&self.leader.scope).await?.as_ref() != Some(&self.leader) {
+            return Err(CoordinatorRuntimeError::NotLeader);
+        }
+        let association = self
+            .associations
+            .get(association_key)
+            .ok_or(CoordinatorRuntimeError::AssociationUnavailable)?;
+        send_control_with_backpressure(
+            &association,
+            &self.version.domain,
+            self.version.term.get(),
+            PlacementControlCommand::DrainCommitted {
+                operation_id: operation_id.to_owned(),
+                expected_incarnation: incarnation,
+            },
+            &self.config,
+        )
+        .await
     }
 
     pub(super) async fn remove_member(

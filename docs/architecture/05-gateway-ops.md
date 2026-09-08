@@ -206,6 +206,19 @@ failure returns `LifecycleInterventionReport`; it never silently escalates to de
 `force_shutdown()` immediately fences local work and is explicitly destructive. The low-level `connect_peer(NodeIdentity)` API is
 diagnostic transport access and cannot admit a member or make a service Ready.
 
+The leave deadline covers the entire operation, including local Actor stop hooks and endpoint/task
+joins after the leaders confirm removal. `shutdown()` derives that deadline from `leave_timeout`.
+Per-component timeouts and replacement Coordinator sessions do not extend it. On expiry, the
+service returns `LeaveTimeout` or an intervention error and retains unfinished Actor cells and
+task handles. A later leave call can resume from `Draining` or `Stopping`; the supervisor rejects
+new tasks once its shutdown begins. Keep the process available for inspection and retry until
+cleanup succeeds or an explicit force action is chosen.
+
+Domain and membership completion require authenticated, scoped `DrainCommitted` responses;
+transport ACKs and local directory updates are insufficient. Confirmed domains and membership
+incarnations are not rejoined after a session replacement. See the
+[drain contract](03-placement.md#11-drain-and-shutdown) for replay and generation-10 compatibility.
+
 ### 6.1 StopFailed and Quarantine Runbook
 
 1. Inspect the failure record: exact activation, original stop reason and phase, error, first/latest

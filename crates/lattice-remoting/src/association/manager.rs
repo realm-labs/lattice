@@ -161,7 +161,11 @@ impl AssociationManager {
             .get(key)
             .is_some_and(|association| association.id() == id)
         {
-            associations.remove(key);
+            let removed = associations
+                .remove(key)
+                .expect("matched association exists");
+            removed.begin_close();
+            removed.finish_close();
             true
         } else {
             false

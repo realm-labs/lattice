@@ -5,7 +5,7 @@ use std::{
     num::NonZeroU64,
     sync::{
         Arc, OnceLock, RwLock,
-        atomic::{AtomicU8, AtomicU64, Ordering},
+        atomic::{AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -22,7 +22,6 @@ use lattice_core::{
     service_context::ServiceContext,
 };
 use thiserror::Error;
-use tokio::sync::{Semaphore, watch};
 
 use lattice_actor::{
     error::{ActorAdminError, ActorError},
@@ -43,7 +42,10 @@ use crate::{
     recipient::ActorSystem,
 };
 
+mod activation;
 mod quarantine;
+
+use activation::{ActivationCleanup, ActivationState};
 
 #[derive(Debug, Clone, Error)]
 pub enum ActorActivationError {
@@ -57,6 +59,8 @@ pub enum ActorActivationError {
     ActivationFailed(ActorError),
     #[error("actor activation is retained after stopping persistence failed")]
     RetainedStopFailure,
+    #[error("actor activation was cancelled before publication")]
+    Cancelled,
 }
 
 static NEXT_ACTIVATION_SEQUENCE: AtomicU64 = AtomicU64::new(1);
@@ -115,7 +119,8 @@ pub struct ActorRegistry<A: Actor> {
     runtime: ActorRuntime,
 }
 
-type ActorFencingTokenResolver = Arc<dyn Fn(&ActorId) -> Option<u64> + Send + Sync + 'static>;
+type ActorFencingTokenResolver =
+    Arc<dyn Fn(&ActorId, &mut dyn FnMut(Option<u64>)) + Send + Sync + 'static>;
 
 /// Monotonic authority generation attached to one placement-managed Actor activation.
 ///
@@ -325,13 +330,14 @@ impl<A: Actor> ActorRegistry<A> {
     /// Installs an authority resolver used by direct registry activations.
     ///
     /// A Registry may host several placement routes, so differently named resolvers are composed.
-    /// Reinstalling the same name replaces its previous authority view. Returning `None` means
-    /// this resolver does not own the Actor ID; if no installed resolver owns it, a new activation
-    /// is rejected before its loader runs.
+    /// Reinstalling the same name replaces its previous authority view. The resolver must invoke
+    /// the callback exactly once while holding the lock that serializes authority changes. Pass
+    /// `None` when the resolver has no live authority for the Actor ID. The callback may publish
+    /// a Registry entry; it never awaits a loader or invokes Actor lifecycle/business callbacks.
     #[doc(hidden)]
     pub fn install_fencing_token_resolver<F>(&self, resolver_name: impl Into<String>, resolver: F)
     where
-        F: Fn(&ActorId) -> Option<u64> + Send + Sync + 'static,
+        F: Fn(&ActorId, &mut dyn FnMut(Option<u64>)) + Send + Sync + 'static,
     {
         self.fencing_token_resolvers
             .write()
@@ -351,12 +357,12 @@ impl<A: Actor> ActorRegistry<A> {
         self.entries
             .iter()
             .filter_map(|entry| match entry.value() {
-                RegistryEntry::Running(handle)
+                RegistryEntry::Running(handle, _)
                     if is_business_admitted(handle.lifecycle_state()) =>
                 {
                     Some(entry.key().clone())
                 }
-                RegistryEntry::Running(_) => None,
+                RegistryEntry::Running(_, _) => None,
                 RegistryEntry::Activating(_) => None,
             })
             .collect()
@@ -364,41 +370,44 @@ impl<A: Actor> ActorRegistry<A> {
 
     /// Returns every nonterminal activation still owned by the active registry.
     ///
-    /// This intentionally includes Starting, Passivating, Stopping, and StopFailed
-    /// cells so an external authority fence cannot miss an in-flight stop.
+    /// This includes loading placeholders and Starting, Passivating, Stopping, and StopFailed
+    /// cells so drain and authority fencing cannot miss in-flight work.
     pub fn active_actor_ids(&self) -> Vec<ActorId> {
         self.entries
             .iter()
             .filter_map(|entry| match entry.value() {
-                RegistryEntry::Running(handle) if !is_terminal(handle.lifecycle_state()) => {
+                RegistryEntry::Running(handle, _) if !is_terminal(handle.lifecycle_state()) => {
                     Some(entry.key().clone())
                 }
-                RegistryEntry::Running(_) | RegistryEntry::Activating(_) => None,
+                RegistryEntry::Activating(_) => Some(entry.key().clone()),
+                RegistryEntry::Running(_, _) => None,
             })
             .collect()
     }
 
     pub fn activation_state(&self, actor_id: &ActorId) -> EntityActivationState {
         match self.entries.get(actor_id).as_deref() {
-            Some(RegistryEntry::Running(_)) => EntityActivationState::Active,
+            Some(RegistryEntry::Running(_, _)) => EntityActivationState::Active,
             Some(RegistryEntry::Activating(activation)) => activation.state(),
             None => EntityActivationState::Absent,
         }
     }
 
     pub fn get_running(&self, actor_id: &ActorId) -> Option<ActorHandle<A>> {
-        if self.resolve_fencing_token(actor_id).is_err() {
-            return None;
-        }
-        match self.entries.get(actor_id).as_deref() {
-            Some(RegistryEntry::Running(handle))
-                if is_business_admitted(handle.lifecycle_state()) =>
-            {
-                Some(handle.clone())
-            }
-            Some(RegistryEntry::Running(_)) => None,
-            Some(RegistryEntry::Activating(_)) | None => None,
-        }
+        let token = self.resolve_fencing_token(actor_id).ok()?;
+        self.with_actor_authority(actor_id, token, || {
+            Ok(match self.entries.get(actor_id).as_deref() {
+                Some(RegistryEntry::Running(handle, current))
+                    if *current == token && is_business_admitted(handle.lifecycle_state()) =>
+                {
+                    Some(handle.clone())
+                }
+                Some(RegistryEntry::Running(_, _)) => None,
+                Some(RegistryEntry::Activating(_)) | None => None,
+            })
+        })
+        .ok()
+        .flatten()
     }
 
     pub fn exact_address(&self, actor_id: &ActorId) -> Option<ActorAddress> {
@@ -440,7 +449,7 @@ impl<A: Actor> ActorRegistry<A> {
     }
 
     pub async fn remove(&self, actor_id: &ActorId) -> Option<ActorHandle<A>> {
-        let handle = self.entry_handle(actor_id)?;
+        let handle = self.cancel_loading_or_handle(actor_id)??;
         if is_business_admitted(handle.lifecycle_state()) {
             let _ = handle.stop(StopReason::Requested);
         }
@@ -490,7 +499,12 @@ impl<A: Actor> ActorRegistry<A> {
     {
         let mut result = RegistryDrainResult::default();
         for actor_id in actor_ids {
-            let Some(handle) = self.entry_handle(&actor_id) else {
+            let Some(entry) = self.cancel_loading_or_handle(&actor_id) else {
+                continue;
+            };
+            let Some(handle) = entry else {
+                result.requested += 1;
+                result.stopped += 1;
                 continue;
             };
             let mut lifecycle = handle.subscribe_lifecycle();
@@ -553,12 +567,26 @@ impl<A: Actor> ActorRegistry<A> {
     where
         I: IntoIterator<Item = ActorId>,
     {
-        let mut lifecycles = actor_ids
+        let entries = actor_ids
             .into_iter()
-            .filter_map(|actor_id| self.entry_handle(&actor_id))
-            .map(|handle| handle.subscribe_lifecycle())
+            .filter_map(|actor_id| {
+                self.entries
+                    .get(&actor_id)
+                    .map(|entry| match entry.value() {
+                        RegistryEntry::Running(handle, _) => Ok(handle.clone()),
+                        RegistryEntry::Activating(activation) => Err(activation.clone()),
+                    })
+            })
             .collect::<Vec<_>>();
-        for lifecycle in &mut lifecycles {
+        for entry in entries {
+            let handle = match entry {
+                Ok(handle) => handle,
+                Err(activation) => match activation.result().await {
+                    Ok(handle) => handle,
+                    Err(_) => continue,
+                },
+            };
+            let mut lifecycle = handle.subscribe_lifecycle();
             while *lifecycle.borrow() != ActorLifecycleState::Stopped {
                 if lifecycle.changed().await.is_err() {
                     break;
@@ -573,7 +601,11 @@ impl<A: Actor> ActorRegistry<A> {
     {
         let mut passivated = 0;
         for actor_id in actor_ids {
-            if let Some(handle) = self.entry_handle(&actor_id)
+            let entry = self.cancel_loading_or_handle(&actor_id);
+            if matches!(entry, Some(None)) {
+                passivated += 1;
+            }
+            if let Some(Some(handle)) = entry
                 && is_business_admitted(handle.lifecycle_state())
             {
                 let mut lifecycle = handle.subscribe_lifecycle();
@@ -606,19 +638,21 @@ impl<A: Actor> ActorRegistry<A> {
         actor: A,
     ) -> Result<ActorHandle<A>, ActorActivationError> {
         self.remove_stopped_running_entry(&actor_id);
-        match self.entries.entry(actor_id.clone()) {
-            Entry::Occupied(_) => Err(ActorActivationError::AlreadyExists),
-            Entry::Vacant(entry) => {
-                let handle = self
-                    .spawn_actor(actor_id.clone(), actor)
-                    .map_err(ActorActivationError::ActivationFailed)?;
-                entry.insert(RegistryEntry::Running(handle.clone()));
-                if handle.terminal_cleanup_started() || is_terminal(handle.lifecycle_state()) {
-                    self.remove_stopped_running_entry(&actor_id);
+        let fencing_token = self.resolve_fencing_token(&actor_id)?;
+        let handle = self.with_actor_authority(&actor_id, fencing_token, || {
+            match self.entries.entry(actor_id.clone()) {
+                Entry::Occupied(_) => Err(ActorActivationError::AlreadyExists),
+                Entry::Vacant(entry) => {
+                    let handle = self
+                        .spawn_actor(actor_id.clone(), actor)
+                        .map_err(ActorActivationError::ActivationFailed)?;
+                    entry.insert(RegistryEntry::Running(handle.clone(), fencing_token));
+                    Ok(handle)
                 }
-                Ok(handle)
             }
-        }
+        })?;
+        self.remove_stopped_running_entry(&actor_id);
+        Ok(handle)
     }
 
     pub async fn get_or_activate<F, Fut>(
@@ -630,40 +664,95 @@ impl<A: Actor> ActorRegistry<A> {
         F: FnOnce() -> Fut,
         Fut: Future<Output = Result<A, A::Error>>,
     {
+        let fencing_token = self.resolve_fencing_token(&actor_id)?;
+        self.get_or_activate_with_token(actor_id, fencing_token, activate)
+            .await
+    }
+
+    async fn get_or_activate_with_token<F, Fut>(
+        &self,
+        actor_id: ActorId,
+        fencing_token: Option<ActorFencingToken>,
+        activate: F,
+    ) -> Result<ActorHandle<A>, ActorActivationError>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<A, A::Error>>,
+    {
         self.remove_stopped_running_entry(&actor_id);
-        let lookup = match self.entries.entry(actor_id.clone()) {
-            Entry::Occupied(entry) => match entry.get() {
-                RegistryEntry::Running(handle)
-                    if handle.lifecycle_state() == ActorLifecycleState::StopFailed =>
-                {
-                    return Err(ActorActivationError::RetainedStopFailure);
+        let lookup = self.with_actor_authority(&actor_id, fencing_token, || {
+            Ok(match self.entries.entry(actor_id.clone()) {
+                Entry::Occupied(entry) => match entry.get() {
+                    RegistryEntry::Running(handle, _)
+                        if handle.lifecycle_state() == ActorLifecycleState::StopFailed =>
+                    {
+                        return Err(ActorActivationError::RetainedStopFailure);
+                    }
+                    RegistryEntry::Running(handle, token) if *token == fencing_token => {
+                        if !is_business_admitted(handle.lifecycle_state()) {
+                            return Err(authority_error("actor is stopping"));
+                        }
+                        RegistryLookup::Running(handle.clone())
+                    }
+                    RegistryEntry::Activating(activation)
+                        if activation.fencing_token == fencing_token =>
+                    {
+                        RegistryLookup::Wait(activation.clone())
+                    }
+                    _ => {
+                        return Err(authority_error(
+                            "actor activation belongs to an older authority generation",
+                        ));
+                    }
+                },
+                Entry::Vacant(entry) => {
+                    let activation =
+                        ActivationState::new(self.config.waiter_capacity, fencing_token);
+                    entry.insert(RegistryEntry::Activating(activation.clone()));
+                    RegistryLookup::Activate(activation)
                 }
-                RegistryEntry::Running(handle) => return Ok(handle.clone()),
-                RegistryEntry::Activating(activation) => RegistryLookup::Wait(activation.clone()),
-            },
-            Entry::Vacant(entry) => {
-                let activation = ActivationState::new(self.config.waiter_capacity);
-                entry.insert(RegistryEntry::Activating(activation.clone()));
-                RegistryLookup::Activate(activation)
-            }
-        };
+            })
+        })?;
 
         let activation = match lookup {
+            RegistryLookup::Running(handle) => return Ok(handle),
             RegistryLookup::Wait(activation) => {
-                return self.wait_for_activation(activation).await;
+                let handle = self.wait_for_activation(activation).await?;
+                return self.with_actor_authority(&actor_id, fencing_token, || {
+                    if self.entries.get(&actor_id).is_some_and(|entry| {
+                        matches!(entry.value(), RegistryEntry::Running(current, token)
+                            if *token == fencing_token && current.local_ref() == handle.local_ref()
+                                && is_business_admitted(current.lifecycle_state())
+                                && !current.business_admission_fenced())
+                    }) {
+                        Ok(handle)
+                    } else {
+                        Err(ActorActivationError::Cancelled)
+                    }
+                });
             }
             RegistryLookup::Activate(activation) => activation,
         };
 
+        let _cleanup = ActivationCleanup {
+            entries: self.entries.clone(),
+            actor_id: actor_id.clone(),
+            activation: activation.clone(),
+        };
         activation.set_loading();
 
-        let result = match activate().await {
+        let loaded = tokio::select! {
+            biased;
+            result = activation.result() => return result,
+            loaded = async { activate().await } => loaded,
+        };
+        let result = match loaded {
             Ok(actor) => {
-                let spawned = match self.entries.entry(actor_id.clone()) {
+                let spawned = self.with_actor_authority(&actor_id, fencing_token, || match self.entries.entry(actor_id.clone()) {
                     Entry::Occupied(mut entry) if matches!(entry.get(), RegistryEntry::Activating(existing) if Arc::ptr_eq(existing, &activation)) => {
                         match self.spawn_actor(actor_id.clone(), actor) {
                             Ok(handle) => {
-                                entry.insert(RegistryEntry::Running(handle.clone()));
+                                entry.insert(RegistryEntry::Running(handle.clone(), fencing_token));
                                 Ok(handle)
                             }
                             Err(error) => {
@@ -675,7 +764,7 @@ impl<A: Actor> ActorRegistry<A> {
                     _ => Err(ActorActivationError::ActivationFailed(ActorError::new(
                         "actor registry entry removed during activation",
                     ))),
-                };
+                });
                 match spawned {
                     Ok(handle) => {
                         if handle.terminal_cleanup_started()
@@ -711,8 +800,10 @@ impl<A: Actor> ActorRegistry<A> {
         F: ActorFactory<A>,
     {
         let ctx = self.create_context(&actor_id)?;
-        self.get_or_activate(actor_id, || async move { factory.create(ctx).await })
-            .await
+        self.get_or_activate_with_token(actor_id, ctx.fencing_token, || async move {
+            factory.create(ctx).await
+        })
+        .await
     }
 
     pub async fn get_or_load<L>(
@@ -724,8 +815,10 @@ impl<A: Actor> ActorRegistry<A> {
         L: ActorLoader<A>,
     {
         let ctx = self.create_context(&actor_id)?;
-        self.get_or_activate(actor_id, || async move { loader.load(ctx).await })
-            .await
+        self.get_or_activate_with_token(actor_id, ctx.fencing_token, || async move {
+            loader.load(ctx).await
+        })
+        .await
     }
 
     /// Validates the exact authority generation carried by a framework routing target.
@@ -767,8 +860,10 @@ impl<A: Actor> ActorRegistry<A> {
         }
         let actor_id = authority.actor_id;
         let ctx = self.create_context_with_token(&actor_id, authority.fencing_token);
-        self.get_or_activate(actor_id, || async move { loader.load(ctx).await })
-            .await
+        self.get_or_activate_with_token(actor_id, ctx.fencing_token, || async move {
+            loader.load(ctx).await
+        })
+        .await
     }
 
     fn create_context(
@@ -804,17 +899,28 @@ impl<A: Actor> ActorRegistry<A> {
         &self,
         actor_id: &ActorId,
     ) -> Result<Option<ActorFencingToken>, ActorActivationError> {
+        self.resolve_authority(actor_id).map(|(token, _)| token)
+    }
+
+    fn resolve_authority(
+        &self,
+        actor_id: &ActorId,
+    ) -> Result<(Option<ActorFencingToken>, Option<ActorFencingTokenResolver>), ActorActivationError>
+    {
         let resolvers = self
             .fencing_token_resolvers
             .read()
             .expect("actor fencing token resolver poisoned")
             .clone();
         if resolvers.is_empty() {
-            return Ok(None);
+            return Ok((None, None));
         }
         let mut generation = None;
+        let mut selected = None;
         for resolver in resolvers.into_values() {
-            let Some(candidate) = resolver(actor_id) else {
+            let mut candidate = None;
+            resolver(actor_id, &mut |value| candidate = value);
+            let Some(candidate) = candidate else {
                 continue;
             };
             if generation.is_some_and(|current| current != candidate) {
@@ -823,65 +929,63 @@ impl<A: Actor> ActorRegistry<A> {
                 ));
             }
             generation = Some(candidate);
+            selected = Some(resolver);
         }
         let generation = generation
             .ok_or_else(|| authority_error("actor activation has no live placement authority"))?;
         ActorFencingToken::new(generation)
-            .map(Some)
+            .map(|token| (Some(token), selected))
             .ok_or_else(|| authority_error("actor placement authority generation is zero"))
+    }
+
+    fn with_actor_authority<R>(
+        &self,
+        actor_id: &ActorId,
+        expected: Option<ActorFencingToken>,
+        operation: impl FnOnce() -> Result<R, ActorActivationError>,
+    ) -> Result<R, ActorActivationError> {
+        let (token, resolver) = self.resolve_authority(actor_id)?;
+        if token != expected {
+            return Err(authority_error(
+                "actor placement authority changed during activation",
+            ));
+        }
+        let Some(resolver) = resolver else {
+            return operation();
+        };
+        let mut operation = Some(operation);
+        let mut result = None;
+        resolver(actor_id, &mut |generation| {
+            result = Some(if generation != expected.map(ActorFencingToken::get) {
+                Err(authority_error(
+                    "actor placement authority changed during activation",
+                ))
+            } else {
+                operation
+                    .take()
+                    .expect("authority resolver invoked callback more than once")()
+            });
+        });
+        result.unwrap_or_else(|| {
+            Err(authority_error(
+                "actor authority resolver did not validate publication",
+            ))
+        })
     }
 
     fn registry_identity(&self) -> usize {
         Arc::as_ptr(&self.entries) as usize
     }
 
-    async fn wait_for_activation(
-        &self,
-        activation: Arc<ActivationState<A>>,
-    ) -> Result<ActorHandle<A>, ActorActivationError> {
-        let permit = activation
-            .waiter_slots
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| ActorActivationError::WaiterCapacityExceeded)?;
-        let mut result_rx = activation.result_tx.subscribe();
-
-        if let Some(result) = result_rx.borrow().clone() {
-            drop(permit);
-            return result;
-        }
-
-        let wait = async {
-            loop {
-                result_rx.changed().await.map_err(|_| {
-                    ActorActivationError::ActivationFailed(ActorError::new(
-                        "activation result channel closed",
-                    ))
-                })?;
-                if let Some(result) = result_rx.borrow().clone() {
-                    return result;
-                }
-            }
-        };
-
-        let result = tokio::time::timeout(self.config.waiter_timeout, wait)
-            .await
-            .map_err(|_| ActorActivationError::WaiterTimeout {
-                timeout: self.config.waiter_timeout,
-            })?;
-        drop(permit);
-        result
-    }
-
     fn remove_stopped_running_entry(&self, actor_id: &ActorId) {
         let removed = self.entries.remove_if(actor_id, |_, entry| {
             matches!(
                 entry,
-                RegistryEntry::Running(handle)
+                RegistryEntry::Running(handle, _)
                     if is_terminal(handle.lifecycle_state())
             )
         });
-        if let Some((_, RegistryEntry::Running(handle))) = removed
+        if let Some((_, RegistryEntry::Running(handle, _))) = removed
             && let Some(reference) = self.remove_exact(&handle)
             && let Some(directory) = self.config.service.extension::<ActivationDirectory>()
         {
@@ -909,7 +1013,7 @@ impl<A: Actor> ActorRegistry<A> {
 
     fn entry_handle(&self, actor_id: &ActorId) -> Option<ActorHandle<A>> {
         match self.entries.get(actor_id).as_deref() {
-            Some(RegistryEntry::Running(handle)) => Some(handle.clone()),
+            Some(RegistryEntry::Running(handle, _)) => Some(handle.clone()),
             Some(RegistryEntry::Activating(_)) | None => None,
         }
     }
@@ -918,10 +1022,10 @@ impl<A: Actor> ActorRegistry<A> {
         self.entries
             .iter()
             .find_map(|entry| match entry.value() {
-                RegistryEntry::Running(handle) if handle.local_ref() == local_ref => {
+                RegistryEntry::Running(handle, _) if handle.local_ref() == local_ref => {
                     Some(handle.clone())
                 }
-                RegistryEntry::Running(_) | RegistryEntry::Activating(_) => None,
+                RegistryEntry::Running(_, _) | RegistryEntry::Activating(_) => None,
             })
             .or_else(|| {
                 self.quarantined
@@ -943,7 +1047,7 @@ impl<A: Actor> ActorRegistry<A> {
         let terminal_activation = self_address.as_ref().map(ActorAddress::activation_id);
         let terminal_hook = Box::new(move |local_ref| {
             entries.remove_if(&terminal_actor_id, |_, entry| {
-                matches!(entry, RegistryEntry::Running(handle) if handle.local_ref() == local_ref)
+                matches!(entry, RegistryEntry::Running(handle, _) if handle.local_ref() == local_ref)
             });
             quarantined.remove_if(&local_ref, |_, entry| {
                 entry.actor_id == terminal_actor_id && entry.handle.local_ref() == local_ref
@@ -1074,43 +1178,12 @@ fn is_business_admitted(state: ActorLifecycleState) -> bool {
 }
 
 enum RegistryEntry<A: Actor> {
-    Running(ActorHandle<A>),
+    Running(ActorHandle<A>, Option<ActorFencingToken>),
     Activating(Arc<ActivationState<A>>),
 }
 
 enum RegistryLookup<A: Actor> {
+    Running(ActorHandle<A>),
     Activate(Arc<ActivationState<A>>),
     Wait(Arc<ActivationState<A>>),
-}
-
-struct ActivationState<A: Actor> {
-    result_tx: watch::Sender<Option<Result<ActorHandle<A>, ActorActivationError>>>,
-    waiter_slots: Arc<Semaphore>,
-    state: AtomicU8,
-}
-
-impl<A: Actor> ActivationState<A> {
-    fn new(waiter_capacity: usize) -> Arc<Self> {
-        let (result_tx, _result_rx) = watch::channel(None);
-        Arc::new(Self {
-            result_tx,
-            waiter_slots: Arc::new(Semaphore::new(waiter_capacity)),
-            state: AtomicU8::new(0),
-        })
-    }
-
-    fn publish(&self, result: Result<ActorHandle<A>, ActorActivationError>) {
-        self.result_tx.send_replace(Some(result));
-    }
-
-    fn set_loading(&self) {
-        self.state.store(1, Ordering::Release);
-    }
-
-    fn state(&self) -> EntityActivationState {
-        match self.state.load(Ordering::Acquire) {
-            0 => EntityActivationState::Activating,
-            _ => EntityActivationState::Loading,
-        }
-    }
 }

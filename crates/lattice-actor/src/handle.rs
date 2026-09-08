@@ -10,7 +10,7 @@ use std::{
 };
 
 use broadcast::error::{RecvError, TryRecvError};
-use tokio::sync::{broadcast, oneshot, watch};
+use tokio::sync::{Notify, broadcast, oneshot, watch};
 
 use crate::{
     error::{ActorAdminError, ActorCallError, ActorTellError},
@@ -49,6 +49,8 @@ pub struct ActorHandle<A: Actor> {
     terminal_cleanup_started: Arc<AtomicBool>,
     lifecycle_tx: watch::Sender<ActorLifecycleState>,
     lifecycle_state: Arc<AtomicU8>,
+    business_fenced: Arc<AtomicBool>,
+    fence_notify: Arc<Notify>,
     stop_failure: Arc<Mutex<Option<StopFailureRecord>>>,
     forced_data_loss_tx: broadcast::Sender<ForcedDataLossEvent>,
     terminal_hook: Arc<Mutex<Option<TerminalHook>>>,
@@ -141,6 +143,8 @@ impl<A: Actor> Clone for ActorHandle<A> {
             terminal_cleanup_started: self.terminal_cleanup_started.clone(),
             lifecycle_tx: self.lifecycle_tx.clone(),
             lifecycle_state: self.lifecycle_state.clone(),
+            business_fenced: self.business_fenced.clone(),
+            fence_notify: self.fence_notify.clone(),
             stop_failure: self.stop_failure.clone(),
             forced_data_loss_tx: self.forced_data_loss_tx.clone(),
             terminal_hook: self.terminal_hook.clone(),
@@ -162,6 +166,8 @@ impl<A: Actor> ActorHandle<A> {
             terminal_cleanup_started: Arc::new(AtomicBool::new(false)),
             lifecycle_tx: init.lifecycle_tx,
             lifecycle_state: Arc::new(AtomicU8::new(ActorLifecycleState::Starting as u8)),
+            business_fenced: Arc::new(AtomicBool::new(false)),
+            fence_notify: Arc::new(Notify::new()),
             stop_failure: init.stop_failure,
             forced_data_loss_tx: init.forced_data_loss_tx,
             terminal_hook: init.terminal_hook,
@@ -294,6 +300,29 @@ impl<A: Actor> ActorHandle<A> {
 
     pub fn stop(&self, reason: StopReason) -> Result<(), ActorTellError<StopReason>> {
         self.try_send_stop(reason)
+    }
+
+    /// Irrevocably closes business admission when this activation loses external authority.
+    ///
+    /// The runtime finishes any turn already admitted, rejects queued turns, and enters normal
+    /// persistence-aware stopping. This signal does not require system mailbox capacity and never
+    /// discards retained state after a stopping failure.
+    #[doc(hidden)]
+    pub fn fence_business_admission(&self) {
+        if !self.business_fenced.swap(true, Ordering::AcqRel) {
+            self.fence_notify.notify_one();
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn business_admission_fenced(&self) -> bool {
+        self.business_fenced.load(Ordering::Acquire)
+    }
+
+    pub(crate) async fn wait_business_fenced(&self) {
+        while !self.business_admission_fenced() {
+            self.fence_notify.notified().await;
+        }
     }
 
     pub fn inspect_stop_failure(&self) -> Option<StopFailureRecord> {
@@ -613,6 +642,14 @@ impl<A: Actor> ActorHandle<A> {
             return None;
         }
         let state = self.lifecycle_state();
+        if self.business_admission_fenced() {
+            return Some(match state {
+                ActorLifecycleState::Starting | ActorLifecycleState::Running => {
+                    ActorLifecycleState::Stopping
+                }
+                state => state,
+            });
+        }
         matches!(
             state,
             ActorLifecycleState::Passivating

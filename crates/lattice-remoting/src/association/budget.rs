@@ -1,4 +1,7 @@
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 
 use tokio::sync::{Notify, futures::Notified};
 
@@ -8,6 +11,22 @@ use super::{Association, AssociationError, BulkAdmission, LaneKind};
 pub(super) struct OutboundByteBudget {
     used: AtomicUsize,
     available: Notify,
+}
+
+/// Owns one admission's reservation until its frame is written or discarded.
+/// The counters outlive the Association when a lane still owns a queued batch.
+#[derive(Debug)]
+pub(crate) struct QueuedBytes {
+    association: Arc<OutboundByteBudget>,
+    node: Arc<OutboundByteBudget>,
+    pub(super) bytes: usize,
+}
+
+impl Drop for QueuedBytes {
+    fn drop(&mut self) {
+        self.association.release(self.bytes);
+        self.node.release(self.bytes);
+    }
 }
 
 impl OutboundByteBudget {
@@ -31,8 +50,9 @@ impl OutboundByteBudget {
         let _ = self
             .used
             .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                Some(current.saturating_sub(bytes))
-            });
+                current.checked_sub(bytes)
+            })
+            .expect("outbound byte reservations are released exactly once");
         self.available.notify_waiters();
     }
 
@@ -57,11 +77,10 @@ impl Association {
             self.metrics.record_queue_rejection();
             AssociationError::QueueFull
         })?;
-        self.reserve_bytes(bytes)?;
+        let reservation = self.reserve_bytes(bytes)?;
         Ok(BulkAdmission {
-            association: self,
-            permit: Some(permit),
-            reserved_bytes: bytes,
+            permit,
+            reservation,
         })
     }
 
@@ -111,20 +130,14 @@ impl Association {
             self.ensure_active()?;
             break permit;
         };
-        self.reserve_bytes_when_available(bytes).await?;
+        let reservation = self.reserve_bytes_when_available(bytes).await?;
         Ok(BulkAdmission {
-            association: self,
-            permit: Some(permit),
-            reserved_bytes: bytes,
+            permit,
+            reservation,
         })
     }
 
-    pub fn release_queued_bytes(&self, bytes: usize) {
-        self.queued_bytes.release(bytes);
-        self.node_queued_bytes.release(bytes);
-    }
-
-    pub(super) fn reserve_bytes(&self, bytes: usize) -> Result<(), AssociationError> {
+    pub(super) fn reserve_bytes(&self, bytes: usize) -> Result<QueuedBytes, AssociationError> {
         self.try_reserve_bytes(bytes)
             .inspect_err(|error| match error {
                 AssociationError::ByteBudgetExceeded => {
@@ -137,7 +150,7 @@ impl Association {
             })
     }
 
-    fn try_reserve_bytes(&self, bytes: usize) -> Result<(), AssociationError> {
+    fn try_reserve_bytes(&self, bytes: usize) -> Result<QueuedBytes, AssociationError> {
         if !self
             .queued_bytes
             .try_reserve(bytes, self.config.max_outbound_bytes_per_association)
@@ -151,10 +164,17 @@ impl Association {
             self.queued_bytes.release(bytes);
             return Err(AssociationError::NodeByteBudgetExceeded);
         }
-        Ok(())
+        Ok(QueuedBytes {
+            association: self.queued_bytes.clone(),
+            node: self.node_queued_bytes.clone(),
+            bytes,
+        })
     }
 
-    async fn reserve_bytes_when_available(&self, bytes: usize) -> Result<(), AssociationError> {
+    async fn reserve_bytes_when_available(
+        &self,
+        bytes: usize,
+    ) -> Result<QueuedBytes, AssociationError> {
         loop {
             let association_available = self.queued_bytes.notified();
             let node_available = self.node_queued_bytes.notified();
@@ -165,7 +185,7 @@ impl Association {
             state_changed.as_mut().enable();
             self.ensure_active()?;
             match self.try_reserve_bytes(bytes) {
-                Ok(()) => return Ok(()),
+                Ok(reservation) => return Ok(reservation),
                 Err(AssociationError::ByteBudgetExceeded) => {
                     tokio::select! {
                         () = association_available.as_mut() => {}
@@ -267,7 +287,10 @@ mod tests {
 
         wait_for_budget_rejection(&association).await;
         assert!(!waiting.is_finished());
-        association.release_queued_bytes(8);
+        let mut interactive = association
+            .take_lane_receiver(LaneKind::Interactive)
+            .unwrap();
+        drop(interactive.try_recv().unwrap());
 
         tokio::time::timeout(Duration::from_secs(1), waiting)
             .await

@@ -1,4 +1,5 @@
 use std::fmt;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
@@ -97,6 +98,11 @@ pub enum ActorLifecycleEvent {
     ForcedDataLoss(StopReason),
 }
 
+/// Observes Actor activity without controlling its lifecycle.
+///
+/// A callback panic is isolated from message delivery and Actor cleanup. The
+/// observer is disabled for all clones of its handle after the first panic;
+/// callbacks already in progress may still complete.
 pub trait ActorObserver: Send + Sync + 'static {
     fn message_enqueued(
         &self,
@@ -140,6 +146,7 @@ pub trait ActorObserver: Send + Sync + 'static {
 pub struct ActorObserverHandle {
     inner: Arc<dyn ActorObserver>,
     enabled: bool,
+    panicked: Arc<AtomicBool>,
 }
 
 impl ActorObserverHandle {
@@ -150,6 +157,7 @@ impl ActorObserverHandle {
         Self {
             inner: Arc::new(observer),
             enabled: true,
+            panicked: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -157,11 +165,12 @@ impl ActorObserverHandle {
         Self {
             inner: observer,
             enabled: true,
+            panicked: Arc::new(AtomicBool::new(false)),
         }
     }
 
     pub(crate) fn is_enabled(&self) -> bool {
-        self.enabled
+        self.enabled && !self.panicked.load(Ordering::Acquire)
     }
 
     pub(crate) fn message_enqueued(
@@ -170,7 +179,9 @@ impl ActorObserverHandle {
         message: &MessageMetadata,
         queue_depth: usize,
     ) {
-        self.inner.message_enqueued(actor, message, queue_depth);
+        self.observe(actor, "message_enqueued", |observer| {
+            observer.message_enqueued(actor, message, queue_depth);
+        });
     }
 
     pub(crate) fn mailbox_rejected(
@@ -179,11 +190,15 @@ impl ActorObserverHandle {
         message: &MessageMetadata,
         reason: MailboxRejection,
     ) {
-        self.inner.mailbox_rejected(actor, message, reason);
+        self.observe(actor, "mailbox_rejected", |observer| {
+            observer.mailbox_rejected(actor, message, reason);
+        });
     }
 
     pub(crate) fn message_started(&self, actor: &ActorMetadata, message: &MessageMetadata) {
-        self.inner.message_started(actor, message);
+        self.observe(actor, "message_started", |observer| {
+            observer.message_started(actor, message);
+        });
     }
 
     pub(crate) fn message_finished(
@@ -193,8 +208,9 @@ impl ActorObserverHandle {
         outcome: MessageOutcome,
         processing_time: Duration,
     ) {
-        self.inner
-            .message_finished(actor, message, outcome, processing_time);
+        self.observe(actor, "message_finished", |observer| {
+            observer.message_finished(actor, message, outcome, processing_time);
+        });
     }
 
     pub(crate) fn request_completed(
@@ -203,14 +219,36 @@ impl ActorObserverHandle {
         message: &MessageMetadata,
         completion: RequestCompletion,
     ) {
-        if !self.enabled {
-            return;
-        }
-        self.inner.request_completed(actor, message, completion);
+        self.observe(actor, "request_completed", |observer| {
+            observer.request_completed(actor, message, completion);
+        });
     }
 
     pub(crate) fn lifecycle(&self, actor: &ActorMetadata, event: ActorLifecycleEvent) {
-        self.inner.lifecycle(actor, event);
+        self.observe(actor, "lifecycle", |observer| {
+            observer.lifecycle(actor, event);
+        });
+    }
+
+    fn observe(
+        &self,
+        actor: &ActorMetadata,
+        callback: &'static str,
+        observe: impl FnOnce(&dyn ActorObserver),
+    ) {
+        if !self.is_enabled() {
+            return;
+        }
+        if catch_unwind(AssertUnwindSafe(|| observe(self.inner.as_ref()))).is_err()
+            && !self.panicked.swap(true, Ordering::AcqRel)
+        {
+            tracing::error!(
+                actor_type = actor.actor_type(),
+                actor = ?actor.local_ref(),
+                callback,
+                "Actor observer panicked and has been disabled"
+            );
+        }
     }
 }
 
@@ -219,6 +257,7 @@ impl Default for ActorObserverHandle {
         Self {
             inner: Arc::new(NoopActorObserver),
             enabled: false,
+            panicked: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -227,7 +266,7 @@ impl fmt::Debug for ActorObserverHandle {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("ActorObserverHandle")
-            .field("enabled", &self.enabled)
+            .field("enabled", &self.is_enabled())
             .finish_non_exhaustive()
     }
 }

@@ -274,6 +274,81 @@ async fn service_retry_api_resolves_retained_actor_cell() {
 }
 
 #[tokio::test]
+async fn leave_deadline_retains_an_actor_waiting_for_its_stop_hook() {
+    let _network = network_test_guard().await;
+    struct SlowStopActor(Arc<tokio::sync::Notify>);
+    impl Actor for SlowStopActor {
+        type Error = ActorError;
+        type Behavior = ::lattice_actor::state_machine::Stateless;
+
+        async fn stopping(
+            &mut self,
+            _ctx: &mut ActorContext<Self>,
+            _reason: StopReason,
+        ) -> Result<(), ActorStopError> {
+            self.0.notified().await;
+            Ok(())
+        }
+    }
+    impl Responder<Ping> for SlowStopActor {
+        async fn respond(
+            &mut self,
+            _ctx: &mut HandlerContext<'_, Self>,
+            request: Ping,
+            reply_to: ReplyTo<Pong>,
+        ) -> Result<(), ActorError> {
+            let _ = reply_to.send(Pong(request.0));
+            Ok(())
+        }
+    }
+    let finish = Arc::new(tokio::sync::Notify::new());
+    let binding = Arc::new(PingProtocol::bind::<SlowStopActor>().unwrap());
+    let registry = Arc::new(ActorRegistry::new_bound(
+        actor_kind!("SlowStopActor"),
+        ActorRegistryConfig::default(),
+        binding.as_ref(),
+    ));
+    let handle = registry
+        .start(ActorId::U64(1), SlowStopActor(finish.clone()))
+        .await
+        .unwrap();
+    let service = LatticeService::builder(node_config(
+        ClusterId::new("leave-slow-stop-test").unwrap(),
+        "slow-stop",
+        unused_address().await,
+        NodeIncarnation::new(1).unwrap(),
+    ))
+    .unwrap()
+    .register_actor(registry.clone(), binding)
+    .unwrap()
+    .build()
+    .unwrap();
+    service.start().await.unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(100);
+    let outcome = tokio::time::timeout_at(
+        deadline + Duration::from_millis(100),
+        service.leave(deadline),
+    )
+    .await
+    .expect("leave remained blocked by the actor stop hook");
+    assert!(matches!(outcome, Err(ServiceError::LeaveTimeout)));
+    assert_eq!(service.node_lifecycle_state(), NodeLifecycleState::Stopping);
+    assert_eq!(registry.live_cells().len(), 1);
+    assert_eq!(handle.lifecycle_state(), ActorLifecycleState::Passivating);
+    finish.notify_one();
+    service
+        .leave(tokio::time::Instant::now() + Duration::from_secs(2))
+        .await
+        .unwrap();
+    assert_eq!(handle.lifecycle_state(), ActorLifecycleState::Stopped);
+    assert!(registry.live_cells().is_empty());
+    assert_eq!(
+        service.node_lifecycle_state(),
+        NodeLifecycleState::Terminated
+    );
+}
+
+#[tokio::test]
 async fn repeated_start_is_rejected_without_stopping_a_ready_node() {
     let _network = network_test_guard().await;
     let binding = Arc::new(PingProtocol::bind::<PingActor>().unwrap());

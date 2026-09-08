@@ -33,6 +33,16 @@ where
 {
     match command {
         ActorCommand::Envelope(mut envelope) => {
+            if handle.business_admission_fenced() {
+                super::reject_prefetched_commands(
+                    std::iter::once(ActorCommand::Envelope(envelope)),
+                    lane,
+                    handle,
+                    QueuedRejection::MailboxClosed,
+                );
+                *stop_reason = Some(StopReason::Requested);
+                return Ok(true);
+            }
             let metadata = envelope.metadata(lane);
             let actor_metadata = handle.observation_metadata();
             let observation_started_at = handle.observer().is_enabled().then(Instant::now);
@@ -102,6 +112,10 @@ where
                 "actor message handled"
             );
             record_activity(activity_tx);
+            if handle.business_admission_fenced() {
+                *stop_reason = Some(StopReason::Requested);
+                return Ok(true);
+            }
             if let Some(requested_reason) = ctx.take_lifecycle_request() {
                 *stop_reason = Some(requested_reason);
                 return Ok(true);

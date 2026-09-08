@@ -67,6 +67,7 @@ pub struct RemotingEndpoint {
     shutdown_tx: watch::Sender<bool>,
     disconnect_tx: broadcast::Sender<AssociationId>,
     tasks: Mutex<Vec<JoinHandle<Result<(), EndpointError>>>>,
+    shutdown_lock: AsyncMutex<()>,
     #[cfg(feature = "tls")]
     security: Option<EndpointSecurity>,
     connect_locks: Mutex<HashMap<PeerConnectKey, Arc<AsyncMutex<()>>>>,
@@ -243,6 +244,7 @@ impl RemotingEndpoint {
         let opened = tokio::select! {
             biased;
             () = wait_for_shutdown(&mut shutdown) => Err(EndpointError::ShuttingDown),
+            () = association.wait_closed() => Err(AssociationError::Closed.into()),
             result = self.open_outbound_lane(&association, &peer, lane) => result,
         };
         let (stream, nonce) = match opened {
@@ -286,6 +288,7 @@ impl RemotingEndpoint {
                 if matches!(result, Ok(LaneExit::Idle)) && lane != LaneKind::Control {
                     connection_permit.take();
                     tokio::select! {
+                        () = association.wait_closed() => return Ok(()),
                         changed = shutdown.changed() => {
                             if changed.is_err() || *shutdown.borrow() {
                                 return Ok(());
@@ -308,6 +311,7 @@ impl RemotingEndpoint {
                         return Ok(());
                     }
                     tokio::select! {
+                        () = association.wait_closed() => return Ok(()),
                         changed = shutdown.changed() => {
                             if changed.is_err() || *shutdown.borrow() {
                                 return Ok(());
@@ -328,6 +332,7 @@ impl RemotingEndpoint {
                     let connection = tokio::select! {
                         biased;
                         () = wait_for_shutdown(&mut shutdown) => return Ok(()),
+                        () = association.wait_closed() => return Ok(()),
                         result = endpoint.open_outbound_lane(&association, &peer, lane) => result,
                     };
                     match connection {
@@ -488,6 +493,7 @@ impl RemotingEndpoint {
                         }
                     };
                     accept_backoff = ACCEPT_BACKOFF_MIN;
+                    let setup_deadline = tokio::time::Instant::now() + self.config.establishing_timeout;
                     let Ok(permit) = self.connections.clone().try_acquire_owned() else {
                         drop(stream);
                         self.accept_diagnostics.observe_connection_limit_rejection(peer);
@@ -496,7 +502,7 @@ impl RemotingEndpoint {
                     let endpoint = self.clone();
                     connections.spawn(async move {
                         let _permit = permit;
-                        endpoint.accept_connection(stream).await
+                        endpoint.accept_connection(stream, setup_deadline).await
                     });
                 }
             }
@@ -511,7 +517,11 @@ impl RemotingEndpoint {
         Ok(())
     }
 
-    async fn accept_connection(self: Arc<Self>, stream: TcpStream) -> Result<(), EndpointError> {
+    async fn accept_connection(
+        self: Arc<Self>,
+        stream: TcpStream,
+        setup_deadline: tokio::time::Instant,
+    ) -> Result<(), EndpointError> {
         let mut shutdown = self.shutdown_tx.subscribe();
         if *shutdown.borrow() {
             return Ok(());
@@ -527,6 +537,7 @@ impl RemotingEndpoint {
             let stream = tokio::select! {
                 biased;
                 () = wait_for_shutdown(&mut shutdown) => return Ok(()),
+                () = tokio::time::sleep_until(setup_deadline) => return Err(EndpointError::InboundSetupTimeout),
                 result = tokio_rustls::TlsAcceptor::from(security.server.clone()).accept(stream) => {
                     result.map_err(|_| WireError::Tls("server handshake failed"))?
                 }
@@ -549,16 +560,21 @@ impl RemotingEndpoint {
         let first_frame = tokio::select! {
             biased;
             () = wait_for_shutdown(&mut shutdown) => return Ok(()),
+            () = tokio::time::sleep_until(setup_deadline) => return Err(EndpointError::InboundSetupTimeout),
             result = connection.read_frame() => result?,
         };
         if first_frame.kind == FrameKind::BootstrapRequest {
-            return self
-                .accept_bootstrap(connection, peer_certificate.as_deref(), first_frame)
-                .await;
+            return tokio::select! {
+                biased;
+                () = wait_for_shutdown(&mut shutdown) => Ok(()),
+                () = tokio::time::sleep_until(setup_deadline) => Err(EndpointError::InboundSetupTimeout),
+                result = self.accept_bootstrap(connection, peer_certificate.as_deref(), first_frame) => result,
+            };
         }
         let (handshake, peer_catalogue) = tokio::select! {
             biased;
             () = wait_for_shutdown(&mut shutdown) => return Ok(()),
+            () = tokio::time::sleep_until(setup_deadline) => return Err(EndpointError::InboundSetupTimeout),
             result = negotiate_inbound_from_frame(
                 &mut connection,
                 first_frame,
@@ -638,6 +654,13 @@ impl RemotingEndpoint {
         let association_id = association.id();
         let mut disconnect = self.disconnect_tx.subscribe();
         tokio::select! {
+            biased;
+            () = association.wait_closed() => {
+                if lane.fails_pending_asks() {
+                    self.messaging.fail_association(association_id);
+                }
+                Ok(LaneExit::RemoteClose)
+            }
             result = BidirectionalLane::new(
                 association.clone(),
                 lane,
@@ -687,6 +710,8 @@ pub enum EndpointError {
     ConnectionLimit,
     #[error("association connection timed out")]
     ConnectTimeout,
+    #[error("inbound connection establishment timed out")]
+    InboundSetupTimeout,
     #[error("association lane {0:?} already owns its queue receiver")]
     LaneAlreadyRunning(LaneKind),
     #[error("local actor protocol catalogue exceeds its configured bound")]

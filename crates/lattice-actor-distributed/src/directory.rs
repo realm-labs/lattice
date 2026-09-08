@@ -1,4 +1,5 @@
 use std::any::Any;
+use std::sync::Mutex;
 
 use dashmap::DashMap;
 use lattice_core::actor_address::{ActorAddress, ActorPath, ProtocolTag};
@@ -17,6 +18,7 @@ struct DirectoryEntry {
 pub struct ActivationDirectory {
     maximum: usize,
     entries: DashMap<ActorPath, DirectoryEntry>,
+    mutations: Mutex<()>,
 }
 
 impl ActivationDirectory {
@@ -27,6 +29,7 @@ impl ActivationDirectory {
         Ok(Self {
             maximum,
             entries: DashMap::new(),
+            mutations: Mutex::new(()),
         })
     }
 
@@ -35,7 +38,13 @@ impl ActivationDirectory {
         reference: &ActorAddress,
         handle: &ActorHandle<A>,
     ) -> Result<(), ActivationDirectoryError> {
-        if self.entries.len() == self.maximum && !self.entries.contains_key(reference.actor_path())
+        // Serialize capacity changes while retaining independent read lookups.
+        // Checking DashMap::len() before insertion is not an atomic reservation.
+        let _mutation = self
+            .mutations
+            .lock()
+            .expect("activation directory mutations poisoned");
+        if self.entries.len() >= self.maximum && !self.entries.contains_key(reference.actor_path())
         {
             return Err(ActivationDirectoryError::Capacity);
         }
@@ -68,6 +77,10 @@ impl ActivationDirectory {
     }
 
     pub fn remove(&self, reference: &ActorAddress) -> bool {
+        let _mutation = self
+            .mutations
+            .lock()
+            .expect("activation directory mutations poisoned");
         self.entries
             .remove_if(reference.actor_path(), |_, entry| {
                 entry.reference.same_activation(reference)

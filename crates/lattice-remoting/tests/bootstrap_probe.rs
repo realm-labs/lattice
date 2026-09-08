@@ -666,15 +666,67 @@ fn endpoint_with_config(
 }
 
 #[cfg(any(feature = "rustls-ring", feature = "rustls-aws-lc"))]
+#[tokio::test]
+async fn stalled_tls_handshakes_release_capacity_before_a_legitimate_probe() {
+    use tokio::io::AsyncReadExt;
+
+    let port = free_port().await;
+    let cluster = ClusterId::new("tls-establishment-deadline").unwrap();
+    let client_identity = identity(cluster.clone(), "client", 1, port - 1);
+    let server_identity = identity(cluster, "server", 2, port);
+    let (client_security, server_security) =
+        tls_security_pair(&client_identity, &server_identity, &server_identity);
+    let config = RemotingConfig {
+        max_associations: 1,
+        establishing_timeout: Duration::from_millis(150),
+        ..test_config()
+    };
+    let capacity = config.required_socket_budget() - 1;
+    let (server, _) =
+        endpoint_with_security_config(server_identity.clone(), server_security, config);
+    let (client, _) = endpoint_with_security(client_identity, client_security);
+    server.bind().await.unwrap();
+    let mut stalled = Vec::new();
+    for _ in 0..capacity {
+        stalled.push(TcpStream::connect(("127.0.0.1", port)).await.unwrap());
+    }
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while server.open_connection_count() != capacity {
+            tokio::task::yield_now().await;
+        }
+        // No TLS ClientHello is sent and no endpoint shutdown is requested.
+        for mut stream in stalled {
+            assert_eq!(stream.read(&mut [0; 1]).await.unwrap(), 0);
+        }
+        while server.open_connection_count() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("TLS setup must obey the original inbound deadline");
+    let response = client
+        .probe_candidate(target(&server_identity, Some("server")))
+        .await
+        .unwrap();
+    assert_eq!(response.remote_identity(), Some(&server_identity));
+    client.shutdown().await.unwrap();
+    server.shutdown().await.unwrap();
+}
+
+#[cfg(any(feature = "rustls-ring", feature = "rustls-aws-lc"))]
 fn endpoint_with_security(
     identity: NodeIdentity,
     security: EndpointSecurity,
 ) -> (Arc<RemotingEndpoint>, Arc<AssociationManager>) {
-    let config = RemotingConfig {
-        heartbeat_interval: Duration::from_millis(50),
-        shutdown_timeout: Duration::from_secs(2),
-        ..RemotingConfig::default()
-    };
+    endpoint_with_security_config(identity, security, test_config())
+}
+
+#[cfg(any(feature = "rustls-ring", feature = "rustls-aws-lc"))]
+fn endpoint_with_security_config(
+    identity: NodeIdentity,
+    security: EndpointSecurity,
+    config: RemotingConfig,
+) -> (Arc<RemotingEndpoint>, Arc<AssociationManager>) {
     let manager = Arc::new(
         AssociationManager::new(
             identity.address.clone(),

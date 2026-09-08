@@ -44,6 +44,9 @@ impl PlacementDomainSession {
             }
             PlacementControlEventKind::Reconcile { association, .. } => {
                 self.require_coordinator(&association)?;
+                if self.drain_confirmation.committed_operation().is_some() {
+                    return Ok(());
+                }
                 self.state
                     .lock()
                     .expect("logic placement state poisoned")
@@ -172,6 +175,23 @@ impl PlacementDomainSession {
                         }
                         self.effects
                             .send(LogicPlacementEffect::DrainReady {
+                                operation_id,
+                                incarnation: expected_incarnation,
+                            })
+                            .await
+                            .map_err(|_| LogicSessionError::EffectBackpressure)
+                    }
+                    PlacementControlCommand::DrainCommitted {
+                        operation_id,
+                        expected_incarnation,
+                    } => {
+                        if expected_incarnation != self.domain_hello.node.incarnation {
+                            return Err(LogicSessionError::UnauthorizedCommand);
+                        }
+                        self.drain_confirmation
+                            .confirm(&operation_id, self.coordinator_term)?;
+                        self.effects
+                            .send(LogicPlacementEffect::DrainCommitted {
                                 operation_id,
                                 incarnation: expected_incarnation,
                             })

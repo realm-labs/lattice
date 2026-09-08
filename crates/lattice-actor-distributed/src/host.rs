@@ -248,14 +248,20 @@ impl ProtocolHostRegistry {
         &mut self,
         host: ActorHost<A, P>,
     ) -> Result<(), HostRegistryError> {
-        if self.hosts.len() == self.maximum {
-            return Err(HostRegistryError::Capacity);
-        }
         let protocol_id = host.protocol_id().get();
-        if self.hosts.insert(protocol_id, Arc::new(host)).is_some() {
-            return Err(HostRegistryError::DuplicateProtocol(protocol_id));
+        let at_capacity = self.hosts.len() >= self.maximum;
+        match self.hosts.entry(protocol_id) {
+            std::collections::btree_map::Entry::Occupied(_) => {
+                Err(HostRegistryError::DuplicateProtocol(protocol_id))
+            }
+            std::collections::btree_map::Entry::Vacant(_) if at_capacity => {
+                Err(HostRegistryError::Capacity)
+            }
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(Arc::new(host));
+                Ok(())
+            }
         }
-        Ok(())
     }
 
     pub fn is_current(&self, target: &ExactActorTarget) -> bool {

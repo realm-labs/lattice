@@ -116,14 +116,14 @@ pub struct ActorRuntimeConfig {
 }
 
 pub struct ActorRuntime {
-    executor: ActorExecutor,
-    registry: ActorRegistry,
+    config: ActorRuntimeConfig,
+    scheduler: ActorScheduler,
 }
 
 impl ActorRuntime {
     pub fn new(config: ActorRuntimeConfig) -> Self;
 
-    pub async fn spawn_actor<A>(
+    pub fn spawn_actor<A>(
         &self,
         actor: A,
         options: ActorSpawnOptions,
@@ -296,17 +296,16 @@ and must not use actor IDs, entity IDs, or payload values as unbounded metric la
 
 ### 7.4 Message Envelope Context
 
-Business handlers receive their declared message type directly. A tell sent by an actor exposes that exact activation through `ActorContext`; process-originated tells have no actor sender.
+Business handlers receive their declared message type directly. There is no implicit sender or
+forwarding context. A tell workflow requiring a later response carries an explicit typed
+`ActorAddress<P>`, `EntityAddress<P>`, or `SingletonAddress<P>` in its message contract.
 
-```rust
-let sender: Option<&ActorRef<()>> = ctx.sender();
-```
-
-The sender is message-scoped and read-only; the runtime replaces it before each tell and clears it after the turn. Clone the `ActorRef` only when the actor intentionally needs to retain the exact sending activation.
-
-`ctx.tell(&actor_ref, message).await` stamps `ctx.self_ref()` as the sender. `ctx.forward(&actor_ref, message).await` preserves the current envelope sender instead, including `None`. Both methods also accept `EntityRef` and `SingletonRef` directly; there is no public binding or bound-recipient type. Local-only `ActorHandle` delivery uses `tell_local` and `forward_local`. Local and remote tells use the same envelope and handler path, and remoting carries an optional exact `ActorRef` after codec dispatch.
-
-Passing `ctx.self_ref().cloned()` in a serializable business message lets another actor retain the reference and send later. `ActorRef<T>` deserializes as ordinary identity data; the receiving context resolves its registered `ProtocolId` when sending, so no bind step is required. Because an `ActorRef` identifies one activation, it becomes stale after stop, restart, passivation, or relocation. Long-lived routing to a sharded or singleton identity should retain an `EntityRef` or `SingletonRef` instead.
+Addresses are serializable identity data. At an execution boundary, `service.bind_actor(address)`
+or `ctx.bind_actor(address)` validates the registered protocol and creates a bound `ActorRef<P>`.
+Bound references retain an `ActorSystem` sending capability and are not serializable. Actor code uses
+`ctx.tell(&target, message).await` with either a local `ActorHandle` or a bound distributed target.
+An exact address becomes stale after stop, restart, passivation, or relocation; store a logical
+entity or singleton address when routing must survive a replacement activation.
 
 An ask does not install a dynamically typed sender in the context. `Responder<R>` receives a typed, single-use `ReplyTo<R::Response>` by value. It may answer immediately or move the token into a continuation message. This keeps reply ownership explicit and prevents tell handlers from accidentally acquiring reply semantics.
 
@@ -489,7 +488,9 @@ let reply = ctx
 
 If the current message is itself an ask, `ActorContext` clamps the downstream deadline to the earlier of the parent deadline and the requested timeout. This prevents nested calls from extending the caller's original budget.
 
-`ActorHandle` must not cross remoting or EventBus boundaries. Cross-process messages carry `ActorRef`, `EntityRef`, or `SingletonRef`. A Gateway session is represented by an `ActorRef<GatewaySessionActor>`.
+`ActorHandle` must not cross remoting or EventBus boundaries. Cross-process messages carry address
+data and bind it at the receiving boundary. A Gateway session is identified by an exact
+`ActorAddress<GatewaySessionProtocol>` and used locally through its bound reference.
 
 ### 7.8 Stash and Deferred Messages
 
@@ -564,7 +565,9 @@ Business logic must remain resilient to delayed notification and concurrent in-f
 
 ## 7.12 Local Child Actors
 
-A child actor is spawned by a parent inside the same process and is not independently placed in etcd. Its concrete `ActorRef` is serializable and can be used by remote nodes while that exact activation lives.
+A child Actor is spawned and supervised by a parent inside the same process. `spawn_child` returns
+an `ActorHandle<C>` and does not assign a distributed address. Independently addressable distributed
+activations are created and owned by an `ActorRegistry`, even if an application calls them children.
 
 Use cases:
 
@@ -583,19 +586,17 @@ Children stop when the parent stops or passivates.
 Children are not migrated independently.
 Children may be restarted by a parent-defined supervision policy.
 Remote code cannot resolve or create a child through placement or wildcard path selection.
-Remote code can send to a child only after receiving its concrete ActorRef.
+Core child handles never cross a process boundary.
 ```
 
 Example:
 
 ```rust
-let child = ctx
-    .spawn_child(
-        "combat-loop",
-        CombatLoopActor::new(self.world_id),
-        ChildActorOptions::default(),
-    )
-    .await?;
+let child = ctx.spawn_child(
+    ChildActorKey::new("combat-loop"),
+    CombatLoopActor::new(self.world_id),
+    ChildActorOptions::default(),
+)?;
 ```
 
 ---
@@ -612,7 +613,6 @@ pub enum ActorLifecycleState {
     Passivating,
     Stopping,
     StopFailed,
-    Quarantined,
     Stopped,
 }
 ```
@@ -628,9 +628,9 @@ Entity activation is serialized per `(EntityType, EntityId)` at the owning shard
 The local registry prevents duplicate local activation and maps actor references to mailboxes. It is not a distributed placement store.
 
 Every registry in one service shares a bounded `ActivationDirectory` through `ServiceContext`.
-Root and child spawns register the exact `(ActorPath, ActivationId, protocol)` and typed local handle;
-remote protocol dispatch resolves through this directory, so heterogeneous child actor types remain
-addressable without flattening child paths into root registry keys. Successful stop, passivation,
+Registry-hosted activations register the exact `(ActorPath, ActivationId, protocol)` and typed local
+handle; remote protocol dispatch resolves through this directory. Core supervision children remain
+local and do not automatically register distributed addresses. Successful stop, passivation,
 startup failure, and explicit force stop run one eager exact terminal-cleanup callback before the
 single `ActorTerminated` event. `StopFailed` remains reserved but non-routable; quarantine is removed
 from current routing and held in a separately bounded recovery map. Capacity exhaustion rejects
@@ -639,6 +639,20 @@ registration or quarantine rather than silently dropping retained state.
 ### 8.3 Lazy Activation
 
 If a request reaches the owner instance and the local actor is not running, the runtime may ask the registered factory/loader to create it. If creation fails, no zombie actor remains and later requests can retry activation.
+
+The first request owns the loader future. Its cancellation or panic removes only its own loading
+placeholder and wakes existing waiters with `ActorActivationError::Cancelled`; later requests can
+retry. Loading is included in the Registry ownership set. Drain, passivation, removal, and external
+fencing invalidate loading placeholders under the same entry lock used for publication, so an old
+producer cannot publish an Actor or remove a replacement after invalidation. No detached loader task
+is introduced. A pending producer drops its loader when polled after invalidation; publication is
+already prohibited even if the producer has not yet been polled.
+
+For placement-managed Actors, loading captures the validated authority generation. Both placeholder
+creation and final Actor publication run inside the authority adapter's synchronous callback while
+it holds the placement-state lock. The lock order is placement state, then Registry entry. No loader
+or Actor callback is awaited under either lock. Existing Actor cells carry their activation generation
+and cannot be reused for a later generation. Logical routes validate their target again after loading.
 
 ### 8.4 Passivation
 
@@ -656,6 +670,15 @@ If an external claim is lost, fence exact/logical admission immediately, quarant
 and surface StateLossPossible when persistence still fails; replacement authority does not wait.
 Scoped tasks and child actors are cancelled or stopped.
 ```
+
+External fencing also closes a persistent gate on the exact local Actor handle. This wakes an idle
+Actor without using system-mailbox capacity and prevents delayed senders and prefetched envelopes
+from starting new business turns. Startup is skipped if fencing occurs before startup admission.
+An already admitted startup or handler is allowed to finish; fencing does not cancel arbitrary
+business futures or roll back side effects already performed. The runtime then uses the normal
+`stopping()` persistence path, retaining the same object on failure. The gate never reopens, including
+after an operator retries persistence. Quarantine transfer and terminal cleanup share the Registry
+entry lock, preventing a quickly stopping Actor from leaving a stale quarantine entry.
 
 ### 8.5 Business-Initiated Stop
 

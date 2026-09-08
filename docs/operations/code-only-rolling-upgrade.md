@@ -81,6 +81,19 @@ on N. Fix N+1 capacity or compatibility instead of bypassing the guard.
 
 ## Full-stop boundary
 
+The 2026-09-08 lifecycle repair advances Coordinator control generation from 9
+to 10. Drain completion now carries a node identity and requires an explicit
+`DrainCommitted` response scoped to the operation, incarnation, and Coordinator
+term. A reliable transport ACK alone no longer completes leave. The placement
+storage generation remains 5; this change does not require a storage migration.
+
+Generation 9 and 10 control participants cannot coexist. Upgrade Logic nodes,
+membership-only gateways, and CoordinatorHosts across a full-stop boundary;
+update the release manifest's control generation to 10. Drain the old deployment
+using its existing protocol, stop every control participant, wait for old leases
+to expire, and start the new deployment before reopening admission. This repair
+does not qualify for `CodeOnlyRollingUpgrade`.
+
 Stop the complete application deployment for any of the following:
 
 - actor message IDs, codecs, request/reply schemas, or protocol fingerprints;

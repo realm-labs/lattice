@@ -523,7 +523,9 @@ impl OutboundMessaging {
             return None;
         }
         ask.set_timeout(duration_nanos(remaining));
+        let reservation = frame.outbound_budget.take();
         *frame = ask.into_frame();
+        frame.outbound_budget = reservation;
         Some(PreparedOutboundFrame::Ask(correlation))
     }
 

@@ -13,6 +13,7 @@ use crate::local::EventSubscriptionHandle;
 #[derive(Debug, Default)]
 pub struct ActorSubscriptions {
     handles: HashMap<String, EventSubscriptionHandle>,
+    retiring: Vec<EventSubscriptionHandle>,
 }
 
 impl ActorSubscriptions {
@@ -20,12 +21,13 @@ impl ActorSubscriptions {
         Self::default()
     }
 
+    /// Counts both installed subscriptions and retired subscriptions still draining.
     pub fn len(&self) -> usize {
-        self.handles.len()
+        self.handles.len() + self.retiring.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.handles.is_empty()
+        self.handles.is_empty() && self.retiring.is_empty()
     }
 
     pub fn contains(&self, key: &str) -> bool {
@@ -43,36 +45,47 @@ impl ActorSubscriptions {
         handle: EventSubscriptionHandle,
         deadline: Duration,
     ) -> bool {
-        let previous = self.handles.insert(key.into(), handle);
-        match previous {
-            Some(previous) => previous.shutdown(deadline).await,
-            None => true,
+        if let Some(previous) = self.handles.insert(key.into(), handle) {
+            self.retiring.push(previous);
         }
+        self.drain_retiring(deadline).await
     }
 
     pub async fn cancel(&mut self, key: &str, deadline: Duration) -> bool {
-        match self.handles.remove(key) {
-            Some(handle) => handle.shutdown(deadline).await,
-            None => true,
+        if let Some(handle) = self.handles.remove(key) {
+            self.retiring.push(handle);
         }
+        self.drain_retiring(deadline).await
     }
 
-    /// Cancels every subscription and waits at most `deadline` in total for their tasks to stop.
+    /// Cancels every subscription and waits at most `deadline` in total for their work to finish.
+    /// Timed-out subscriptions remain owned here so later calls can finish draining them.
     pub async fn shutdown(&mut self, deadline: Duration) -> bool {
+        self.retiring.extend(take(&mut self.handles).into_values());
+        self.drain_retiring(deadline).await
+    }
+
+    async fn drain_retiring(&mut self, deadline: Duration) -> bool {
         let started = Instant::now();
-        let handles = take(&mut self.handles);
-        let mut drained = true;
-        for handle in handles.into_values() {
-            let remaining = deadline.saturating_sub(started.elapsed());
-            drained &= handle.shutdown(remaining).await;
+        for handle in &self.retiring {
+            handle.cancel();
         }
-        drained
+        let mut index = 0;
+        while index < self.retiring.len() {
+            let remaining = deadline.saturating_sub(started.elapsed());
+            if self.retiring[index].shutdown(remaining).await {
+                self.retiring.swap_remove(index);
+            } else {
+                index += 1;
+            }
+        }
+        self.retiring.is_empty()
     }
 }
 
 impl Drop for ActorSubscriptions {
     fn drop(&mut self) {
-        for handle in self.handles.values() {
+        for handle in self.handles.values().chain(self.retiring.iter()) {
             handle.cancel();
         }
     }

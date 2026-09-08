@@ -29,10 +29,9 @@ use crate::{
     },
 };
 
-// Generation 9 gives snapshots a dedicated protobuf representation. Other commands retain their
-// established JSON representation inside the protobuf envelope, so Serde compatibility fields on
-// domain models never pass through a positional binary codec.
-pub const PLACEMENT_CONTROL_GENERATION: u64 = 9;
+// Generation 10 requires application-level drain confirmation and identifies the departing node
+// in completion requests, so a new leader can confirm an already committed removal from storage.
+pub const PLACEMENT_CONTROL_GENERATION: u64 = 10;
 pub const DEFAULT_MAX_CONTROL_PAYLOAD: usize = 256 * 1024;
 
 pub fn control_stream_id(scope: &CoordinatorScope) -> ControlStreamId {
@@ -137,9 +136,15 @@ pub enum PlacementControlCommand {
     },
     DrainComplete {
         operation_id: String,
+        node_id: String,
         expected_incarnation: NodeIncarnation,
     },
     MembershipDrainComplete {
+        operation_id: String,
+        node_id: String,
+        expected_incarnation: NodeIncarnation,
+    },
+    DrainCommitted {
         operation_id: String,
         expected_incarnation: NodeIncarnation,
     },
@@ -180,6 +185,7 @@ impl PlacementControlCommand {
             Self::DrainReady { .. } => "DrainReady",
             Self::DrainComplete { .. } => "DrainComplete",
             Self::MembershipDrainComplete { .. } => "MembershipDrainComplete",
+            Self::DrainCommitted { .. } => "DrainCommitted",
             Self::ForceRemove { .. } => "ForceRemove",
         }
     }
@@ -963,6 +969,30 @@ mod tests {
     }
 
     #[test]
+    fn drain_confirmation_contract_rejects_previous_generation_peers() {
+        for scope in [
+            CoordinatorScope::Membership,
+            CoordinatorScope::Placement(PlacementDomainId::new("drain").unwrap()),
+        ] {
+            let command = PlacementControlCommand::DrainCommitted {
+                operation_id: "leave".to_owned(),
+                expected_incarnation: NodeIncarnation::new(1).unwrap(),
+            };
+            let payload = encode_control_command_for_term(&scope, 2, &command, 1024).unwrap();
+            assert_eq!(
+                decode_control_command(&payload, 1024).unwrap().command,
+                command
+            );
+            let mut previous = PlacementControlWire::decode(payload.as_ref()).unwrap();
+            previous.generation = 9;
+            assert_eq!(
+                decode_control_command(&previous.encode_to_vec(), 1024).unwrap_err(),
+                PlacementControlError::GenerationMismatch
+            );
+        }
+    }
+
+    #[test]
     fn coordinator_term_round_trips_and_rejects_zero() {
         let command = PlacementControlCommand::NodeHeartbeat {
             incarnation: NodeIncarnation::new(1).unwrap(),
@@ -1073,6 +1103,7 @@ mod tests {
         assert_eq!(
             PlacementControlCommand::MembershipDrainComplete {
                 operation_id: "terminal-leave-1".to_string(),
+                node_id: "departing".to_string(),
                 expected_incarnation: NodeIncarnation::new(1).unwrap(),
             }
             .name(),

@@ -12,7 +12,6 @@ use lattice_core::{
 use lattice_remoting::association::{AssociationKey, AssociationManager};
 use tokio::{
     sync::{broadcast, mpsc, watch},
-    task::JoinSet,
     time::MissedTickBehavior,
 };
 
@@ -39,11 +38,13 @@ mod member_fanout;
 mod routing;
 #[cfg(test)]
 mod strategy_tests;
+mod tasks;
 #[cfg(test)]
 mod tests;
 
 use election::{candidate_delay, elect_domain_leader, next_term};
 use helpers::next_membership_event;
+use tasks::OwnedTasks;
 
 #[derive(Debug, Clone)]
 pub struct CoordinatorHostConfig {
@@ -145,6 +146,7 @@ where
     state: CoordinatorHostScopeState,
 }
 
+#[derive(Debug)]
 enum HostBackgroundCompletion {
     MembershipSnapshot(AssociationKey),
     DomainReconciliation(PlacementDomainId),
@@ -169,7 +171,7 @@ where
     membership_associations: BTreeMap<NodeIncarnation, AssociationKey>,
     directory_events: watch::Sender<BTreeMap<CoordinatorScope, LeaderRecord>>,
     scope_events: watch::Sender<BTreeMap<CoordinatorScope, CoordinatorHostScopeState>>,
-    background_tasks: JoinSet<HostBackgroundCompletion>,
+    background_tasks: OwnedTasks<HostBackgroundCompletion, ()>,
     snapshotting_associations: HashSet<AssociationKey>,
     pending_snapshot_replays: HashSet<AssociationKey>,
     reconciling_domains: BTreeSet<PlacementDomainId>,
@@ -283,7 +285,7 @@ where
             membership_associations: BTreeMap::new(),
             directory_events,
             scope_events,
-            background_tasks: JoinSet::new(),
+            background_tasks: OwnedTasks::new(),
             snapshotting_associations: HashSet::new(),
             pending_snapshot_replays: HashSet::new(),
             reconciling_domains: BTreeSet::new(),
@@ -336,7 +338,7 @@ where
         mut controls: mpsc::Receiver<PlacementControlEvent>,
         mut shutdown: watch::Receiver<bool>,
     ) -> Result<(), CoordinatorRuntimeError> {
-        let mut tasks = JoinSet::new();
+        let mut tasks = OwnedTasks::new();
         for (domain, hosted) in &mut self.domains {
             let Some(leader) = hosted.leader.take() else {
                 continue;
@@ -346,7 +348,7 @@ where
             hosted.sender = Some(sender);
             hosted.shutdown = Some(stop);
             let domain = domain.clone();
-            tasks.spawn(async move { (domain, leader.run(receiver, stop_rx).await) });
+            tasks.spawn(domain, async move { leader.run(receiver, stop_rx).await });
         }
 
         // Membership renewal, placement-domain campaigning, and full member reconciliation each own
@@ -359,7 +361,7 @@ where
         let mut member_reconciliation =
             tokio::time::interval(self.config.member_reconciliation_interval);
         member_reconciliation.set_missed_tick_behavior(MissedTickBehavior::Delay);
-        let mut elections = JoinSet::new();
+        let mut elections = OwnedTasks::new();
         let mut campaigning = BTreeSet::new();
         loop {
             tokio::select! {
@@ -381,42 +383,54 @@ where
                 _ = member_reconciliation.tick() => {
                     self.spawn_global_member_reconciliation();
                 }
-                Some(result) = elections.join_next(), if !elections.is_empty() => {
-                    if let Ok((domain, outcome)) = result {
-                        campaigning.remove(&domain);
-                        self.install_campaign_outcome(domain, outcome, &mut tasks);
-                        self.publish_directory();
-                    }
-                }
-                Some(result) = tasks.join_next(), if !tasks.is_empty() => {
-                    if let Ok((domain, result)) = result {
-                        if let Some(hosted) = self.domains.get_mut(&domain) {
-                            hosted.sender = None;
-                            hosted.shutdown = None;
-                            hosted.state = CoordinatorHostScopeState::Failed;
+                Some((domain, outcome)) = elections.join_next(), if !elections.is_empty() => {
+                    campaigning.remove(&domain);
+                    match outcome {
+                        Ok(outcome) => self.install_campaign_outcome(domain, outcome, &mut tasks),
+                        Err(error) => {
+                            if let Some(hosted) = self.domains.get_mut(&domain) {
+                                hosted.state = CoordinatorHostScopeState::Failed;
+                            }
+                            tracing::warn!(target: "lattice.cluster.placement", domain = %domain.as_str(), %error, "placement-domain campaign task failed");
                         }
-                        if let Err(error) = result {
+                    }
+                    self.publish_directory();
+                }
+                Some((domain, outcome)) = tasks.join_next(), if !tasks.is_empty() => {
+                    if let Some(hosted) = self.domains.get_mut(&domain) {
+                        hosted.sender = None;
+                        hosted.shutdown = None;
+                        hosted.handle = None;
+                        hosted.state = CoordinatorHostScopeState::Failed;
+                    }
+                    match outcome {
+                        Ok(Ok(())) => {},
+                        Ok(Err(error)) => {
                             tracing::warn!(target: "lattice.cluster.placement", domain = %domain.as_str(), %error, "placement-domain leader task stopped");
-                        }
-                        self.publish_directory();
-                        if !*shutdown.borrow() {
-                            self.spawn_campaigns([domain], &mut campaigning, &mut elections);
+                        },
+                        Err(error) => {
+                            tracing::warn!(target: "lattice.cluster.placement", domain = %domain.as_str(), %error, "placement-domain leader task failed");
                         }
                     }
+                    self.publish_directory();
+                    if !*shutdown.borrow() {
+                        self.spawn_campaigns([domain], &mut campaigning, &mut elections);
+                    }
                 }
-                Some(result) = self.background_tasks.join_next(),
+                Some((completion, result)) = self.background_tasks.join_next(),
                     if !self.background_tasks.is_empty() => {
-                        if let Ok(completion) = result {
-                            match completion {
-                                HostBackgroundCompletion::MembershipSnapshot(association) => {
-                                    self.snapshotting_associations.remove(&association);
-                                    if self.pending_snapshot_replays.remove(&association) {
-                                        self.spawn_membership_snapshot(association, None);
-                                    }
+                        if let Err(error) = result {
+                            tracing::warn!(target: "lattice.cluster.placement", ?completion, %error, "Coordinator background task failed");
+                        }
+                        match completion {
+                            HostBackgroundCompletion::MembershipSnapshot(association) => {
+                                self.snapshotting_associations.remove(&association);
+                                if self.pending_snapshot_replays.remove(&association) {
+                                    self.spawn_membership_snapshot(association, None);
                                 }
-                                HostBackgroundCompletion::DomainReconciliation(domain) => {
-                                    self.reconciling_domains.remove(&domain);
-                                }
+                            }
+                            HostBackgroundCompletion::DomainReconciliation(domain) => {
+                                self.reconciling_domains.remove(&domain);
                             }
                         }
                     }

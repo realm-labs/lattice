@@ -43,6 +43,12 @@ Generation 5 is the only runtime schema. `MembershipVersion` orders membership; 
 `PlacementVersion` orders each placement stream. Generation 4, `migrating-to-5`, or a different
 durable-limit record prevents startup rather than guessing compatibility.
 
+Coordinator control generation is **10**, independently of storage generation **5**. Membership
+and placement sessions require the scoped `DrainCommitted` contract described in section 11.
+Generation 9 peers are rejected; upgrading control generation requires a
+[full deployment stop](../operations/code-only-rolling-upgrade.md#full-stop-boundary), including
+membership-only gateways and CoordinatorHosts. It does not require a storage migration.
+
 Shard and Singleton remain different public/runtime concepts, but their distributed authority is implemented by one internal placement-slot engine:
 
 ```text
@@ -119,6 +125,10 @@ AppliedRevision(PlacementVersion)
 ```
 
 The receiver stages chunks outside the live routing table, rejects duplicate/out-of-range chunks, and enforces configured chunk count, total bytes, and assembly deadline. It atomically installs the snapshot only after every chunk and the BLAKE3 digest validate. A disconnect, timeout, digest mismatch, or revision gap discards staging and requests a fresh snapshot. Deltas received while staging are buffered only within a small bound or trigger resnapshot.
+
+Both membership and placement staging use the session's real monotonic elapsed time at begin,
+chunk, and end validation. A chunk or end arriving after the assembly budget is rejected even if
+its snapshot identity and digest are otherwise valid; transport activity does not reset that budget.
 
 Snapshot pages, deltas, and acknowledgements use reliable Association control. Scope version provides
 ordering/gap detection; Association sequence provides bounded retransmission. Replay is idempotent.
@@ -438,18 +448,47 @@ member, publishes the next generation, and activates the new singleton.
 
 ## 11. Drain and Shutdown
 
-Graceful drain aggregates all joined domains:
+`LatticeService::leave(deadline)` uses one operation ID and one absolute monotonic deadline for the
+whole exit, including membership confirmation and local component shutdown:
 
-1. stop new admission and begin every domain drain concurrently within bounds;
-2. independently hand off/fence shards and singletons in each domain;
-3. acknowledge each domain completion without undoing completed domains;
-4. stop activations and finish bounded work;
-5. remove global membership only after every required domain completion;
-6. at deadline, return a structured intervention report for voluntary `StopFailed` blockers; an
-   operator must choose retry or an explicit destructive force action.
+1. close new admission and begin each required domain drain;
+2. complete each domain's shard/singleton handoffs and Actor stop barriers;
+3. on `DrainReady`, send `DrainComplete(operation_id, node_id, expected_incarnation)` to that
+   domain leader and wait for its `DrainCommitted` response;
+4. retain each domain's confirmed completion while other domains continue draining;
+5. after every required domain is confirmed, send `MembershipDrainComplete` with the same
+   operation and exact node identity, and wait for the membership leader's `DrainCommitted`;
+6. fence the removed incarnation locally, enter `Stopping`, drain remaining local Actors, and
+   join endpoint and supervised tasks before publishing `Terminated`.
+
+`DrainCommitted` is an application-level response bound to the requested operation and incarnation,
+authenticated Association, Coordinator scope, and term. A reliable transport ACK can also consume
+a rejected command; it is not proof of domain or membership removal. A local member-directory
+fence likewise cannot substitute for the leader's confirmation.
+
+Completion retries reuse the operation ID and the original leave deadline. Once a domain has
+requested completion, retries resend `DrainComplete` rather than restarting at `BeginDrain`.
+Replacement sessions use their current authenticated term. If a committed response was lost,
+the current leader rechecks durable state: placement requires the exact domain member, owned
+slots, and claims to be absent; membership requires the departing incarnation to be absent.
+It also verifies current leadership before sending confirmation. This permits replay after leader
+replacement without an unbounded in-memory receipt cache or deletion of a newer incarnation.
+
+A received confirmation remains valid if its session closes before the leave caller observes it.
+The service retains that proof and does not rejoin a domain or membership incarnation already
+confirmed drained. A membership-only node whose handle is temporarily unavailable still waits for
+a replacement session within the same deadline.
+
+At deadline, leave returns `LeaveTimeout`, or `InterventionRequired` with a
+`LifecycleInterventionReport` for recorded `StopFailed` blockers. It remains `Draining` while
+authority confirmation is outstanding, or `Stopping` while local cleanup is outstanding.
+Cancellation and timeout retain Actor cells and unjoined endpoint/supervisor tasks with their
+owners. A later leave call resumes cleanup; it does not publish `Terminated` while work remains.
+The supervisor closes new task admission once its shutdown begins.
 
 Forced shutdown relies on lease expiry and claim fencing and is never a transparent fallback from
-graceful shutdown. Operators can observe every blocking activation and quarantined old instance.
+graceful shutdown. A caller must explicitly choose `force_shutdown()`; voluntary `StopFailed`
+Actors remain available for inspection and persistence retry until that choice is made.
 
 ## 12. Migration Constraint
 

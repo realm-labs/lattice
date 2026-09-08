@@ -213,8 +213,14 @@ impl<A: Actor, L: ActorLoader<A>, P: Protocol> SingletonRouteHost<A, L, P> {
             domain: self.domain.clone(),
             kind: self.kind.clone(),
         };
-        let slot = self.slot(&target.reference)?;
+        if target.reference.protocol_id() != self.protocol_id
+            || target.reference.domain() != &self.domain
+            || target.reference.config_fingerprint() != self.config_fingerprint
+        {
+            return Err(RemoteMessageError::ProtocolFingerprintMismatch);
+        }
         let state = self.state.lock().expect("logic placement state poisoned");
+        let slot = state.slot(&key).ok_or(RemoteMessageError::StaleAuthority)?;
         if target.owner_address != self.local_node.address
             || target.owner_incarnation != self.local_node.incarnation
             || target.assignment_generation != slot.assignment_generation.get()
@@ -239,10 +245,13 @@ impl<A: Actor, L: ActorLoader<A>, P: Protocol> SingletonRouteHost<A, L, P> {
                 target.assignment_generation,
             )
             .map_err(|_| RemoteMessageError::StaleAuthority)?;
-        self.registry
+        let handle = self
+            .registry
             .load_with_validated_authority(authority, self.loader.clone())
             .await
-            .map_err(|_| RemoteMessageError::HandlerFailed)
+            .map_err(|_| RemoteMessageError::HandlerFailed)?;
+        self.validate_local(target)?;
+        Ok(handle)
     }
 }
 

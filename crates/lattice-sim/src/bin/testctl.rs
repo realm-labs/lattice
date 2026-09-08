@@ -156,20 +156,16 @@ fn run_profile(
         Profile::Sim => runner.run("seeded-simulation-suite", || simulate(seed, artifacts)),
         Profile::Model => {
             runner.run("bounded-state-explorer", || {
-                cargo(&[
-                    "test",
-                    "-p",
+                cargo_test_exact(
                     "lattice-sim",
-                    "scenario::tests::bounded_state_explorer_checks_every_transition",
-                ])
+                    "scenario::tests::bounded_state_explorer_checks_every_production_handoff_transition",
+                )
             });
             runner.run("multi-domain-bounded-state-explorer", || {
-                cargo(&[
-                    "test",
-                    "-p",
+                cargo_test_exact(
                     "lattice-sim",
-                    "domains::tests::multi_domain_bounded_state_explorer_checks_every_transition",
-                ])
+                    "domains::tests::multi_domain_bounded_state_explorer_checks_every_production_reducer_transition",
+                )
             });
         }
         Profile::E2e => {

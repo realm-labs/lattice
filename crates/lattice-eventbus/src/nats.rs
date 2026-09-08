@@ -5,7 +5,7 @@ use std::{
         Arc, Weak,
         atomic::{AtomicU64, Ordering},
     },
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use async_nats::{HeaderMap, jetstream};
@@ -18,12 +18,16 @@ use jetstream::{
     stream::{Config as StreamConfig, RetentionPolicy, Stream},
 };
 use serde::{Deserialize, Serialize};
-use tokio::sync::{Mutex, OnceCell};
+use tokio::{
+    sync::{Mutex, OnceCell},
+    time::Instant,
+};
 use tracing::{Instrument, warn};
 
 use crate::{
     error::EventBusError,
-    local::{EventBus, EventHandler, EventSubscriptionHandle, SubscriptionState},
+    lifecycle::{Activity, SubscriptionState, drain},
+    local::{EventBus, EventHandler, EventSubscriptionHandle},
     types::{EventEnvelope, EventId, EventSubscription, Subject, SubjectFilter},
 };
 
@@ -33,6 +37,7 @@ pub struct NatsEventBus {
     jetstream: jetstream::Context,
     stream: Arc<OnceCell<Stream>>,
     subscriptions: Arc<Mutex<HashMap<u64, Arc<SubscriptionState>>>>,
+    activity: Arc<Activity>,
     metrics: Arc<NatsEventBusMetrics>,
     config: NatsEventBusConfig,
 }
@@ -56,6 +61,7 @@ impl NatsEventBus {
             client,
             stream: Arc::new(OnceCell::new()),
             subscriptions: Arc::new(Mutex::new(HashMap::new())),
+            activity: Arc::default(),
             metrics: Arc::new(NatsEventBusMetrics::default()),
             config,
         }
@@ -83,13 +89,15 @@ impl NatsEventBus {
             .await
     }
 
-    async fn track(&self, id: u64, state: &Arc<SubscriptionState>) {
-        self.subscriptions.lock().await.insert(id, state.clone());
-
+    fn remove_when_finished(&self, id: u64, state: &Arc<SubscriptionState>) {
         let subscriptions = Arc::downgrade(&self.subscriptions);
         let mut cancellation = state.cancellation();
+        let state = Arc::downgrade(state);
         tokio::spawn(async move {
             cancellation.cancelled().await;
+            if let Some(state) = state.upgrade() {
+                state.wait_finished().await;
+            }
             if let Some(subscriptions) = Weak::upgrade(&subscriptions) {
                 subscriptions.lock().await.remove(&id);
             }
@@ -304,6 +312,7 @@ fn default_redelivery_backoff_secs() -> Vec<u64> {
 #[async_trait]
 impl EventBus for NatsEventBus {
     async fn publish(&self, event: EventEnvelope) -> Result<(), EventBusError> {
+        let _publishing = self.activity.enter()?;
         let subject = event.subject.as_str().to_string();
         let message_id = event.event_id.as_str().to_string();
         let payload =
@@ -339,9 +348,18 @@ impl EventBus for NatsEventBus {
     {
         let id = NATS_SUBSCRIPTION_ID.fetch_add(1, Ordering::SeqCst);
         let state = SubscriptionState::new();
+        let setup = state.setup();
+        let _subscribing = {
+            let mut subscriptions = self.subscriptions.lock().await;
+            let admission = self.activity.enter()?;
+            subscriptions.insert(id, state.clone());
+            admission
+        };
+        self.remove_when_finished(id, &state);
         let handler = Arc::new(handler);
         let filter = subscription.filter.clone();
         let mut cancellation = state.cancellation();
+        let activity = state.activity.clone();
 
         if let Some(durable_name) = &subscription.durable_name {
             let stream = self.stream().await?;
@@ -379,6 +397,9 @@ impl EventBus for NatsEventBus {
                         };
                         match message {
                             Ok(message) => {
+                                let Ok(_handling) = activity.enter() else {
+                                    break;
+                                };
                                 consume_durable_message(
                                     handler.as_ref(),
                                     &filter,
@@ -418,6 +439,9 @@ impl EventBus for NatsEventBus {
                         let Some(message) = message else {
                             break;
                         };
+                        let Ok(_handling) = activity.enter() else {
+                            break;
+                        };
                         consume_core_message(handler.as_ref(), &filter, &metrics, message).await;
                     }
                 }
@@ -425,19 +449,15 @@ impl EventBus for NatsEventBus {
             ));
         }
 
-        self.track(id, &state).await;
+        setup.complete()?;
         Ok(EventSubscriptionHandle::new(id, state))
     }
 
     async fn shutdown(&self, deadline: Duration) -> bool {
-        let states = std::mem::take(&mut *self.subscriptions.lock().await);
-        let started = Instant::now();
-        let mut drained = true;
-        for state in states.into_values() {
-            let remaining = deadline.saturating_sub(started.elapsed());
-            drained &= state.shutdown(remaining).await;
-        }
-        drained
+        let deadline = Instant::now() + deadline;
+        self.activity.close();
+        let states = self.subscriptions.lock().await.values().cloned().collect();
+        drain(&self.activity, states, deadline).await
     }
 }
 
@@ -673,6 +693,7 @@ impl InMemoryNatsClient {
         Self {
             inner: Arc::new(NatsInner {
                 next_id: AtomicU64::new(1),
+                activity: Arc::default(),
                 stream: Mutex::new(Vec::new()),
                 subscribers: Mutex::new(HashMap::new()),
                 duplicate_window: Mutex::new(HashSet::new()),
@@ -689,6 +710,7 @@ impl Default for InMemoryNatsClient {
 
 struct NatsInner {
     next_id: AtomicU64,
+    activity: Arc<Activity>,
     stream: Mutex<Vec<EventEnvelope>>,
     subscribers: Mutex<HashMap<u64, NatsSubscriber>>,
     duplicate_window: Mutex<HashSet<EventId>>,
@@ -713,6 +735,7 @@ struct NatsSubscriber {
 #[async_trait]
 impl EventBus for InMemoryNatsEventBus {
     async fn publish(&self, event: EventEnvelope) -> Result<(), EventBusError> {
+        let _publishing = self.client.inner.activity.enter()?;
         let stored = self
             .client
             .inner
@@ -753,26 +776,27 @@ impl EventBus for InMemoryNatsEventBus {
     {
         let id = self.client.inner.next_id.fetch_add(1, Ordering::SeqCst);
         let state = SubscriptionState::new();
+        let setup = state.setup();
         let subscriber = NatsSubscriber {
             subscription,
             handler: Arc::new(handler),
             state: state.clone(),
         };
-        self.client
-            .inner
-            .subscribers
-            .lock()
-            .await
-            .insert(id, subscriber.clone());
+        let mut subscribers = self.client.inner.subscribers.lock().await;
+        let _subscribing = self.client.inner.activity.enter()?;
+        subscribers.insert(id, subscriber.clone());
+        drop(subscribers);
 
         let inner = Arc::downgrade(&self.client.inner);
         let mut cancellation = state.cancellation();
-        tokio::spawn(async move {
+        let activity = state.activity.clone();
+        state.attach(tokio::spawn(async move {
             cancellation.cancelled().await;
+            activity.wait_idle().await;
             if let Some(inner) = Weak::upgrade(&inner) {
                 inner.subscribers.lock().await.remove(&id);
             }
-        });
+        }));
 
         if subscriber.subscription.durable_name.is_some() {
             let replay = self.client.inner.stream.lock().await.clone();
@@ -781,22 +805,33 @@ impl EventBus for InMemoryNatsEventBus {
             }
         }
 
+        setup.complete()?;
         Ok(EventSubscriptionHandle::new(id, state))
     }
 
-    async fn shutdown(&self, _deadline: Duration) -> bool {
-        let subscribers = std::mem::take(&mut *self.client.inner.subscribers.lock().await);
-        for subscriber in subscribers.values() {
-            subscriber.state.cancel();
-        }
-        true
+    async fn shutdown(&self, deadline: Duration) -> bool {
+        let deadline = Instant::now() + deadline;
+        self.client.inner.activity.close();
+        let states = self
+            .client
+            .inner
+            .subscribers
+            .lock()
+            .await
+            .values()
+            .map(|subscriber| subscriber.state.clone())
+            .collect();
+        drain(&self.client.inner.activity, states, deadline).await
     }
 }
 
 async fn deliver(subscriber: &NatsSubscriber, event: EventEnvelope) {
-    if subscriber.state.is_cancelled() || !subscriber.subscription.filter.matches(&event.subject) {
+    if !subscriber.subscription.filter.matches(&event.subject) {
         return;
     }
+    let Ok(_handling) = subscriber.state.activity.enter() else {
+        return;
+    };
     if let Err(error) = subscriber.handler.handle(event).await {
         warn!(%error, "in-memory NATS event handler failed");
     }

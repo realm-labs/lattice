@@ -118,12 +118,14 @@ where
                         CoordinatorScope::Membership,
                         PlacementControlCommand::MembershipDrainComplete {
                             operation_id,
+                            node_id,
                             expected_incarnation,
                         },
                     ) => {
                         let result = self
                             .complete_membership_drain(
                                 operation_id,
+                                node_id,
                                 *expected_incarnation,
                                 &inbound.association,
                             )
@@ -299,6 +301,7 @@ where
     async fn complete_membership_drain(
         &mut self,
         operation_id: &str,
+        node_id: &str,
         expected_incarnation: NodeIncarnation,
         association: &AssociationKey,
     ) -> Result<(), CoordinatorRuntimeError> {
@@ -308,38 +311,78 @@ where
         {
             return Err(CoordinatorRuntimeError::StaleMember);
         }
-        let hello = self
-            .pending_member_hellos
-            .get(&expected_incarnation)
-            .cloned()
-            .ok_or(CoordinatorRuntimeError::StaleMember)?;
-        if self.membership_associations.get(&expected_incarnation) != Some(association) {
+        let node = crate::types::NodeKey {
+            node_id: node_id.to_owned(),
+            address: association.remote_address.clone(),
+            incarnation: expected_incarnation,
+        };
+        if node.validate().is_err() {
             return Err(CoordinatorRuntimeError::StaleMember);
         }
         let membership = self
             .membership
             .as_mut()
             .ok_or(CoordinatorRuntimeError::NotLeader)?;
-        let member = self
+        if let Some(member) = self
             .store
-            .get_member(&hello.node.node_id)
+            .get_member(node_id)
             .await?
-            .filter(|member| {
-                member.node == hello.node && member.node.incarnation == expected_incarnation
-            })
-            .ok_or(CoordinatorRuntimeError::StaleMember)?;
-        match member.status {
-            MemberStatus::Joining => return Err(CoordinatorRuntimeError::StaleMember),
-            MemberStatus::Up => {
-                membership.begin_leave(&member.node).await?;
+            .filter(|member| member.node.incarnation == expected_incarnation)
+        {
+            if member.node != node
+                || self.membership_associations.get(&expected_incarnation) != Some(association)
+            {
+                return Err(CoordinatorRuntimeError::StaleMember);
             }
-            MemberStatus::Leaving => {}
+            match member.status {
+                MemberStatus::Joining => return Err(CoordinatorRuntimeError::MemberNotReady),
+                MemberStatus::Up => {
+                    membership.begin_leave(&member.node).await?;
+                }
+                MemberStatus::Leaving => {}
+            }
+            membership
+                .remove(&member.node, MemberRemovalReason::GracefulLeave)
+                .await?;
         }
-        let removed = membership
-            .remove(&member.node, MemberRemovalReason::GracefulLeave)
-            .await?;
+        let leader = membership.leader().clone();
+        // Do not let a heartbeat already queued behind the completion request re-create the
+        // member while the removal event is waiting to be fanned out by the host loop.
+        self.pending_member_hellos.remove(&expected_incarnation);
+        self.membership_associations.remove(&expected_incarnation);
+        // The removed record is also the idempotency witness after a commit whose response was
+        // lost. A replacement incarnation is never removed by this request.
+        if self
+            .store
+            .get_leader(&CoordinatorScope::Membership)
+            .await?
+            .as_ref()
+            != Some(&leader)
+        {
+            return Err(CoordinatorRuntimeError::NotLeader);
+        }
+        let peer = self
+            .associations
+            .get(association)
+            .ok_or(CoordinatorRuntimeError::AssociationUnavailable)?;
+        let payload = crate::control::encode_control_command_for_term(
+            &CoordinatorScope::Membership,
+            leader.term.get(),
+            &PlacementControlCommand::DrainCommitted {
+                operation_id: operation_id.to_owned(),
+                expected_incarnation,
+            },
+            self.config.placement.maximum_control_payload,
+        )
+        .map_err(CoordinatorRuntimeError::Control)?;
+        peer.admit_control_command_in_wait(
+            crate::control::control_stream_id(&CoordinatorScope::Membership),
+            payload,
+            crate::session::CONTROL_ADMISSION_TIMEOUT,
+        )
+        .await?;
         if let Err(error) = self
-            .fanout_global_member_removal(removed.node, MemberRemovalReason::GracefulLeave)
+            .fanout_global_member_removal(node, MemberRemovalReason::GracefulLeave)
             .await
         {
             tracing::warn!(
@@ -420,5 +463,133 @@ mod routing_backpressure_tests {
                 ControlRetryReason::ConsumerBusy
             ))
         ));
+    }
+
+    #[tokio::test]
+    async fn membership_commit_is_confirmed_again_after_response_loss_and_leader_replacement() {
+        use crate::{
+            control::decode_control_command, runtime::host::CoordinatorHostConfig,
+            storage::InMemoryPlacementStore,
+        };
+        use lattice_core::{actor_address::ClusterId, release::ReleaseManifest};
+        use lattice_remoting::{
+            association::AssociationManager, config::RemotingConfig,
+            control::decode_control_envelope,
+        };
+        use std::{collections::BTreeSet, sync::Arc};
+
+        let store = Arc::new(InMemoryPlacementStore::new(16, 16).unwrap());
+        let local = NodeKey {
+            node_id: "leader".to_owned(),
+            address: NodeAddress::new("127.0.0.1", 34701).unwrap(),
+            incarnation: NodeIncarnation::new(1).unwrap(),
+        };
+        let departing = NodeKey {
+            node_id: "departing".to_owned(),
+            address: NodeAddress::new("127.0.0.1", 34702).unwrap(),
+            incarnation: NodeIncarnation::new(2).unwrap(),
+        };
+        let associations = Arc::new(
+            AssociationManager::new(
+                local.address.clone(),
+                local.incarnation,
+                RemotingConfig::default(),
+            )
+            .unwrap(),
+        );
+        let peer = associations
+            .get_or_create(
+                ClusterId::new("commit-replay").unwrap(),
+                departing.address.clone(),
+                departing.incarnation,
+            )
+            .unwrap();
+        let mut host = CoordinatorHost::elect(
+            store.clone(),
+            associations.clone(),
+            local.clone(),
+            BTreeSet::new(),
+            CoordinatorHostConfig::default(),
+        )
+        .await
+        .unwrap();
+        let hello = MemberHello {
+            node: departing.clone(),
+            release: ReleaseManifest::development(1),
+            rollout_participant: true,
+            roles: Default::default(),
+            failure_domains: Default::default(),
+            protocols: Vec::new(),
+            remoting_capabilities: Default::default(),
+        };
+        host.membership
+            .as_mut()
+            .unwrap()
+            .join(hello.clone())
+            .await
+            .unwrap();
+        host.membership
+            .as_mut()
+            .unwrap()
+            .mark_up(&departing)
+            .await
+            .unwrap();
+        host.pending_member_hellos
+            .insert(departing.incarnation, hello);
+        host.membership_associations
+            .insert(departing.incarnation, peer.key().clone());
+        host.complete_membership_drain(
+            "leave",
+            &departing.node_id,
+            departing.incarnation,
+            peer.key(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            store
+                .get_member(&departing.node_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            !host
+                .pending_member_hellos
+                .contains_key(&departing.incarnation)
+        );
+        // No response is delivered to the departing node before the leader restarts.
+        host.membership.take().unwrap().shutdown().await.unwrap();
+        let mut replacement = CoordinatorHost::elect(
+            store.clone(),
+            associations,
+            local,
+            BTreeSet::new(),
+            CoordinatorHostConfig::default(),
+        )
+        .await
+        .unwrap();
+        replacement
+            .complete_membership_drain(
+                "leave",
+                &departing.node_id,
+                departing.incarnation,
+                peer.key(),
+            )
+            .await
+            .unwrap();
+        let responses = peer.replay_control_frames().into_iter().filter_map(|frame| {
+            let envelope = decode_control_envelope(&frame).ok()?;
+            decode_control_command(&envelope.payload, crate::control::DEFAULT_MAX_CONTROL_PAYLOAD).ok()
+        }).filter(|command| matches!(&command.command, PlacementControlCommand::DrainCommitted { operation_id, expected_incarnation } if operation_id == "leave" && *expected_incarnation == departing.incarnation)).collect::<Vec<_>>();
+        assert_eq!(responses.len(), 2);
+        assert!(responses[1].coordinator_term > responses[0].coordinator_term);
+        replacement
+            .membership
+            .take()
+            .unwrap()
+            .shutdown()
+            .await
+            .unwrap();
     }
 }

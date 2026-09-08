@@ -2,10 +2,7 @@ use std::{collections::BTreeSet, sync::Arc, time::Duration};
 
 use lattice_core::{actor_address::PlacementDomainId, coordinator::CoordinatorScope};
 use lattice_remoting::association::AssociationManager;
-use tokio::{
-    sync::{mpsc, watch},
-    task::JoinSet,
-};
+use tokio::sync::{mpsc, watch};
 
 use crate::{
     storage::{CoordinatorLeaseStore, MembershipStore, PlacementDomainStore, ScopedElectionStore},
@@ -15,7 +12,7 @@ use crate::{
 use super::super::CoordinatorRuntimeError;
 use super::{
     CoordinatorHost, CoordinatorHostConfig, CoordinatorHostScopeState, MembershipLeader,
-    PlacementDomainLeader,
+    PlacementDomainLeader, tasks::OwnedTasks,
 };
 
 pub(super) async fn elect_domain_leader<S>(
@@ -181,10 +178,10 @@ where
         &self,
         domains: impl IntoIterator<Item = PlacementDomainId>,
         campaigning: &mut BTreeSet<PlacementDomainId>,
-        elections: &mut JoinSet<(
+        elections: &mut OwnedTasks<
             PlacementDomainId,
             Result<PlacementDomainLeader<S>, CoordinatorRuntimeError>,
-        )>,
+        >,
     ) {
         for domain in domains {
             if !self.domains.contains_key(&domain) || !campaigning.insert(domain.clone()) {
@@ -194,10 +191,8 @@ where
             let associations = self.associations.clone();
             let node = self.node.clone();
             let config = self.config.clone();
-            elections.spawn(async move {
-                let outcome =
-                    campaign_for_domain(store, associations, node, domain.clone(), &config).await;
-                (domain, outcome)
+            elections.spawn(domain.clone(), async move {
+                campaign_for_domain(store, associations, node, domain, &config).await
             });
         }
     }
@@ -206,7 +201,7 @@ where
         &mut self,
         domain: PlacementDomainId,
         outcome: Result<PlacementDomainLeader<S>, CoordinatorRuntimeError>,
-        tasks: &mut JoinSet<(PlacementDomainId, Result<(), CoordinatorRuntimeError>)>,
+        tasks: &mut OwnedTasks<PlacementDomainId, Result<(), CoordinatorRuntimeError>>,
     ) {
         match outcome {
             Ok(leader) => {
@@ -221,7 +216,7 @@ where
                 hosted.shutdown = Some(stop);
                 hosted.handle = Some(handle);
                 hosted.state = CoordinatorHostScopeState::Active(record);
-                tasks.spawn(async move { (domain, leader.run(receiver, stop_rx).await) });
+                tasks.spawn(domain, async move { leader.run(receiver, stop_rx).await });
             }
             Err(CoordinatorRuntimeError::NotLeader) => {
                 if let Some(hosted) = self.domains.get_mut(&domain) {

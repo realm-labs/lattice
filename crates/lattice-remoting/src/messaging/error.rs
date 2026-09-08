@@ -1,15 +1,4 @@
-use super::{AssociationError, Error, FrameKind};
-use crate::wire::WireError;
-
-#[derive(Debug, Error)]
-pub enum InboundConnectionError {
-    #[error("inbound remoting socket failed")]
-    Wire(#[from] WireError),
-    #[error("inbound remoting message is invalid")]
-    Message(#[from] RemoteMessageError),
-    #[error("frame kind {0:?} is invalid on the actor data loop")]
-    UnexpectedFrame(FrameKind),
-}
+use super::{AssociationError, Error};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u16)]

@@ -1,7 +1,7 @@
 use lattice_actor::context::HandlerContext;
 use std::{
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
@@ -33,6 +33,241 @@ use lattice_core::{
 use tokio::sync::{Semaphore, oneshot};
 
 struct SlowActor;
+
+#[tokio::test]
+async fn cancelled_activation_releases_placeholder_and_notifies_existing_waiters() {
+    let registry = Arc::new(ActorRegistry::<SlowActor>::new(
+        actor_kind!("Cancelled"),
+        ActorRegistryConfig::default(),
+    ));
+    let actor_id = ActorId::U64(71);
+    let mut producer = Box::pin(registry.get_or_activate(actor_id.clone(), || async {
+        std::future::pending::<Result<SlowActor, ActorError>>().await
+    }));
+    assert!(futures_util::poll!(&mut producer).is_pending());
+    let mut waiter = Box::pin(registry.get_or_activate(actor_id.clone(), || async {
+        panic!("existing waiter must not become the loader")
+    }));
+    assert!(futures_util::poll!(&mut waiter).is_pending());
+    drop(producer);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), waiter)
+            .await
+            .expect("cancelled producer must wake existing waiters")
+            .is_err()
+    );
+    assert!(registry.active_actor_ids().is_empty());
+    registry
+        .get_or_activate(actor_id, || async { Ok(SlowActor) })
+        .await
+        .unwrap();
+    assert!(registry.drain().await.completed());
+}
+
+#[tokio::test]
+async fn panicking_loader_releases_its_activation_placeholder() {
+    let registry = Arc::new(ActorRegistry::<SlowActor>::new(
+        actor_kind!("PanickingLoader"),
+        ActorRegistryConfig::default(),
+    ));
+    let task_registry = registry.clone();
+    assert!(
+        tokio::spawn(async move {
+            task_registry
+                .get_or_activate(ActorId::U64(72), || async { panic!("loader panic") })
+                .await
+        })
+        .await
+        .unwrap_err()
+        .is_panic()
+    );
+    assert!(registry.active_actor_ids().is_empty());
+    tokio::time::timeout(
+        Duration::from_millis(100),
+        registry.get_or_activate(ActorId::U64(72), || async { Ok(SlowActor) }),
+    )
+    .await
+    .expect("panic cleanup must permit retry")
+    .unwrap();
+    assert!(registry.drain().await.completed());
+}
+
+#[tokio::test]
+async fn draining_loading_activation_prevents_late_publication() {
+    let registry = ActorRegistry::<SlowActor>::new(
+        actor_kind!("DrainLoading"),
+        ActorRegistryConfig::default(),
+    );
+    let actor_id = ActorId::U64(73);
+    let (release, ready) = oneshot::channel();
+    let mut producer = Box::pin(registry.get_or_activate(actor_id.clone(), || async {
+        ready.await.unwrap();
+        Ok(SlowActor)
+    }));
+    assert!(futures_util::poll!(&mut producer).is_pending());
+    assert_eq!(registry.active_actor_ids(), std::slice::from_ref(&actor_id));
+    let drained = registry.drain().await;
+    assert!(drained.completed());
+    let _ = release.send(());
+    assert!(
+        producer.await.is_err(),
+        "a drained loader cannot spawn an Actor"
+    );
+    assert!(registry.get_running(&actor_id).is_none());
+}
+
+#[tokio::test]
+async fn fencing_loading_activation_does_not_remove_a_replacement() {
+    let registry = ActorRegistry::<SlowActor>::new(
+        actor_kind!("FenceLoading"),
+        ActorRegistryConfig::default(),
+    );
+    let actor_id = ActorId::U64(74);
+    let mut old = Box::pin(registry.get_or_activate(actor_id.clone(), || async {
+        std::future::pending::<Result<SlowActor, ActorError>>().await
+    }));
+    assert!(futures_util::poll!(&mut old).is_pending());
+    registry
+        .fence_after_authority_loss(&actor_id)
+        .await
+        .unwrap();
+    let replacement = registry
+        .get_or_activate(actor_id.clone(), || async { Ok(SlowActor) })
+        .await
+        .unwrap();
+    drop(old);
+    assert_eq!(
+        registry.get_running(&actor_id).unwrap().local_ref(),
+        replacement.local_ref()
+    );
+    assert!(registry.drain().await.completed());
+}
+
+#[tokio::test]
+async fn authority_change_during_loading_rejects_publication_and_allows_retry() {
+    let registry = ActorRegistry::<SlowActor>::new(
+        actor_kind!("GenerationLoading"),
+        ActorRegistryConfig::default(),
+    );
+    let generation = Arc::new(Mutex::new(Some(1)));
+    registry.install_fencing_token_resolver("test", {
+        let generation = generation.clone();
+        move |_, publish| {
+            let generation = generation.lock().unwrap();
+            publish(*generation);
+        }
+    });
+    let actor_id = ActorId::U64(75);
+    for new_generation in [None, Some(2)] {
+        *generation.lock().unwrap() = Some(1);
+        let (release, ready) = oneshot::channel();
+        let mut producer = Box::pin(registry.get_or_activate(actor_id.clone(), || async {
+            ready.await.unwrap();
+            Ok(SlowActor)
+        }));
+        assert!(futures_util::poll!(&mut producer).is_pending());
+        *generation.lock().unwrap() = new_generation;
+        release.send(()).unwrap();
+        assert!(producer.await.is_err());
+        assert!(registry.active_actor_ids().is_empty());
+    }
+    registry
+        .get_or_activate(actor_id.clone(), || async { Ok(SlowActor) })
+        .await
+        .unwrap();
+    *generation.lock().unwrap() = Some(3);
+    assert!(
+        registry
+            .get_or_activate(actor_id.clone(), || async {
+                panic!("old generation must be fenced before loading a replacement")
+            })
+            .await
+            .is_err()
+    );
+    assert!(registry.get_running(&actor_id).is_none());
+    assert!(registry.drain().await.completed());
+}
+
+#[tokio::test]
+async fn wait_terminal_tracks_loading_until_invalidation() {
+    let registry =
+        ActorRegistry::<SlowActor>::new(actor_kind!("WaitLoading"), ActorRegistryConfig::default());
+    let actor_id = ActorId::U64(76);
+    let mut producer = Box::pin(registry.get_or_activate(actor_id.clone(), || async {
+        std::future::pending::<Result<SlowActor, ActorError>>().await
+    }));
+    assert!(futures_util::poll!(&mut producer).is_pending());
+    let mut waiter = Box::pin(registry.wait_actor_ids_terminal([actor_id.clone()]));
+    assert!(futures_util::poll!(&mut waiter).is_pending());
+    assert!(registry.drain_actor_ids([actor_id]).await.completed());
+    tokio::time::timeout(Duration::from_millis(100), waiter)
+        .await
+        .unwrap();
+    assert!(producer.await.is_err());
+}
+
+#[tokio::test]
+async fn activation_waiter_revalidates_authority_after_publication() {
+    let registry = ActorRegistry::<SlowActor>::new(
+        actor_kind!("WaiterGeneration"),
+        ActorRegistryConfig::default(),
+    );
+    let generation = Arc::new(Mutex::new(Some(1)));
+    registry.install_fencing_token_resolver("test", {
+        let generation = generation.clone();
+        move |_, publish| {
+            let generation = generation.lock().unwrap();
+            publish(*generation);
+        }
+    });
+    let actor_id = ActorId::U64(77);
+    let (release, ready) = oneshot::channel();
+    let mut producer = Box::pin(registry.get_or_activate(actor_id.clone(), || async {
+        ready.await.unwrap();
+        Ok(SlowActor)
+    }));
+    assert!(futures_util::poll!(&mut producer).is_pending());
+    let mut waiter = Box::pin(registry.get_or_activate(actor_id.clone(), || async {
+        panic!("waiter cannot run loader")
+    }));
+    assert!(futures_util::poll!(&mut waiter).is_pending());
+    release.send(()).unwrap();
+    producer.await.unwrap();
+    *generation.lock().unwrap() = None;
+    assert!(waiter.await.is_err());
+    assert!(registry.drain().await.completed());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fast_fence_cleanup_cannot_leave_a_stopped_cell_in_quarantine() {
+    let registry = Arc::new(ActorRegistry::<SlowActor>::new(
+        actor_kind!("FenceCleanup"),
+        ActorRegistryConfig::default(),
+    ));
+    let mut tasks = tokio::task::JoinSet::new();
+    for id in 0..128 {
+        let registry = registry.clone();
+        tasks.spawn(async move {
+            let actor_id = ActorId::U64(id);
+            let handle = registry.start(actor_id.clone(), SlowActor).await.unwrap();
+            let mut terminated = handle.subscribe_terminated();
+            registry
+                .fence_after_authority_loss(&actor_id)
+                .await
+                .unwrap();
+            terminated.recv().await.unwrap();
+        });
+    }
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(result) = tasks.join_next().await {
+            result.unwrap();
+        }
+    })
+    .await
+    .unwrap();
+    assert!(registry.active_actor_ids().is_empty());
+    assert_eq!(registry.quarantine_len(), 0);
+}
 
 impl Actor for SlowActor {
     type Error = ActorError;

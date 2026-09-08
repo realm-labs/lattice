@@ -79,27 +79,29 @@ where
         let store = self.store.clone();
         let associations = self.associations.clone();
         let config = self.config.clone();
-        self.background_tasks.spawn(async move {
-            let result = Self::send_membership_snapshot(
-                store,
-                associations,
-                config,
-                version,
-                &association_key,
-            )
-            .await;
-            if let Some(completion) = completion {
-                let _ = completion.send(result.map_err(super::helpers::dispatch_error));
-            } else if let Err(error) = result {
-                tracing::warn!(
-                    target: "lattice.cluster.membership",
-                    %error,
-                    remote = %association_key.remote_address,
-                    "membership snapshot replay failed"
-                );
-            }
-            HostBackgroundCompletion::MembershipSnapshot(association_key)
-        });
+        self.background_tasks.spawn(
+            HostBackgroundCompletion::MembershipSnapshot(association_key.clone()),
+            async move {
+                let result = Self::send_membership_snapshot(
+                    store,
+                    associations,
+                    config,
+                    version,
+                    &association_key,
+                )
+                .await;
+                if let Some(completion) = completion {
+                    let _ = completion.send(result.map_err(super::helpers::dispatch_error));
+                } else if let Err(error) = result {
+                    tracing::warn!(
+                        target: "lattice.cluster.membership",
+                        %error,
+                        remote = %association_key.remote_address,
+                        "membership snapshot replay failed"
+                    );
+                }
+            },
+        );
     }
 
     async fn send_membership_snapshot(
@@ -229,38 +231,41 @@ where
             let completed_domain = domain.clone();
             let sender = sender.clone();
             let maximum_work = self.config.placement.maximum_reconciliation_work_per_pass;
-            self.background_tasks.spawn(async move {
-                let result = async {
-                    let participants = store.list_domain_members(&domain).await?;
-                    for participant in participants.into_iter().take(maximum_work) {
-                        let globally_up = store
-                            .get_member(&participant.node.node_id)
-                            .await?
-                            .is_some_and(|member| {
-                                member.node == participant.node && member.status == MemberStatus::Up
-                            });
-                        if globally_up {
-                            continue;
+            self.background_tasks.spawn(
+                HostBackgroundCompletion::DomainReconciliation(completed_domain),
+                async move {
+                    let result = async {
+                        let participants = store.list_domain_members(&domain).await?;
+                        for participant in participants.into_iter().take(maximum_work) {
+                            let globally_up = store
+                                .get_member(&participant.node.node_id)
+                                .await?
+                                .is_some_and(|member| {
+                                    member.node == participant.node
+                                        && member.status == MemberStatus::Up
+                                });
+                            if globally_up {
+                                continue;
+                            }
+                            try_remove_global_member_from_domain(
+                                &sender,
+                                participant.node,
+                                MemberRemovalReason::FailureDetected,
+                            )?;
                         }
-                        try_remove_global_member_from_domain(
-                            &sender,
-                            participant.node,
-                            MemberRemovalReason::FailureDetected,
-                        )?;
+                        Ok::<(), CoordinatorRuntimeError>(())
                     }
-                    Ok::<(), CoordinatorRuntimeError>(())
-                }
-                .await;
-                if let Err(error) = result {
-                    tracing::warn!(
-                        target: "lattice.cluster.membership",
-                        domain = %domain.as_str(),
-                        %error,
-                        "global member reconciliation deferred"
-                    );
-                }
-                HostBackgroundCompletion::DomainReconciliation(completed_domain)
-            });
+                    .await;
+                    if let Err(error) = result {
+                        tracing::warn!(
+                            target: "lattice.cluster.membership",
+                            domain = %domain.as_str(),
+                            %error,
+                            "global member reconciliation deferred"
+                        );
+                    }
+                },
+            );
         }
     }
 

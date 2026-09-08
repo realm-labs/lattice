@@ -1093,6 +1093,7 @@ impl LatticeServiceBuilder {
             supervisor,
             logic_runtime: Mutex::new(self.logic_runtime),
             join_runtimes: Mutex::new(join_runtimes),
+            membership_required: membership_join_runtime.is_some(),
             membership_join_runtime: Mutex::new(membership_join_runtime),
             membership_handle,
             logic_shutdown: Mutex::new(None),

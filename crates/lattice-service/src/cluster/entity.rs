@@ -267,8 +267,9 @@ impl<A: Actor, L: ActorLoader<A>, P: Protocol> EntityRouteHost<A, L, P> {
         &self,
         target: &LogicalEntityTarget,
     ) -> Result<PlacementSlotKey, RemoteMessageError> {
-        let (key, slot) = self.route_slot(&target.reference)?;
+        let key = self.slot_key(&target.reference)?;
         let state = self.state.lock().expect("logic placement state poisoned");
+        let slot = state.slot(&key).ok_or(RemoteMessageError::StaleAuthority)?;
         if target.owner_address != self.local_node.address
             || target.owner_incarnation != self.local_node.incarnation
             || target.assignment_generation != slot.assignment_generation.get()
@@ -293,10 +294,13 @@ impl<A: Actor, L: ActorLoader<A>, P: Protocol> EntityRouteHost<A, L, P> {
                 target.assignment_generation,
             )
             .map_err(|_| RemoteMessageError::StaleAuthority)?;
-        self.registry
+        let handle = self
+            .registry
             .load_with_validated_authority(authority, self.loader.clone())
             .await
-            .map_err(|_| RemoteMessageError::HandlerFailed)
+            .map_err(|_| RemoteMessageError::HandlerFailed)?;
+        self.validate_local(target)?;
+        Ok(handle)
     }
 }
 
