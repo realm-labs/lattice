@@ -185,7 +185,12 @@ impl MembershipJoinRuntime {
                 .expect("membership session state poisoned")
                 .ready()
             {
-                self.ready.send_replace(true);
+                // Placement sessions re-bootstrap on readiness transitions, not every heartbeat.
+                self.ready.send_if_modified(|ready| {
+                    let changed = !*ready;
+                    *ready = true;
+                    changed
+                });
                 let recovering = self
                     .lifecycle
                     .lock()

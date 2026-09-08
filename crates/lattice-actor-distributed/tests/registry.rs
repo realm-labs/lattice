@@ -171,20 +171,124 @@ async fn authority_change_during_loading_rejects_publication_and_allows_retry() 
         assert!(producer.await.is_err());
         assert!(registry.active_actor_ids().is_empty());
     }
-    registry
+    let old = registry
         .get_or_activate(actor_id.clone(), || async { Ok(SlowActor) })
         .await
         .unwrap();
     *generation.lock().unwrap() = Some(3);
-    assert!(
+    let replacement = registry
+        .get_or_activate(actor_id.clone(), || async {
+            assert!(old.business_admission_fenced());
+            Ok(SlowActor)
+        })
+        .await
+        .expect("current authority must retire an activation left by an older generation");
+    assert_ne!(old.local_ref(), replacement.local_ref());
+    assert_eq!(
+        registry.get_running(&actor_id).unwrap().local_ref(),
+        replacement.local_ref()
+    );
+    assert!(registry.drain().await.completed());
+}
+
+#[tokio::test]
+async fn current_generation_cancels_a_loading_predecessor_and_its_waiters() {
+    let registry = ActorRegistry::<SlowActor>::new(
+        actor_kind!("ReplaceLoading"),
+        ActorRegistryConfig::default(),
+    );
+    let generation = Arc::new(Mutex::new(Some(1)));
+    registry.install_fencing_token_resolver("test", {
+        let generation = generation.clone();
+        move |_, publish| publish(*generation.lock().unwrap())
+    });
+    let actor_id = ActorId::U64(78);
+    let mut old = Box::pin(registry.get_or_activate(actor_id.clone(), || async {
+        std::future::pending::<Result<SlowActor, ActorError>>().await
+    }));
+    assert!(futures_util::poll!(&mut old).is_pending());
+    let mut waiter = Box::pin(registry.get_or_activate(actor_id.clone(), || async {
+        panic!("waiter must not load")
+    }));
+    assert!(futures_util::poll!(&mut waiter).is_pending());
+    *generation.lock().unwrap() = Some(2);
+    let replacement = registry
+        .get_or_activate(actor_id.clone(), || async { Ok(SlowActor) })
+        .await
+        .unwrap();
+    assert!(matches!(old.await, Err(ActorActivationError::Cancelled)));
+    assert!(matches!(waiter.await, Err(ActorActivationError::Cancelled)));
+    assert_eq!(
+        registry.get_running(&actor_id).unwrap().local_ref(),
+        replacement.local_ref()
+    );
+    assert!(registry.drain().await.completed());
+}
+
+#[tokio::test]
+async fn new_generation_preserves_an_old_stop_failure_in_quarantine() {
+    let registry = ActorRegistry::new(
+        actor_kind!("ReplaceStopFailure"),
+        ActorRegistryConfig::default(),
+    );
+    let generation = Arc::new(Mutex::new(Some(1)));
+    registry.install_fencing_token_resolver("test", {
+        let generation = generation.clone();
+        move |_, publish| publish(*generation.lock().unwrap())
+    });
+    let actor_id = ActorId::U64(79);
+    let persistence_available = Arc::new(AtomicBool::new(false));
+    let dropped = Arc::new(AtomicUsize::new(0));
+    let old = registry
+        .start(
+            actor_id.clone(),
+            RetainedRegistryActor {
+                persistence_available: persistence_available.clone(),
+                dropped: dropped.clone(),
+            },
+        )
+        .await
+        .unwrap();
+    assert!(!registry.drain().await.completed());
+    assert!(matches!(
         registry
             .get_or_activate(actor_id.clone(), || async {
-                panic!("old generation must be fenced before loading a replacement")
+                panic!("same authority must retain failure")
             })
-            .await
-            .is_err()
+            .await,
+        Err(ActorActivationError::RetainedStopFailure)
+    ));
+    *generation.lock().unwrap() = Some(2);
+    let replacement = registry
+        .get_or_activate(actor_id.clone(), || async {
+            Ok(RetainedRegistryActor {
+                persistence_available: Arc::new(AtomicBool::new(true)),
+                dropped: Arc::new(AtomicUsize::new(0)),
+            })
+        })
+        .await
+        .unwrap();
+    assert!(old.business_admission_fenced());
+    assert!(registry.inspect_quarantined(&actor_id).is_some());
+    assert_eq!(dropped.load(Ordering::SeqCst), 0);
+    let mut lifecycle = old.subscribe_lifecycle();
+    persistence_available.store(true, Ordering::SeqCst);
+    registry
+        .retry_quarantined_exact(old.local_ref())
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while *lifecycle.borrow() != ActorLifecycleState::Stopped {
+            lifecycle.changed().await.unwrap();
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(registry.quarantine_len(), 0);
+    assert_eq!(
+        registry.get_running(&actor_id).unwrap().local_ref(),
+        replacement.local_ref()
     );
-    assert!(registry.get_running(&actor_id).is_none());
     assert!(registry.drain().await.completed());
 }
 

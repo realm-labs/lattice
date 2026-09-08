@@ -468,6 +468,24 @@ where
             .ok_or(CoordinatorRuntimeError::MemberNotReady)?;
         self.gracefully_removed_sessions
             .remove(&hello.node.incarnation);
+        // Membership can rejoin the same process under a new durable lease while this
+        // domain still retains its previous session. The live global record authorizes
+        // replacing that session; its old lease must not reject the new hello.
+        if self
+            .sessions
+            .get(&hello.node.incarnation)
+            .is_some_and(|session| {
+                session.record != record
+                    && session.hello == hello
+                    && session.association == association_key
+            })
+        {
+            self.sessions.remove(&hello.node.incarnation);
+            self.loads.forget_incarnation(hello.node.incarnation);
+            self.node_load_received.remove(&hello.node.incarnation);
+            self.shard_load_received
+                .retain(|(owner, _, _), _| owner != &hello.node.incarnation);
+        }
         if let Some(session) = self.sessions.get_mut(&hello.node.incarnation) {
             if session.record != record
                 || session.hello != hello

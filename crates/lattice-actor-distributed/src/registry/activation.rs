@@ -4,11 +4,17 @@ use std::sync::{
 };
 
 use dashmap::{DashMap, mapref::entry::Entry};
-use lattice_actor::{handle::ActorHandle, traits::Actor};
+use lattice_actor::{
+    handle::ActorHandle,
+    traits::{Actor, ActorLifecycleState},
+};
 use lattice_core::id::ActorId;
 use tokio::sync::{Semaphore, watch};
 
-use super::{ActorActivationError, ActorFencingToken, ActorRegistry, RegistryEntry};
+use super::{
+    ActorActivationError, ActorFencingToken, ActorRegistry, RegistryEntry, RegistryLookup,
+    authority_error, is_business_admitted,
+};
 use crate::entity::EntityActivationState;
 
 pub(super) struct ActivationState<A: Actor> {
@@ -83,6 +89,56 @@ impl<A: Actor> ActivationState<A> {
 }
 
 impl<A: Actor> ActorRegistry<A> {
+    // Called under the resolver's authority lock. A current grant can supersede an old
+    // activation even if disconnect/snapshot recovery lost the old session's stop effect.
+    // Fence it before admitting the replacement; retain any failed persistence in quarantine.
+    pub(super) fn lookup_activation(
+        &self,
+        actor_id: &ActorId,
+        fencing_token: Option<ActorFencingToken>,
+    ) -> Result<RegistryLookup<A>, ActorActivationError> {
+        loop {
+            match self.entries.entry(actor_id.clone()) {
+                Entry::Occupied(entry) => {
+                    let existing_token = match entry.get() {
+                        RegistryEntry::Running(_, token) => *token,
+                        RegistryEntry::Activating(activation) => activation.fencing_token,
+                    };
+                    if existing_token != fencing_token {
+                        self.fence_entry(entry).map_err(|error| {
+                            ActorActivationError::ActivationFailed(
+                                lattice_actor::error::ActorError::from_error(error),
+                            )
+                        })?;
+                        continue;
+                    }
+                    return match entry.get() {
+                        RegistryEntry::Running(handle, _) => {
+                            if handle.lifecycle_state() == ActorLifecycleState::StopFailed {
+                                return Err(ActorActivationError::RetainedStopFailure);
+                            }
+                            if !is_business_admitted(handle.lifecycle_state())
+                                || handle.business_admission_fenced()
+                            {
+                                return Err(authority_error("actor is stopping"));
+                            }
+                            Ok(RegistryLookup::Running(handle.clone()))
+                        }
+                        RegistryEntry::Activating(activation) => {
+                            Ok(RegistryLookup::Wait(activation.clone()))
+                        }
+                    };
+                }
+                Entry::Vacant(entry) => {
+                    let activation =
+                        ActivationState::new(self.config.waiter_capacity, fencing_token);
+                    entry.insert(RegistryEntry::Activating(activation.clone()));
+                    return Ok(RegistryLookup::Activate(activation));
+                }
+            }
+        }
+    }
+
     pub(super) async fn wait_for_activation(
         &self,
         activation: Arc<ActivationState<A>>,

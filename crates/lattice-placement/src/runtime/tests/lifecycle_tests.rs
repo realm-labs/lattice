@@ -2,6 +2,100 @@ use super::*;
 use crate::runtime::membership_plane::{MembershipLeader, MembershipLeaderConfig};
 
 #[tokio::test]
+async fn membership_rejoin_replaces_stale_domain_session_and_ignores_late_removal() {
+    let cluster = ClusterId::new("membership-rejoin").unwrap();
+    let (coordinator, _) = node(&cluster, "coordinator", 34911, 1);
+    let (member, _) = node(&cluster, "member", 34912, 2);
+    let associations = Arc::new(
+        AssociationManager::new(
+            coordinator.address.clone(),
+            coordinator.incarnation,
+            RemotingConfig::default(),
+        )
+        .unwrap(),
+    );
+    let key = attach_test_session(
+        &associations,
+        &cluster,
+        coordinator.incarnation,
+        &member,
+        100,
+    );
+    let store = Arc::new(InMemoryPlacementStore::new(16, 16).unwrap());
+    let mut membership = MembershipLeader::elect(
+        store.clone(),
+        coordinator.clone(),
+        CoordinatorTerm::new(1).unwrap(),
+        MembershipLeaderConfig::default(),
+    )
+    .await
+    .unwrap();
+    let hello = empty_hello(member.clone());
+    membership.join(hello.member.clone()).await.unwrap();
+    membership.mark_up(&member).await.unwrap();
+    let mut leader = PlacementDomainLeader::elect(
+        store.clone(),
+        associations,
+        coordinator,
+        CoordinatorScope::Placement(domain()),
+        CoordinatorTerm::new(1).unwrap(),
+        PlacementDomainLeaderConfig::default(),
+    )
+    .await
+    .unwrap();
+    leader
+        .register(hello.domain.clone(), key.clone())
+        .await
+        .unwrap();
+    let old_lease = leader.sessions[&member.incarnation].lease_id;
+    membership
+        .remove(&member, MemberRemovalReason::FailureDetected)
+        .await
+        .unwrap();
+    membership.join(hello.member.clone()).await.unwrap();
+    membership.mark_up(&member).await.unwrap();
+    leader.register(hello.domain, key).await.unwrap();
+    let current = store.get_member(&member.node_id).await.unwrap().unwrap();
+    assert_ne!(old_lease, current.lease_id);
+    assert_eq!(leader.sessions[&member.incarnation].record, current);
+    leader
+        .handle_control(PlacementControlEventKind::GlobalMemberRemoved {
+            node: member.clone(),
+            reason: MemberRemovalReason::FailureDetected,
+        })
+        .await
+        .unwrap();
+    assert!(leader.sessions.contains_key(&member.incarnation));
+    assert!(
+        store
+            .get_domain_member(&domain(), &member.node_id)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    // A current removal still removes participation normally.
+    membership
+        .remove(&member, MemberRemovalReason::FailureDetected)
+        .await
+        .unwrap();
+    leader
+        .handle_control(PlacementControlEventKind::GlobalMemberRemoved {
+            node: member.clone(),
+            reason: MemberRemovalReason::FailureDetected,
+        })
+        .await
+        .unwrap();
+    assert!(!leader.sessions.contains_key(&member.incarnation));
+    assert!(
+        store
+            .get_domain_member(&domain(), &member.node_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
 async fn placement_drain_commit_replays_from_durable_absence_after_leader_replacement() {
     let cluster = ClusterId::new("placement-drain-replay").unwrap();
     let (coordinator, _) = node(&cluster, "coordinator", 34901, 1);

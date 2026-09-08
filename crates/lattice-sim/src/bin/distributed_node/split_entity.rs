@@ -688,7 +688,12 @@ impl SplitHost {
         };
         // A host that never joined has no slots to hand over and cannot complete a drain, but it
         // still holds the port the next release needs, so it is stopped either way.
-        if service.shutdown().await.is_err() {
+        let joined = service.member_snapshot().members.iter().any(|member| {
+            member.node.node_id == self.node_id
+                && member.node.incarnation == incarnation
+                && matches!(member.status, MemberStatus::Up | MemberStatus::Leaving)
+        });
+        if !joined || service.shutdown().await.is_err() {
             service.terminal_shutdown().await?;
         }
         Ok(outcome)

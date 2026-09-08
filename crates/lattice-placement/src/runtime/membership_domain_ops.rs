@@ -437,6 +437,13 @@ where
         node: NodeKey,
         reason: MemberRemovalReason,
     ) -> Result<(), CoordinatorRuntimeError> {
+        // Fanout is asynchronous. A removal from the previous membership session must
+        // not delete participation that was registered after the same process rejoined.
+        if self.store.get_member(&node.node_id).await?.is_some_and(|member| {
+            member.node == node && member.status == MemberStatus::Up
+        }) {
+            return Ok(());
+        }
         let Some(domain_member) = self
             .store
             .get_domain_member(&self.version.domain, &node.node_id)

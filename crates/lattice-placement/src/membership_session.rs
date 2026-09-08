@@ -223,6 +223,7 @@ impl MembershipSession {
         let mut heartbeat = tokio::time::interval(self.config.heartbeat_interval);
         heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
         heartbeat.reset();
+        let mut last_heartbeat = Instant::now();
         loop {
             tokio::select! {
                 changed = shutdown.changed() => {
@@ -243,6 +244,12 @@ impl MembershipSession {
                     result?;
                 }
                 _ = heartbeat.tick() => {
+                    // A paused process may resume on an active TCP association after its
+                    // application session expired. Re-bootstrap instead of trusting that socket.
+                    if last_heartbeat.elapsed() > self.config.heartbeat_interval.saturating_mul(2) {
+                        return Err(LogicSessionError::HeartbeatInterrupted);
+                    }
+                    last_heartbeat = Instant::now();
                     if self.drain_confirmation.requested() {
                         continue;
                     }
@@ -502,6 +509,98 @@ mod tests {
         release::ReleaseManifest,
     };
     use lattice_remoting::{config::RemotingConfig, control::CommandId};
+
+    #[tokio::test(start_paused = true)]
+    async fn paused_sessions_require_registration_even_when_the_association_stays_active() {
+        use lattice_remoting::association::{LaneAttachment, LaneKind};
+        for placement in [false, true] {
+            let local = NodeKey {
+                node_id: "paused".to_owned(),
+                address: NodeAddress::new("127.0.0.1", 34611).unwrap(),
+                incarnation: NodeIncarnation::new(1).unwrap(),
+            };
+            let associations = Arc::new(
+                AssociationManager::new(
+                    local.address.clone(),
+                    local.incarnation,
+                    RemotingConfig::default(),
+                )
+                .unwrap(),
+            );
+            let association = associations
+                .get_or_create(
+                    ClusterId::new("paused-session").unwrap(),
+                    NodeAddress::new("127.0.0.1", 34612).unwrap(),
+                    NodeIncarnation::new(2).unwrap(),
+                )
+                .unwrap();
+            for (lane, nonce) in [
+                (LaneKind::Control, 1),
+                (LaneKind::Interactive, 2),
+                (LaneKind::Bulk(0), 3),
+            ] {
+                association
+                    .attach(LaneAttachment {
+                        association_id: association.id(),
+                        key: association.key().clone(),
+                        lane,
+                        connection_nonce: nonce,
+                    })
+                    .unwrap();
+            }
+            let config = LogicCoordinatorConfig::default();
+            let pause = config.heartbeat_interval.saturating_mul(3);
+            let (_controls_tx, controls) = mpsc::channel(8);
+            let (_shutdown_tx, shutdown) = watch::channel(false);
+            let mut run: std::pin::Pin<
+                Box<dyn std::future::Future<Output = Result<(), LogicSessionError>>>,
+            > = if placement {
+                let (session, _effects) = crate::session::PlacementDomainSession::new(
+                    crate::coordinator::PlacementDomainHello::builder(
+                        local,
+                        lattice_core::actor_address::PlacementDomainId::new("paused").unwrap(),
+                        1,
+                    )
+                    .build(),
+                    association.key().clone(),
+                    associations,
+                    config,
+                    8,
+                    1,
+                )
+                .unwrap();
+                Box::pin(session.run(controls, shutdown))
+            } else {
+                let hello = MemberHello {
+                    node: local,
+                    release: ReleaseManifest::development(1),
+                    rollout_participant: true,
+                    roles: Default::default(),
+                    failure_domains: Default::default(),
+                    protocols: Vec::new(),
+                    remoting_capabilities: Default::default(),
+                };
+                let (session, _, _effects) = MembershipSession::new(
+                    hello,
+                    association.key().clone(),
+                    associations,
+                    config,
+                    8,
+                    1,
+                )
+                .unwrap();
+                Box::pin(async move { session.run_recoverable(controls, shutdown).await.0 })
+            };
+            let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+            assert!(run.as_mut().poll(&mut context).is_pending());
+            tokio::time::advance(pause).await;
+            assert_eq!(association.state(), AssociationState::Active);
+            assert!(matches!(
+                run.as_mut().poll(&mut context),
+                std::task::Poll::Ready(Err(LogicSessionError::HeartbeatInterrupted))
+            ));
+        }
+    }
 
     #[tokio::test(start_paused = true)]
     async fn membership_snapshot_staging_expires_on_the_real_monotonic_clock() {

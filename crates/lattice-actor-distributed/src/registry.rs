@@ -681,37 +681,7 @@ impl<A: Actor> ActorRegistry<A> {
     {
         self.remove_stopped_running_entry(&actor_id);
         let lookup = self.with_actor_authority(&actor_id, fencing_token, || {
-            Ok(match self.entries.entry(actor_id.clone()) {
-                Entry::Occupied(entry) => match entry.get() {
-                    RegistryEntry::Running(handle, _)
-                        if handle.lifecycle_state() == ActorLifecycleState::StopFailed =>
-                    {
-                        return Err(ActorActivationError::RetainedStopFailure);
-                    }
-                    RegistryEntry::Running(handle, token) if *token == fencing_token => {
-                        if !is_business_admitted(handle.lifecycle_state()) {
-                            return Err(authority_error("actor is stopping"));
-                        }
-                        RegistryLookup::Running(handle.clone())
-                    }
-                    RegistryEntry::Activating(activation)
-                        if activation.fencing_token == fencing_token =>
-                    {
-                        RegistryLookup::Wait(activation.clone())
-                    }
-                    _ => {
-                        return Err(authority_error(
-                            "actor activation belongs to an older authority generation",
-                        ));
-                    }
-                },
-                Entry::Vacant(entry) => {
-                    let activation =
-                        ActivationState::new(self.config.waiter_capacity, fencing_token);
-                    entry.insert(RegistryEntry::Activating(activation.clone()));
-                    RegistryLookup::Activate(activation)
-                }
-            })
+            self.lookup_activation(&actor_id, fencing_token)
         })?;
 
         let activation = match lookup {

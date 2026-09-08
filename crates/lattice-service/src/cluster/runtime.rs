@@ -446,12 +446,17 @@ impl LogicJoinRuntime {
         let applier = self.effect_applier();
         let changed = handle.change_notifier();
         let mut membership_ready = self.membership_ready.clone();
+        membership_ready.borrow_and_update();
         loop {
             // The placement state can become ready while authority effects produced by the
             // snapshot are still queued. Publishing domain readiness before those effects are
             // applied exposes a transient Ready state in which logical messages are rejected as
             // stale authority.
-            if handle.ready_for_admission() && effects.is_empty() && *membership_ready.borrow() {
+            if !membership_ready.has_changed().unwrap_or(true)
+                && handle.ready_for_admission()
+                && effects.is_empty()
+                && *membership_ready.borrow()
+            {
                 self.set_domain_state(PlacementDomainState::Ready);
                 let state = self
                     .lifecycle
@@ -585,6 +590,19 @@ impl LogicJoinRuntime {
                             .map(|(_, controls)| controls)
                             .unwrap_or_else(|_| closed_controls()),
                             retry: false,
+                        };
+                    }
+                    self.set_domain_state(PlacementDomainState::Degraded);
+                    if *membership_ready.borrow_and_update() {
+                        // A membership recovery can outlive the Coordinator's placement session
+                        // while its TCP association stays active (for example after a process
+                        // pause). Re-register and install a fresh snapshot before routing again.
+                        let _ = session_shutdown.send(true);
+                        return LogicSessionReturn {
+                            controls: task.await
+                                .map(|(_, controls)| controls)
+                                .unwrap_or_else(|_| closed_controls()),
+                            retry: true,
                         };
                     }
                 }

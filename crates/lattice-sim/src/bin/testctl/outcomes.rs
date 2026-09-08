@@ -54,6 +54,7 @@ impl ScenarioRunner {
         if self.selected && !self.outcomes.iter().any(|outcome| outcome.name == name) {
             return;
         }
+        eprintln!("testctl: starting {name}");
         let started = Instant::now();
         let result = catch_unwind(AssertUnwindSafe(test)).unwrap_or_else(|panic| {
             let message = panic
@@ -78,6 +79,16 @@ impl ScenarioRunner {
                 outcome.error = Some(error);
             }
         }
+        eprintln!(
+            "testctl: {name} {:?} in {}ms{}",
+            outcome.status,
+            outcome.elapsed_millis,
+            outcome
+                .error
+                .as_ref()
+                .map(|error| format!(": {error}"))
+                .unwrap_or_default()
+        );
     }
 
     pub fn outcomes(&self) -> &[ScenarioOutcome] {

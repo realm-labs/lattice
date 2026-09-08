@@ -134,6 +134,8 @@ jobs:
             ${{ runner.os }}-${{ runner.arch }}-docker-${{ env.LATTICE_DOCKER_CACHE_ABI }}-${{ env.LATTICE_DOCKER_CACHE_PROFILE }}-
 
       - name: Run pinned profile
+        # Leave time for the script's cleanup and diagnostic upload before the job deadline.
+        timeout-minutes: 18
         run: ./scripts/test-docker.sh partition
 
       - name: Upload failure diagnostics

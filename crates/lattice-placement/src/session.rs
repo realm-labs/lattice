@@ -395,6 +395,7 @@ impl PlacementDomainSession {
         let mut heartbeat = tokio::time::interval(self.config.heartbeat_interval);
         heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
         heartbeat.reset();
+        let mut last_heartbeat = Instant::now();
         loop {
             tokio::select! {
                 biased;
@@ -431,6 +432,10 @@ impl PlacementDomainSession {
                     self.tick_authorities().await?;
                 }
                 _ = heartbeat.tick() => {
+                    if last_heartbeat.elapsed() > self.config.heartbeat_interval.saturating_mul(2) {
+                        return Err(LogicSessionError::HeartbeatInterrupted);
+                    }
+                    last_heartbeat = Instant::now();
                     if self.drain_confirmation.requested() {
                         continue;
                     }
@@ -714,6 +719,8 @@ pub enum LogicSessionError {
     StaleGeneration,
     #[error("logic Coordinator heartbeat sequence exhausted")]
     HeartbeatSequenceExhausted,
+    #[error("session heartbeat was interrupted; fresh registration is required")]
+    HeartbeatInterrupted,
     #[error("logic Coordinator did not acknowledge drain completion inside its bound")]
     DrainNotAcknowledged,
     #[error("logic Coordinator effect consumer is closed")]

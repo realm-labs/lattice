@@ -1,4 +1,4 @@
-use dashmap::mapref::entry::Entry;
+use dashmap::mapref::entry::{Entry, OccupiedEntry};
 use lattice_core::id::ActorId;
 
 use lattice_actor::{
@@ -147,6 +147,14 @@ impl<A: Actor> ActorRegistry<A> {
         let Entry::Occupied(entry) = self.entries.entry(actor_id.clone()) else {
             return Err(ActorQuarantineError::NotRetained);
         };
+        self.fence_entry(entry)
+    }
+
+    pub(super) fn fence_entry(
+        &self,
+        entry: OccupiedEntry<'_, ActorId, RegistryEntry<A>>,
+    ) -> Result<(), ActorQuarantineError> {
+        let actor_id = entry.key().clone();
         let handle = match entry.get() {
             RegistryEntry::Activating(activation) => {
                 activation.publish(Err(super::ActorActivationError::Cancelled));
