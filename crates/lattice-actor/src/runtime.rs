@@ -23,7 +23,10 @@ use crate::{
         ActorCommand, MailboxConfig, MailboxLane, QueuedRejection,
         channel::{self, Receiver},
     },
-    observation::{ActorLifecycleEvent, ActorObserverHandle},
+    observation::{
+        ActorLifecycleEvent, ActorObserverHandle, record_new_stop_failure,
+        record_resolved_stop_failure,
+    },
     resources::ActorResources,
     traits::{Actor, ActorLifecycleState, StopReason},
     watch::{ActorTermination, LocalActorRef, TerminatedReason},
@@ -977,7 +980,7 @@ where
             Err(payload) => return Err(ActorPanic::new("stopping", payload)),
             Ok(Ok(())) => {
                 if failure.is_some() {
-                    crate::observation::record_resolved_stop_failure(false);
+                    record_resolved_stop_failure(false);
                 }
                 return Ok((false, retry_result.take()));
             }
@@ -991,7 +994,7 @@ where
                         record
                     }
                     None => {
-                        crate::observation::record_new_stop_failure();
+                        record_new_stop_failure();
                         StopFailureRecord {
                             reason,
                             previous_phase,
@@ -1057,7 +1060,7 @@ where
                         ticket: authorization.ticket,
                         failed_attempts,
                     });
-                    crate::observation::record_resolved_stop_failure(true);
+                    record_resolved_stop_failure(true);
                     return Ok((true, Some(result)));
                 }
                 Some(ActorCommand::Stop(requested_reason)) => {

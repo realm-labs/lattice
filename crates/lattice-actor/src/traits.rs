@@ -266,6 +266,22 @@ pub enum ActorLifecycleState {
     Stopped,
 }
 
+impl TryFrom<u8> for ActorLifecycleState {
+    type Error = ();
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            value if value == Self::Starting as u8 => Ok(Self::Starting),
+            value if value == Self::Running as u8 => Ok(Self::Running),
+            value if value == Self::Passivating as u8 => Ok(Self::Passivating),
+            value if value == Self::Stopping as u8 => Ok(Self::Stopping),
+            value if value == Self::StopFailed as u8 => Ok(Self::StopFailed),
+            value if value == Self::Stopped as u8 => Ok(Self::Stopped),
+            _ => Err(()),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PassivationReason {
     BusinessIdle,

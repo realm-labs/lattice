@@ -275,7 +275,7 @@ where
     // The parent has already released this child, so a full system lane would otherwise leave it
     // running with no owner able to retry.
     tokio::spawn(async move {
-        let _ = handle.stop_when_capacity_internal(reason).await;
+        let _ = handle.send_stop_internal(reason).await;
     });
 }
 

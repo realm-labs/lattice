@@ -9,6 +9,7 @@ use crate::{
     error::ActorAdminError,
     handle::ActorHandle,
     mailbox::{ActorCommand, MailboxLane, QueuedRejection},
+    runtime::reject_prefetched_commands,
     traits::{Actor, MessageOutcome, StopReason},
 };
 
@@ -34,7 +35,7 @@ where
     match command {
         ActorCommand::Envelope(mut envelope) => {
             if handle.business_admission_fenced() {
-                super::reject_prefetched_commands(
+                reject_prefetched_commands(
                     std::iter::once(ActorCommand::Envelope(envelope)),
                     lane,
                     handle,
