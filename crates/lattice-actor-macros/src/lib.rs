@@ -2,7 +2,7 @@ use proc_macro::TokenStream;
 use proc_macro_crate::{FoundCrate, crate_name};
 use proc_macro2::Span;
 use quote::{ToTokens, quote};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use syn::parse::{Parse, ParseStream};
 use syn::{
     Attribute, DeriveInput, Ident, Pat, Token, Type, braced, bracketed, parse_macro_input,
@@ -52,12 +52,37 @@ struct BehaviorEntry {
 ///
 /// A completed definition uses exactly one admission mode: `always` is true
 /// and `patterns` is empty, or `always` is false and `patterns` contains one or
-/// more state patterns. Both fields are empty only while the first declaration
-/// for a message is being inserted.
+/// more state patterns. The initial `always == false` and empty `patterns`
+/// state exists only while the first declaration for a message is being
+/// inserted. `pattern_keys` mirrors `patterns` for duplicate detection.
 struct MessageAdmission {
     message: Type,
     always: bool,
     patterns: Vec<Pat>,
+    pattern_keys: BTreeSet<String>,
+}
+
+impl MessageAdmission {
+    /// Adds the alternatives from one state pattern, rejecting any alternative
+    /// already declared for this message.
+    fn add_pattern(&mut self, pattern: &Pat) -> syn::Result<()> {
+        if let Pat::Or(or_pattern) = pattern {
+            for case in &or_pattern.cases {
+                self.add_pattern(case)?;
+            }
+            return Ok(());
+        }
+
+        let key = pattern.to_token_stream().to_string();
+        if !self.pattern_keys.insert(key) {
+            return Err(syn::Error::new_spanned(
+                pattern,
+                "message state pattern is declared more than once",
+            ));
+        }
+        self.patterns.push(pattern.clone());
+        Ok(())
+    }
 }
 
 impl Parse for BehaviorInput {
@@ -107,6 +132,7 @@ fn expand_actor_behavior(input: BehaviorInput) -> syn::Result<proc_macro2::Token
                 message,
                 always: false,
                 patterns: Vec::new(),
+                pattern_keys: BTreeSet::new(),
             });
 
             // `None` represents `always => [Message]`; `Some` contains a state
@@ -137,7 +163,7 @@ fn expand_actor_behavior(input: BehaviorInput) -> syn::Result<proc_macro2::Token
                         "message may be declared either `always` or in individual states, not both",
                     ));
                 }
-                Some(pattern) => admission.patterns.push(pattern.clone()),
+                Some(pattern) => admission.add_pattern(pattern)?,
             }
         }
     }
@@ -147,6 +173,7 @@ fn expand_actor_behavior(input: BehaviorInput) -> syn::Result<proc_macro2::Token
             message,
             always,
             patterns,
+            ..
         } = admission;
         if always {
             quote! {

@@ -1,0 +1,5 @@
+error: message state pattern is declared more than once
+  --> tests/ui/actor_behavior/overlapping_or_pattern.rs:13:9
+   |
+13 |         State::Idle => [Ping];
+   |         ^^^^^^^^^^^
