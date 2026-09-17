@@ -48,6 +48,12 @@ struct BehaviorEntry {
     messages: Vec<Type>,
 }
 
+struct MessageAdmission {
+    message: Type,
+    always: bool,
+    patterns: Vec<Pat>,
+}
+
 impl Parse for BehaviorInput {
     fn parse(input: ParseStream<'_>) -> syn::Result<Self> {
         let behavior = input.parse()?;
@@ -87,33 +93,40 @@ impl Parse for BehaviorInput {
 fn expand_actor_behavior(input: BehaviorInput) -> syn::Result<proc_macro2::TokenStream> {
     let actor = actor_crate_path()?;
     let behavior = input.behavior;
-    let mut messages: BTreeMap<String, (Type, bool, Vec<Pat>)> = BTreeMap::new();
+    let mut messages = BTreeMap::new();
     for entry in input.entries {
         for message in entry.messages {
             let key = message.to_token_stream().to_string();
-            let definition = messages
-                .entry(key)
-                .or_insert_with(|| (message, false, Vec::new()));
+            let admission = messages.entry(key).or_insert_with(|| MessageAdmission {
+                message,
+                always: false,
+                patterns: Vec::new(),
+            });
             match &entry.pattern {
-                None if definition.1 || !definition.2.is_empty() => {
+                None if admission.always || !admission.patterns.is_empty() => {
                     return Err(syn::Error::new_spanned(
-                        &definition.0,
+                        &admission.message,
                         "message may be declared either `always` or in individual states, not both",
                     ));
                 }
-                None => definition.1 = true,
-                Some(pattern) if definition.1 => {
+                None => admission.always = true,
+                Some(_) if admission.always => {
                     return Err(syn::Error::new_spanned(
-                        &definition.0,
+                        &admission.message,
                         "message may be declared either `always` or in individual states, not both",
                     ));
                 }
-                Some(pattern) => definition.2.push(pattern.clone()),
+                Some(pattern) => admission.patterns.push(pattern.clone()),
             }
         }
     }
 
-    let filters = messages.into_values().map(|(message, always, patterns)| {
+    let filters = messages.into_values().map(|admission| {
+        let MessageAdmission {
+            message,
+            always,
+            patterns,
+        } = admission;
         if always {
             quote! {
                 impl #actor::state_machine::Accepts<#message> for #behavior {
