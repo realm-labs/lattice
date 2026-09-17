@@ -62,14 +62,33 @@ pub struct Stateless;
 
 impl Behavior for Stateless {}
 
-/// Compile-time message admission for a behavior.
+/// Describes whether a behavior admits a particular message type.
 ///
-/// Stateful behavior declarations implement this trait once per supported message. `ALWAYS` lets
-/// the runtime compile the admission branch away for stateless actors and messages accepted in every
-/// state.
+/// Stateful behavior declarations implement this trait once per supported
+/// message. Admission combines a type-level fast path with a check of the
+/// current behavior value:
+///
+/// | [`ALWAYS`](Self::ALWAYS) | [`accepts`](Self::accepts) | Result |
+/// |---|---|---|
+/// | `true` | not called | accepted in every state |
+/// | `false` | `true` | accepted in the current state |
+/// | `false` | `false` | rejected in the current state |
+///
+/// In particular, `ALWAYS == false` does not mean that the message is always
+/// rejected. It means the runtime must call `accepts` with the current behavior
+/// value. When `ALWAYS == true`, the runtime skips that dynamic check.
 pub trait Accepts<M>: Behavior {
+    /// Whether the message is accepted independently of the current behavior
+    /// value.
+    ///
+    /// Implementations that set this to `true` must also make [`accepts`](Self::accepts)
+    /// return `true` for every behavior value.
     const ALWAYS: bool = false;
 
+    /// Returns whether the message is accepted by the current behavior value.
+    ///
+    /// The runtime only calls this method when [`ALWAYS`](Self::ALWAYS) is
+    /// `false`.
     fn accepts(&self) -> bool;
 }
 
