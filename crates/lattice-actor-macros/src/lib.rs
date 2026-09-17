@@ -48,6 +48,12 @@ struct BehaviorEntry {
     messages: Vec<Type>,
 }
 
+/// Admission declarations collected for one message type.
+///
+/// A completed definition uses exactly one admission mode: `always` is true
+/// and `patterns` is empty, or `always` is false and `patterns` contains one or
+/// more state patterns. Both fields are empty only while the first declaration
+/// for a message is being inserted.
 struct MessageAdmission {
     message: Type,
     always: bool,
@@ -102,6 +108,21 @@ fn expand_actor_behavior(input: BehaviorInput) -> syn::Result<proc_macro2::Token
                 always: false,
                 patterns: Vec::new(),
             });
+
+            // `None` represents `always => [Message]`; `Some` contains a state
+            // pattern such as `State::Idle => [Message]`.
+            //
+            // The first declaration selects the admission mode. More state
+            // patterns may then be appended, but the following are rejected:
+            //
+            // - `always` followed by either another `always` or a state;
+            // - one or more states followed by `always`.
+            //
+            // For example, `State::Idle => [Ping]; State::Running => [Ping]`
+            // is valid and produces
+            // `matches!(self, State::Idle | State::Running)`, whereas either
+            // order of `always => [Ping]` and `State::Idle => [Ping]` is
+            // ambiguous and is rejected.
             match &entry.pattern {
                 None if admission.always || !admission.patterns.is_empty() => {
                     return Err(syn::Error::new_spanned(
