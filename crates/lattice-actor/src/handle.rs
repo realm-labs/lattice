@@ -695,17 +695,8 @@ impl<A: Actor> ActorHandle<A> {
         command: ActorCommand<A>,
         lane: MailboxLane,
     ) -> Result<(), ActorCallError> {
-        if lane == MailboxLane::Normal {
-            let state = self.lifecycle_state();
-            if matches!(
-                state,
-                ActorLifecycleState::Passivating
-                    | ActorLifecycleState::Stopping
-                    | ActorLifecycleState::StopFailed
-                    | ActorLifecycleState::Stopped
-            ) {
-                return Err(ActorCallError::LifecycleUnavailable { state });
-            }
+        if let Some(state) = self.unavailable_lifecycle(lane) {
+            return Err(ActorCallError::LifecycleUnavailable { state });
         }
         let metadata = self
             .observer

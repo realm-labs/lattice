@@ -8,10 +8,11 @@ use std::{
 
 use lattice_actor::{
     context::{ActorContext, HandlerContext},
-    error::{ActorError, ActorStopError},
+    error::{ActorCallError, ActorError, ActorStopError},
     mailbox::MailboxConfig,
+    reply::ReplyTo,
     runtime::{ActorRuntime, ActorSpawnOptions},
-    traits::{Actor, ActorLifecycleState, Handler, Message, StopReason},
+    traits::{Actor, ActorLifecycleState, Handler, Message, Request, Responder, StopReason},
 };
 use tokio::sync::Semaphore;
 
@@ -78,6 +79,24 @@ impl Handler<Work> for FencedActor {
     }
 }
 
+struct Probe;
+
+impl Request for Probe {
+    type Response = ();
+}
+
+impl Responder<Probe> for FencedActor {
+    async fn respond(
+        &mut self,
+        _: &mut HandlerContext<'_, Self>,
+        _: Probe,
+        reply_to: ReplyTo<()>,
+    ) -> Result<(), Self::Error> {
+        let _ = reply_to.send(());
+        Ok(())
+    }
+}
+
 #[tokio::test]
 async fn fence_before_first_poll_skips_startup_and_still_persists() {
     let observed = Arc::new(Observed::default());
@@ -129,6 +148,12 @@ async fn fence_rejects_prefetched_work_even_when_system_mailbox_is_full() {
     assert!(handle.stop(StopReason::Requested).is_err());
     handle.fence_business_admission();
     assert!(handle.try_tell(Work(false)).is_err());
+    assert_eq!(
+        handle.ask(Probe, Duration::from_secs(1)).await,
+        Err(ActorCallError::LifecycleUnavailable {
+            state: ActorLifecycleState::Stopping,
+        })
+    );
     release.add_permits(1);
     let mut lifecycle = handle.subscribe_lifecycle();
     tokio::time::timeout(Duration::from_secs(1), async {
