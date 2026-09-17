@@ -10,6 +10,7 @@
 > Historical implementation record: [../implementation-plan.md](../implementation-plan.md).
 > Architecture and distributed-correctness review: [../architecture-review.md](../architecture-review.md).
 > Current source review (2026-09-08): [architecture, maintainability, and cluster lifecycle](../code-review-2026-09-08.md).
+> Ongoing source review (opened 2026-09-17): [current findings and deferred decisions](../code-review-2026-09-17.md).
 > Review remediation progress and validation: [review-remediation-plan.md](../review-remediation-plan.md).
 > Coordinator correctness hardening execution plan: [../coordinator-correctness-implementation-plan.md](../coordinator-correctness-implementation-plan.md).
 
