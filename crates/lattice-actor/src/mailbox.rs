@@ -9,6 +9,7 @@ use crate::error::{ActorAdminError, ActorCallError};
 use crate::handle::ForceStopAuthorization;
 use crate::observation::{RequestCompletion, RequestObservation};
 use crate::reply::ReplyTo;
+use crate::state_machine::Accepts;
 use crate::traits::{
     Actor, Handler, Message, MessageKind, MessageLane, MessageMetadata, MessageOutcome,
     MessageRejection, MessageView, Request, Responder, ResponderErrorAction, StopReason,
@@ -23,6 +24,38 @@ mod pool;
 use envelope::PooledEnvelope;
 use future::PooledFuture;
 
+/// Capacity and scheduling limits for one Actor mailbox.
+///
+/// Every Actor has two independently bounded message lanes:
+///
+/// - the normal lane carries ordinary tells, requests, and continuations;
+/// - the system lane carries runtime-internal notifications and is checked with
+///   priority at each turn boundary.
+///
+/// The deferred-operation capacity is separate from both queues. It bounds
+/// asynchronous work that leaves the current Actor turn, such as
+/// [`ActorContext::pipe_to_self`], [`ActorContext::continue_with`], and
+/// [`ActorContext::defer_reply`]. The same limit is also applied to the number
+/// of outstanding request reply tokens. Active deferred operations and reply
+/// tokens are counted independently.
+///
+/// The turn budget controls scheduling fairness rather than storage: it limits
+/// how many normal-lane messages may be processed before the runtime starts a
+/// new turn and checks the system lane again. It does not preempt a running
+/// handler or bound handler execution time.
+///
+/// [`Default`] configures both lanes and deferred work with a capacity of
+/// 1,024 and uses a normal-lane turn budget of 64.
+///
+/// # Examples
+///
+/// ```
+/// use lattice_actor::mailbox::MailboxConfig;
+///
+/// let mailbox = MailboxConfig::with_lanes(1_024, 64)
+///     .with_deferred_capacity(128)
+///     .with_turn_budget(32);
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MailboxConfig {
     normal_capacity: usize,
@@ -34,6 +67,13 @@ pub struct MailboxConfig {
 impl MailboxConfig {
     const DEFAULT_TURN_BUDGET: usize = 64;
 
+    /// Creates a configuration that uses `capacity` for both message lanes and
+    /// for deferred operations.
+    ///
+    /// The normal-lane turn budget is 64. Use the builder methods to tune the
+    /// deferred capacity or turn budget independently.
+    ///
+    /// Message-lane capacities must be nonzero when the Actor is spawned.
     pub fn bounded(capacity: usize) -> Self {
         Self {
             normal_capacity: capacity,
@@ -43,6 +83,13 @@ impl MailboxConfig {
         }
     }
 
+    /// Creates a configuration with independent normal- and system-lane
+    /// capacities.
+    ///
+    /// The deferred-operation capacity initially matches `normal_capacity`,
+    /// and the normal-lane turn budget is 64.
+    ///
+    /// Both message-lane capacities must be nonzero when the Actor is spawned.
     pub fn with_lanes(normal_capacity: usize, system_capacity: usize) -> Self {
         Self {
             normal_capacity,
@@ -52,6 +99,17 @@ impl MailboxConfig {
         }
     }
 
+    /// Sets the maximum number of deferred operations owned by one Actor.
+    ///
+    /// The limit is used by asynchronous off-turn work, including
+    /// [`ActorContext::pipe_to_self`], [`ActorContext::continue_with`], and
+    /// [`ActorContext::defer_reply`]. Starting work after the limit is reached
+    /// returns [`crate::error::PipeToSelfError::Capacity`]. The same value also
+    /// independently limits outstanding request reply tokens; excess requests
+    /// are rejected with [`MessageRejection::DeferredReplyCapacityExceeded`].
+    ///
+    /// A value of zero disables deferred operations and causes requests that
+    /// need a reply token to be rejected.
     pub fn with_deferred_capacity(mut self, deferred_capacity: usize) -> Self {
         self.deferred_capacity = deferred_capacity;
         self
@@ -64,6 +122,10 @@ impl MailboxConfig {
     /// messages that can precede a waiting system message. Handler execution time is not bounded.
     /// The runtime may prefetch up to 64 messages for the active turn; prefetched messages no
     /// longer occupy channel capacity but remain owned by that Actor until handled or stopped.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `turn_budget` is zero.
     pub fn with_turn_budget(mut self, turn_budget: usize) -> Self {
         assert!(turn_budget > 0, "actor mailbox turn budget must be nonzero");
         self.turn_budget = turn_budget;
@@ -219,7 +281,7 @@ impl<M: Message> TellEnvelope<M> {
 impl<A, M> ActorEnvelope<A> for TellEnvelope<M>
 where
     A: Handler<M>,
-    <A as crate::traits::Actor>::Behavior: crate::state_machine::Accepts<M>,
+    <A as Actor>::Behavior: Accepts<M>,
     M: Message,
 {
     fn metadata(&self, lane: MailboxLane) -> MessageMetadata {
@@ -240,9 +302,7 @@ where
                 .as_ref()
                 .expect("tell envelope message is present before dispatch");
             actor.before_message(ctx, MessageView::new(metadata, msg));
-            if !<A::Behavior as crate::state_machine::Accepts<M>>::ALWAYS
-                && !crate::state_machine::Accepts::<M>::accepts(behavior)
-            {
+            if !<A::Behavior as Accepts<M>>::ALWAYS && !Accepts::<M>::accepts(behavior) {
                 let outcome = MessageOutcome::Rejected(MessageRejection::UnhandledInCurrentState);
                 actor.after_message(ctx, metadata, outcome);
                 ctx.set_current_deadline(None);
