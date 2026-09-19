@@ -18,6 +18,7 @@ use crate::{
     error::{ActorCallError, PipeToSelfError},
     mailbox::continuation::ContinuationEnvelope,
     reply::{ReplyControl, ReplyTo},
+    state_machine::Accepts,
     traits::{Actor, Handler, Message},
 };
 
@@ -91,7 +92,7 @@ impl<A: Actor> ActorContext<A> {
     ) -> Result<PipeTaskHandle, PipeToSelfError>
     where
         A: Handler<M>,
-        <A as crate::traits::Actor>::Behavior: crate::state_machine::Accepts<M>,
+        A::Behavior: Accepts<M>,
         M: Message,
         Fut: Future + Send + 'static,
         Fut::Output: Send + 'static,
@@ -173,7 +174,7 @@ impl<A: Actor> ActorContext<A> {
     ) -> Result<(), PipeToSelfError>
     where
         A: Handler<M>,
-        <A as crate::traits::Actor>::Behavior: crate::state_machine::Accepts<M>,
+        A::Behavior: Accepts<M>,
         M: Message,
         T: Send + 'static,
         Fut: Future + Send + 'static,
