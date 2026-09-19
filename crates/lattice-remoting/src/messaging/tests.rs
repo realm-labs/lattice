@@ -1,7 +1,6 @@
 use super::test_support::serve_inbound_connection;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
-use lattice_core::actor_address::{AddressError, ErasedProtocol};
 use tokio::net::{TcpListener, TcpStream};
 
 use super::{codec::*, error::*, inbound::*, outbound::*, target::*, *};
@@ -67,19 +66,6 @@ fn target(protocol_id: ProtocolId) -> ActorAddress {
         protocol_id,
     )
     .unwrap()
-}
-
-#[test]
-fn exact_target_rejects_an_activation_from_another_node_incarnation() {
-    let mut exact = ExactActorTarget::from(&target(ProtocolId::new(7).unwrap()));
-    exact.node_incarnation = NodeIncarnation::new(3).unwrap();
-
-    assert!(matches!(
-        exact.actor_address::<ErasedProtocol>(),
-        Err(AddressError::NonCanonical {
-            field: "activation node incarnation"
-        })
-    ));
 }
 
 struct RecordingDispatch {

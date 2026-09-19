@@ -256,7 +256,7 @@ fn target_to_wire(target: &ExactActorTarget) -> ExactActorTargetWire {
         cluster_id: target.cluster_id.as_str().to_owned(),
         host: target.node_address.host().to_owned(),
         port: u32::from(target.node_address.port()),
-        node_incarnation: Bytes::copy_from_slice(&target.node_incarnation.get().to_be_bytes()),
+        node_incarnation: Bytes::copy_from_slice(&target.node_incarnation().get().to_be_bytes()),
         actor_path: target.actor_path.to_string(),
         activation_sequence: target.activation_id.local_sequence(),
         protocol_id: target.protocol_id.get(),
@@ -276,7 +276,6 @@ fn target_from_wire(wire: Option<ExactActorTargetWire>) -> Result<ExactActorTarg
     Ok(ExactActorTarget {
         cluster_id: ClusterId::new(wire.cluster_id).map_err(|_| WatchError::InvalidCommand)?,
         node_address: NodeAddress::new(wire.host, port).map_err(|_| WatchError::InvalidCommand)?,
-        node_incarnation,
         actor_path: ActorPath::try_from(wire.actor_path).map_err(|_| WatchError::InvalidCommand)?,
         activation_id: ActivationId::new(node_incarnation, wire.activation_sequence)
             .map_err(|_| WatchError::InvalidCommand)?,
@@ -622,7 +621,7 @@ impl WatchRegistry {
             .desired
             .iter()
             .filter_map(|(id, desired)| {
-                (desired.target.node_incarnation == incarnation).then_some(*id)
+                (desired.target.node_incarnation() == incarnation).then_some(*id)
             })
             .collect::<Vec<_>>();
         ids.into_iter()

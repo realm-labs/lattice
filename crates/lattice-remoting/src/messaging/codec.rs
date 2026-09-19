@@ -427,7 +427,6 @@ pub(super) fn target_from_wire(
             .map_err(|_| RemoteMessageError::InvalidPayload)?,
         node_address: NodeAddress::new(decode_wire_string(wire.host)?, port)
             .map_err(|_| RemoteMessageError::InvalidPayload)?,
-        node_incarnation,
         actor_path: ActorPath::try_from(decode_wire_string(wire.actor_path)?)
             .map_err(|_| RemoteMessageError::InvalidPayload)?,
         activation_id: ActivationId::new(node_incarnation, wire.activation_sequence)

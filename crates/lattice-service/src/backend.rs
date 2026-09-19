@@ -1047,7 +1047,7 @@ impl RecipientBackend for ServiceRecipientBackend {
             .ok_or(WatchError::InvalidCommand)?;
         if target.cluster_id == self.local_cluster
             && target.node_address == self.local_address
-            && target.node_incarnation == self.local_incarnation
+            && target.node_incarnation() == self.local_incarnation
         {
             self.watches
                 .lock()

@@ -9,7 +9,6 @@ use super::{
 pub struct ExactActorTarget {
     pub cluster_id: ClusterId,
     pub node_address: NodeAddress,
-    pub node_incarnation: NodeIncarnation,
     pub actor_path: ActorPath,
     pub activation_id: ActivationId,
     pub protocol_id: ProtocolId,
@@ -20,7 +19,6 @@ impl<A: ProtocolTag> From<&ActorAddress<A>> for ExactActorTarget {
         Self {
             cluster_id: value.cluster_id().clone(),
             node_address: value.node_address().clone(),
-            node_incarnation: value.node_incarnation(),
             actor_path: value.actor_path().clone(),
             activation_id: value.activation_id(),
             protocol_id: value.protocol_id(),
@@ -29,12 +27,11 @@ impl<A: ProtocolTag> From<&ActorAddress<A>> for ExactActorTarget {
 }
 
 impl ExactActorTarget {
+    pub fn node_incarnation(&self) -> NodeIncarnation {
+        self.activation_id.node_incarnation()
+    }
+
     pub fn actor_address<A: ProtocolTag>(&self) -> Result<ActorAddress<A>, AddressError> {
-        if self.node_incarnation != self.activation_id.node_incarnation() {
-            return Err(AddressError::NonCanonical {
-                field: "activation node incarnation",
-            });
-        }
         ActorAddress::new(
             self.cluster_id.clone(),
             self.node_address.clone(),
