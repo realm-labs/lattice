@@ -10,7 +10,6 @@ members = [
     "crates/lattice-discovery-k8s",
     "crates/lattice-codegen",
     "crates/lattice-remoting",
-    "crates/lattice-gateway",
     "crates/lattice-id",
     "crates/lattice-id-etcd",
     "crates/lattice-eventbus",
@@ -62,7 +61,6 @@ lattice-actor-macros = { path = "crates/lattice-actor-macros" }
 lattice-codegen = { path = "crates/lattice-codegen" }
 lattice-remoting = { path = "crates/lattice-remoting", default-features = false }
 lattice-eventbus = { path = "crates/lattice-eventbus" }
-lattice-gateway = { path = "crates/lattice-gateway" }
 lattice-id = { path = "crates/lattice-id", version = "0.1.0" }
 lattice-id-etcd = { path = "crates/lattice-id-etcd", version = "0.1.0" }
 lattice-ops = { path = "crates/lattice-ops" }

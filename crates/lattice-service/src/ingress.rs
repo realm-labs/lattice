@@ -11,9 +11,9 @@
 //! and through peer remoting, while the edge sheds load until the node is a full member again.
 //!
 //! Edges that cannot route their traffic through [`ExternalIngress::tell`] or
-//! [`ExternalIngress::ask`] — a `lattice-gateway` binding decoding into an application type, for
-//! instance — should call [`ExternalIngress::admit`] before dispatching so the same decision is
-//! applied at the same point.
+//! [`ExternalIngress::ask`] — an application-owned protocol adapter with its own dispatch path,
+//! for instance — should call [`ExternalIngress::admit`] before dispatching so the same decision
+//! is applied at the same point.
 
 use std::time::Duration;
 

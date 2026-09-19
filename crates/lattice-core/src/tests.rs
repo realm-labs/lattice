@@ -2,7 +2,6 @@ use crate::actor_address::{
     ActivationId, ActorAddress, ActorPath, ClusterId, ConfigFingerprint, EntityAddress, EntityId,
     EntityType, NodeAddress, NodeIncarnation, PlacementDomainId, ProtocolId,
 };
-use crate::id::{ActorId, RouteKey};
 use crate::kind::{ActorKind, ServiceKind};
 use crate::trace::TraceContext;
 use crate::trace::TraceSpanKind;
@@ -15,11 +14,6 @@ const WORLD_ACTOR: ActorKind = actor_kind!("World");
 fn actor_kind_and_service_kind_macros_are_const() {
     assert_eq!(WORLD_SERVICE.as_str(), "World");
     assert_eq!(WORLD_ACTOR.as_str(), "World");
-}
-
-#[test]
-fn actor_id_converts_to_route_key() {
-    assert_eq!(ActorId::U64(42).to_route_key(), RouteKey::U64(42));
 }
 
 #[test]

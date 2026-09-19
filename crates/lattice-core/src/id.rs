@@ -2,10 +2,10 @@
 //!
 //! Lattice carries two identity vocabularies and they are not interchangeable:
 //!
-//! - This module plus [`crate::kind`] hold the *node-local* vocabulary. [`ActorId`],
-//!   [`RouteKey`] and [`crate::kind::ActorKind`] are application-shaped keys used for
-//!   registry lookups and gateway routing. They are deliberately unvalidated and
-//!   unbounded so applications can key actors by whatever their domain uses.
+//! - This module plus [`crate::kind`] hold the *node-local* vocabulary. [`ActorId`] and
+//!   [`crate::kind::ActorKind`] are application-shaped keys used for registry lookups. They are
+//!   deliberately unvalidated and unbounded so applications can key actors by whatever their
+//!   domain uses.
 //! - [`crate::actor_address`] holds the *boundary* vocabulary. [`crate::actor_address::EntityId`],
 //!   [`crate::actor_address::EntityType`] and friends are canonical and length-bounded
 //!   because they are serialized into references that cross nodes.
@@ -25,29 +25,9 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(tag = "type", content = "value", rename_all = "snake_case")]
-pub enum RouteKey {
-    Str(String),
-    U64(u64),
-    I64(i64),
-    Bytes(Vec<u8>),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(tag = "type", content = "value", rename_all = "snake_case")]
 pub enum ActorId {
     Str(String),
     U64(u64),
     I64(i64),
     Bytes(Vec<u8>),
-}
-
-impl ActorId {
-    pub fn to_route_key(&self) -> RouteKey {
-        match self {
-            Self::Str(value) => RouteKey::Str(value.clone()),
-            Self::U64(value) => RouteKey::U64(*value),
-            Self::I64(value) => RouteKey::I64(*value),
-            Self::Bytes(value) => RouteKey::Bytes(value.clone()),
-        }
-    }
 }

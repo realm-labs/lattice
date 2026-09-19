@@ -7,7 +7,9 @@
 
 ## 1. Gateway Boundary
 
-Gateway receives business-specific client frames and turns them into typed actor messages.
+An application-owned Gateway receives business-specific client frames and turns them into typed
+actor messages. Lattice deliberately does not prescribe the external transport or framing protocol;
+HTTP, WebSocket, QUIC, and custom TCP adapters enter the actor system through `ExternalIngress`.
 
 ```text
 read external frame
@@ -18,7 +20,9 @@ read external frame
   -> encode an optional reply to the external protocol
 ```
 
-The Gateway never forwards opaque client bytes into an actor for a second decode. It does not expose the internal remoting protocol to clients or own domain state.
+The Gateway never forwards opaque client bytes into an actor for a second decode. It does not expose
+the internal remoting protocol to clients or own domain state. Transport lifecycle, authentication,
+rate limiting, and session management remain application concerns.
 
 ```rust
 #[async_trait::async_trait]
@@ -29,6 +33,13 @@ pub trait ClientCodec: Send + Sync + 'static {
 ```
 
 Large route tables should be generated from a business-owned schema or loaded from validated configuration. A route binding selects a recipient kind, extracts its ID/path, chooses tell or ask, and declares a rate class.
+
+After decoding and admission, the adapter sends through the service boundary:
+
+```rust
+let ingress = service.external_ingress();
+let reply = ingress.ask(target, request, timeout).await?;
+```
 
 ## 2. Client Push
 

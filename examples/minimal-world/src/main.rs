@@ -35,11 +35,6 @@ use lattice_eventbus::{
     local::{EventBus, LocalEventBus},
     types::{EventEnvelope, EventId, EventSubscription, Subject, SubjectFilter},
 };
-use lattice_gateway::{
-    error::GatewayError,
-    frame::ClientFrame,
-    server::{GatewayTcpServer, read_client_frame, write_client_frame},
-};
 use lattice_ops::{
     admin::{AdminAuth, AdminHttpAdapter, AdminSnapshot, CoordinatorAdminHandler},
     scheduler::ServiceScheduler,
@@ -56,13 +51,8 @@ use lattice_service::{
     deployment::EmbeddedCoordinatorConfig,
     registration::{EntityOptions, SingletonOptions},
 };
-use prost::Message;
 use serde::Deserialize;
-use tokio::{
-    net::{TcpListener as TokioTcpListener, TcpStream},
-    sync::Mutex,
-    time::Instant,
-};
+use tokio::{sync::Mutex, time::Instant};
 
 pub mod world {
     include!(concat!(env!("OUT_DIR"), "/world.rs"));
@@ -375,60 +365,6 @@ async fn main() -> Result<(), Box<dyn StdError>> {
         .await;
     let scheduled = scheduled_rx.await?;
 
-    let gateway_listener = TokioTcpListener::bind("127.0.0.1:0").await?;
-    let gateway_address = gateway_listener.local_addr()?;
-    let gateway_logic = logic.clone();
-    let gateway_world = world_ref.clone();
-    let (gateway_stop_tx, gateway_stop_rx) = tokio::sync::oneshot::channel();
-    let gateway =
-        GatewayTcpServer::new(gateway_listener, move |frame: ClientFrame| {
-            let logic = gateway_logic.clone();
-            let target = gateway_world.clone();
-            async move {
-                if frame.msg_id != 1 || frame.payload.len() != 8 {
-                    return Err(GatewayError::DecodePayload(
-                        "msg 1 requires an eight-byte player ID".to_owned(),
-                    ));
-                }
-                let player_id =
-                    u64::from_be_bytes(frame.payload.as_slice().try_into().map_err(|_| {
-                        GatewayError::DecodePayload("invalid player ID".to_owned())
-                    })?);
-                let reply = eventually_enter(&logic, target, player_id)
-                    .await
-                    .map_err(|error| GatewayError::Recipient(error.to_string()))?;
-                Ok(Some(ClientFrame {
-                    msg_id: 2,
-                    payload: reply.encode_to_vec(),
-                }))
-            }
-        });
-    let gateway_task = tokio::spawn(async move {
-        gateway
-            .run_until_shutdown_signal(async {
-                let _ = gateway_stop_rx.await;
-            })
-            .await
-    });
-    let mut gateway_client = TcpStream::connect(gateway_address).await?;
-    write_client_frame(
-        &mut gateway_client,
-        ClientFrame {
-            msg_id: 1,
-            payload: 1002_u64.to_be_bytes().to_vec(),
-        },
-    )
-    .await?;
-    let gateway_reply = EnterWorldReply::decode(
-        read_client_frame(&mut gateway_client)
-            .await?
-            .payload
-            .as_slice(),
-    )?;
-    drop(gateway_client);
-    let _ = gateway_stop_tx.send(());
-    gateway_task.await??;
-
     let coordinator_handle = application
         .coordinator_service()
         .ok_or_else(|| IoError::other("Coordinator service is unavailable"))?
@@ -482,14 +418,8 @@ async fn main() -> Result<(), Box<dyn StdError>> {
     application.shutdown().await?;
 
     println!(
-        "domain={} direct_players={} gateway_players={} singleton_tick={} event={} task={} metrics={}",
-        domain,
-        direct_reply.player_count,
-        gateway_reply.player_count,
-        clock_reply.tick,
-        event_type,
-        scheduled,
-        metric_count,
+        "domain={} players={} singleton_tick={} event={} task={} metrics={}",
+        domain, direct_reply.player_count, clock_reply.tick, event_type, scheduled, metric_count,
     );
     Ok(())
 }

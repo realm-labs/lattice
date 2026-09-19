@@ -13,7 +13,6 @@ futures-util.workspace = true
 lattice-actor.workspace = true
 lattice-actor-distributed.workspace = true
 lattice-core.workspace = true
-lattice-gateway.workspace = true
 lattice-placement.workspace = true
 lattice-remoting.workspace = true
 lattice-service.workspace = true

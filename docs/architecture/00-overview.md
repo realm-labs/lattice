@@ -713,12 +713,12 @@ lattice-service
   process assembly, ShardRegions, SingletonProxies, drain and shutdown
 
 lattice-codegen
-  actor_protocol! macro and optional business-catalogue/Gateway generators; no generated gRPC clients
+  actor_protocol! macro and optional business-catalogue generators; no generated gRPC clients
 
 lattice-sim (test support, not production API)
   deterministic clock/network/etcd/process simulation, trace journal and invariant checking
 
-lattice-eventbus / lattice-scheduler / lattice-config / lattice-gateway / lattice-ops
+lattice-eventbus / lattice-scheduler / lattice-config / lattice-ops
   focused integration and operational concerns
 ```
 

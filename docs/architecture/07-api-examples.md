@@ -351,38 +351,28 @@ match inventory
 
 Expected domain failures are part of the typed reply. `AskError` is reserved for transport/runtime failures represented by stable `RemoteFailureCode` values. The runtime does not automatically retry a state-changing ask; the business operation ID makes reconciliation and an intentional retry safe.
 
-## 9. Gateway Binding
+## 9. Application-Owned Gateway
 
 ```rust
-let routes = GatewayRoutes::builder()
-    .ask_entity::<PlayerActor, GetProfile>(
-        ClientMsgId(1001),
-        |frame, auth| PlayerId::try_from(auth.principal.clone()),
-        |frame| game_codec.decode::<GetProfile>(frame.payload),
-        RateClass::Interactive,
-    )
-    .ask_singleton::<MatchmakerActor, JoinQueue>(
-        ClientMsgId(2001),
-        "matchmaker",
-        |frame, auth| decode_join_queue(frame, auth),
-        RateClass::Interactive,
-    )
-    .build()?;
+let ingress = service.external_ingress();
 
-LatticeGateway::builder(NodeConfig::from_env()?)
-    .remoting(RemotingConfig::from_config()?)
-    .coordinator_discovery(membership_discovery()?)
-    .coordinator_discovery(placement_discovery("player")?)
-    .coordinator_discovery(placement_discovery("matchmaking")?)
-    .client_codec(GameClientCodec::new())
-    .routes(routes)
-    .build()
-    .await?
-    .run_until_shutdown()
-    .await
+async fn handle_get_profile(
+    ingress: &ExternalIngress,
+    target: EntityAddress<PlayerProtocol>,
+    frame: ClientFrame,
+) -> Result<ServerFrame, GatewayError> {
+    let request = game_codec.decode::<GetProfile>(&frame.payload)?;
+    let reply = ingress
+        .ask(target, request, Duration::from_secs(3))
+        .await?;
+    Ok(game_codec.encode(reply)?)
+}
 ```
 
-Code generation may create route tables and codec registrations, but generated code targets actor protocols and references, not tonic clients.
+The application owns HTTP/WebSocket/custom-TCP lifecycle, authentication, rate limiting, session
+management, codec selection, and route tables. Lattice owns external admission and typed recipient
+delivery. Code generation may create business route tables and codec registrations, but generated
+code targets actor protocols and references, not tonic clients.
 
 ## 10. EventBus, Scheduler, and Config
 
@@ -396,7 +386,7 @@ ctx.scheduler()
 
 let mut changes = service.config().watch(ConfigKey::new("gateway.rate_limit")).await?;
 while let Some(change) = changes.next().await {
-    service.gateway_rate_limits().apply(change?)?;
+    application_gateway_rate_limits.apply(change?)?;
 }
 ```
 
