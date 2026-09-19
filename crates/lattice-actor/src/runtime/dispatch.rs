@@ -1,7 +1,6 @@
 use std::{any::type_name, panic::AssertUnwindSafe, time::Instant};
 
 use futures_util::FutureExt;
-use tokio::sync::watch;
 use tracing::{Instrument, debug};
 
 use crate::{
@@ -13,7 +12,7 @@ use crate::{
     traits::{Actor, MessageOutcome, StopReason},
 };
 
-use super::{panic::ActorPanic, passivation::record_activity};
+use super::panic::ActorPanic;
 
 pub(super) struct ActorInstance<'a, A: Actor> {
     pub(super) actor: &'a mut A,
@@ -27,7 +26,6 @@ pub(super) async fn handle_command<A>(
     instance: ActorInstance<'_, A>,
     ctx: &mut ActorContext<A>,
     stop_reason: &mut Option<StopReason>,
-    activity_tx: Option<&watch::Sender<u64>>,
 ) -> Result<bool, ActorPanic>
 where
     A: Actor,
@@ -111,7 +109,6 @@ where
                 mailbox.lane = lane.as_str(),
                 "actor message handled"
             );
-            record_activity(activity_tx);
             if handle.business_admission_fenced() {
                 *stop_reason = Some(StopReason::Requested);
                 return Ok(true);

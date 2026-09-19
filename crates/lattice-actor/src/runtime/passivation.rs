@@ -1,56 +1,16 @@
-use tokio::sync::watch;
+use std::future::pending;
 
 use super::PassivationPolicy;
-use crate::{
-    error::ActorTellError,
-    handle::ActorHandle,
-    traits::{Actor, PassivationReason, StopReason},
-};
 
-pub(super) fn spawn_passivation_monitor<A>(
-    handle: &ActorHandle<A>,
-    passivation: PassivationPolicy,
-) -> Option<watch::Sender<u64>>
-where
-    A: Actor,
-{
-    let PassivationPolicy::IdleTimeout(timeout) = passivation else {
-        return None;
-    };
-
-    let (activity_tx, mut activity_rx) = watch::channel(0_u64);
-    let handle = handle.clone();
-    tokio::spawn(async move {
-        loop {
-            let observed = *activity_rx.borrow();
-            tokio::select! {
-                _ = tokio::time::sleep(timeout) => {
-                    if *activity_rx.borrow() != observed {
-                        continue;
-                    }
-                    // A transiently full system lane must not retire the monitor; the actor would
-                    // then stay resident forever. Only a closed mailbox ends the retry loop.
-                    match handle.try_stop_internal(StopReason::Passivated(
-                        PassivationReason::IdleTimeout,
-                    )) {
-                        Err(ActorTellError::MailboxFull(_)) => {}
-                        Ok(()) | Err(_) => break,
-                    }
-                }
-                changed = activity_rx.changed() => {
-                    if changed.is_err() {
-                        break;
-                    }
-                }
-            }
-        }
-    });
-    Some(activity_tx)
-}
-
-pub(super) fn record_activity(activity_tx: Option<&watch::Sender<u64>>) {
-    if let Some(activity_tx) = activity_tx {
-        let next = activity_tx.borrow().wrapping_add(1);
-        activity_tx.send_replace(next);
+/// Waits for the configured idle period while the Actor runtime is ready to
+/// receive its next command.
+///
+/// The caller cancels this future as soon as a mailbox command becomes ready
+/// and constructs a fresh one after that command has finished. Consequently,
+/// startup and handler execution time do not count as idle time.
+pub(super) async fn wait_for_idle_timeout(passivation: PassivationPolicy) {
+    match passivation {
+        PassivationPolicy::Disabled => pending().await,
+        PassivationPolicy::IdleTimeout(timeout) => tokio::time::sleep(timeout).await,
     }
 }

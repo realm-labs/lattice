@@ -28,7 +28,7 @@ use crate::{
         record_resolved_stop_failure,
     },
     resources::ActorResources,
-    traits::{Actor, ActorLifecycleState, StopReason},
+    traits::{Actor, ActorLifecycleState, PassivationReason, StopReason},
     watch::{ActorTermination, LocalActorRef, TerminatedReason},
 };
 
@@ -41,7 +41,7 @@ mod worker_pool;
 
 use dispatch::{ActorInstance, handle_command};
 use panic::{ActorPanic, finalize_panicked_actor, terminate_panicked_actor};
-use passivation::spawn_passivation_monitor;
+use passivation::wait_for_idle_timeout;
 use rejection::{reject_prefetched_commands, reject_queued_commands};
 use spawner::ActorSpawner;
 use worker_pool::{ActorWorkerPool, WorkerPoolKind};
@@ -125,6 +125,12 @@ pub struct ActorSpawnOptions {
 pub enum PassivationPolicy {
     #[default]
     Disabled,
+    /// Passivates the Actor after it spends this long waiting for its next
+    /// mailbox command.
+    ///
+    /// Startup, message handlers, and lifecycle hooks do not count as idle
+    /// time. A mailbox command that is ready at the timeout boundary takes
+    /// priority over passivation.
     IdleTimeout(Duration),
 }
 
@@ -624,7 +630,6 @@ where
         spawner,
         deferred_capacity,
     );
-    let activity_tx = spawn_passivation_monitor(&handle, passivation);
     let actor_type = type_name::<A>();
     let local_ref = handle.local_ref().id();
     let mut behavior = match std::panic::catch_unwind(AssertUnwindSafe(|| actor.initial_behavior()))
@@ -721,7 +726,6 @@ where
                 },
                 &mut ctx,
                 &mut stop_reason,
-                activity_tx.as_ref(),
             )
             .await
             {
@@ -757,7 +761,6 @@ where
                             },
                             &mut ctx,
                             &mut stop_reason,
-                            activity_tx.as_ref(),
                         )
                         .await
                         {
@@ -794,7 +797,6 @@ where
                                     },
                                     &mut ctx,
                                     &mut stop_reason,
-                                    activity_tx.as_ref(),
                                 )
                                 .await
                                 {
@@ -842,6 +844,11 @@ where
                     }
                     None => {}
                 }
+            }
+            _ = wait_for_idle_timeout(passivation) => {
+                stop_reason = Some(StopReason::Passivated(
+                    PassivationReason::IdleTimeout,
+                ));
             }
         }
     }
