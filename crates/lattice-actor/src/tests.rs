@@ -5,7 +5,6 @@
 
 use std::{sync::Arc, time::Duration};
 
-use lattice_core::instance::InstanceId;
 use thiserror::Error;
 use tokio::sync::{Mutex, Semaphore};
 
@@ -89,18 +88,20 @@ struct ProbePipeCapacity {
 }
 
 #[derive(Debug, crate::Request)]
-#[request(response = InstanceId)]
-struct ReadContextInstance;
+#[request(response = Option<&'static str>)]
+struct ReadContextExtension;
 
 #[derive(Debug, crate::Request)]
-#[request(response = InstanceId)]
+#[request(response = Option<&'static str>)]
 struct SpawnContextChild;
 
 #[derive(crate::Message)]
 struct ContextChildResolved {
-    result: Result<InstanceId, ActorCallError>,
-    reply_to: ReplyTo<InstanceId>,
+    result: Result<Option<&'static str>, ActorCallError>,
+    reply_to: ReplyTo<Option<&'static str>>,
 }
+
+struct ContextMarker(&'static str);
 
 struct TestActor {
     events: Arc<Mutex<Vec<&'static str>>>,
@@ -237,14 +238,18 @@ impl Handler<Tick> for TestActor {
     }
 }
 
-impl Responder<ReadContextInstance> for TestActor {
+impl Responder<ReadContextExtension> for TestActor {
     async fn respond(
         &mut self,
         ctx: &mut HandlerContext<'_, Self>,
-        _request: ReadContextInstance,
-        reply_to: ReplyTo<InstanceId>,
+        _request: ReadContextExtension,
+        reply_to: ReplyTo<Option<&'static str>>,
     ) -> Result<(), ActorError> {
-        let _ = reply_to.send(ctx.service().instance_id().clone());
+        let marker = ctx
+            .service()
+            .extension::<ContextMarker>()
+            .map(|marker| marker.0);
+        let _ = reply_to.send(marker);
         Ok(())
     }
 }
@@ -254,7 +259,7 @@ impl Responder<SpawnContextChild> for TestActor {
         &mut self,
         ctx: &mut HandlerContext<'_, Self>,
         _request: SpawnContextChild,
-        reply_to: ReplyTo<InstanceId>,
+        reply_to: ReplyTo<Option<&'static str>>,
     ) -> Result<(), ActorError> {
         let child = TestActor {
             events: Arc::new(Mutex::new(Vec::new())),
@@ -268,7 +273,7 @@ impl Responder<SpawnContextChild> for TestActor {
         )?;
         ctx.defer_reply(
             reply_to,
-            async move { handle.ask(ReadContextInstance, ASK_TIMEOUT).await },
+            async move { handle.ask(ReadContextExtension, ASK_TIMEOUT).await },
             |result, reply_to| ContextChildResolved { result, reply_to },
         )?;
         Ok(())

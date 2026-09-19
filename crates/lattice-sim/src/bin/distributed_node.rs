@@ -35,8 +35,6 @@ use lattice_core::{
     actor_kind,
     coordinator::CoordinatorScope,
     id::ActorId,
-    instance::InstanceId,
-    kind::ServiceKind,
     service_context::ServiceContext,
 };
 use lattice_discovery::{
@@ -618,10 +616,7 @@ async fn server(reference: PathBuf) -> Result<(), Box<dyn Error>> {
     let address = NodeAddress::new("fixture-server", 25520)?;
     let incarnation = NodeIncarnation::generate();
     let protocol = Arc::new(FixtureProtocol::bind::<PingActor>()?);
-    let mut service_context = ServiceContext::builder(
-        ServiceKind::from_static("distributed-fixture"),
-        InstanceId::new("distributed-fixture"),
-    );
+    let mut service_context = ServiceContext::builder();
     service_context.insert_extension(ActivationDirectory::new(64)?)?;
     let registry = Arc::new(ActorRegistry::new_bound(
         actor_kind!("DistributedFixture"),
@@ -945,10 +940,7 @@ fn entity_service(
     slot: &PlacementSlot,
     owns_slot: bool,
 ) -> Result<EntityServiceFixture, Box<dyn Error>> {
-    let mut context = ServiceContext::builder(
-        ServiceKind::from_static("distributed-entity-fixture"),
-        InstanceId::new(node.node_id.clone()),
-    );
+    let mut context = ServiceContext::builder();
     context.insert_extension(ActivationDirectory::new(64)?)?;
     let protocol = Arc::new(FixtureProtocol::bind::<PingActor>()?);
     let registry = Arc::new(ActorRegistry::new_bound(

@@ -224,6 +224,7 @@ async fn request_panic_completes_ask_and_observation_once() {
     let runtime = ActorRuntime::new(ActorRuntimeConfig {
         default_execution: ActorExecutionPolicy::TaskPerActor,
         observer: ActorObserverHandle::new(observer.clone()),
+        ..ActorRuntimeConfig::default()
     });
     let handle = runtime
         .spawn_actor(RequestPanicActor, ActorSpawnOptions::default())
@@ -388,6 +389,7 @@ async fn queued_ask_is_rejected_with_actor_panicked() {
     let runtime = ActorRuntime::new(ActorRuntimeConfig {
         default_execution: ActorExecutionPolicy::TaskPerActor,
         observer: ActorObserverHandle::new(observer.clone()),
+        ..ActorRuntimeConfig::default()
     });
     let handle = runtime
         .spawn_actor(QueueActor, ActorSpawnOptions::default())
@@ -811,6 +813,7 @@ async fn prefetched_ask_is_rejected_with_actor_panicked() {
     let runtime = ActorRuntime::new(ActorRuntimeConfig {
         default_execution: ActorExecutionPolicy::TaskPerActor,
         observer: ActorObserverHandle::new(observer.clone()),
+        ..ActorRuntimeConfig::default()
     });
     let handle = runtime
         .spawn_actor(QueueActor, ActorSpawnOptions::default())

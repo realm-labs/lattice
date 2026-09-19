@@ -2,7 +2,6 @@
 
 use std::sync::Arc;
 
-use lattice_core::service_context::ServiceContext;
 use tokio::sync::{Mutex, Semaphore};
 
 use super::{ASK_TIMEOUT, Ping, Record, TestActor};
@@ -51,7 +50,6 @@ async fn keyed_worker_pool_system_mailbox_keeps_priority_over_normal_mailbox() {
                 execution: Some(ActorExecutionPolicy::KeyedWorkerPool { worker_count: 2 }),
                 scheduler_key: None,
                 passivation: PassivationPolicy::Disabled,
-                service: ServiceContext::empty(),
             },
         )
         .unwrap();

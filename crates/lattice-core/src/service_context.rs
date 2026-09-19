@@ -5,9 +5,6 @@ use std::sync::Arc;
 
 use thiserror::Error;
 
-use crate::instance::InstanceId;
-use crate::kind::ServiceKind;
-
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum ServiceContextError {
     #[error("extension {type_name} is already registered")]
@@ -20,8 +17,6 @@ pub struct ServiceContext {
 }
 
 struct ServiceContextInner {
-    service_kind: ServiceKind,
-    instance_id: InstanceId,
     extensions: HashMap<TypeId, StoredComponent>,
 }
 
@@ -29,8 +24,6 @@ impl fmt::Debug for ServiceContextInner {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("ServiceContextInner")
-            .field("service_kind", &self.service_kind)
-            .field("instance_id", &self.instance_id)
             .field("extension_count", &self.extensions.len())
             .finish()
     }
@@ -40,8 +33,6 @@ impl fmt::Debug for ServiceContext {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("ServiceContext")
-            .field("service_kind", &self.service_kind())
-            .field("instance_id", &self.instance_id())
             .field("extension_count", &self.extension_count())
             .finish()
     }
@@ -64,33 +55,17 @@ impl fmt::Debug for StoredComponent {
 
 impl ServiceContext {
     pub fn empty() -> Self {
-        Self::new(ServiceKind::from_static("local"), InstanceId::new("local"))
-    }
-
-    pub fn new(service_kind: ServiceKind, instance_id: InstanceId) -> Self {
         Self {
             inner: Arc::new(ServiceContextInner {
-                service_kind,
-                instance_id,
                 extensions: HashMap::new(),
             }),
         }
     }
 
-    pub fn builder(service_kind: ServiceKind, instance_id: InstanceId) -> ServiceContextBuilder {
+    pub fn builder() -> ServiceContextBuilder {
         ServiceContextBuilder {
-            service_kind,
-            instance_id,
             extensions: HashMap::new(),
         }
-    }
-
-    pub fn service_kind(&self) -> &ServiceKind {
-        &self.inner.service_kind
-    }
-
-    pub fn instance_id(&self) -> &InstanceId {
-        &self.inner.instance_id
     }
 
     pub fn extension<T>(&self) -> Option<Arc<T>>
@@ -101,6 +76,34 @@ impl ServiceContext {
             .extensions
             .get(&TypeId::of::<T>())
             .and_then(|extension| extension.value.clone().downcast::<T>().ok())
+    }
+
+    /// Returns a new context with one additional immutable extension.
+    ///
+    /// Existing contexts are unchanged. This is primarily useful when a runtime integration adds
+    /// one of its own service-scoped capabilities while preserving the application-provided
+    /// service context.
+    pub fn with_extension<T>(&self, extension: T) -> Result<Self, ServiceContextError>
+    where
+        T: Send + Sync + 'static,
+    {
+        let type_id = TypeId::of::<T>();
+        if self.inner.extensions.contains_key(&type_id) {
+            return Err(ServiceContextError::DuplicateExtension {
+                type_name: type_name::<T>(),
+            });
+        }
+        let mut extensions = self.inner.extensions.clone();
+        extensions.insert(
+            type_id,
+            StoredComponent {
+                type_name: type_name::<T>(),
+                value: Arc::new(extension),
+            },
+        );
+        Ok(Self {
+            inner: Arc::new(ServiceContextInner { extensions }),
+        })
     }
 
     pub fn extension_count(&self) -> usize {
@@ -116,8 +119,6 @@ impl Default for ServiceContext {
 
 #[derive(Debug)]
 pub struct ServiceContextBuilder {
-    service_kind: ServiceKind,
-    instance_id: InstanceId,
     extensions: HashMap<TypeId, StoredComponent>,
 }
 
@@ -154,10 +155,23 @@ impl ServiceContextBuilder {
     pub fn build(self) -> ServiceContext {
         ServiceContext {
             inner: Arc::new(ServiceContextInner {
-                service_kind: self.service_kind,
-                instance_id: self.instance_id,
                 extensions: self.extensions,
             }),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn adding_an_extension_preserves_the_original_context() {
+        let original = ServiceContext::empty();
+        let extended = original.with_extension(42_u64).unwrap();
+
+        assert!(original.extension::<u64>().is_none());
+        assert_eq!(*extended.extension::<u64>().unwrap(), 42);
+        assert!(extended.with_extension(7_u64).is_err());
     }
 }

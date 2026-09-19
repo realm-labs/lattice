@@ -20,7 +20,6 @@ use lattice_actor::{
     },
     watch::{ActorTerminated, TerminatedReason},
 };
-use lattice_core::service_context::ServiceContext;
 use tokio::sync::{Mutex, Semaphore};
 
 const ASK_TIMEOUT: Duration = Duration::from_secs(5);
@@ -703,7 +702,6 @@ async fn passivation_policy_idle_timeout_stops_idle_actor() {
                 execution: None,
                 scheduler_key: None,
                 passivation: PassivationPolicy::IdleTimeout(Duration::from_millis(10)),
-                service: ServiceContext::empty(),
             },
         )
         .unwrap();

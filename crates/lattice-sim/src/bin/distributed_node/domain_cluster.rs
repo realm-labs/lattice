@@ -240,10 +240,7 @@ async fn domain_logic(
     let mut scale_actor = None;
     if membership_only {
         let protocol = Arc::new(FixtureProtocol::bind::<PingActor>()?);
-        let mut context = ServiceContext::builder(
-            ServiceKind::from_static("distributed-scale-fixture"),
-            InstanceId::new(node_id.clone()),
-        );
+        let mut context = ServiceContext::builder();
         context.insert_extension(ActivationDirectory::new(8)?)?;
         let registry = Arc::new(ActorRegistry::new_bound(
             actor_kind!("DistributedScaleFixture"),

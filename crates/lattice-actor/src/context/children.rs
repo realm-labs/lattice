@@ -13,10 +13,10 @@ use tokio::task::AbortHandle;
 
 use super::ActorContext;
 use crate::{
+    attachments::ActorRuntimeAttachments,
     error::{ActorError, ActorTellError},
     handle::ActorHandle,
     observation::ActorObserverHandle,
-    resources::ActorResources,
     runtime::{
         ActorSpawnContext, ActorSpawnOptions, PassivationPolicy, spawn_actor_from_context,
         spawner::ActorSpawner,
@@ -123,7 +123,6 @@ impl<A: Actor> ActorContext<A> {
     fn child_spawn_env(&self) -> ChildSpawnEnv {
         ChildSpawnEnv {
             service: self.service.clone(),
-            resources: self.resources.clone(),
             observer: self.handle.observer().clone(),
             spawner: self.spawner.clone(),
         }
@@ -224,7 +223,6 @@ pub(super) trait ChildStop: Send {
 /// that no longer holds the [`ActorContext`].
 struct ChildSpawnEnv {
     service: ServiceContext,
-    resources: ActorResources,
     observer: ActorObserverHandle,
     spawner: ActorSpawner,
 }
@@ -248,11 +246,11 @@ impl ChildSpawnEnv {
                     execution: Some(options.execution),
                     scheduler_key: options.scheduler_key.clone(),
                     passivation: PassivationPolicy::Disabled,
-                    service: self.service.clone(),
                 },
+                service: self.service.clone(),
                 observer: self.observer.clone(),
                 terminal_hook: None,
-                resources: self.resources.clone(),
+                runtime_attachments: ActorRuntimeAttachments::empty(),
                 spawner: self.spawner.clone(),
             },
         )

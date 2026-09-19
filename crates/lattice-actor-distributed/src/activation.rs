@@ -1,4 +1,4 @@
-//! Distributed capabilities attached to a local Actor activation.
+//! Distributed capabilities exposed through a local Actor context.
 
 use std::sync::{Arc, OnceLock};
 
@@ -12,6 +12,30 @@ use crate::{
     recipient::{ActorSystem, RecipientError},
     reference::{ActorRef, EntityRef, Recipient, SingletonRef},
 };
+
+/// Service-scoped access to the distributed Actor system.
+#[derive(Clone)]
+pub(crate) struct DistributedActorRuntime {
+    actor_system: Arc<OnceLock<ActorSystem>>,
+}
+
+impl DistributedActorRuntime {
+    pub(crate) fn new(actor_system: Arc<OnceLock<ActorSystem>>) -> Self {
+        Self { actor_system }
+    }
+}
+
+/// Exact distributed identity belonging to one Actor activation.
+#[derive(Clone)]
+pub(crate) struct DistributedActorIdentity {
+    self_address: Option<ActorAddress>,
+}
+
+impl DistributedActorIdentity {
+    pub(crate) fn new(self_address: Option<ActorAddress>) -> Self {
+        Self { self_address }
+    }
+}
 
 #[derive(Clone)]
 pub struct DistributedActorContext {
@@ -99,6 +123,13 @@ pub trait DistributedActorContextExt<A: Actor> {
 
 impl<A: Actor> DistributedActorContextExt<A> for ActorContext<A> {
     fn distributed(&self) -> Option<Arc<DistributedActorContext>> {
-        self.resource::<DistributedActorContext>()
+        let runtime = self.service().extension::<DistributedActorRuntime>()?;
+        let self_address = self
+            .runtime_attachment::<DistributedActorIdentity>()
+            .and_then(|identity| identity.self_address.clone());
+        Some(Arc::new(DistributedActorContext::new(
+            self_address,
+            runtime.actor_system.clone(),
+        )))
     }
 }

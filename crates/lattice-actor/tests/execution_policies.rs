@@ -14,7 +14,6 @@ use lattice_actor::runtime::{
 use lattice_actor::traits::{
     Actor, ChildActorKey, ChildActorOptions, ChildSupervision, Handler, Responder, StopReason,
 };
-use lattice_core::service_context::ServiceContext;
 use tokio::sync::{Mutex, mpsc};
 
 const ASK_TIMEOUT: Duration = Duration::from_secs(5);
@@ -227,7 +226,6 @@ async fn dedicated_thread_pool_policy_runs_actor_with_same_mailbox_semantics() {
                 execution: Some(ActorExecutionPolicy::DedicatedThreadPool { worker_count: 2 }),
                 scheduler_key: None,
                 passivation: PassivationPolicy::Disabled,
-                service: ServiceContext::empty(),
             },
         )
         .unwrap();
@@ -252,7 +250,6 @@ async fn keyed_worker_pool_execution_policy_runs_actor_with_same_mailbox_semanti
                 execution: Some(ActorExecutionPolicy::KeyedWorkerPool { worker_count: 4 }),
                 scheduler_key: Some(SchedulerKey::U64(42)),
                 passivation: PassivationPolicy::Disabled,
-                service: ServiceContext::empty(),
             },
         )
         .unwrap();
@@ -318,7 +315,6 @@ async fn execution_policies_reject_zero_workers() {
             execution: Some(ActorExecutionPolicy::KeyedWorkerPool { worker_count: 0 }),
             scheduler_key: None,
             passivation: PassivationPolicy::Disabled,
-            service: ServiceContext::empty(),
         },
     );
     let dedicated = runtime.spawn_actor(
@@ -330,7 +326,6 @@ async fn execution_policies_reject_zero_workers() {
             execution: Some(ActorExecutionPolicy::DedicatedThreadPool { worker_count: 0 }),
             scheduler_key: None,
             passivation: PassivationPolicy::Disabled,
-            service: ServiceContext::empty(),
         },
     );
 
@@ -357,7 +352,6 @@ async fn dedicated_thread_pool_reuses_configured_worker_threads() {
                 execution: Some(ActorExecutionPolicy::DedicatedThreadPool { worker_count: 1 }),
                 scheduler_key: None,
                 passivation: PassivationPolicy::Disabled,
-                service: ServiceContext::empty(),
             },
         )
         .unwrap();
@@ -371,7 +365,6 @@ async fn dedicated_thread_pool_reuses_configured_worker_threads() {
                 execution: Some(ActorExecutionPolicy::DedicatedThreadPool { worker_count: 1 }),
                 scheduler_key: None,
                 passivation: PassivationPolicy::Disabled,
-                service: ServiceContext::empty(),
             },
         )
         .unwrap();
@@ -395,7 +388,6 @@ async fn dedicated_thread_pool_is_scoped_by_actor_type() {
                 execution: Some(ActorExecutionPolicy::DedicatedThreadPool { worker_count: 1 }),
                 scheduler_key: None,
                 passivation: PassivationPolicy::Disabled,
-                service: ServiceContext::empty(),
             },
         )
         .unwrap();
@@ -407,7 +399,6 @@ async fn dedicated_thread_pool_is_scoped_by_actor_type() {
                 execution: Some(ActorExecutionPolicy::DedicatedThreadPool { worker_count: 1 }),
                 scheduler_key: None,
                 passivation: PassivationPolicy::Disabled,
-                service: ServiceContext::empty(),
             },
         )
         .unwrap();
@@ -431,7 +422,6 @@ async fn keyed_worker_pool_uses_scheduler_key_for_worker_affinity() {
                 execution: Some(ActorExecutionPolicy::KeyedWorkerPool { worker_count: 2 }),
                 scheduler_key: Some(SchedulerKey::from("same-key")),
                 passivation: PassivationPolicy::Disabled,
-                service: ServiceContext::empty(),
             },
         )
         .unwrap();
@@ -445,7 +435,6 @@ async fn keyed_worker_pool_uses_scheduler_key_for_worker_affinity() {
                 execution: Some(ActorExecutionPolicy::KeyedWorkerPool { worker_count: 2 }),
                 scheduler_key: Some(SchedulerKey::from("same-key")),
                 passivation: PassivationPolicy::Disabled,
-                service: ServiceContext::empty(),
             },
         )
         .unwrap();

@@ -24,18 +24,18 @@ use lattice_core::{
 use thiserror::Error;
 
 use lattice_actor::{
+    attachments::ActorRuntimeAttachments,
     error::{ActorAdminError, ActorError},
     handle::{ActorHandle, StopFailureRecord},
     mailbox::MailboxConfig,
     observation::ActorObserverHandle,
-    resources::ActorResources,
     runtime::{ActorRuntime, ActorRuntimeConfig, ActorSpawnOptions, PassivationPolicy},
     traits::{Actor, ActorLifecycleState, PassivationReason, StopReason},
     watch::LocalActorRef,
 };
 
 use crate::{
-    activation::DistributedActorContext,
+    activation::{DistributedActorIdentity, DistributedActorRuntime},
     directory::ActivationDirectory,
     entity::EntityActivationState,
     protocol::{ActorProtocolBinding, Protocol},
@@ -260,7 +260,7 @@ where
 }
 
 impl<A: Actor> ActorRegistry<A> {
-    pub fn new(kind: ActorKind, config: ActorRegistryConfig) -> Self {
+    pub fn new(kind: ActorKind, mut config: ActorRegistryConfig) -> Self {
         assert!(
             config.address.is_none(),
             "registries with exact ActorAddresses must be constructed with ActorRegistry::new_bound"
@@ -269,6 +269,15 @@ impl<A: Actor> ActorRegistry<A> {
             config.quarantine_capacity > 0,
             "quarantine capacity must be nonzero"
         );
+        let actor_system = Arc::new(OnceLock::new());
+        config.service = config
+            .service
+            .with_extension(DistributedActorRuntime::new(actor_system.clone()))
+            .expect("distributed Actor runtime extension is private to ActorRegistry");
+        let runtime = ActorRuntime::new(ActorRuntimeConfig {
+            service: config.service.clone(),
+            ..ActorRuntimeConfig::default()
+        });
         Self {
             kind,
             config,
@@ -276,10 +285,10 @@ impl<A: Actor> ActorRegistry<A> {
             entries: Arc::new(DashMap::new()),
             exact_entries: Arc::new(DashMap::new()),
             quarantined: Arc::new(DashMap::new()),
-            actor_system: Arc::new(OnceLock::new()),
+            actor_system,
             fencing_token_resolvers: Arc::new(RwLock::new(BTreeMap::new())),
             observer: ActorObserverHandle::default(),
-            runtime: ActorRuntime::default(),
+            runtime,
         }
     }
 
@@ -288,13 +297,22 @@ impl<A: Actor> ActorRegistry<A> {
     /// the binding and cannot drift from the registered dispatcher.
     pub fn new_bound<P: Protocol>(
         kind: ActorKind,
-        config: ActorRegistryConfig,
+        mut config: ActorRegistryConfig,
         protocol: &ActorProtocolBinding<A, P>,
     ) -> Self {
         assert!(
             config.quarantine_capacity > 0,
             "quarantine capacity must be nonzero"
         );
+        let actor_system = Arc::new(OnceLock::new());
+        config.service = config
+            .service
+            .with_extension(DistributedActorRuntime::new(actor_system.clone()))
+            .expect("distributed Actor runtime extension is private to ActorRegistry");
+        let runtime = ActorRuntime::new(ActorRuntimeConfig {
+            service: config.service.clone(),
+            ..ActorRuntimeConfig::default()
+        });
         Self {
             kind,
             config,
@@ -302,10 +320,10 @@ impl<A: Actor> ActorRegistry<A> {
             entries: Arc::new(DashMap::new()),
             exact_entries: Arc::new(DashMap::new()),
             quarantined: Arc::new(DashMap::new()),
-            actor_system: Arc::new(OnceLock::new()),
+            actor_system,
             fencing_token_resolvers: Arc::new(RwLock::new(BTreeMap::new())),
             observer: ActorObserverHandle::default(),
-            runtime: ActorRuntime::default(),
+            runtime,
         }
     }
 
@@ -313,6 +331,7 @@ impl<A: Actor> ActorRegistry<A> {
         self.observer = observer.clone();
         self.runtime = ActorRuntime::new(ActorRuntimeConfig {
             observer,
+            service: self.config.service.clone(),
             ..ActorRuntimeConfig::default()
         });
         self
@@ -1029,12 +1048,9 @@ impl<A: Actor> ActorRegistry<A> {
                 directory.remove(reference);
             }
         });
-        let mut resources = ActorResources::builder();
-        resources
-            .insert(DistributedActorContext::new(
-                self_address.clone(),
-                self.actor_system.clone(),
-            ))
+        let mut runtime_attachments = ActorRuntimeAttachments::builder();
+        runtime_attachments
+            .insert(DistributedActorIdentity::new(self_address.clone()))
             .map_err(|error| ActorError::new(error.to_string()))?;
         let handle = self
             .runtime
@@ -1045,9 +1061,8 @@ impl<A: Actor> ActorRegistry<A> {
                     execution: None,
                     scheduler_key: None,
                     passivation: self.config.passivation,
-                    service: self.config.service.clone(),
                 },
-                resources.build(),
+                runtime_attachments.build(),
                 Some(terminal_hook),
             )
             .map_err(|error| ActorError::new(error.to_string()))?;

@@ -16,6 +16,7 @@ use tokio::sync::{broadcast, oneshot, watch};
 use tracing::{Instrument, debug, error, info};
 
 use crate::{
+    attachments::ActorRuntimeAttachments,
     context::ActorContext,
     error::{ActorAdminError, ActorCallError, ActorSpawnError},
     handle::{ActorHandle, ActorHandleInit, ForcedDataLossEvent, StopFailureRecord, TerminalHook},
@@ -27,7 +28,6 @@ use crate::{
         ActorLifecycleEvent, ActorObserverHandle, record_new_stop_failure,
         record_resolved_stop_failure,
     },
-    resources::ActorResources,
     traits::{Actor, ActorLifecycleState, PassivationReason, StopReason},
     watch::{ActorTermination, LocalActorRef, TerminatedReason},
 };
@@ -101,6 +101,8 @@ impl From<Vec<u8>> for SchedulerKey {
 pub struct ActorRuntimeConfig {
     pub default_execution: ActorExecutionPolicy,
     pub observer: ActorObserverHandle,
+    /// Shared environment inherited by every Actor spawned by this runtime.
+    pub service: ServiceContext,
 }
 
 impl Default for ActorRuntimeConfig {
@@ -108,6 +110,7 @@ impl Default for ActorRuntimeConfig {
         Self {
             default_execution: ActorExecutionPolicy::TaskPerActor,
             observer: ActorObserverHandle::default(),
+            service: ServiceContext::empty(),
         }
     }
 }
@@ -118,7 +121,6 @@ pub struct ActorSpawnOptions {
     pub execution: Option<ActorExecutionPolicy>,
     pub scheduler_key: Option<SchedulerKey>,
     pub passivation: PassivationPolicy,
-    pub service: ServiceContext,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -160,7 +162,7 @@ impl ActorRuntime {
     where
         A: Actor,
     {
-        self.spawn_managed_actor(actor, options, ActorResources::empty(), None)
+        self.spawn_managed_actor(actor, options, ActorRuntimeAttachments::empty(), None)
     }
 
     /// Spawns an Actor with immutable integration capabilities and a terminal hook.
@@ -173,7 +175,7 @@ impl ActorRuntime {
         &self,
         actor: A,
         options: ActorSpawnOptions,
-        resources: ActorResources,
+        runtime_attachments: ActorRuntimeAttachments,
         terminal_hook: Option<Box<dyn FnOnce(LocalActorRef) + Send + 'static>>,
     ) -> Result<ActorHandle<A>, ActorSpawnError>
     where
@@ -184,9 +186,10 @@ impl ActorRuntime {
             actor,
             ActorSpawnContext {
                 options,
+                service: self.config.service.clone(),
                 observer: self.config.observer.clone(),
                 terminal_hook,
-                resources,
+                runtime_attachments,
                 spawner: spawner.clone(),
             },
         )
@@ -410,7 +413,6 @@ where
                 execution: Some(ActorExecutionPolicy::TaskPerActor),
                 scheduler_key: None,
                 passivation: PassivationPolicy::Disabled,
-                service: ServiceContext::empty(),
             },
         )
         .expect("TaskPerActor execution is supported")
@@ -424,25 +426,28 @@ pub fn spawn_actor_with_context<A>(
 where
     A: Actor,
 {
-    ActorRuntime::default()
-        .spawn_actor(
-            actor,
-            ActorSpawnOptions {
-                mailbox,
-                execution: Some(ActorExecutionPolicy::TaskPerActor),
-                scheduler_key: None,
-                passivation: PassivationPolicy::Disabled,
-                service,
-            },
-        )
-        .expect("TaskPerActor execution is supported")
+    ActorRuntime::new(ActorRuntimeConfig {
+        service,
+        ..ActorRuntimeConfig::default()
+    })
+    .spawn_actor(
+        actor,
+        ActorSpawnOptions {
+            mailbox,
+            execution: Some(ActorExecutionPolicy::TaskPerActor),
+            scheduler_key: None,
+            passivation: PassivationPolicy::Disabled,
+        },
+    )
+    .expect("TaskPerActor execution is supported")
 }
 
 pub(crate) struct ActorSpawnContext {
     pub(crate) options: ActorSpawnOptions,
+    pub(crate) service: ServiceContext,
     pub(crate) observer: ActorObserverHandle,
     pub(crate) terminal_hook: Option<TerminalHook>,
-    pub(crate) resources: ActorResources,
+    pub(crate) runtime_attachments: ActorRuntimeAttachments,
     pub(crate) spawner: ActorSpawner,
 }
 
@@ -459,15 +464,15 @@ impl ActorSpawnContext {
     {
         let ActorSpawnContext {
             options,
+            service,
             observer,
             terminal_hook,
-            resources,
+            runtime_attachments,
             spawner,
         } = self;
         let ActorSpawnOptions {
             mailbox,
             passivation,
-            service,
             scheduler_key,
             execution: _,
         } = options;
@@ -477,7 +482,7 @@ impl ActorSpawnContext {
                 service,
                 observer,
                 terminal_hook,
-                resources,
+                runtime_attachments,
                 spawner,
             ),
             passivation,
@@ -510,7 +515,7 @@ struct ActorRuntimeParts<A: Actor> {
     normal_rx: Receiver<ActorCommand<A>>,
     system_rx: Receiver<ActorCommand<A>>,
     service: ServiceContext,
-    resources: ActorResources,
+    runtime_attachments: ActorRuntimeAttachments,
     spawner: ActorSpawner,
     deferred_capacity: usize,
     turn_budget: usize,
@@ -521,7 +526,7 @@ fn create_actor_parts<A>(
     service: ServiceContext,
     observer: ActorObserverHandle,
     terminal_hook: Option<TerminalHook>,
-    resources: ActorResources,
+    runtime_attachments: ActorRuntimeAttachments,
     spawner: ActorSpawner,
 ) -> ActorRuntimeParts<A>
 where
@@ -552,7 +557,7 @@ where
         normal_rx,
         system_rx,
         service,
-        resources,
+        runtime_attachments,
         spawner,
         deferred_capacity: mailbox.deferred_capacity(),
         turn_budget: mailbox.turn_budget(),
@@ -618,7 +623,7 @@ where
         mut normal_rx,
         mut system_rx,
         service,
-        resources,
+        runtime_attachments,
         spawner,
         deferred_capacity,
         turn_budget,
@@ -626,7 +631,7 @@ where
     let mut ctx = ActorContext::new(
         handle.clone(),
         service,
-        resources,
+        runtime_attachments,
         spawner,
         deferred_capacity,
     );

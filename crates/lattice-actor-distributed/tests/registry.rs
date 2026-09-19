@@ -26,8 +26,6 @@ use lattice_core::{
     actor_address::{ActorAddress, ClusterId, NodeAddress, NodeIncarnation, ProtocolId},
     actor_kind,
     id::ActorId,
-    instance::InstanceId,
-    kind::ServiceKind,
     service_context::ServiceContext,
 };
 use tokio::sync::{Semaphore, oneshot};
@@ -939,10 +937,7 @@ async fn authority_loss_during_stopping_finishes_in_non_authoritative_quarantine
 
 #[tokio::test]
 async fn idle_passivation_eagerly_releases_registry_and_directory_capacity() {
-    let mut service = ServiceContext::builder(
-        ServiceKind::from_static("test"),
-        InstanceId::new("registry-passivation"),
-    );
+    let mut service = ServiceContext::builder();
     service
         .insert_extension(ActivationDirectory::new(1).unwrap())
         .unwrap();

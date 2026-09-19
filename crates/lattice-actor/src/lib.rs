@@ -10,13 +10,13 @@ extern crate self as lattice_actor;
 
 pub use lattice_actor_macros::{Message, Request, actor_behavior};
 
+pub mod attachments;
 pub mod context;
 pub mod error;
 pub mod handle;
 pub mod mailbox;
 pub mod observation;
 pub mod reply;
-pub mod resources;
 pub mod runtime;
 pub mod state_machine;
 pub mod traits;

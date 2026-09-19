@@ -1,12 +1,12 @@
 //! The actor-facing runtime context.
 //!
-//! [`ActorContext`] owns every per-activation resource: child actors, DeathWatch subscriptions,
-//! scoped tasks, deferred replies, and actor-local extensions. Its surface is grouped into
+//! [`ActorContext`] owns every per-activation runtime facility: child actors, DeathWatch
+//! subscriptions, scoped tasks, deferred replies, and integration attachments. Its surface is
+//! grouped into
 //! sibling modules by responsibility; the type definitions stay here so the published paths are
 //! independent of that grouping.
 
 use std::{
-    any::{Any, TypeId},
     collections::HashMap,
     fmt,
     sync::{
@@ -20,10 +20,10 @@ use lattice_core::service_context::ServiceContext;
 use tokio::task::{JoinHandle, JoinSet};
 
 use crate::{
+    attachments::ActorRuntimeAttachments,
     error::ActorError,
     handle::ActorHandle,
     reply::PendingReply,
-    resources::ActorResources,
     runtime::spawner::ActorSpawner,
     traits::{Actor, ChildActorKey, PassivationReason, StopReason},
     watch::WatchId,
@@ -31,7 +31,6 @@ use crate::{
 
 mod children;
 mod deferred;
-mod extensions;
 mod messaging;
 mod tasks;
 
@@ -50,20 +49,10 @@ pub struct PipeTaskHandle {
     abort: tokio::task::AbortHandle,
 }
 
-/// Type-indexed state owned by one actor activation.
-///
-/// Values are retained for the lifetime of the surrounding [`ActorContext`]. They are not shared,
-/// serialized, persisted, or carried across passivation, termination, or supervision restart.
-#[derive(Default)]
-pub struct ActorLocalExtensions {
-    values: HashMap<TypeId, Box<dyn Any + Send>>,
-}
-
 pub struct ActorContext<A: Actor> {
     handle: ActorHandle<A>,
     service: ServiceContext,
-    resources: ActorResources,
-    local_extensions: ActorLocalExtensions,
+    runtime_attachments: ActorRuntimeAttachments,
     spawner: ActorSpawner,
     lifecycle_request: Option<StopReason>,
     tasks: JoinSet<()>,
@@ -82,8 +71,7 @@ impl<A: Actor> fmt::Debug for ActorContext<A> {
         debug.field("handle", &self.handle);
         debug
             .field("service", &self.service)
-            .field("resources", &self.resources)
-            .field("local_extensions", &self.local_extensions)
+            .field("runtime_attachments", &self.runtime_attachments)
             .field("lifecycle_request", &self.lifecycle_request)
             .field("task_count", &self.tasks.len())
             .field("deferred_task_count", &self.deferred_tasks.len())
@@ -105,15 +93,14 @@ impl<A: Actor> ActorContext<A> {
     pub(crate) fn new(
         handle: ActorHandle<A>,
         service: ServiceContext,
-        resources: ActorResources,
+        runtime_attachments: ActorRuntimeAttachments,
         spawner: ActorSpawner,
         deferred_capacity: usize,
     ) -> Self {
         Self {
             handle,
             service,
-            resources,
-            local_extensions: ActorLocalExtensions::new(),
+            runtime_attachments,
             spawner,
             lifecycle_request: None,
             tasks: JoinSet::new(),
@@ -135,20 +122,13 @@ impl<A: Actor> ActorContext<A> {
         &self.service
     }
 
-    /// Returns an immutable capability installed for this activation.
-    pub fn resource<T>(&self) -> Option<Arc<T>>
+    /// Returns immutable activation metadata installed by a runtime integration.
+    #[doc(hidden)]
+    pub fn runtime_attachment<T>(&self) -> Option<Arc<T>>
     where
         T: Send + Sync + 'static,
     {
-        self.resources.get::<T>()
-    }
-
-    pub fn local_extensions(&self) -> &ActorLocalExtensions {
-        &self.local_extensions
-    }
-
-    pub fn local_extensions_mut(&mut self) -> &mut ActorLocalExtensions {
-        &mut self.local_extensions
+        self.runtime_attachments.get::<T>()
     }
 
     /// Returns the absolute deadline attached to the current request, if any.
