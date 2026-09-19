@@ -14,36 +14,16 @@ use tokio::{
 
 use crate::error::ActorSpawnError;
 
-#[derive(Debug, Clone, Copy)]
-pub(super) enum WorkerPoolKind {
-    Keyed,
-    Dedicated { actor_type: &'static str },
-}
-
-impl WorkerPoolKind {
-    fn thread_name(self, worker_index: usize) -> String {
-        match self {
-            Self::Keyed => format!("lattice-keyed-worker-{worker_index}"),
-            Self::Dedicated { actor_type } => {
-                format!("lattice-dedicated-worker-{worker_index}-{actor_type}")
-            }
-        }
-    }
-}
-
 pub(super) struct ActorWorkerPool {
     workers: Vec<ActorWorker>,
     next_worker: AtomicU64,
 }
 
 impl ActorWorkerPool {
-    pub(super) fn start(
-        kind: WorkerPoolKind,
-        worker_count: usize,
-    ) -> Result<Self, ActorSpawnError> {
+    pub(super) fn start(pool_key: &str, worker_count: usize) -> Result<Self, ActorSpawnError> {
         let mut workers = Vec::with_capacity(worker_count);
         for worker_index in 0..worker_count {
-            workers.push(ActorWorker::start(kind, worker_index)?);
+            workers.push(ActorWorker::start(pool_key, worker_index)?);
         }
         Ok(Self {
             workers,
@@ -87,11 +67,11 @@ struct ActorWorker {
 }
 
 impl ActorWorker {
-    fn start(kind: WorkerPoolKind, worker_index: usize) -> Result<Self, ActorSpawnError> {
+    fn start(pool_key: &str, worker_index: usize) -> Result<Self, ActorSpawnError> {
         let (handle_tx, handle_rx) = std_mpsc::sync_channel(1);
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let join_handle = ThreadBuilder::new()
-            .name(kind.thread_name(worker_index))
+            .name(format!("lattice-worker-{worker_index}-{pool_key}"))
             .spawn(move || {
                 let runtime = RuntimeBuilder::new_current_thread()
                     .enable_all()

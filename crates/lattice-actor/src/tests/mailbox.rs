@@ -8,7 +8,10 @@ use super::{ASK_TIMEOUT, Ping, Record, TestActor, spawn_actor};
 use crate::{
     error::ActorTellError,
     mailbox::MailboxConfig,
-    runtime::{ActorExecutionPolicy, ActorRuntime, ActorSpawnOptions, PassivationPolicy},
+    runtime::{
+        ActorExecutionPolicy, ActorRuntime, ActorSpawnOptions, PassivationPolicy, WorkerPlacement,
+        WorkerPoolKey,
+    },
 };
 
 #[tokio::test]
@@ -31,7 +34,7 @@ async fn actor_handle_ask_and_tell_deliver_typed_messages() {
 }
 
 #[tokio::test]
-async fn keyed_worker_pool_system_mailbox_keeps_priority_over_normal_mailbox() {
+async fn worker_pool_system_mailbox_keeps_priority_over_normal_mailbox() {
     let runtime = ActorRuntime::default();
     let events = Arc::new(Mutex::new(Vec::new()));
     let start_gate = Arc::new(Semaphore::new(0));
@@ -45,7 +48,11 @@ async fn keyed_worker_pool_system_mailbox_keeps_priority_over_normal_mailbox() {
             },
             ActorSpawnOptions {
                 mailbox: MailboxConfig::bounded(8),
-                execution: Some(ActorExecutionPolicy::KeyedWorkerPool { worker_count: 2 }),
+                execution: Some(ActorExecutionPolicy::WorkerPool {
+                    pool_key: WorkerPoolKey::new("mailbox-tests").unwrap(),
+                    worker_count: 2,
+                    placement: WorkerPlacement::RoundRobin,
+                }),
                 scheduler_key: None,
                 passivation: PassivationPolicy::Disabled,
             },

@@ -230,7 +230,7 @@ impl ChildSpawnEnv {
             ActorSpawnContext {
                 options: ActorSpawnOptions {
                     mailbox: options.mailbox,
-                    execution: Some(options.execution),
+                    execution: Some(options.execution.clone()),
                     scheduler_key: options.scheduler_key.clone(),
                     passivation: PassivationPolicy::Disabled,
                 },

@@ -1,7 +1,7 @@
 use std::{
-    any::{TypeId, type_name},
+    any::type_name,
     collections::HashMap,
-    fmt::{Debug, Formatter, Result as FmtResult},
+    fmt::{Debug, Display, Formatter, Result as FmtResult},
     num::NonZeroUsize,
     panic::AssertUnwindSafe,
     sync::{
@@ -13,6 +13,7 @@ use std::{
 
 use futures_util::FutureExt;
 use lattice_core::service_context::ServiceContext;
+use thiserror::Error;
 use tokio::sync::{broadcast, oneshot, watch};
 use tracing::{Instrument, debug, error, info};
 
@@ -47,21 +48,90 @@ use passivation::wait_for_idle_timeout;
 use rejection::{reject_prefetched_commands, reject_queued_commands};
 use spawner::ActorSpawner;
 use task_runtime::ActorTaskRuntime;
-use worker_pool::{ActorWorkerPool, WorkerPoolKind};
+use worker_pool::ActorWorkerPool;
 
 static NEXT_LOCAL_ACTOR_ID: AtomicU64 = AtomicU64::new(1);
 // Match the default turn budget so the common saturated path releases mailbox capacity once per
 // turn instead of once per message. Smaller turn budgets still cap the prefetch.
 const NORMAL_RECEIVE_BATCH_SIZE: usize = 64;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Selects the executor and worker-placement policy for an Actor activation.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ActorExecutionPolicy {
+    /// Runs the Actor as an independent task on the Tokio runtime owned by [`ActorRuntime`].
     TaskPerActor,
-    KeyedWorkerPool { worker_count: usize },
-    DedicatedThreadPool { worker_count: usize },
+    /// Runs the Actor on a named, fixed-size worker pool owned by [`ActorRuntime`].
+    WorkerPool {
+        /// Identifies the pool to share within this runtime.
+        pool_key: WorkerPoolKey,
+        /// Number of single-threaded workers in the pool.
+        worker_count: usize,
+        /// Selects one worker for this activation.
+        placement: WorkerPlacement,
+    },
 }
 
-/// Stable affinity key for actors scheduled on a keyed worker pool.
+/// Stable identity of a worker pool owned by one [`ActorRuntime`].
+///
+/// Actors that use the same key intentionally share the same worker threads, regardless of their
+/// Rust type. Reusing a key with a different worker count is rejected.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct WorkerPoolKey(Arc<str>);
+
+impl WorkerPoolKey {
+    pub fn new(value: impl Into<Arc<str>>) -> Result<Self, WorkerPoolKeyError> {
+        let value = value.into();
+        if value.contains('\0') {
+            return Err(WorkerPoolKeyError::ContainsNul);
+        }
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Display for WorkerPoolKey {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> FmtResult {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl TryFrom<String> for WorkerPoolKey {
+    type Error = WorkerPoolKeyError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl TryFrom<&str> for WorkerPoolKey {
+    type Error = WorkerPoolKeyError;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+/// Failure returned when a worker-pool identity cannot be used safely.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum WorkerPoolKeyError {
+    /// Thread names cannot contain a NUL character.
+    #[error("worker pool key must not contain a NUL character")]
+    ContainsNul,
+}
+
+/// Strategy used to select one worker within a named worker pool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkerPlacement {
+    /// Distributes new activations across workers in spawn order.
+    RoundRobin,
+    /// Hashes [`ActorSpawnOptions::scheduler_key`] to preserve worker affinity.
+    Affinity,
+}
+
+/// Stable affinity key for actors using [`WorkerPlacement::Affinity`].
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum SchedulerKey {
     String(String),
@@ -125,6 +195,7 @@ impl Default for ActorRuntimeConfig {
 pub struct ActorSpawnOptions {
     pub mailbox: MailboxConfig,
     pub execution: Option<ActorExecutionPolicy>,
+    /// Stable key required when the selected policy uses [`WorkerPlacement::Affinity`].
     pub scheduler_key: Option<SchedulerKey>,
     pub passivation: PassivationPolicy,
 }
@@ -214,7 +285,10 @@ impl ActorRuntime {
     where
         A: Actor,
     {
-        let spawner = ActorSpawner::new(self.scheduler.clone(), self.config.default_execution);
+        let spawner = ActorSpawner::new(
+            self.scheduler.clone(),
+            self.config.default_execution.clone(),
+        );
         spawner.spawn(
             actor,
             ActorSpawnContext {
@@ -248,24 +322,21 @@ impl Debug for ActorScheduler {
 
 struct SchedulerResources {
     task_runtime: ActorTaskRuntime,
-    keyed_workers: Mutex<HashMap<usize, Arc<ActorWorkerPool>>>,
-    dedicated_workers: Mutex<HashMap<DedicatedPoolKey, Arc<ActorWorkerPool>>>,
+    worker_pools: Mutex<HashMap<WorkerPoolKey, WorkerPoolEntry>>,
 }
 
 impl SchedulerResources {
     fn new(task_worker_count: usize) -> Self {
         Self {
             task_runtime: ActorTaskRuntime::new(task_worker_count),
-            keyed_workers: Mutex::new(HashMap::new()),
-            dedicated_workers: Mutex::new(HashMap::new()),
+            worker_pools: Mutex::new(HashMap::new()),
         }
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct DedicatedPoolKey {
-    actor_type: TypeId,
+struct WorkerPoolEntry {
     worker_count: usize,
+    pool: Arc<ActorWorkerPool>,
 }
 
 impl ActorScheduler {
@@ -281,13 +352,13 @@ impl ActorScheduler {
             })
     }
 
-    pub fn keyed_worker_index(
+    pub fn affinity_worker_index(
         scheduler_key: &SchedulerKey,
         worker_count: usize,
     ) -> Result<usize, ActorSpawnError> {
         if worker_count == 0 {
             return Err(ActorSpawnError::InvalidExecutionPolicy {
-                reason: "KeyedWorkerPool worker_count must be greater than zero",
+                reason: "WorkerPool worker_count must be greater than zero",
             });
         }
         Ok((stable_scheduler_key_hash(scheduler_key) % worker_count as u64) as usize)
@@ -304,21 +375,17 @@ impl ActorScheduler {
     {
         match execution {
             ActorExecutionPolicy::TaskPerActor => self.spawn_task_per_actor(actor, context),
-            ActorExecutionPolicy::KeyedWorkerPool { worker_count } => {
+            ActorExecutionPolicy::WorkerPool {
+                pool_key,
+                worker_count,
+                placement,
+            } => {
                 if worker_count == 0 {
                     return Err(ActorSpawnError::InvalidExecutionPolicy {
-                        reason: "KeyedWorkerPool worker_count must be greater than zero",
+                        reason: "WorkerPool worker_count must be greater than zero",
                     });
                 }
-                self.spawn_keyed_worker_pool_actor(actor, context, worker_count)
-            }
-            ActorExecutionPolicy::DedicatedThreadPool { worker_count } => {
-                if worker_count == 0 {
-                    return Err(ActorSpawnError::InvalidExecutionPolicy {
-                        reason: "DedicatedThreadPool worker_count must be greater than zero",
-                    });
-                }
-                self.spawn_dedicated_pool_actor(actor, context, worker_count)
+                self.spawn_worker_pool_actor(actor, context, pool_key, worker_count, placement)
             }
         }
     }
@@ -342,97 +409,69 @@ impl ActorScheduler {
         )
     }
 
-    fn spawn_keyed_worker_pool_actor<A>(
+    fn spawn_worker_pool_actor<A>(
         &self,
         actor: A,
         context: ActorSpawnContext,
+        pool_key: WorkerPoolKey,
         worker_count: usize,
+        placement: WorkerPlacement,
     ) -> Result<ActorHandle<A>, ActorSpawnError>
     where
         A: Actor,
     {
-        let pool = self.keyed_worker_pool(worker_count)?;
         let (parts, passivation, scheduler_key) = context.into_parts();
-        let scheduler_key =
-            scheduler_key.unwrap_or_else(|| SchedulerKey::U64(parts.handle.local_ref().id()));
-        let worker_index = Self::keyed_worker_index(&scheduler_key, worker_count)?;
+        let affinity_worker_index = match placement {
+            WorkerPlacement::RoundRobin => None,
+            WorkerPlacement::Affinity => {
+                let scheduler_key =
+                    scheduler_key.ok_or(ActorSpawnError::InvalidExecutionPolicy {
+                        reason: "WorkerPool affinity placement requires a scheduler_key",
+                    })?;
+                Some(Self::affinity_worker_index(&scheduler_key, worker_count)?)
+            }
+        };
+        let pool = self.worker_pool(pool_key, worker_count)?;
+        let worker_index = affinity_worker_index.unwrap_or_else(|| pool.next_worker_index());
         Ok(spawn_actor_on_pool(
             actor,
             parts,
             passivation,
             &pool,
             worker_index,
-            "keyed_worker_pool",
+            "worker_pool",
         ))
     }
 
-    fn spawn_dedicated_pool_actor<A>(
+    fn worker_pool(
         &self,
-        actor: A,
-        context: ActorSpawnContext,
-        worker_count: usize,
-    ) -> Result<ActorHandle<A>, ActorSpawnError>
-    where
-        A: Actor,
-    {
-        let pool = self.dedicated_worker_pool::<A>(worker_count)?;
-        let worker_index = pool.next_worker_index();
-        let (parts, passivation, _scheduler_key) = context.into_parts();
-        Ok(spawn_actor_on_pool(
-            actor,
-            parts,
-            passivation,
-            &pool,
-            worker_index,
-            "dedicated_thread_pool",
-        ))
-    }
-
-    fn keyed_worker_pool(
-        &self,
+        pool_key: WorkerPoolKey,
         worker_count: usize,
     ) -> Result<Arc<ActorWorkerPool>, ActorSpawnError> {
         let resources = self.resources()?;
         let mut pools = resources
-            .keyed_workers
+            .worker_pools
             .lock()
             .expect("actor worker pool mutex poisoned");
-        if let Some(pool) = pools.get(&worker_count) {
-            return Ok(pool.clone());
+        if let Some(entry) = pools.get(&pool_key) {
+            if entry.worker_count != worker_count {
+                return Err(ActorSpawnError::WorkerPoolConfigurationConflict {
+                    pool_key,
+                    configured_worker_count: entry.worker_count,
+                    requested_worker_count: worker_count,
+                });
+            }
+            return Ok(entry.pool.clone());
         }
 
-        let pool = Arc::new(ActorWorkerPool::start(WorkerPoolKind::Keyed, worker_count)?);
-        pools.insert(worker_count, pool.clone());
-        Ok(pool)
-    }
-
-    fn dedicated_worker_pool<A>(
-        &self,
-        worker_count: usize,
-    ) -> Result<Arc<ActorWorkerPool>, ActorSpawnError>
-    where
-        A: Actor,
-    {
-        let key = DedicatedPoolKey {
-            actor_type: TypeId::of::<A>(),
-            worker_count,
-        };
-        let resources = self.resources()?;
-        let mut pools = resources
-            .dedicated_workers
-            .lock()
-            .expect("actor worker pool mutex poisoned");
-        if let Some(pool) = pools.get(&key) {
-            return Ok(pool.clone());
-        }
-
-        let pool = Arc::new(ActorWorkerPool::start(
-            WorkerPoolKind::Dedicated {
-                actor_type: type_name::<A>(),
+        let pool = Arc::new(ActorWorkerPool::start(pool_key.as_str(), worker_count)?);
+        pools.insert(
+            pool_key,
+            WorkerPoolEntry {
+                worker_count,
+                pool: pool.clone(),
             },
-            worker_count,
-        )?);
-        pools.insert(key, pool.clone());
+        );
         Ok(pool)
     }
 }

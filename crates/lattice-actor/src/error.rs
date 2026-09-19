@@ -2,7 +2,10 @@ use std::{error::Error as StdError, fmt};
 
 use thiserror::Error;
 
-use crate::{runtime::ActorExecutionPolicy, traits::ActorLifecycleState};
+use crate::{
+    runtime::{ActorExecutionPolicy, WorkerPoolKey},
+    traits::ActorLifecycleState,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 #[error("{message}")]
@@ -234,6 +237,14 @@ pub enum ActorSpawnError {
     UnsupportedExecutionPolicy { policy: ActorExecutionPolicy },
     #[error("invalid actor execution policy: {reason}")]
     InvalidExecutionPolicy { reason: &'static str },
+    #[error(
+        "worker pool `{pool_key}` already has {configured_worker_count} workers, but this spawn requested {requested_worker_count}"
+    )]
+    WorkerPoolConfigurationConflict {
+        pool_key: WorkerPoolKey,
+        configured_worker_count: usize,
+        requested_worker_count: usize,
+    },
     #[error("actor executor failed to start: {reason}")]
     ExecutorStartFailed { reason: &'static str },
 }

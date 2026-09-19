@@ -20,6 +20,7 @@ use lattice_actor_distributed::{
     reply::ReplyTo,
     runtime::{
         ActorExecutionPolicy, ActorRuntime, ActorRuntimeConfig, ActorSpawnOptions, SchedulerKey,
+        WorkerPlacement, WorkerPoolKey,
     },
     traits::{
         Actor, ActorLifecycleState, ChildActorKey, ChildActorOptions, ChildSupervision, Handler,
@@ -168,8 +169,16 @@ impl Responder<Ping> for PolicyActor {
 async fn callback_panic_terminates_actor_under_every_execution_policy() {
     for policy in [
         ActorExecutionPolicy::TaskPerActor,
-        ActorExecutionPolicy::KeyedWorkerPool { worker_count: 1 },
-        ActorExecutionPolicy::DedicatedThreadPool { worker_count: 1 },
+        ActorExecutionPolicy::WorkerPool {
+            pool_key: WorkerPoolKey::new("panic-affinity").unwrap(),
+            worker_count: 1,
+            placement: WorkerPlacement::Affinity,
+        },
+        ActorExecutionPolicy::WorkerPool {
+            pool_key: WorkerPoolKey::new("panic-round-robin").unwrap(),
+            worker_count: 1,
+            placement: WorkerPlacement::RoundRobin,
+        },
     ] {
         let runtime = ActorRuntime::default();
         let stopping_calls = Arc::new(AtomicUsize::new(0));
@@ -178,7 +187,7 @@ async fn callback_panic_terminates_actor_under_every_execution_policy() {
                 PolicyActor {
                     stopping_calls: stopping_calls.clone(),
                 },
-                options(policy),
+                options(policy.clone()),
             )
             .unwrap();
         let mut terminated = handle.subscribe_terminated();

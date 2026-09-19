@@ -9,7 +9,7 @@ use lattice_actor::mailbox::MailboxConfig;
 use lattice_actor::reply::ReplyTo;
 use lattice_actor::runtime::{
     ActorExecutionPolicy, ActorRuntime, ActorRuntimeConfig, ActorScheduler, ActorSpawnOptions,
-    PassivationPolicy, SchedulerKey,
+    PassivationPolicy, SchedulerKey, WorkerPlacement, WorkerPoolKey, WorkerPoolKeyError,
 };
 use lattice_actor::traits::{
     Actor, ChildActorKey, ChildActorOptions, ChildSupervision, Handler, Responder, StopReason,
@@ -17,6 +17,22 @@ use lattice_actor::traits::{
 use tokio::sync::{Mutex, mpsc};
 
 const ASK_TIMEOUT: Duration = Duration::from_secs(5);
+
+fn round_robin_pool(pool_key: &str, worker_count: usize) -> ActorExecutionPolicy {
+    ActorExecutionPolicy::WorkerPool {
+        pool_key: WorkerPoolKey::new(pool_key).unwrap(),
+        worker_count,
+        placement: WorkerPlacement::RoundRobin,
+    }
+}
+
+fn affinity_pool(pool_key: &str, worker_count: usize) -> ActorExecutionPolicy {
+    ActorExecutionPolicy::WorkerPool {
+        pool_key: WorkerPoolKey::new(pool_key).unwrap(),
+        worker_count,
+        placement: WorkerPlacement::Affinity,
+    }
+}
 
 #[derive(Debug, lattice_actor::Request)]
 #[request(response = String)]
@@ -106,23 +122,23 @@ impl Actor for ParentActor {
     async fn started(&mut self, ctx: &mut ActorContext<Self>) -> Result<(), Self::Error> {
         for (key, execution, scheduler_key) in [
             (
-                "keyed-a",
-                ActorExecutionPolicy::KeyedWorkerPool { worker_count: 2 },
+                "affinity-a",
+                affinity_pool("child-affinity", 2),
                 Some(SchedulerKey::from("shared-child-key")),
             ),
             (
-                "keyed-b",
-                ActorExecutionPolicy::KeyedWorkerPool { worker_count: 2 },
+                "affinity-b",
+                affinity_pool("child-affinity", 2),
                 Some(SchedulerKey::from("shared-child-key")),
             ),
             (
-                "dedicated-a",
-                ActorExecutionPolicy::DedicatedThreadPool { worker_count: 1 },
+                "round-robin-a",
+                round_robin_pool("child-round-robin", 1),
                 None,
             ),
             (
-                "dedicated-b",
-                ActorExecutionPolicy::DedicatedThreadPool { worker_count: 1 },
+                "round-robin-b",
+                round_robin_pool("child-round-robin", 1),
                 None,
             ),
         ] {
@@ -169,7 +185,7 @@ impl Actor for RestartingParent {
             ChildActorOptions {
                 mailbox: MailboxConfig::bounded(8),
                 supervision: ChildSupervision::RestartChild,
-                execution: ActorExecutionPolicy::DedicatedThreadPool { worker_count: 1 },
+                execution: round_robin_pool("restarting-children", 1),
                 ..ChildActorOptions::default()
             },
         )?);
@@ -302,10 +318,13 @@ fn runtime_shutdown_releases_actors_from_every_owned_executor() {
     let (started_tx, started_rx) = std_mpsc::channel();
     let (dropped_tx, dropped_rx) = std_mpsc::channel();
 
-    for execution in [
-        ActorExecutionPolicy::TaskPerActor,
-        ActorExecutionPolicy::KeyedWorkerPool { worker_count: 1 },
-        ActorExecutionPolicy::DedicatedThreadPool { worker_count: 1 },
+    for (execution, scheduler_key) in [
+        (ActorExecutionPolicy::TaskPerActor, None),
+        (round_robin_pool("shutdown-round-robin", 1), None),
+        (
+            affinity_pool("shutdown-affinity", 1),
+            Some(SchedulerKey::from("shutdown-actor")),
+        ),
     ] {
         let _handle = runtime
             .spawn_actor(
@@ -315,6 +334,7 @@ fn runtime_shutdown_releases_actors_from_every_owned_executor() {
                 },
                 ActorSpawnOptions {
                     execution: Some(execution),
+                    scheduler_key,
                     ..ActorSpawnOptions::default()
                 },
             )
@@ -331,7 +351,7 @@ fn runtime_shutdown_releases_actors_from_every_owned_executor() {
 }
 
 #[tokio::test]
-async fn dedicated_thread_pool_policy_runs_actor_with_same_mailbox_semantics() {
+async fn worker_pool_policy_runs_actor_with_same_mailbox_semantics() {
     let runtime = ActorRuntime::default();
     let events = Arc::new(Mutex::new(Vec::new()));
     let handle = runtime
@@ -341,21 +361,21 @@ async fn dedicated_thread_pool_policy_runs_actor_with_same_mailbox_semantics() {
             },
             ActorSpawnOptions {
                 mailbox: MailboxConfig::bounded(8),
-                execution: Some(ActorExecutionPolicy::DedicatedThreadPool { worker_count: 2 }),
+                execution: Some(round_robin_pool("mailbox-semantics", 2)),
                 scheduler_key: None,
                 passivation: PassivationPolicy::Disabled,
             },
         )
         .unwrap();
 
-    let reply = handle.ask(Ping("dedicated"), ASK_TIMEOUT).await.unwrap();
+    let reply = handle.ask(Ping("worker-pool"), ASK_TIMEOUT).await.unwrap();
 
-    assert_eq!(reply, "pong:dedicated");
-    assert_eq!(*events.lock().await, vec!["dedicated"]);
+    assert_eq!(reply, "pong:worker-pool");
+    assert_eq!(*events.lock().await, vec!["worker-pool"]);
 }
 
 #[tokio::test]
-async fn keyed_worker_pool_execution_policy_runs_actor_with_same_mailbox_semantics() {
+async fn affinity_worker_pool_runs_actor_with_same_mailbox_semantics() {
     let runtime = ActorRuntime::default();
     let events = Arc::new(Mutex::new(Vec::new()));
     let handle = runtime
@@ -365,7 +385,7 @@ async fn keyed_worker_pool_execution_policy_runs_actor_with_same_mailbox_semanti
             },
             ActorSpawnOptions {
                 mailbox: MailboxConfig::bounded(8),
-                execution: Some(ActorExecutionPolicy::KeyedWorkerPool { worker_count: 4 }),
+                execution: Some(affinity_pool("affinity-semantics", 4)),
                 scheduler_key: Some(SchedulerKey::U64(42)),
                 passivation: PassivationPolicy::Disabled,
             },
@@ -424,7 +444,7 @@ async fn supervised_child_restart_preserves_the_selected_execution_policy() {
 }
 
 #[tokio::test]
-async fn execution_policies_reject_zero_workers() {
+async fn worker_pool_rejects_zero_workers() {
     let runtime = ActorRuntime::default();
     let shard = runtime.spawn_actor(
         TestActor {
@@ -432,19 +452,19 @@ async fn execution_policies_reject_zero_workers() {
         },
         ActorSpawnOptions {
             mailbox: MailboxConfig::bounded(8),
-            execution: Some(ActorExecutionPolicy::KeyedWorkerPool { worker_count: 0 }),
+            execution: Some(round_robin_pool("zero-round-robin", 0)),
             scheduler_key: None,
             passivation: PassivationPolicy::Disabled,
         },
     );
-    let dedicated = runtime.spawn_actor(
+    let affinity = runtime.spawn_actor(
         TestActor {
             events: Arc::new(Mutex::new(Vec::new())),
         },
         ActorSpawnOptions {
             mailbox: MailboxConfig::bounded(8),
-            execution: Some(ActorExecutionPolicy::DedicatedThreadPool { worker_count: 0 }),
-            scheduler_key: None,
+            execution: Some(affinity_pool("zero-affinity", 0)),
+            scheduler_key: Some(SchedulerKey::from("zero")),
             passivation: PassivationPolicy::Disabled,
         },
     );
@@ -454,13 +474,13 @@ async fn execution_policies_reject_zero_workers() {
         Err(ActorSpawnError::InvalidExecutionPolicy { .. })
     ));
     assert!(matches!(
-        dedicated,
+        affinity,
         Err(ActorSpawnError::InvalidExecutionPolicy { .. })
     ));
 }
 
 #[tokio::test]
-async fn dedicated_thread_pool_reuses_configured_worker_threads() {
+async fn named_worker_pool_reuses_configured_worker_threads() {
     let runtime = ActorRuntime::default();
     let first = runtime
         .spawn_actor(
@@ -469,7 +489,7 @@ async fn dedicated_thread_pool_reuses_configured_worker_threads() {
             },
             ActorSpawnOptions {
                 mailbox: MailboxConfig::bounded(8),
-                execution: Some(ActorExecutionPolicy::DedicatedThreadPool { worker_count: 1 }),
+                execution: Some(round_robin_pool("shared-test-actors", 1)),
                 scheduler_key: None,
                 passivation: PassivationPolicy::Disabled,
             },
@@ -482,7 +502,7 @@ async fn dedicated_thread_pool_reuses_configured_worker_threads() {
             },
             ActorSpawnOptions {
                 mailbox: MailboxConfig::bounded(8),
-                execution: Some(ActorExecutionPolicy::DedicatedThreadPool { worker_count: 1 }),
+                execution: Some(round_robin_pool("shared-test-actors", 1)),
                 scheduler_key: None,
                 passivation: PassivationPolicy::Disabled,
             },
@@ -496,7 +516,7 @@ async fn dedicated_thread_pool_reuses_configured_worker_threads() {
 }
 
 #[tokio::test]
-async fn dedicated_thread_pool_is_scoped_by_actor_type() {
+async fn named_worker_pool_can_be_shared_across_actor_types() {
     let runtime = ActorRuntime::default();
     let first = runtime
         .spawn_actor(
@@ -505,7 +525,7 @@ async fn dedicated_thread_pool_is_scoped_by_actor_type() {
             },
             ActorSpawnOptions {
                 mailbox: MailboxConfig::bounded(8),
-                execution: Some(ActorExecutionPolicy::DedicatedThreadPool { worker_count: 1 }),
+                execution: Some(round_robin_pool("cross-type", 1)),
                 scheduler_key: None,
                 passivation: PassivationPolicy::Disabled,
             },
@@ -516,9 +536,41 @@ async fn dedicated_thread_pool_is_scoped_by_actor_type() {
             OtherActor,
             ActorSpawnOptions {
                 mailbox: MailboxConfig::bounded(8),
-                execution: Some(ActorExecutionPolicy::DedicatedThreadPool { worker_count: 1 }),
+                execution: Some(round_robin_pool("cross-type", 1)),
                 scheduler_key: None,
                 passivation: PassivationPolicy::Disabled,
+            },
+        )
+        .unwrap();
+
+    assert_eq!(
+        first.ask(CurrentThread, ASK_TIMEOUT).await.unwrap(),
+        second.ask(CurrentThread, ASK_TIMEOUT).await.unwrap()
+    );
+}
+
+#[tokio::test]
+async fn different_pool_keys_isolate_actors_of_the_same_type() {
+    let runtime = ActorRuntime::default();
+    let first = runtime
+        .spawn_actor(
+            TestActor {
+                events: Arc::new(Mutex::new(Vec::new())),
+            },
+            ActorSpawnOptions {
+                execution: Some(round_robin_pool("latency-sensitive", 1)),
+                ..ActorSpawnOptions::default()
+            },
+        )
+        .unwrap();
+    let second = runtime
+        .spawn_actor(
+            TestActor {
+                events: Arc::new(Mutex::new(Vec::new())),
+            },
+            ActorSpawnOptions {
+                execution: Some(round_robin_pool("background", 1)),
+                ..ActorSpawnOptions::default()
             },
         )
         .unwrap();
@@ -530,7 +582,7 @@ async fn dedicated_thread_pool_is_scoped_by_actor_type() {
 }
 
 #[tokio::test]
-async fn keyed_worker_pool_uses_scheduler_key_for_worker_affinity() {
+async fn worker_pool_uses_scheduler_key_for_worker_affinity() {
     let runtime = ActorRuntime::default();
     let first = runtime
         .spawn_actor(
@@ -539,7 +591,7 @@ async fn keyed_worker_pool_uses_scheduler_key_for_worker_affinity() {
             },
             ActorSpawnOptions {
                 mailbox: MailboxConfig::bounded(8),
-                execution: Some(ActorExecutionPolicy::KeyedWorkerPool { worker_count: 2 }),
+                execution: Some(affinity_pool("affinity", 2)),
                 scheduler_key: Some(SchedulerKey::from("same-key")),
                 passivation: PassivationPolicy::Disabled,
             },
@@ -552,7 +604,7 @@ async fn keyed_worker_pool_uses_scheduler_key_for_worker_affinity() {
             },
             ActorSpawnOptions {
                 mailbox: MailboxConfig::bounded(8),
-                execution: Some(ActorExecutionPolicy::KeyedWorkerPool { worker_count: 2 }),
+                execution: Some(affinity_pool("affinity", 2)),
                 scheduler_key: Some(SchedulerKey::from("same-key")),
                 passivation: PassivationPolicy::Disabled,
             },
@@ -565,13 +617,67 @@ async fn keyed_worker_pool_uses_scheduler_key_for_worker_affinity() {
     );
 }
 
+#[tokio::test]
+async fn affinity_requires_an_explicit_scheduler_key() {
+    let runtime = ActorRuntime::default();
+    let result = runtime.spawn_actor(
+        TestActor {
+            events: Arc::new(Mutex::new(Vec::new())),
+        },
+        ActorSpawnOptions {
+            execution: Some(affinity_pool("missing-affinity-key", 1)),
+            scheduler_key: None,
+            ..ActorSpawnOptions::default()
+        },
+    );
+
+    assert!(matches!(
+        result,
+        Err(ActorSpawnError::InvalidExecutionPolicy { .. })
+    ));
+}
+
+#[tokio::test]
+async fn worker_pool_rejects_a_conflicting_worker_count() {
+    let runtime = ActorRuntime::default();
+    let _first = runtime
+        .spawn_actor(
+            TestActor {
+                events: Arc::new(Mutex::new(Vec::new())),
+            },
+            ActorSpawnOptions {
+                execution: Some(round_robin_pool("configured-once", 1)),
+                ..ActorSpawnOptions::default()
+            },
+        )
+        .unwrap();
+    let second = runtime.spawn_actor(
+        TestActor {
+            events: Arc::new(Mutex::new(Vec::new())),
+        },
+        ActorSpawnOptions {
+            execution: Some(round_robin_pool("configured-once", 2)),
+            ..ActorSpawnOptions::default()
+        },
+    );
+
+    assert!(matches!(
+        second,
+        Err(ActorSpawnError::WorkerPoolConfigurationConflict {
+            pool_key,
+            configured_worker_count: 1,
+            requested_worker_count: 2,
+        }) if pool_key == WorkerPoolKey::new("configured-once").unwrap()
+    ));
+}
+
 #[test]
-fn keyed_worker_pool_maps_actor_identity_deterministically_to_worker() {
+fn affinity_maps_scheduler_key_deterministically_to_worker() {
     let scheduler_key = SchedulerKey::U64(42);
 
-    let first = ActorScheduler::keyed_worker_index(&scheduler_key, 8).unwrap();
-    let second = ActorScheduler::keyed_worker_index(&scheduler_key, 8).unwrap();
-    let zero = ActorScheduler::keyed_worker_index(&scheduler_key, 0);
+    let first = ActorScheduler::affinity_worker_index(&scheduler_key, 8).unwrap();
+    let second = ActorScheduler::affinity_worker_index(&scheduler_key, 8).unwrap();
+    let zero = ActorScheduler::affinity_worker_index(&scheduler_key, 0);
 
     assert_eq!(first, second);
     assert!(first < 8);
@@ -579,4 +685,16 @@ fn keyed_worker_pool_maps_actor_identity_deterministically_to_worker() {
         zero,
         Err(ActorSpawnError::InvalidExecutionPolicy { .. })
     ));
+}
+
+#[test]
+fn worker_pool_key_rejects_nul_characters() {
+    assert_eq!(
+        WorkerPoolKey::new("invalid\0pool"),
+        Err(WorkerPoolKeyError::ContainsNul)
+    );
+    assert_eq!(
+        WorkerPoolKey::try_from("invalid\0pool"),
+        Err(WorkerPoolKeyError::ContainsNul)
+    );
 }

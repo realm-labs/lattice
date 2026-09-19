@@ -314,7 +314,7 @@ pub struct ChildActorOptions {
     pub supervision: ChildSupervision,
     /// Execution policy used to run this child.
     pub execution: ActorExecutionPolicy,
-    /// Affinity key used only by [`crate::runtime::ActorExecutionPolicy::KeyedWorkerPool`].
+    /// Affinity key required by [`crate::runtime::WorkerPlacement::Affinity`].
     pub scheduler_key: Option<SchedulerKey>,
 }
 

@@ -26,7 +26,11 @@ impl ActorSpawner {
     where
         A: Actor,
     {
-        let execution = context.options.execution.unwrap_or(self.default_execution);
+        let execution = context
+            .options
+            .execution
+            .clone()
+            .unwrap_or_else(|| self.default_execution.clone());
         self.scheduler.spawn(actor, context, execution)
     }
 }

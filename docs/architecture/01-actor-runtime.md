@@ -102,11 +102,19 @@ lattice ActorRuntime
 The public scheduling API shape is:
 
 ```rust
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ActorExecutionPolicy {
     TaskPerActor,
-    KeyedWorkerPool { worker_count: usize },
-    DedicatedThreadPool { worker_count: usize },
+    WorkerPool {
+        pool_key: WorkerPoolKey,
+        worker_count: usize,
+        placement: WorkerPlacement,
+    },
+}
+
+pub enum WorkerPlacement {
+    RoundRobin,
+    Affinity,
 }
 
 #[derive(Debug, Clone)]
@@ -155,21 +163,35 @@ TaskPerActor:
   All such tasks in one ActorRuntime share its dedicated multi-thread Tokio runtime.
   This is the default for user actors and child actors.
 
-KeyedWorkerPool:
-  A fixed worker set owns many actor mailbox loops on lattice-managed worker runtimes.
-  The scheduler_key maps deterministically to a worker.
-  If scheduler_key is not provided, the runtime hashes the concrete ActorPath.
-  This is useful for stable affinity, cache locality, and predictable distribution without claiming to be a full shard scheduler.
-
-DedicatedThreadPool:
-  A named pool for actors that must be isolated from normal Tokio worker threads.
-  The pool is scoped by actor Rust type and worker_count.
-  Actors of the same type reuse that type's dedicated worker pool.
-  Different actor types do not share a dedicated worker pool unless a future explicit named-pool API is added.
+WorkerPool:
+  A named fixed worker set owns many actor mailbox loops on lattice-managed worker runtimes.
+  pool_key explicitly defines the resource-sharing and isolation boundary.
+  Actors share a pool only when they use the same ActorRuntime and pool_key; their Rust types are irrelevant.
+  Reusing one pool_key with a different worker_count is a configuration error.
   A pool worker can run many actor mailbox loops; this is not one OS thread per actor.
-  Actors of the same type are assigned across the pool, currently by round-robin.
+  RoundRobin assigns each new activation to the next worker and ignores scheduler_key.
+  Affinity requires an explicit scheduler_key and maps it deterministically to one worker.
   This is for blocking-heavy or CPU-heavy actor families only when they cannot offload work elsewhere.
 ```
+
+For example, sharded entities can deliberately share one pool while retaining stable worker
+affinity:
+
+```rust
+ActorSpawnOptions {
+    execution: Some(ActorExecutionPolicy::WorkerPool {
+        pool_key: WorkerPoolKey::new("entity-workers")?,
+        worker_count: 8,
+        placement: WorkerPlacement::Affinity,
+    }),
+    scheduler_key: Some(SchedulerKey::from(entity_id)),
+    ..ActorSpawnOptions::default()
+}
+```
+
+Two actors of the same Rust type can instead use different `pool_key` values to obtain isolated
+worker sets. Conversely, different Actor types can intentionally share a worker set by using the
+same key and worker count.
 
 Rules:
 
@@ -179,11 +201,11 @@ ActorRuntime owns task naming, lifecycle, cancellation, metrics, tracing, and dr
 ActorRuntime must be retained for the lifetime of its Actors; dropping it shuts down its execution resources.
 ActorContext creates scoped tasks through the actor runtime so they can be cancelled or isolated.
 ServiceContext creates service-scoped tasks through the service runtime.
-CPU-heavy or blocking work must not run directly on Tokio worker threads; use a blocking pool, dedicated worker, or external compute service.
+CPU-heavy or blocking work must not run directly on Tokio worker threads; use a named worker pool, blocking pool, or external compute service.
 ActorRegistry stores actor ownership independently from the concrete execution policy.
 Mailbox semantics are identical across execution policies.
 Changing execution policy must not change `Handler<M>` business code.
-Sharded entities should pass a stable scheduler_key derived from EntityId when using KeyedWorkerPool.
+Sharded entities should pass a stable scheduler_key derived from EntityId when using WorkerPool affinity placement.
 ```
 
 Forbidden implementation shortcuts:
@@ -194,7 +216,7 @@ Do not add global Actor spawn helpers that construct an isolated ActorRuntime pe
 Do not make ActorHandle depend on Tokio JoinHandle.
 Do not let each actor kind invent its own scheduling path.
 Do not encode execution policy into business `Handler<M>` bounds.
-Do not add KeyedWorkerPool/DedicatedThreadPool behavior before TaskPerActor semantics are tested.
+Do not infer worker-pool identity from Actor type or worker count; resource sharing must use an explicit pool_key.
 ```
 
 This keeps the first version simple while fixing the final scheduling boundary: lattice owns actor scheduling; Tokio is only the first backing executor.
