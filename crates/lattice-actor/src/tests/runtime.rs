@@ -5,15 +5,16 @@ use std::sync::Arc;
 use lattice_core::service_context::ServiceContext;
 use tokio::sync::{Mutex, oneshot};
 
-use super::{ASK_TIMEOUT, ContextMarker, Ping, ReadContextExtension, SpawnContextChild, TestActor};
+use super::{
+    ASK_TIMEOUT, ContextMarker, Ping, ReadContextExtension, SpawnContextChild, TestActor,
+    spawn_actor,
+};
 use crate::{
     attachments::ActorRuntimeAttachments,
     context::ActorContext,
     error::ActorFailure,
     mailbox::MailboxConfig,
-    runtime::{
-        ActorExecutionPolicy, ActorRuntime, ActorRuntimeConfig, ActorSpawnOptions, spawn_actor,
-    },
+    runtime::{ActorExecutionPolicy, ActorRuntime, ActorRuntimeConfig, ActorSpawnOptions},
     traits::{Actor, ChildActorKey, ChildActorOptions},
 };
 

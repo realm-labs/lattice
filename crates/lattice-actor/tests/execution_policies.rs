@@ -1,5 +1,5 @@
 use lattice_actor::context::HandlerContext;
-use std::sync::Arc;
+use std::sync::{Arc, mpsc as std_mpsc};
 use std::time::Duration;
 
 use lattice_actor::context::ActorContext;
@@ -8,8 +8,8 @@ use lattice_actor::handle::ActorHandle;
 use lattice_actor::mailbox::MailboxConfig;
 use lattice_actor::reply::ReplyTo;
 use lattice_actor::runtime::{
-    ActorExecutionPolicy, ActorRuntime, ActorScheduler, ActorSpawnOptions, PassivationPolicy,
-    SchedulerKey,
+    ActorExecutionPolicy, ActorRuntime, ActorRuntimeConfig, ActorScheduler, ActorSpawnOptions,
+    PassivationPolicy, SchedulerKey,
 };
 use lattice_actor::traits::{
     Actor, ChildActorKey, ChildActorOptions, ChildSupervision, Handler, Responder, StopReason,
@@ -31,6 +31,15 @@ struct TestActor {
 }
 
 struct OtherActor;
+
+struct StandaloneActor {
+    started: std_mpsc::Sender<String>,
+}
+
+struct ShutdownActor {
+    started: std_mpsc::Sender<()>,
+    dropped: std_mpsc::Sender<()>,
+}
 
 #[derive(lattice_actor::Request)]
 #[request(response = Vec<String>)]
@@ -60,6 +69,34 @@ impl Actor for TestActor {
 impl Actor for OtherActor {
     type Error = ActorFailure;
     type Behavior = ::lattice_actor::state_machine::Stateless;
+}
+
+impl Actor for StandaloneActor {
+    type Error = ActorFailure;
+    type Behavior = ::lattice_actor::state_machine::Stateless;
+
+    async fn started(&mut self, _ctx: &mut ActorContext<Self>) -> Result<(), Self::Error> {
+        let _ = self
+            .started
+            .send(format!("{:?}", std::thread::current().id()));
+        Ok(())
+    }
+}
+
+impl Actor for ShutdownActor {
+    type Error = ActorFailure;
+    type Behavior = ::lattice_actor::state_machine::Stateless;
+
+    async fn started(&mut self, _ctx: &mut ActorContext<Self>) -> Result<(), Self::Error> {
+        let _ = self.started.send(());
+        Ok(())
+    }
+}
+
+impl Drop for ShutdownActor {
+    fn drop(&mut self) {
+        let _ = self.dropped.send(());
+    }
 }
 
 impl Actor for ParentActor {
@@ -212,6 +249,87 @@ impl Responder<CurrentThread> for OtherActor {
     }
 }
 
+#[test]
+fn task_per_actor_uses_one_owned_runtime_without_an_ambient_tokio_context() {
+    let runtime = ActorRuntime::new(ActorRuntimeConfig {
+        task_worker_count: 1,
+        ..ActorRuntimeConfig::default()
+    });
+    let (started_tx, started_rx) = std_mpsc::channel();
+
+    let _first = runtime
+        .spawn_actor(
+            StandaloneActor {
+                started: started_tx.clone(),
+            },
+            ActorSpawnOptions::default(),
+        )
+        .unwrap();
+    let _second = runtime
+        .spawn_actor(
+            StandaloneActor {
+                started: started_tx,
+            },
+            ActorSpawnOptions::default(),
+        )
+        .unwrap();
+
+    let first_thread = started_rx.recv_timeout(ASK_TIMEOUT).unwrap();
+    let second_thread = started_rx.recv_timeout(ASK_TIMEOUT).unwrap();
+    assert_eq!(first_thread, second_thread);
+}
+
+#[test]
+fn task_per_actor_rejects_zero_runtime_workers() {
+    let runtime = ActorRuntime::new(ActorRuntimeConfig {
+        task_worker_count: 0,
+        ..ActorRuntimeConfig::default()
+    });
+    let (started, _started_rx) = std_mpsc::channel();
+
+    assert!(matches!(
+        runtime.spawn_actor(StandaloneActor { started }, ActorSpawnOptions::default()),
+        Err(ActorSpawnError::InvalidExecutionPolicy { .. })
+    ));
+}
+
+#[test]
+fn runtime_shutdown_releases_actors_from_every_owned_executor() {
+    let runtime = ActorRuntime::new(ActorRuntimeConfig {
+        task_worker_count: 1,
+        ..ActorRuntimeConfig::default()
+    });
+    let (started_tx, started_rx) = std_mpsc::channel();
+    let (dropped_tx, dropped_rx) = std_mpsc::channel();
+
+    for execution in [
+        ActorExecutionPolicy::TaskPerActor,
+        ActorExecutionPolicy::KeyedWorkerPool { worker_count: 1 },
+        ActorExecutionPolicy::DedicatedThreadPool { worker_count: 1 },
+    ] {
+        let _handle = runtime
+            .spawn_actor(
+                ShutdownActor {
+                    started: started_tx.clone(),
+                    dropped: dropped_tx.clone(),
+                },
+                ActorSpawnOptions {
+                    execution: Some(execution),
+                    ..ActorSpawnOptions::default()
+                },
+            )
+            .unwrap();
+    }
+
+    for _ in 0..3 {
+        started_rx.recv_timeout(ASK_TIMEOUT).unwrap();
+    }
+    runtime.shutdown();
+    for _ in 0..3 {
+        dropped_rx.recv_timeout(ASK_TIMEOUT).unwrap();
+    }
+}
+
 #[tokio::test]
 async fn dedicated_thread_pool_policy_runs_actor_with_same_mailbox_semantics() {
     let runtime = ActorRuntime::default();
@@ -262,7 +380,8 @@ async fn keyed_worker_pool_execution_policy_runs_actor_with_same_mailbox_semanti
 
 #[tokio::test]
 async fn child_actors_use_selected_execution_policies_and_scheduler_affinity() {
-    let parent = ActorRuntime::default()
+    let runtime = ActorRuntime::default();
+    let parent = runtime
         .spawn_actor(
             ParentActor {
                 children: Vec::new(),
@@ -281,7 +400,8 @@ async fn child_actors_use_selected_execution_policies_and_scheduler_affinity() {
 #[tokio::test]
 async fn supervised_child_restart_preserves_the_selected_execution_policy() {
     let (started_tx, mut started_rx) = mpsc::unbounded_channel();
-    let parent = ActorRuntime::default()
+    let runtime = ActorRuntime::default();
+    let parent = runtime
         .spawn_actor(
             RestartingParent {
                 child: None,

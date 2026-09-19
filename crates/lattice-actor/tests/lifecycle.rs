@@ -13,7 +13,7 @@ use lattice_actor::{
     handle::ActorHandle,
     mailbox::MailboxConfig,
     reply::ReplyTo,
-    runtime::{ActorRuntime, ActorSpawnOptions, PassivationPolicy, spawn_actor},
+    runtime::{ActorRuntime, ActorSpawnOptions, PassivationPolicy},
     traits::{
         Actor, ActorLifecycleState, ChildActorKey, ChildActorOptions, ChildSupervision, Handler,
         PassivationReason, Responder, StopReason,
@@ -21,6 +21,9 @@ use lattice_actor::{
     watch::{ActorTerminated, TerminatedReason},
 };
 use tokio::sync::{Mutex, Semaphore};
+
+mod support;
+use support::spawn_actor;
 
 const ASK_TIMEOUT: Duration = Duration::from_secs(5);
 

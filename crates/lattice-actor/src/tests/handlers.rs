@@ -6,12 +6,11 @@ use tokio::sync::Mutex;
 
 use super::{
     ASK_TIMEOUT, BusinessErrorActor, LoadBusinessState, Ping, Record, RecoverBusinessState,
-    TestActor,
+    TestActor, spawn_actor,
 };
 use crate::{
     error::ActorCallError,
     mailbox::MailboxConfig,
-    runtime::spawn_actor,
     traits::{Handler, Message, Request, Responder},
 };
 

@@ -2,9 +2,10 @@ use std::{
     any::{TypeId, type_name},
     collections::HashMap,
     fmt::{Debug, Formatter, Result as FmtResult},
+    num::NonZeroUsize,
     panic::AssertUnwindSafe,
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, Weak,
         atomic::{AtomicU64, Ordering},
     },
     time::{Duration, SystemTime},
@@ -37,6 +38,7 @@ mod panic;
 mod passivation;
 mod rejection;
 pub(crate) mod spawner;
+mod task_runtime;
 mod worker_pool;
 
 use dispatch::{ActorInstance, handle_command};
@@ -44,6 +46,7 @@ use panic::{ActorPanic, finalize_panicked_actor, terminate_panicked_actor};
 use passivation::wait_for_idle_timeout;
 use rejection::{reject_prefetched_commands, reject_queued_commands};
 use spawner::ActorSpawner;
+use task_runtime::ActorTaskRuntime;
 use worker_pool::{ActorWorkerPool, WorkerPoolKind};
 
 static NEXT_LOCAL_ACTOR_ID: AtomicU64 = AtomicU64::new(1);
@@ -100,6 +103,8 @@ impl From<Vec<u8>> for SchedulerKey {
 #[derive(Debug, Clone)]
 pub struct ActorRuntimeConfig {
     pub default_execution: ActorExecutionPolicy,
+    /// Number of worker threads in the dedicated Tokio runtime used by `TaskPerActor`.
+    pub task_worker_count: usize,
     pub observer: ActorObserverHandle,
     /// Shared environment inherited by every Actor spawned by this runtime.
     pub service: ServiceContext,
@@ -109,6 +114,7 @@ impl Default for ActorRuntimeConfig {
     fn default() -> Self {
         Self {
             default_execution: ActorExecutionPolicy::TaskPerActor,
+            task_worker_count: std::thread::available_parallelism().map_or(1, NonZeroUsize::get),
             observer: ActorObserverHandle::default(),
             service: ServiceContext::empty(),
         }
@@ -136,22 +142,49 @@ pub enum PassivationPolicy {
     IdleTimeout(Duration),
 }
 
-#[derive(Debug, Clone)]
+/// Owner of the execution resources shared by a group of Actors.
+///
+/// `TaskPerActor` activations run on a dedicated Tokio runtime rather than the caller's ambient
+/// runtime. Dropping the runtime shuts its executors down, so the owner must remain alive for as
+/// long as its Actors.
 pub struct ActorRuntime {
     config: ActorRuntimeConfig,
+    resources: Arc<SchedulerResources>,
     scheduler: ActorScheduler,
+}
+
+impl Debug for ActorRuntime {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> FmtResult {
+        formatter
+            .debug_struct("ActorRuntime")
+            .field("config", &self.config)
+            .field("scheduler", &self.scheduler)
+            .finish_non_exhaustive()
+    }
 }
 
 impl ActorRuntime {
     pub fn new(config: ActorRuntimeConfig) -> Self {
+        let resources = Arc::new(SchedulerResources::new(config.task_worker_count));
         Self {
+            scheduler: ActorScheduler::new(Arc::downgrade(&resources)),
             config,
-            scheduler: ActorScheduler::default(),
+            resources,
         }
     }
 
     pub fn scheduler(&self) -> &ActorScheduler {
         &self.scheduler
+    }
+
+    /// Shuts down every executor owned by this runtime.
+    ///
+    /// This is an execution-level shutdown: active Actor tasks are cancelled and their graceful
+    /// `stopping` hooks are not run. A service should stop or drain its Actors before consuming the
+    /// runtime. Dropping `ActorRuntime` has the same fallback behavior.
+    pub fn shutdown(self) {
+        let Self { resources, .. } = self;
+        drop(resources);
     }
 
     pub fn spawn_actor<A>(
@@ -204,7 +237,7 @@ impl Default for ActorRuntime {
 
 #[derive(Clone)]
 pub struct ActorScheduler {
-    pools: Arc<SchedulerPools>,
+    resources: Weak<SchedulerResources>,
 }
 
 impl Debug for ActorScheduler {
@@ -213,18 +246,20 @@ impl Debug for ActorScheduler {
     }
 }
 
-impl Default for ActorScheduler {
-    fn default() -> Self {
-        Self {
-            pools: Arc::new(SchedulerPools::default()),
-        }
-    }
-}
-
-#[derive(Default)]
-struct SchedulerPools {
+struct SchedulerResources {
+    task_runtime: ActorTaskRuntime,
     keyed_workers: Mutex<HashMap<usize, Arc<ActorWorkerPool>>>,
     dedicated_workers: Mutex<HashMap<DedicatedPoolKey, Arc<ActorWorkerPool>>>,
+}
+
+impl SchedulerResources {
+    fn new(task_worker_count: usize) -> Self {
+        Self {
+            task_runtime: ActorTaskRuntime::new(task_worker_count),
+            keyed_workers: Mutex::new(HashMap::new()),
+            dedicated_workers: Mutex::new(HashMap::new()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -234,6 +269,18 @@ struct DedicatedPoolKey {
 }
 
 impl ActorScheduler {
+    fn new(resources: Weak<SchedulerResources>) -> Self {
+        Self { resources }
+    }
+
+    fn resources(&self) -> Result<Arc<SchedulerResources>, ActorSpawnError> {
+        self.resources
+            .upgrade()
+            .ok_or(ActorSpawnError::ExecutorStartFailed {
+                reason: "ActorRuntime was dropped before the Actor could spawn",
+            })
+    }
+
     pub fn keyed_worker_index(
         scheduler_key: &SchedulerKey,
         worker_count: usize,
@@ -256,7 +303,7 @@ impl ActorScheduler {
         A: Actor,
     {
         match execution {
-            ActorExecutionPolicy::TaskPerActor => Ok(spawn_task_per_actor(actor, context)),
+            ActorExecutionPolicy::TaskPerActor => self.spawn_task_per_actor(actor, context),
             ActorExecutionPolicy::KeyedWorkerPool { worker_count } => {
                 if worker_count == 0 {
                     return Err(ActorSpawnError::InvalidExecutionPolicy {
@@ -274,6 +321,25 @@ impl ActorScheduler {
                 self.spawn_dedicated_pool_actor(actor, context, worker_count)
             }
         }
+    }
+
+    fn spawn_task_per_actor<A>(
+        &self,
+        actor: A,
+        context: ActorSpawnContext,
+    ) -> Result<ActorHandle<A>, ActorSpawnError>
+    where
+        A: Actor,
+    {
+        let resources = self.resources()?;
+        let (parts, passivation, _scheduler_key) = context.into_parts();
+        spawn_actor_as_tokio_task(
+            actor,
+            parts,
+            passivation,
+            &resources.task_runtime,
+            "task_per_actor",
+        )
     }
 
     fn spawn_keyed_worker_pool_actor<A>(
@@ -326,8 +392,8 @@ impl ActorScheduler {
         &self,
         worker_count: usize,
     ) -> Result<Arc<ActorWorkerPool>, ActorSpawnError> {
-        let mut pools = self
-            .pools
+        let resources = self.resources()?;
+        let mut pools = resources
             .keyed_workers
             .lock()
             .expect("actor worker pool mutex poisoned");
@@ -351,8 +417,8 @@ impl ActorScheduler {
             actor_type: TypeId::of::<A>(),
             worker_count,
         };
-        let mut pools = self
-            .pools
+        let resources = self.resources()?;
+        let mut pools = resources
             .dedicated_workers
             .lock()
             .expect("actor worker pool mutex poisoned");
@@ -399,47 +465,6 @@ fn stable_scheduler_key_hash(scheduler_key: &SchedulerKey) -> u64 {
         }
     }
     hash
-}
-
-pub fn spawn_actor<A>(actor: A, mailbox: MailboxConfig) -> ActorHandle<A>
-where
-    A: Actor,
-{
-    ActorRuntime::default()
-        .spawn_actor(
-            actor,
-            ActorSpawnOptions {
-                mailbox,
-                execution: Some(ActorExecutionPolicy::TaskPerActor),
-                scheduler_key: None,
-                passivation: PassivationPolicy::Disabled,
-            },
-        )
-        .expect("TaskPerActor execution is supported")
-}
-
-pub fn spawn_actor_with_context<A>(
-    actor: A,
-    mailbox: MailboxConfig,
-    service: ServiceContext,
-) -> ActorHandle<A>
-where
-    A: Actor,
-{
-    ActorRuntime::new(ActorRuntimeConfig {
-        service,
-        ..ActorRuntimeConfig::default()
-    })
-    .spawn_actor(
-        actor,
-        ActorSpawnOptions {
-            mailbox,
-            execution: Some(ActorExecutionPolicy::TaskPerActor),
-            scheduler_key: None,
-            passivation: PassivationPolicy::Disabled,
-        },
-    )
-    .expect("TaskPerActor execution is supported")
 }
 
 pub(crate) struct ActorSpawnContext {
@@ -502,14 +527,6 @@ where
     spawner.spawn(actor, context)
 }
 
-fn spawn_task_per_actor<A>(actor: A, context: ActorSpawnContext) -> ActorHandle<A>
-where
-    A: Actor,
-{
-    let (parts, passivation, _scheduler_key) = context.into_parts();
-    spawn_actor_as_tokio_task(actor, parts, passivation, "task_per_actor")
-}
-
 struct ActorRuntimeParts<A: Actor> {
     handle: ActorHandle<A>,
     normal_rx: Receiver<ActorCommand<A>>,
@@ -568,8 +585,9 @@ fn spawn_actor_as_tokio_task<A>(
     actor: A,
     parts: ActorRuntimeParts<A>,
     passivation: PassivationPolicy,
+    runtime: &ActorTaskRuntime,
     execution_policy: &'static str,
-) -> ActorHandle<A>
+) -> Result<ActorHandle<A>, ActorSpawnError>
 where
     A: Actor,
 {
@@ -581,9 +599,9 @@ where
         actor.local_ref = handle.local_ref().id(),
         execution.policy = execution_policy
     );
-    tokio::spawn(run_actor(actor, parts, passivation).instrument(span));
+    runtime.spawn(run_actor(actor, parts, passivation).instrument(span))?;
 
-    handle
+    Ok(handle)
 }
 
 fn spawn_actor_on_pool<A>(

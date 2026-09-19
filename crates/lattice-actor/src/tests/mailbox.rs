@@ -4,13 +4,11 @@ use std::sync::Arc;
 
 use tokio::sync::{Mutex, Semaphore};
 
-use super::{ASK_TIMEOUT, Ping, Record, TestActor};
+use super::{ASK_TIMEOUT, Ping, Record, TestActor, spawn_actor};
 use crate::{
     error::ActorTellError,
     mailbox::MailboxConfig,
-    runtime::{
-        ActorExecutionPolicy, ActorRuntime, ActorSpawnOptions, PassivationPolicy, spawn_actor,
-    },
+    runtime::{ActorExecutionPolicy, ActorRuntime, ActorSpawnOptions, PassivationPolicy},
 };
 
 #[tokio::test]

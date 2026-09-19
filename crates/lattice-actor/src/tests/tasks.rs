@@ -4,12 +4,11 @@ use std::{sync::Arc, time::Duration};
 
 use tokio::sync::{Mutex, oneshot};
 
-use super::Tick;
+use super::{Tick, spawn_actor};
 use crate::{
     context::{ActorContext, HandlerContext},
     error::ActorFailure,
     mailbox::MailboxConfig,
-    runtime::spawn_actor,
     traits::{Actor, Handler, StopReason},
 };
 

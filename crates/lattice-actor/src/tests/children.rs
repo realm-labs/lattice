@@ -4,14 +4,13 @@ use std::{sync::Arc, time::Duration};
 
 use tokio::sync::Semaphore;
 
-use super::ASK_TIMEOUT;
+use super::{ASK_TIMEOUT, spawn_actor};
 use crate::{
     context::{ActorContext, HandlerContext},
     error::ActorFailure,
     handle::ActorHandle,
     mailbox::MailboxConfig,
     reply::ReplyTo,
-    runtime::spawn_actor,
     traits::{Actor, ChildActorKey, ChildActorOptions, Handler, Responder},
 };
 

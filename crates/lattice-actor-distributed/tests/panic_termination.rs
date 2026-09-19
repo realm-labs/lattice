@@ -2,7 +2,7 @@ use lattice_actor::context::HandlerContext;
 use std::{
     any::type_name,
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicUsize, Ordering},
     },
     time::Duration,
@@ -31,6 +31,23 @@ use lattice_core::{actor_kind, id::ActorId};
 use tokio::sync::Semaphore;
 
 const TIMEOUT: Duration = Duration::from_secs(2);
+
+fn spawn_actor<A>(actor: A, mailbox: MailboxConfig) -> ActorHandle<A>
+where
+    A: Actor,
+{
+    static RUNTIME: OnceLock<ActorRuntime> = OnceLock::new();
+    RUNTIME
+        .get_or_init(ActorRuntime::default)
+        .spawn_actor(
+            actor,
+            ActorSpawnOptions {
+                mailbox,
+                ..ActorSpawnOptions::default()
+            },
+        )
+        .expect("test Actor should spawn")
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum ObserverEvent {
@@ -290,8 +307,7 @@ impl Responder<CrashRequest> for BeforeHookPanicActor {
 
 #[tokio::test]
 async fn panic_before_reply_control_registration_returns_actor_panicked() {
-    let handle =
-        lattice_actor::runtime::spawn_actor(BeforeHookPanicActor, MailboxConfig::bounded(8));
+    let handle = spawn_actor(BeforeHookPanicActor, MailboxConfig::bounded(8));
     assert_eq!(
         handle.ask(CrashRequest, TIMEOUT).await,
         Err(ActorCallError::ActorPanicked)
@@ -328,8 +344,7 @@ impl Responder<Ping> for AfterHookPanicActor {
 
 #[tokio::test]
 async fn panic_after_successful_reply_does_not_overwrite_the_reply() {
-    let handle =
-        lattice_actor::runtime::spawn_actor(AfterHookPanicActor, MailboxConfig::bounded(8));
+    let handle = spawn_actor(AfterHookPanicActor, MailboxConfig::bounded(8));
     let mut terminated = handle.subscribe_terminated();
     assert_eq!(handle.ask(Ping, TIMEOUT).await.unwrap(), 7);
     assert_eq!(
@@ -481,7 +496,7 @@ impl Handler<Crash> for DeferredPanicActor {
 
 #[tokio::test]
 async fn deferred_ask_is_cancelled_with_actor_panicked() {
-    let handle = lattice_actor::runtime::spawn_actor(
+    let handle = spawn_actor(
         DeferredPanicActor { reply: None },
         MailboxConfig::bounded(8),
     );
@@ -536,7 +551,7 @@ impl Responder<Ping> for ScopedTaskActor {
 
 #[tokio::test]
 async fn scoped_task_panic_remains_isolated_from_the_actor() {
-    let handle = lattice_actor::runtime::spawn_actor(ScopedTaskActor, MailboxConfig::bounded(8));
+    let handle = spawn_actor(ScopedTaskActor, MailboxConfig::bounded(8));
     let ran = Arc::new(Semaphore::new(0));
     handle
         .tell(LaunchPanickingTask { ran: ran.clone() })
@@ -616,7 +631,7 @@ impl Actor for StoppingPanicActor {
 
 #[tokio::test]
 async fn stopping_panic_terminates_without_entering_stop_failed() {
-    let handle = lattice_actor::runtime::spawn_actor(StoppingPanicActor, MailboxConfig::bounded(8));
+    let handle = spawn_actor(StoppingPanicActor, MailboxConfig::bounded(8));
     let mut terminated = handle.subscribe_terminated();
     handle.stop(StopReason::Requested).unwrap();
     assert_eq!(
@@ -646,7 +661,7 @@ impl Drop for DropPanicActor {
 
 #[tokio::test]
 async fn actor_drop_panic_still_publishes_termination() {
-    let handle = lattice_actor::runtime::spawn_actor(DropPanicActor, MailboxConfig::bounded(8));
+    let handle = spawn_actor(DropPanicActor, MailboxConfig::bounded(8));
     let mut terminated = handle.subscribe_terminated();
     handle.stop(StopReason::Requested).unwrap();
     assert_eq!(
@@ -732,7 +747,7 @@ impl Handler<CrashChild> for SupervisingParent {
 #[tokio::test]
 async fn restart_child_supervision_replaces_panicked_child() {
     let child_started = Arc::new(Semaphore::new(0));
-    let parent = lattice_actor::runtime::spawn_actor(
+    let parent = spawn_actor(
         SupervisingParent {
             child: None,
             child_started: child_started.clone(),
@@ -754,7 +769,7 @@ async fn restart_child_supervision_replaces_panicked_child() {
 #[tokio::test]
 async fn stop_parent_supervision_observes_panicked_child() {
     let child_started = Arc::new(Semaphore::new(0));
-    let parent = lattice_actor::runtime::spawn_actor(
+    let parent = spawn_actor(
         SupervisingParent {
             child: None,
             child_started: child_started.clone(),

@@ -65,7 +65,8 @@ fn address(sequence: u64) -> ActorAddress {
 
 #[tokio::test]
 async fn concurrent_directory_registration_never_exceeds_capacity() {
-    let handle = ActorRuntime::default()
+    let runtime = ActorRuntime::default();
+    let handle = runtime
         .spawn_actor(TestActor, ActorSpawnOptions::default())
         .unwrap();
     for _ in 0..16 {

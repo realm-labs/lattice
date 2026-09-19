@@ -1,14 +1,15 @@
 use lattice_actor::context::HandlerContext;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use lattice_actor::context::ActorContext;
 use lattice_actor::error::{ActorFailure, ActorStopError};
+use lattice_actor::handle::ActorHandle;
 use lattice_actor::mailbox::MailboxConfig;
-use lattice_actor::runtime::spawn_actor;
+use lattice_actor::runtime::{ActorRuntime, ActorSpawnOptions};
 use lattice_actor::traits::{Actor, ActorLifecycleState, Handler, StopReason};
 use lattice_store_mongodb::document::LoadedDocument;
 use lattice_store_mongodb::document::tracked::Tracked;
@@ -26,6 +27,23 @@ use lattice_store_mongodb::scan::ScanBudget;
 use lattice_store_mongodb::{MongoDocument, MongoScan};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Semaphore;
+
+fn spawn_actor<A>(actor: A, mailbox: MailboxConfig) -> ActorHandle<A>
+where
+    A: Actor,
+{
+    static RUNTIME: OnceLock<ActorRuntime> = OnceLock::new();
+    RUNTIME
+        .get_or_init(ActorRuntime::default)
+        .spawn_actor(
+            actor,
+            ActorSpawnOptions {
+                mailbox,
+                ..ActorSpawnOptions::default()
+            },
+        )
+        .expect("test Actor should spawn")
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, MongoDocument, MongoScan)]
 #[mongo(collection = "actor_persistence_test")]

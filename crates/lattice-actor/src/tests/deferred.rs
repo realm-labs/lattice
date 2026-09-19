@@ -4,8 +4,10 @@ use std::{sync::Arc, time::Duration};
 
 use tokio::sync::{Mutex, Semaphore};
 
-use super::{ASK_TIMEOUT, DeferredReply, Ping, PipeRecord, ProbePipeCapacity, Record, TestActor};
-use crate::{mailbox::MailboxConfig, runtime::spawn_actor};
+use super::{
+    ASK_TIMEOUT, DeferredReply, Ping, PipeRecord, ProbePipeCapacity, Record, TestActor, spawn_actor,
+};
+use crate::mailbox::MailboxConfig;
 
 #[tokio::test]
 async fn deferred_reply_does_not_block_the_actor_mailbox() {

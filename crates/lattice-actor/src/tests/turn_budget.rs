@@ -2,11 +2,11 @@ use std::sync::Arc;
 
 use tokio::sync::{Mutex, Semaphore};
 
+use super::spawn_actor;
 use crate::{
     context::HandlerContext,
     error::ActorFailure,
     mailbox::MailboxConfig,
-    runtime::spawn_actor,
     state_machine::Stateless,
     traits::{Actor, Handler},
 };

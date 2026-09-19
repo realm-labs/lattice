@@ -5,7 +5,6 @@ use lattice_actor::{
     error::ActorFailure,
     mailbox::MailboxConfig,
     reply::ReplyTo,
-    runtime::spawn_actor,
     state_machine::Stateless,
     traits::{
         Actor, Handler, MessageKind, MessageMetadata, MessageOutcome, MessageView, Request,
@@ -13,6 +12,9 @@ use lattice_actor::{
     },
 };
 use tokio::sync::Semaphore;
+
+mod support;
+use support::spawn_actor;
 
 const TIMEOUT: Duration = Duration::from_secs(1);
 

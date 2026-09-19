@@ -3,7 +3,10 @@
 //! The shared actor fixtures live here; each submodule holds the tests for one runtime concern
 //! and reaches the fixtures through `super`.
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{Arc, OnceLock},
+    time::Duration,
+};
 
 use thiserror::Error;
 use tokio::sync::{Mutex, Semaphore};
@@ -11,7 +14,10 @@ use tokio::sync::{Mutex, Semaphore};
 use crate::{
     context::{ActorContext, HandlerContext},
     error::{ActorCallError, ActorContextError, ActorFailure, ActorStopError, PipeToSelfError},
+    handle::ActorHandle,
+    mailbox::MailboxConfig,
     reply::ReplyTo,
+    runtime::{ActorRuntime, ActorSpawnOptions},
     traits::{
         Actor, ChildActorKey, ChildActorOptions, Handler, MessageMetadata, PassivationReason,
         Responder, ResponderErrorAction, StopReason,
@@ -28,6 +34,23 @@ mod tasks;
 mod turn_budget;
 
 const ASK_TIMEOUT: Duration = Duration::from_secs(5);
+
+fn spawn_actor<A>(actor: A, mailbox: MailboxConfig) -> ActorHandle<A>
+where
+    A: Actor,
+{
+    static RUNTIME: OnceLock<ActorRuntime> = OnceLock::new();
+    RUNTIME
+        .get_or_init(ActorRuntime::default)
+        .spawn_actor(
+            actor,
+            ActorSpawnOptions {
+                mailbox,
+                ..ActorSpawnOptions::default()
+            },
+        )
+        .expect("test Actor should spawn")
+}
 
 #[derive(Debug, crate::Request)]
 #[request(response = String)]

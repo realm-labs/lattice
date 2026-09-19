@@ -216,12 +216,12 @@ fn now_unix_ms() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use std::{io::Error as IoError, time::Duration};
+    use std::{io::Error as IoError, sync::OnceLock, time::Duration};
 
     use lattice_actor_distributed::{
         context::HandlerContext,
         mailbox::MailboxConfig,
-        runtime::spawn_actor,
+        runtime::{ActorRuntime, ActorSpawnOptions},
         state_machine::Stateless,
         traits::{Actor, ActorLifecycleState, Handler, Message, StopReason},
     };
@@ -234,6 +234,23 @@ mod tests {
         local::{EventBus, LocalEventBus},
         types::{EventEnvelope, EventId, EventSubscription, SubjectFilter},
     };
+
+    fn spawn_actor<A>(actor: A, mailbox: MailboxConfig) -> ActorHandle<A>
+    where
+        A: Actor,
+    {
+        static RUNTIME: OnceLock<ActorRuntime> = OnceLock::new();
+        RUNTIME
+            .get_or_init(ActorRuntime::default)
+            .spawn_actor(
+                actor,
+                ActorSpawnOptions {
+                    mailbox,
+                    ..ActorSpawnOptions::default()
+                },
+            )
+            .expect("test Actor should spawn")
+    }
 
     #[derive(Clone, PartialEq, prost::Message)]
     struct TestEvent {

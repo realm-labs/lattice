@@ -8,12 +8,14 @@ use lattice_actor::context::ActorContext;
 use lattice_actor::error::ActorFailure;
 use lattice_actor::mailbox::MailboxConfig;
 use lattice_actor::reply::ReplyTo;
-use lattice_actor::runtime::spawn_actor;
 use lattice_actor::traits::{
     Actor, Handler, MessageKind, MessageLane, MessageMetadata, MessageOutcome, MessageView,
     Responder, ResponderErrorAction,
 };
 use tokio::sync::Semaphore;
+
+mod support;
+use support::spawn_actor;
 
 #[derive(Debug, lattice_actor::Message)]
 struct PayloadTell {

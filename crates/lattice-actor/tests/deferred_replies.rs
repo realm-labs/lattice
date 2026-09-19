@@ -12,10 +12,12 @@ use lattice_actor::{
     handle::ActorHandle,
     mailbox::MailboxConfig,
     reply::ReplyTo,
-    runtime::spawn_actor,
     traits::{Actor, Handler, Responder, StopReason},
 };
 use tokio::sync::Semaphore;
+
+mod support;
+use support::spawn_actor;
 
 const ASK_TIMEOUT: Duration = Duration::from_secs(5);
 

@@ -143,7 +143,8 @@ async fn interval_timer_survives_a_transiently_full_mailbox() {
     }
 
     let ticks = Arc::new(Mutex::new(0));
-    let handle = ActorRuntime::default()
+    let runtime = ActorRuntime::default();
+    let handle = runtime
         .spawn_actor(
             TickActor {
                 ticks: ticks.clone(),

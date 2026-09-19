@@ -4,12 +4,12 @@ use std::{sync::Arc, time::Duration};
 
 use tokio::sync::{Mutex, Semaphore};
 
-use super::{ASK_TIMEOUT, Ping, Record, StopAfterReply, TestActor};
+use super::{ASK_TIMEOUT, Ping, Record, StopAfterReply, TestActor, spawn_actor};
 use crate::{
     context::{ActorContext, HandlerContext},
     error::{ActorCallError, ActorFailure, ActorStopError, ActorTellError},
     mailbox::MailboxConfig,
-    runtime::{ActorRuntime, ActorSpawnOptions, PassivationPolicy, spawn_actor},
+    runtime::{ActorRuntime, ActorSpawnOptions, PassivationPolicy},
     traits::{Actor, ActorLifecycleState, Handler, PassivationReason, StopReason},
 };
 
@@ -124,7 +124,8 @@ async fn idle_passivation_waits_until_a_long_handler_finishes() {
     }
 
     let stopped = Arc::new(Semaphore::new(0));
-    let handle = ActorRuntime::default()
+    let runtime = ActorRuntime::default();
+    let handle = runtime
         .spawn_actor(
             IdleActor {
                 stopped: stopped.clone(),

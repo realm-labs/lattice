@@ -101,7 +101,8 @@ impl Responder<Probe> for FencedActor {
 async fn fence_before_first_poll_skips_startup_and_still_persists() {
     let observed = Arc::new(Observed::default());
     observed.persistence_available.store(true, Ordering::SeqCst);
-    let handle = ActorRuntime::default()
+    let runtime = ActorRuntime::default();
+    let handle = runtime
         .spawn_actor(
             FencedActor {
                 observed: observed.clone(),
@@ -128,7 +129,8 @@ async fn fence_rejects_prefetched_work_even_when_system_mailbox_is_full() {
     let observed = Arc::new(Observed::default());
     let entered = Arc::new(Semaphore::new(0));
     let release = Arc::new(Semaphore::new(0));
-    let handle = ActorRuntime::default()
+    let runtime = ActorRuntime::default();
+    let handle = runtime
         .spawn_actor(
             FencedActor {
                 observed: observed.clone(),
@@ -176,7 +178,8 @@ async fn fence_rejects_prefetched_work_even_when_system_mailbox_is_full() {
 async fn fence_wakes_an_idle_actor_without_a_mailbox_command() {
     let observed = Arc::new(Observed::default());
     observed.persistence_available.store(true, Ordering::SeqCst);
-    let handle = ActorRuntime::default()
+    let runtime = ActorRuntime::default();
+    let handle = runtime
         .spawn_actor(
             FencedActor {
                 observed,

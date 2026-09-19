@@ -87,14 +87,14 @@ supervision-restarted Actor receives a new empty extension set with its new cont
 
 ### 7.2 Actor Scheduling Model
 
-The actor scheduling model is part of lattice, not an implementation detail left to each feature. The first implementation runs on the service process's Tokio runtime, but all actor execution must go through `ActorRuntime`.
+The actor scheduling model is part of lattice, not an implementation detail left to each feature. Each long-lived `ActorRuntime` owns its execution resources; Actor execution does not depend on an ambient application Tokio runtime.
 
 Required layering:
 
 ```text
-Tokio runtime
-  -> lattice ActorRuntime
-    -> ActorExecutor
+lattice ActorRuntime
+  -> owned execution resources
+    -> ActorScheduler
       -> ActorExecutionPolicy
         -> actor mailbox loop
 ```
@@ -112,11 +112,14 @@ pub enum ActorExecutionPolicy {
 #[derive(Debug, Clone)]
 pub struct ActorRuntimeConfig {
     pub default_execution: ActorExecutionPolicy,
+    pub task_worker_count: usize,
     pub observer: ActorObserverHandle,
+    pub service: ServiceContext,
 }
 
 pub struct ActorRuntime {
     config: ActorRuntimeConfig,
+    resources: Arc<SchedulerResources>,
     scheduler: ActorScheduler,
 }
 
@@ -130,6 +133,8 @@ impl ActorRuntime {
     ) -> Result<ActorHandle<A>, ActorSpawnError>
     where
         A: Actor;
+
+    pub fn shutdown(self);
 }
 
 #[derive(Debug, Clone)]
@@ -147,7 +152,8 @@ Final scheduling semantics:
 ```text
 TaskPerActor:
   One managed Tokio task owns one actor mailbox loop.
-  This is the default for user actors, child actors, and the early runtime implementation.
+  All such tasks in one ActorRuntime share its dedicated multi-thread Tokio runtime.
+  This is the default for user actors and child actors.
 
 KeyedWorkerPool:
   A fixed worker set owns many actor mailbox loops on lattice-managed worker runtimes.
@@ -170,6 +176,7 @@ Rules:
 ```text
 Actor tasks are spawned by lattice ActorRuntime, not directly by business code.
 ActorRuntime owns task naming, lifecycle, cancellation, metrics, tracing, and drain integration.
+ActorRuntime must be retained for the lifetime of its Actors; dropping it shuts down its execution resources.
 ActorContext creates scoped tasks through the actor runtime so they can be cancelled or isolated.
 ServiceContext creates service-scoped tasks through the service runtime.
 CPU-heavy or blocking work must not run directly on Tokio worker threads; use a blocking pool, dedicated worker, or external compute service.
@@ -183,6 +190,7 @@ Forbidden implementation shortcuts:
 
 ```text
 Do not expose tokio::spawn as the actor spawn API.
+Do not add global Actor spawn helpers that construct an isolated ActorRuntime per call.
 Do not make ActorHandle depend on Tokio JoinHandle.
 Do not let each actor kind invent its own scheduling path.
 Do not encode execution policy into business `Handler<M>` bounds.
