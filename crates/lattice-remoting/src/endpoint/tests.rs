@@ -780,7 +780,6 @@ async fn real_tcp_endpoint_establishes_all_lanes_and_delivers_ask() {
     let target = ActorAddress::new(
         cluster_id,
         server_identity.address.clone(),
-        server_identity.incarnation,
         ActorPath::user(["user", "echo"]).unwrap(),
         ActivationId::new(server_identity.incarnation, 1).unwrap(),
         protocol_id,

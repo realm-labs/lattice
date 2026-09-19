@@ -128,7 +128,6 @@ async fn idle_data_lanes_sleep_until_either_side_wakes_them() {
     let target = ActorAddress::new(
         cluster_id.clone(),
         server_identity.address,
-        server_identity.incarnation,
         ActorPath::user(["user", "echo"]).unwrap(),
         ActivationId::new(server_identity.incarnation, 1).unwrap(),
         protocol_id,
@@ -156,7 +155,6 @@ async fn idle_data_lanes_sleep_until_either_side_wakes_them() {
     let reverse_target = ActorAddress::new(
         cluster_id,
         client_identity.address,
-        client_identity.incarnation,
         ActorPath::user(["user", "reverse-echo"]).unwrap(),
         ActivationId::new(client_identity.incarnation, 2).unwrap(),
         protocol_id,

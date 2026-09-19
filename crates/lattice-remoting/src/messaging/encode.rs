@@ -479,7 +479,6 @@ mod tests {
         ActorAddress::new(
             ClusterId::new("test-cluster").unwrap(),
             NodeAddress::new(host, 25520).unwrap(),
-            incarnation,
             ActorPath::user(["user", "玩家", "one"]).unwrap(),
             ActivationId::new(incarnation, sequence).unwrap(),
             ProtocolId::new(7).unwrap(),

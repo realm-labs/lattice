@@ -348,7 +348,6 @@ fn actor_address(node: &NodeKey) -> ActorAddress {
     ActorAddress::new(
         ClusterId::new("sim-cluster").unwrap(),
         node.address.clone(),
-        node.incarnation,
         ActorPath::user(["user", "simulated"]).unwrap(),
         ActivationId::new(node.incarnation, 1).unwrap(),
         ProtocolId::new(1).unwrap(),

@@ -221,7 +221,6 @@ async fn interactive_lane_stays_awake_while_ask_is_in_flight() {
     let target = ActorAddress::new(
         ClusterId::new("lane-test").unwrap(),
         server_address,
-        server_incarnation,
         ActorPath::user(["user", "echo"]).unwrap(),
         ActivationId::new(server_incarnation, 1).unwrap(),
         protocol_id,
@@ -361,7 +360,6 @@ fn lane_target(
     ActorAddress::new(
         ClusterId::new("lane-test").unwrap(),
         address.clone(),
-        incarnation,
         ActorPath::user(["user", "echo"]).unwrap(),
         ActivationId::new(incarnation, 1).unwrap(),
         protocol_id,

@@ -57,7 +57,6 @@ fn actor_and_entity_refs_have_distinct_exact_and_logical_identity() {
     let actor = ActorAddress::new(
         ClusterId::new("test").unwrap(),
         NodeAddress::new("127.0.0.1", 19083).unwrap(),
-        node,
         ActorPath::user(["user", "session-1"]).unwrap(),
         ActivationId::new(node, 1).unwrap(),
         protocol,

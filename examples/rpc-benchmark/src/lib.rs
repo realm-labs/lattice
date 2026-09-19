@@ -119,7 +119,6 @@ impl RemotingTopology {
         let target = ActorAddress::new(
             cluster_id,
             remote_address,
-            remote_incarnation,
             ActorPath::user(["user", "bench", "u-1"])?,
             ActivationId::new(remote_incarnation, 1)?,
             protocol_id,

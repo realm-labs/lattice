@@ -1099,7 +1099,6 @@ impl<A: Actor> ActorRegistry<A> {
         ActorAddress::new(
             config.cluster_id.clone(),
             config.node_address.clone(),
-            config.node_incarnation,
             path,
             next_activation_id(config.node_incarnation),
             protocol_id,

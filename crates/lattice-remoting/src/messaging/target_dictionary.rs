@@ -60,7 +60,6 @@ mod tests {
         ActorAddress::new(
             ClusterId::new("dictionary-test").unwrap(),
             NodeAddress::new("127.0.0.1", 25520).unwrap(),
-            incarnation,
             ActorPath::user(["user", "target"]).unwrap(),
             ActivationId::new(incarnation, sequence).unwrap(),
             ProtocolId::new(7).unwrap(),

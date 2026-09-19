@@ -2,7 +2,7 @@ use std::{collections::BTreeMap, sync::Arc, time::Instant};
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use lattice_core::actor_address::{ActorAddress, ProtocolId};
+use lattice_core::actor_address::ProtocolId;
 use lattice_remoting::messaging::{
     error::RemoteMessageError,
     inbound::{ImmediateTellDispatch, InboundDispatch},
@@ -73,15 +73,9 @@ impl<A: Actor, P: Protocol> ActorHost<A, P> {
     }
 
     fn resolve(&self, target: &ExactActorTarget) -> Result<ActorHandle<A>, RemoteMessageError> {
-        let reference = ActorAddress::new(
-            target.cluster_id.clone(),
-            target.node_address.clone(),
-            target.node_incarnation,
-            target.actor_path.clone(),
-            target.activation_id,
-            target.protocol_id,
-        )
-        .map_err(|_| RemoteMessageError::InvalidPayload)?;
+        let reference = target
+            .actor_address()
+            .map_err(|_| RemoteMessageError::InvalidPayload)?;
         self.registry
             .get_exact(&reference)
             .ok_or(RemoteMessageError::StaleActivation)

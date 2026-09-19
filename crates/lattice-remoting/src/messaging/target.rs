@@ -30,10 +30,14 @@ impl<A: ProtocolTag> From<&ActorAddress<A>> for ExactActorTarget {
 
 impl ExactActorTarget {
     pub fn actor_address<A: ProtocolTag>(&self) -> Result<ActorAddress<A>, AddressError> {
+        if self.node_incarnation != self.activation_id.node_incarnation() {
+            return Err(AddressError::NonCanonical {
+                field: "activation node incarnation",
+            });
+        }
         ActorAddress::new(
             self.cluster_id.clone(),
             self.node_address.clone(),
-            self.node_incarnation,
             self.actor_path.clone(),
             self.activation_id,
             self.protocol_id,

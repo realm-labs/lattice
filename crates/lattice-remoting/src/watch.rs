@@ -740,7 +740,6 @@ mod tests {
         ActorAddress::new(
             ClusterId::new("test").unwrap(),
             NodeAddress::new("remote", 25520).unwrap(),
-            node,
             ActorPath::user(["user", "actor"]).unwrap(),
             ActivationId::new(node, sequence).unwrap(),
             ProtocolId::new(7).unwrap(),

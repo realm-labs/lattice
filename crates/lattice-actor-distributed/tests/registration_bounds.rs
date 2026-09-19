@@ -56,7 +56,6 @@ fn address(sequence: u64) -> ActorAddress {
     ActorAddress::new(
         ClusterId::new("review").unwrap(),
         NodeAddress::new("127.0.0.1", 19301).unwrap(),
-        incarnation,
         ActorPath::user([format!("actor-{sequence}")]).unwrap(),
         ActivationId::new(incarnation, sequence).unwrap(),
         ProtocolId::new(301).unwrap(),

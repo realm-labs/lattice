@@ -293,7 +293,6 @@ impl RemoteActorTopology {
         let target = ActorAddress::new(
             cluster_id,
             server_identity.address,
-            server_identity.incarnation,
             ActorPath::user(["user", "benchmark-echo"])?,
             ActivationId::new(server_identity.incarnation, 1)?,
             protocol_id,

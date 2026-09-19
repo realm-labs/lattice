@@ -413,7 +413,6 @@ mod tests {
         ActorAddress::new(
             ClusterId::new("test").unwrap(),
             NodeAddress::new("remote", 25520).unwrap(),
-            incarnation,
             ActorPath::user(["user", &format!("target-{sequence}")]).unwrap(),
             ActivationId::new(incarnation, sequence).unwrap(),
             protocol_id,

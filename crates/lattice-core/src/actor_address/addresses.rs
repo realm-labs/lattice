@@ -13,7 +13,6 @@ use crate::actor_address::identity::{
 pub struct ActorAddress<P: ProtocolTag = ErasedProtocol> {
     cluster_id: ClusterId,
     node_address: NodeAddress,
-    node_incarnation: NodeIncarnation,
     actor_path: ActorPath,
     activation_id: ActivationId,
     protocol_id: ProtocolId,
@@ -25,21 +24,14 @@ impl<P: ProtocolTag> ActorAddress<P> {
     fn from_parts(
         cluster_id: ClusterId,
         node_address: NodeAddress,
-        node_incarnation: NodeIncarnation,
         actor_path: ActorPath,
         activation_id: ActivationId,
         protocol_id: ProtocolId,
     ) -> Result<Self, AddressError> {
-        if activation_id.node_incarnation() != node_incarnation {
-            return Err(AddressError::NonCanonical {
-                field: "activation node incarnation",
-            });
-        }
         validate_protocol::<P>(protocol_id)?;
         Ok(Self {
             cluster_id,
             node_address,
-            node_incarnation,
             actor_path,
             activation_id,
             protocol_id,
@@ -56,7 +48,7 @@ impl<P: ProtocolTag> ActorAddress<P> {
     }
 
     pub fn node_incarnation(&self) -> NodeIncarnation {
-        self.node_incarnation
+        self.activation_id.node_incarnation()
     }
 
     pub fn actor_path(&self) -> &ActorPath {
@@ -75,7 +67,6 @@ impl<P: ProtocolTag> ActorAddress<P> {
         ActorAddress::from_parts(
             self.cluster_id.clone(),
             self.node_address.clone(),
-            self.node_incarnation,
             self.actor_path.clone(),
             self.activation_id,
             self.protocol_id,
@@ -86,7 +77,6 @@ impl<P: ProtocolTag> ActorAddress<P> {
         ActorAddress {
             cluster_id: self.cluster_id.clone(),
             node_address: self.node_address.clone(),
-            node_incarnation: self.node_incarnation,
             actor_path: self.actor_path.clone(),
             activation_id: self.activation_id,
             protocol_id: self.protocol_id,
@@ -97,7 +87,6 @@ impl<P: ProtocolTag> ActorAddress<P> {
     pub fn same_activation<Q: ProtocolTag>(&self, other: &ActorAddress<Q>) -> bool {
         self.cluster_id == other.cluster_id
             && self.node_address == other.node_address
-            && self.node_incarnation == other.node_incarnation
             && self.actor_path == other.actor_path
             && self.activation_id == other.activation_id
             && self.protocol_id == other.protocol_id
@@ -108,7 +97,6 @@ impl ActorAddress<ErasedProtocol> {
     pub fn new(
         cluster_id: ClusterId,
         node_address: NodeAddress,
-        node_incarnation: NodeIncarnation,
         actor_path: ActorPath,
         activation_id: ActivationId,
         protocol_id: ProtocolId,
@@ -116,7 +104,6 @@ impl ActorAddress<ErasedProtocol> {
         Self::from_parts(
             cluster_id,
             node_address,
-            node_incarnation,
             actor_path,
             activation_id,
             protocol_id,
@@ -128,7 +115,6 @@ impl ActorAddress<ErasedProtocol> {
 struct ActorAddressData {
     cluster_id: ClusterId,
     node_address: NodeAddress,
-    node_incarnation: NodeIncarnation,
     actor_path: ActorPath,
     activation_id: ActivationId,
     protocol_id: ProtocolId,
@@ -143,7 +129,6 @@ impl<'de, P: ProtocolTag> Deserialize<'de> for ActorAddress<P> {
         Self::from_parts(
             data.cluster_id,
             data.node_address,
-            data.node_incarnation,
             data.actor_path,
             data.activation_id,
             data.protocol_id,
@@ -485,32 +470,17 @@ mod tests {
     }
 
     #[test]
-    fn actor_address_requires_activation_from_the_named_node() {
-        let node = NodeIncarnation::new(1).unwrap();
-        let other = NodeIncarnation::new(2).unwrap();
-        let result = ActorAddress::new(
-            ClusterId::new("test").unwrap(),
-            NodeAddress::new("127.0.0.1", 25520).unwrap(),
-            node,
-            ActorPath::user(["user", "actor"]).unwrap(),
-            ActivationId::new(other, 1).unwrap(),
-            ProtocolId::new(7).unwrap(),
-        );
-        assert!(matches!(result, Err(AddressError::NonCanonical { .. })));
-    }
-
-    #[test]
     fn typed_address_conversion_and_deserialization_validate_protocol_id() {
         let incarnation = NodeIncarnation::new(3).unwrap();
         let erased = ActorAddress::new(
             ClusterId::new("test").unwrap(),
             NodeAddress::new("127.0.0.1", 25520).unwrap(),
-            incarnation,
             ActorPath::user(["user", "actor"]).unwrap(),
             ActivationId::new(incarnation, 1).unwrap(),
             ProtocolId::new(7).unwrap(),
         )
         .unwrap();
+        assert_eq!(erased.node_incarnation(), incarnation);
 
         let typed = erased.try_typed::<TestProtocol>().unwrap();
         assert!(typed.same_activation(&erased));
@@ -523,6 +493,12 @@ mod tests {
         ));
 
         let encoded = serde_json::to_vec(&typed).unwrap();
+        assert!(
+            serde_json::to_value(&typed)
+                .unwrap()
+                .get("node_incarnation")
+                .is_none()
+        );
         let decoded: ActorAddress<TestProtocol> = serde_json::from_slice(&encoded).unwrap();
         assert!(decoded.same_activation(&typed));
         assert!(serde_json::from_slice::<ActorAddress<OtherProtocol>>(&encoded).is_err());
