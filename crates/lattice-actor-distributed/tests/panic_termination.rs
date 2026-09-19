@@ -418,6 +418,7 @@ async fn queued_ask_is_rejected_with_actor_panicked() {
     let handle = runtime
         .spawn_actor(QueueActor, ActorSpawnOptions::default())
         .unwrap();
+    let mut terminated = handle.subscribe_terminated();
     let entered = Arc::new(Semaphore::new(0));
     let release = Arc::new(Semaphore::new(0));
     handle
@@ -449,6 +450,14 @@ async fn queued_ask_is_rejected_with_actor_panicked() {
     release.add_permits(1);
 
     assert_eq!(ask.await.unwrap(), Err(ActorCallError::ActorPanicked));
+    assert_eq!(
+        tokio::time::timeout(TIMEOUT, terminated.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .reason,
+        TerminatedReason::Panicked
+    );
     assert_eq!(
         observer
             .snapshot()
@@ -842,6 +851,7 @@ async fn prefetched_ask_is_rejected_with_actor_panicked() {
     let handle = runtime
         .spawn_actor(QueueActor, ActorSpawnOptions::default())
         .unwrap();
+    let mut terminated = handle.subscribe_terminated();
     let entered = Arc::new(Semaphore::new(0));
     let release = Arc::new(Semaphore::new(0));
     handle
@@ -876,6 +886,14 @@ async fn prefetched_ask_is_rejected_with_actor_panicked() {
     release.add_permits(1);
 
     assert_eq!(ask.await.unwrap(), Err(ActorCallError::ActorPanicked));
+    assert_eq!(
+        tokio::time::timeout(TIMEOUT, terminated.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .reason,
+        TerminatedReason::Panicked
+    );
     assert_eq!(
         observer
             .snapshot()
