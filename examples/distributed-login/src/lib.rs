@@ -8,7 +8,7 @@ use std::{
 
 use lattice_actor_distributed::{
     actor_protocol,
-    error::ActorError,
+    error::ActorFailure,
     protocol::ProstCodec,
     registry::{ActorAddressConfig, ActorRegistry, ActorRegistryConfig},
     reply::ReplyTo,
@@ -44,7 +44,7 @@ pub struct WorldActor {
 }
 
 impl Actor for WorldActor {
-    type Error = ActorError;
+    type Error = ActorFailure;
     type Behavior = ::lattice_actor::state_machine::Stateless;
 }
 
@@ -54,7 +54,7 @@ impl Responder<LoginRequest> for WorldActor {
         _ctx: &mut HandlerContext<'_, Self>,
         request: LoginRequest,
         reply_to: ReplyTo<LoginAcceptedReply>,
-    ) -> Result<(), ActorError> {
+    ) -> Result<(), ActorFailure> {
         let accepted = request.world_id == self.world_id && !request.token.is_empty();
         if accepted {
             self.sessions += 1;
@@ -74,7 +74,7 @@ pub struct PlayerActor {
 }
 
 impl Actor for PlayerActor {
-    type Error = ActorError;
+    type Error = ActorFailure;
     type Behavior = ::lattice_actor::state_machine::Stateless;
 }
 
@@ -84,7 +84,7 @@ impl Responder<InitSessionRequest> for PlayerActor {
         _ctx: &mut HandlerContext<'_, Self>,
         request: InitSessionRequest,
         reply_to: ReplyTo<InitSessionReply>,
-    ) -> Result<(), ActorError> {
+    ) -> Result<(), ActorFailure> {
         let ok = request.player_id == self.player_id && !request.session_id.is_empty();
         if ok {
             self.sessions += 1;

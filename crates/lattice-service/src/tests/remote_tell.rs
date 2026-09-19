@@ -10,7 +10,7 @@ use bytes::BytesMut;
 use lattice_actor_distributed::{
     actor_protocol,
     context::HandlerContext,
-    error::ActorError,
+    error::ActorFailure,
     mailbox::MailboxConfig,
     protocol::{CodecDescriptor, DecodeError, EncodeError, WireCodec},
     registry::{ActorAddressConfig, ActorRegistry, ActorRegistryConfig},
@@ -54,7 +54,7 @@ struct FloodActor {
 }
 
 impl Actor for FloodActor {
-    type Error = ActorError;
+    type Error = ActorFailure;
     type Behavior = lattice_actor::state_machine::Stateless;
 }
 
@@ -63,7 +63,7 @@ impl Handler<FloodTell> for FloodActor {
         &mut self,
         _ctx: &mut HandlerContext<'_, Self>,
         message: FloodTell,
-    ) -> Result<(), ActorError> {
+    ) -> Result<(), ActorFailure> {
         self.processed.fetch_add(1, Ordering::Relaxed);
         if message.0 == 0 {
             self.completed.notify_waiters();

@@ -7,7 +7,7 @@ use lattice_actor_distributed::{
     actor_protocol,
     context::HandlerContext,
     directory::{ActivationDirectory, ActivationDirectoryError},
-    error::ActorError,
+    error::ActorFailure,
     host::{ActorHost, HostRegistryError, ProtocolHostRegistry},
     protocol::ProstCodec,
     registry::{ActorAddressConfig, ActorRegistry, ActorRegistryConfig},
@@ -25,7 +25,7 @@ use lattice_core::{
 struct TestActor;
 
 impl Actor for TestActor {
-    type Error = ActorError;
+    type Error = ActorFailure;
     type Behavior = lattice_actor_distributed::state_machine::Stateless;
 }
 
@@ -38,7 +38,7 @@ impl Handler<Probe> for TestActor {
         &mut self,
         _: &mut HandlerContext<'_, Self>,
         _: Probe,
-    ) -> Result<(), ActorError> {
+    ) -> Result<(), ActorFailure> {
         Ok(())
     }
 }

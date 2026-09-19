@@ -2,7 +2,7 @@ use std::{future::Future, sync::Arc, time::Duration};
 
 use lattice_actor::{
     context::{ActorContext, HandlerContext},
-    error::ActorError,
+    error::ActorFailure,
     mailbox::MailboxConfig,
     reply::ReplyTo,
     runtime::spawn_actor,
@@ -64,7 +64,7 @@ struct WorkflowActor {
 }
 
 impl Actor for WorkflowActor {
-    type Error = ActorError;
+    type Error = ActorFailure;
     type Behavior = Stateless;
 
     fn before_message(&mut self, _context: &mut ActorContext<Self>, message: MessageView<'_>) {
@@ -150,7 +150,7 @@ impl Handler<StartFailure> for WorkflowActor {
         message: StartFailure,
     ) -> Result<(), Self::Error> {
         context.continue_with(wait_for(message.gate, 3), |_actor, _context, _output| {
-            Err(ActorError::new("expected continuation failure"))
+            Err(ActorFailure::new("expected continuation failure"))
         })?;
         Ok(())
     }

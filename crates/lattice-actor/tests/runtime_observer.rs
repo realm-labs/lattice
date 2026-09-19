@@ -6,7 +6,7 @@ use std::{
 };
 
 use lattice_actor::{
-    error::{ActorCallError, ActorError, ActorTellError},
+    error::{ActorCallError, ActorFailure, ActorTellError},
     mailbox::MailboxConfig,
     observation::{
         ActorLifecycleEvent, ActorMetadata, ActorObserver, ActorObserverHandle, MailboxRejection,
@@ -52,7 +52,7 @@ struct QueuedRequest;
 struct ObservedActor;
 
 impl Actor for ObservedActor {
-    type Error = ActorError;
+    type Error = ActorFailure;
     type Behavior = ::lattice_actor::state_machine::Stateless;
 }
 
@@ -61,7 +61,7 @@ impl Handler<WireTell> for ObservedActor {
         &mut self,
         _ctx: &mut HandlerContext<'_, Self>,
         _message: WireTell,
-    ) -> Result<(), ActorError> {
+    ) -> Result<(), ActorFailure> {
         Ok(())
     }
 }
@@ -72,7 +72,7 @@ impl Responder<DeferredRequest> for ObservedActor {
         ctx: &mut HandlerContext<'_, Self>,
         request: DeferredRequest,
         reply_to: ReplyTo<&'static str>,
-    ) -> Result<(), ActorError> {
+    ) -> Result<(), ActorFailure> {
         request.entered.add_permits(1);
         ctx.spawn_scoped(async move {
             if let Ok(permit) = request.release.acquire().await {
@@ -89,7 +89,7 @@ impl Handler<BlockingTell> for ObservedActor {
         &mut self,
         _ctx: &mut HandlerContext<'_, Self>,
         message: BlockingTell,
-    ) -> Result<(), ActorError> {
+    ) -> Result<(), ActorFailure> {
         message.entered.add_permits(1);
         if let Ok(permit) = message.release.acquire().await {
             permit.forget();
@@ -103,7 +103,7 @@ impl Handler<QueuedTell> for ObservedActor {
         &mut self,
         _ctx: &mut HandlerContext<'_, Self>,
         _message: QueuedTell,
-    ) -> Result<(), ActorError> {
+    ) -> Result<(), ActorFailure> {
         Ok(())
     }
 }
@@ -113,7 +113,7 @@ impl Handler<BlockingStop> for ObservedActor {
         &mut self,
         ctx: &mut HandlerContext<'_, Self>,
         message: BlockingStop,
-    ) -> Result<(), ActorError> {
+    ) -> Result<(), ActorFailure> {
         message.entered.add_permits(1);
         message.release.acquire().await.unwrap().forget();
         ctx.request_stop();
@@ -127,7 +127,7 @@ impl Responder<QueuedRequest> for ObservedActor {
         _ctx: &mut HandlerContext<'_, Self>,
         _request: QueuedRequest,
         reply_to: ReplyTo<()>,
-    ) -> Result<(), ActorError> {
+    ) -> Result<(), ActorFailure> {
         reply_to.send(())?;
         Ok(())
     }

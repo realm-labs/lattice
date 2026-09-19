@@ -904,13 +904,13 @@ pub fn __protocol_id(value: u64) -> Result<ProtocolId, ProtocolBuildError> {
 mod tests {
     use super::*;
     use lattice_actor::{
-        context::HandlerContext, error::ActorError, reply::ReplyTo, traits::Handler,
+        context::HandlerContext, error::ActorFailure, reply::ReplyTo, traits::Handler,
     };
 
     struct TestActor;
 
     impl Actor for TestActor {
-        type Error = ActorError;
+        type Error = ActorFailure;
         type Behavior = ::lattice_actor::state_machine::Stateless;
     }
 

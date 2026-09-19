@@ -10,7 +10,7 @@ use tokio::sync::{Mutex, Semaphore};
 
 use crate::{
     context::{ActorContext, HandlerContext},
-    error::{ActorCallError, ActorError, ActorStopError, PipeToSelfError},
+    error::{ActorCallError, ActorContextError, ActorFailure, ActorStopError, PipeToSelfError},
     reply::ReplyTo,
     traits::{
         Actor, ChildActorKey, ChildActorOptions, Handler, MessageMetadata, PassivationReason,
@@ -113,14 +113,14 @@ struct TestActor {
 struct Fail;
 
 impl Actor for TestActor {
-    type Error = ActorError;
+    type Error = ActorFailure;
     type Behavior = ::lattice_actor::state_machine::Stateless;
-    async fn started(&mut self, _ctx: &mut ActorContext<Self>) -> Result<(), ActorError> {
+    async fn started(&mut self, _ctx: &mut ActorContext<Self>) -> Result<(), ActorFailure> {
         if let Some(gate) = self.start_gate.take() {
             let permit = gate
                 .acquire()
                 .await
-                .map_err(|_| ActorError::new("start gate was closed"))?;
+                .map_err(|_| ActorFailure::new("start gate was closed"))?;
             permit.forget();
         }
         Ok(())
@@ -144,7 +144,7 @@ impl Responder<Ping> for TestActor {
         ctx: &mut HandlerContext<'_, Self>,
         request: Ping,
         reply_to: ReplyTo<String>,
-    ) -> Result<(), ActorError> {
+    ) -> Result<(), ActorFailure> {
         self.events.lock().await.push(request.0);
         let _ = ctx;
         let _ = reply_to.send(format!("pong:{}", request.0));
@@ -157,7 +157,7 @@ impl Handler<Record> for TestActor {
         &mut self,
         _ctx: &mut HandlerContext<'_, Self>,
         msg: Record,
-    ) -> Result<(), ActorError> {
+    ) -> Result<(), ActorFailure> {
         self.events.lock().await.push(msg.value);
         if let Some(processed) = msg.processed {
             processed.add_permits(1);
@@ -171,7 +171,7 @@ impl Handler<PipeRecord> for TestActor {
         &mut self,
         ctx: &mut HandlerContext<'_, Self>,
         message: PipeRecord,
-    ) -> Result<(), ActorError> {
+    ) -> Result<(), ActorFailure> {
         message.entered.add_permits(1);
         let gate = message.gate;
         let processed = message.processed;
@@ -194,7 +194,7 @@ impl Responder<ProbePipeCapacity> for TestActor {
         ctx: &mut HandlerContext<'_, Self>,
         request: ProbePipeCapacity,
         reply_to: ReplyTo<bool>,
-    ) -> Result<(), ActorError> {
+    ) -> Result<(), ActorFailure> {
         let gate = request.gate;
         ctx.pipe_to_self(
             async move {
@@ -219,10 +219,10 @@ impl Responder<StopAfterReply> for TestActor {
         ctx: &mut HandlerContext<'_, Self>,
         _request: StopAfterReply,
         reply_to: ReplyTo<&'static str>,
-    ) -> Result<(), ActorError> {
+    ) -> Result<(), ActorFailure> {
         self.events.lock().await.push("handled");
         let _ = reply_to.send("reply-before-stop");
-        ctx.request_passivation(PassivationReason::BusinessIdle)?;
+        ctx.request_passivation(PassivationReason::BusinessIdle);
         Ok(())
     }
 }
@@ -232,7 +232,7 @@ impl Handler<Tick> for TestActor {
         &mut self,
         _ctx: &mut HandlerContext<'_, Self>,
         _msg: Tick,
-    ) -> Result<(), ActorError> {
+    ) -> Result<(), ActorFailure> {
         self.events.lock().await.push("tick");
         Ok(())
     }
@@ -244,7 +244,7 @@ impl Responder<ReadContextExtension> for TestActor {
         ctx: &mut HandlerContext<'_, Self>,
         _request: ReadContextExtension,
         reply_to: ReplyTo<Option<&'static str>>,
-    ) -> Result<(), ActorError> {
+    ) -> Result<(), ActorFailure> {
         let marker = ctx
             .service()
             .extension::<ContextMarker>()
@@ -260,7 +260,7 @@ impl Responder<SpawnContextChild> for TestActor {
         ctx: &mut HandlerContext<'_, Self>,
         _request: SpawnContextChild,
         reply_to: ReplyTo<Option<&'static str>>,
-    ) -> Result<(), ActorError> {
+    ) -> Result<(), ActorFailure> {
         let child = TestActor {
             events: Arc::new(Mutex::new(Vec::new())),
             start_gate: None,
@@ -285,7 +285,7 @@ impl Handler<ContextChildResolved> for TestActor {
         &mut self,
         _ctx: &mut HandlerContext<'_, Self>,
         message: ContextChildResolved,
-    ) -> Result<(), ActorError> {
+    ) -> Result<(), ActorFailure> {
         match message.result {
             Ok(instance) => message.reply_to.send(instance)?,
             Err(error) => message.reply_to.fail_with(error)?,
@@ -299,8 +299,8 @@ impl Handler<Fail> for TestActor {
         &mut self,
         _ctx: &mut HandlerContext<'_, Self>,
         _msg: Fail,
-    ) -> Result<(), ActorError> {
-        Err(ActorError::new("handler failed"))
+    ) -> Result<(), ActorFailure> {
+        Err(ActorFailure::new("handler failed"))
     }
 }
 
@@ -310,7 +310,7 @@ impl Responder<DeferredReply> for TestActor {
         ctx: &mut HandlerContext<'_, Self>,
         request: DeferredReply,
         reply_to: ReplyTo<&'static str>,
-    ) -> Result<(), ActorError> {
+    ) -> Result<(), ActorFailure> {
         request.entered.add_permits(1);
         ctx.defer_reply(
             reply_to,
@@ -330,7 +330,7 @@ impl Handler<DeferredReady> for TestActor {
         &mut self,
         _ctx: &mut HandlerContext<'_, Self>,
         message: DeferredReady,
-    ) -> Result<(), ActorError> {
+    ) -> Result<(), ActorFailure> {
         self.events.lock().await.push("deferred-ready");
         let _ = message.reply_to.send("done");
         Ok(())
@@ -342,7 +342,7 @@ enum BusinessActorError {
     #[error("business store is unavailable")]
     StoreUnavailable,
     #[error(transparent)]
-    Framework(#[from] ActorError),
+    Framework(#[from] ActorContextError),
 }
 
 struct BusinessErrorActor {
@@ -388,7 +388,7 @@ impl Responder<LoadBusinessState> for BusinessErrorActor {
         _request: LoadBusinessState,
         _reply_to: ReplyTo<()>,
     ) -> Result<(), BusinessActorError> {
-        ctx.request_passivation(PassivationReason::BusinessIdle)?;
+        ctx.request_passivation(PassivationReason::BusinessIdle);
         load_business_state()?;
         Ok(())
     }

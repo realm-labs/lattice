@@ -10,7 +10,7 @@
 //! use lattice_actor::{
 //!     actor_behavior,
 //!     context::HandlerContext,
-//!     error::ActorError,
+//!     error::ActorFailure,
 //!     traits::{Actor, Handler},
 //! };
 //!
@@ -37,7 +37,7 @@
 //! struct Worker;
 //!
 //! impl Actor for Worker {
-//!     type Error = ActorError;
+//!     type Error = ActorFailure;
 //!     type Behavior = WorkerBehavior;
 //! }
 //!

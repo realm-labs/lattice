@@ -7,7 +7,7 @@ use tokio::sync::{Mutex, Semaphore};
 use super::{ASK_TIMEOUT, Ping, Record, StopAfterReply, TestActor};
 use crate::{
     context::{ActorContext, HandlerContext},
-    error::{ActorCallError, ActorError, ActorStopError, ActorTellError},
+    error::{ActorCallError, ActorFailure, ActorStopError, ActorTellError},
     mailbox::MailboxConfig,
     runtime::{ActorRuntime, ActorSpawnOptions, PassivationPolicy, spawn_actor},
     traits::{Actor, ActorLifecycleState, Handler, PassivationReason, StopReason},
@@ -70,7 +70,7 @@ async fn idle_passivation_waits_until_a_long_handler_finishes() {
     }
 
     impl Actor for IdleActor {
-        type Error = ActorError;
+        type Error = ActorFailure;
         type Behavior = crate::state_machine::Stateless;
 
         async fn stopping(
@@ -104,7 +104,7 @@ async fn idle_passivation_waits_until_a_long_handler_finishes() {
             &mut self,
             _ctx: &mut HandlerContext<'_, Self>,
             msg: Park,
-        ) -> Result<(), ActorError> {
+        ) -> Result<(), ActorFailure> {
             msg.entered.add_permits(1);
             msg.release.acquire().await.unwrap().forget();
             msg.completed.add_permits(1);
@@ -117,7 +117,7 @@ async fn idle_passivation_waits_until_a_long_handler_finishes() {
             &mut self,
             _ctx: &mut HandlerContext<'_, Self>,
             msg: Observe,
-        ) -> Result<(), ActorError> {
+        ) -> Result<(), ActorFailure> {
             msg.processed.add_permits(1);
             Ok(())
         }

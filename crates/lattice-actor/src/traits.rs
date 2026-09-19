@@ -128,6 +128,12 @@ pub enum ResponderErrorAction<Response, Error> {
 }
 
 pub trait Actor: Sized + Send + 'static {
+    /// The concrete error handled inside this Actor.
+    ///
+    /// Prefer a domain-specific `thiserror` enum and include
+    /// [`ActorContextError`](crate::error::ActorContextError) with `#[from]` when the Actor uses
+    /// fallible context operations. An unrecovered value is converted to
+    /// [`ActorFailure`](crate::error::ActorFailure) only after it crosses the Actor boundary.
     type Error: StdError + Send + Sync + 'static;
     type Behavior: Behavior;
 

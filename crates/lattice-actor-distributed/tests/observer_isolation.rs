@@ -8,7 +8,7 @@ use std::{
 
 use lattice_actor_distributed::{
     context::HandlerContext,
-    error::ActorError,
+    error::ActorFailure,
     observation::{
         ActorLifecycleEvent, ActorMetadata, ActorObserver, ActorObserverHandle, RequestCompletion,
     },
@@ -79,7 +79,7 @@ impl ActorObserver for PanickingObserver {
 struct HealthyActor;
 
 impl Actor for HealthyActor {
-    type Error = ActorError;
+    type Error = ActorFailure;
     type Behavior = lattice_actor_distributed::state_machine::Stateless;
 }
 
@@ -93,7 +93,7 @@ impl Responder<Ping> for HealthyActor {
         _: &mut HandlerContext<'_, Self>,
         _: Ping,
         reply: ReplyTo<u32>,
-    ) -> Result<(), ActorError> {
+    ) -> Result<(), ActorFailure> {
         reply.send(7)?;
         Ok(())
     }

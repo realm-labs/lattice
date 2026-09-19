@@ -2,7 +2,7 @@ use std::{collections::BTreeSet, sync::atomic::AtomicUsize, time::Duration};
 
 use async_trait::async_trait;
 use lattice_actor_distributed::{
-    error::ActorError,
+    error::ActorFailure,
     registry::{ActorCreateContext, ActorRegistryConfig},
 };
 use lattice_core::{
@@ -26,7 +26,7 @@ struct PausedLoader {
 
 #[async_trait]
 impl ActorLoader<EntityActor> for PausedLoader {
-    async fn load(&self, ctx: ActorCreateContext) -> Result<EntityActor, ActorError> {
+    async fn load(&self, ctx: ActorCreateContext) -> Result<EntityActor, ActorFailure> {
         self.entered.add_permits(1);
         self.release.acquire().await.unwrap().forget();
         CountingLoader(Arc::new(AtomicUsize::new(0)))

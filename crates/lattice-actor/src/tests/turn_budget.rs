@@ -4,7 +4,7 @@ use tokio::sync::{Mutex, Semaphore};
 
 use crate::{
     context::HandlerContext,
-    error::ActorError,
+    error::ActorFailure,
     mailbox::MailboxConfig,
     runtime::spawn_actor,
     state_machine::Stateless,
@@ -28,7 +28,7 @@ struct TurnActor {
 }
 
 impl Actor for TurnActor {
-    type Error = ActorError;
+    type Error = ActorFailure;
     type Behavior = Stateless;
 }
 
@@ -37,14 +37,14 @@ impl Handler<BlockNormalTurn> for TurnActor {
         &mut self,
         _ctx: &mut HandlerContext<'_, Self>,
         message: BlockNormalTurn,
-    ) -> Result<(), ActorError> {
+    ) -> Result<(), ActorFailure> {
         self.events.lock().await.push("blocked");
         message.entered.add_permits(1);
         let permit = message
             .gate
             .acquire_owned()
             .await
-            .map_err(|_| ActorError::new("normal turn gate was closed"))?;
+            .map_err(|_| ActorFailure::new("normal turn gate was closed"))?;
         permit.forget();
         Ok(())
     }
@@ -55,7 +55,7 @@ impl Handler<Record> for TurnActor {
         &mut self,
         _ctx: &mut HandlerContext<'_, Self>,
         message: Record,
-    ) -> Result<(), ActorError> {
+    ) -> Result<(), ActorFailure> {
         self.events.lock().await.push(message.value);
         message.processed.add_permits(1);
         Ok(())

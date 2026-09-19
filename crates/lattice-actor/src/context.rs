@@ -21,7 +21,6 @@ use tokio::task::{JoinHandle, JoinSet};
 
 use crate::{
     attachments::ActorRuntimeAttachments,
-    error::ActorError,
     handle::ActorHandle,
     reply::PendingReply,
     runtime::spawner::ActorSpawner,
@@ -148,9 +147,8 @@ impl<A: Actor> ActorContext<A> {
         self.lifecycle_request = Some(StopReason::Requested);
     }
 
-    pub fn request_passivation(&mut self, reason: PassivationReason) -> Result<(), ActorError> {
+    pub fn request_passivation(&mut self, reason: PassivationReason) {
         self.lifecycle_request = Some(StopReason::Passivated(reason));
-        Ok(())
     }
 
     pub(crate) fn take_lifecycle_request(&mut self) -> Option<StopReason> {

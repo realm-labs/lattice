@@ -61,7 +61,7 @@ use std::{
 use tokio::sync::oneshot;
 
 use crate::{
-    error::{ActorCallError, ActorError, ReplyError},
+    error::{ActorCallError, ActorFailure, ReplyError},
     observation::{RequestCompletion, RequestObservation},
 };
 
@@ -124,7 +124,9 @@ impl<T: Send + 'static> ReplyTo<T> {
     where
         E: Error + Send + Sync + 'static,
     {
-        self.finish(Err(ActorCallError::Handler(ActorError::from_error(error))))
+        self.finish(Err(ActorCallError::Handler(ActorFailure::from_error(
+            error,
+        ))))
     }
 
     /// Completes the request with a specific actor-call error.
@@ -216,7 +218,7 @@ impl<T: Send + 'static> ReplyControl<T> {
     where
         E: Error + Send + Sync + 'static,
     {
-        self.cancel(ActorCallError::Handler(ActorError::from_error(error)));
+        self.cancel(ActorCallError::Handler(ActorFailure::from_error(error)));
     }
 
     pub(crate) fn respond_after_error(&self, response: T) {
@@ -581,7 +583,7 @@ mod state_tests {
     #[test]
     fn handler_failure_discards_a_staged_reply() {
         let (state, _receiver) = responding(RespondingToken::Staged(Ok(42)));
-        let error = ActorCallError::Handler(ActorError::new("handler failed"));
+        let error = ActorCallError::Handler(ActorFailure::new("handler failed"));
         let (state, delivery) = state.complete(Err(error), RequestCompletion::HandlerFailed);
 
         assert!(matches!(state, ReplyState::Completed));

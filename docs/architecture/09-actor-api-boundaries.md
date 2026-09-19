@@ -72,7 +72,7 @@ async fn handle(
     &mut self,
     ctx: &mut HandlerContext<'_, Self>,
     message: Dispatch,
-) -> Result<(), ActorError> {
+) -> Result<(), ActorFailure> {
     let target = ctx.bind_actor(message.target)?;
     ctx.tell(&target, Deliver(message.payload)).await?;
     Ok(())

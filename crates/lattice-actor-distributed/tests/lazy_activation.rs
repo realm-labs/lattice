@@ -9,7 +9,7 @@ use std::{
 
 use async_trait::async_trait;
 use lattice_actor_distributed::{
-    error::ActorError,
+    error::ActorFailure,
     mailbox::MailboxConfig,
     registry::{
         ActorActivationError, ActorCreateContext, ActorLoader, ActorRegistry, ActorRegistryConfig,
@@ -29,7 +29,7 @@ struct Ping;
 struct LazyActor;
 
 impl Actor for LazyActor {
-    type Error = ActorError;
+    type Error = ActorFailure;
     type Behavior = ::lattice_actor::state_machine::Stateless;
 }
 
@@ -39,7 +39,7 @@ impl Responder<Ping> for LazyActor {
         _ctx: &mut HandlerContext<'_, Self>,
         _request: Ping,
         reply_to: ReplyTo<&'static str>,
-    ) -> Result<(), ActorError> {
+    ) -> Result<(), ActorFailure> {
         let _ = reply_to.send("pong");
         Ok(())
     }
@@ -54,7 +54,7 @@ struct CountingLoader {
 
 #[async_trait]
 impl ActorLoader<LazyActor> for CountingLoader {
-    async fn load(&self, ctx: ActorCreateContext) -> Result<LazyActor, ActorError> {
+    async fn load(&self, ctx: ActorCreateContext) -> Result<LazyActor, ActorFailure> {
         assert_eq!(ctx.actor_kind, actor_kind!("Lazy"));
         assert_eq!(ctx.actor_id, ActorId::U64(7));
         self.loads.fetch_add(1, Ordering::SeqCst);
@@ -63,7 +63,7 @@ impl ActorLoader<LazyActor> for CountingLoader {
         }
         if self.failures_remaining.load(Ordering::SeqCst) > 0 {
             self.failures_remaining.fetch_sub(1, Ordering::SeqCst);
-            return Err(ActorError::new("load failed"));
+            return Err(ActorFailure::new("load failed"));
         }
         Ok(LazyActor)
     }

@@ -9,7 +9,7 @@ use std::{
 use bytes::Bytes;
 use futures_util::{StreamExt as _, stream::FuturesUnordered};
 use lattice_actor_distributed::{
-    error::{ActorError, ActorTellError},
+    error::{ActorFailure, ActorTellError},
     mailbox::MailboxConfig,
     observation::{ActorMetadata, ActorObserver, ActorObserverHandle},
     registry::{ActorRegistry, ActorRegistryConfig},
@@ -132,7 +132,7 @@ struct CompletionActor {
 }
 
 impl Actor for CompletionActor {
-    type Error = ActorError;
+    type Error = ActorFailure;
     type Behavior = ::lattice_actor::state_machine::Stateless;
 }
 
@@ -167,7 +167,7 @@ impl Responder<CompletionAsk> for CompletionActor {
         reply_to: ReplyTo<Bytes>,
     ) -> Result<(), Self::Error> {
         self.processed_bytes = self.processed_bytes.wrapping_add(request.0.len());
-        reply_to.send(request.0).map_err(ActorError::from_error)
+        reply_to.send(request.0).map_err(ActorFailure::from_error)
     }
 }
 

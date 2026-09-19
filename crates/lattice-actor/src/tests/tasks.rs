@@ -7,7 +7,7 @@ use tokio::sync::{Mutex, oneshot};
 use super::Tick;
 use crate::{
     context::{ActorContext, HandlerContext},
-    error::ActorError,
+    error::ActorFailure,
     mailbox::MailboxConfig,
     runtime::spawn_actor,
     traits::{Actor, Handler, StopReason},
@@ -20,9 +20,9 @@ async fn local_timer_delivers_message_to_actor() {
     }
 
     impl Actor for TimerActor {
-        type Error = ActorError;
+        type Error = ActorFailure;
         type Behavior = ::lattice_actor::state_machine::Stateless;
-        async fn started(&mut self, ctx: &mut ActorContext<Self>) -> Result<(), ActorError> {
+        async fn started(&mut self, ctx: &mut ActorContext<Self>) -> Result<(), ActorFailure> {
             ctx.notify_after(Duration::from_millis(5), Tick);
             Ok(())
         }
@@ -33,7 +33,7 @@ async fn local_timer_delivers_message_to_actor() {
             &mut self,
             _ctx: &mut HandlerContext<'_, Self>,
             _msg: Tick,
-        ) -> Result<(), ActorError> {
+        ) -> Result<(), ActorFailure> {
             self.events.lock().await.push("tick");
             Ok(())
         }
@@ -68,9 +68,9 @@ async fn scoped_task_is_cancelled_when_actor_stops() {
     }
 
     impl Actor for TaskActor {
-        type Error = ActorError;
+        type Error = ActorFailure;
         type Behavior = ::lattice_actor::state_machine::Stateless;
-        async fn started(&mut self, ctx: &mut ActorContext<Self>) -> Result<(), ActorError> {
+        async fn started(&mut self, ctx: &mut ActorContext<Self>) -> Result<(), ActorFailure> {
             let signal = DropSignal(self.dropped_tx.take());
             ctx.spawn_scoped(async move {
                 let _signal = signal;

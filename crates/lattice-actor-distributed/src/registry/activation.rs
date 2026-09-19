@@ -107,7 +107,7 @@ impl<A: Actor> ActorRegistry<A> {
                     if existing_token != fencing_token {
                         self.fence_entry(entry).map_err(|error| {
                             ActorActivationError::ActivationFailed(
-                                lattice_actor::error::ActorError::from_error(error),
+                                lattice_actor::error::ActorFailure::from_error(error),
                             )
                         })?;
                         continue;

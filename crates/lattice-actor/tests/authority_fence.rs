@@ -8,7 +8,7 @@ use std::{
 
 use lattice_actor::{
     context::{ActorContext, HandlerContext},
-    error::{ActorCallError, ActorError, ActorStopError},
+    error::{ActorCallError, ActorFailure, ActorStopError},
     mailbox::MailboxConfig,
     reply::ReplyTo,
     runtime::{ActorRuntime, ActorSpawnOptions},
@@ -32,7 +32,7 @@ struct FencedActor {
 }
 
 impl Actor for FencedActor {
-    type Error = ActorError;
+    type Error = ActorFailure;
     type Behavior = lattice_actor::state_machine::Stateless;
 
     async fn started(&mut self, _: &mut ActorContext<Self>) -> Result<(), Self::Error> {

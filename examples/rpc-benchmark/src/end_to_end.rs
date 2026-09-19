@@ -12,7 +12,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::{StreamExt as _, stream::FuturesUnordered};
 use lattice_actor_distributed::{
-    error::{ActorCallError, ActorError},
+    error::{ActorCallError, ActorFailure},
     handle::ActorHandle,
     registry::{ActorRegistry, ActorRegistryConfig},
     reply::ReplyTo,
@@ -90,7 +90,7 @@ struct EchoActor {
 }
 
 impl Actor for EchoActor {
-    type Error = ActorError;
+    type Error = ActorFailure;
     type Behavior = ::lattice_actor::state_machine::Stateless;
 }
 
@@ -116,7 +116,7 @@ impl Responder<EchoRequest> for EchoActor {
         request: EchoRequest,
         reply_to: ReplyTo<Bytes>,
     ) -> Result<(), Self::Error> {
-        reply_to.send(request.0).map_err(ActorError::from_error)
+        reply_to.send(request.0).map_err(ActorFailure::from_error)
     }
 }
 

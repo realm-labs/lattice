@@ -35,7 +35,7 @@ impl Handler<PositionUpdated> for PlayerActor {
         &mut self,
         _ctx: &mut ActorContext<Self>,
         msg: PositionUpdated,
-    ) -> Result<(), ActorError> {
+    ) -> Result<(), ActorFailure> {
         self.profile.position = (msg.x, msg.y);
         Ok(())
     }
@@ -47,7 +47,7 @@ impl Responder<GetProfile> for PlayerActor {
         _ctx: &mut ActorContext<Self>,
         _request: GetProfile,
         reply_to: ReplyTo<PlayerProfile>,
-    ) -> Result<(), ActorError> {
+    ) -> Result<(), ActorFailure> {
         reply_to.send(self.profile.clone())?;
         Ok(())
     }
@@ -310,7 +310,7 @@ impl Handler<Terminated> for SessionOwner {
         &mut self,
         _ctx: &mut ActorContext<Self>,
         event: Terminated,
-    ) -> Result<(), ActorError> {
+    ) -> Result<(), ActorFailure> {
         match event.subject {
             WatchedSubject::Actor(actor) => self.on_exact_activation_lost(actor),
             WatchedSubject::EntityActivation { entity, activation } =>

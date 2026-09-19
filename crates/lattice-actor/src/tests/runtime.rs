@@ -9,7 +9,7 @@ use super::{ASK_TIMEOUT, ContextMarker, Ping, ReadContextExtension, SpawnContext
 use crate::{
     attachments::ActorRuntimeAttachments,
     context::ActorContext,
-    error::ActorError,
+    error::ActorFailure,
     mailbox::MailboxConfig,
     runtime::{
         ActorExecutionPolicy, ActorRuntime, ActorRuntimeConfig, ActorSpawnOptions, spawn_actor,
@@ -98,7 +98,7 @@ struct AttachmentChild {
 }
 
 impl Actor for AttachmentChild {
-    type Error = ActorError;
+    type Error = ActorFailure;
     type Behavior = crate::state_machine::Stateless;
 
     async fn started(&mut self, ctx: &mut ActorContext<Self>) -> Result<(), Self::Error> {
@@ -117,7 +117,7 @@ struct AttachmentParent {
 }
 
 impl Actor for AttachmentParent {
-    type Error = ActorError;
+    type Error = ActorFailure;
     type Behavior = crate::state_machine::Stateless;
 
     async fn started(&mut self, ctx: &mut ActorContext<Self>) -> Result<(), Self::Error> {

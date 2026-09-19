@@ -5,7 +5,7 @@ use std::{sync::Arc, time::Duration};
 use lattice_actor_distributed::{
     activation::DistributedActorContextExt,
     context::{ActorContext, HandlerContext},
-    error::ActorError,
+    error::ActorFailure,
     registry::{ActorAddressConfig, ActorRegistry, ActorRegistryConfig},
     reply::ReplyTo,
     traits::{Actor, Handler, Responder, StopReason},
@@ -34,13 +34,13 @@ struct RemoteWatcherActor {
 }
 
 impl Actor for RemoteWatcherActor {
-    type Error = ActorError;
+    type Error = ActorFailure;
     type Behavior = ::lattice_actor::state_machine::Stateless;
 
     async fn started(&mut self, ctx: &mut ActorContext<Self>) -> Result<(), Self::Error> {
         let target = ctx
             .bind_actor(self.target.clone())
-            .map_err(|error| ActorError::new(error.to_string()))?;
+            .map_err(|error| ActorFailure::new(error.to_string()))?;
         let watch_id = ctx.watch(&target).await?;
         *self.watch_id.lock().await = Some(watch_id);
         self.ready.add_permits(1);

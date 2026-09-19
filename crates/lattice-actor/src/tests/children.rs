@@ -7,7 +7,7 @@ use tokio::sync::Semaphore;
 use super::ASK_TIMEOUT;
 use crate::{
     context::{ActorContext, HandlerContext},
-    error::ActorError,
+    error::ActorFailure,
     handle::ActorHandle,
     mailbox::MailboxConfig,
     reply::ReplyTo,
@@ -20,7 +20,7 @@ async fn stop_child_waits_for_system_lane_capacity() {
     struct ChildActor;
 
     impl Actor for ChildActor {
-        type Error = ActorError;
+        type Error = ActorFailure;
         type Behavior = crate::state_machine::Stateless;
     }
 
@@ -45,7 +45,7 @@ async fn stop_child_waits_for_system_lane_capacity() {
             &mut self,
             _ctx: &mut HandlerContext<'_, Self>,
             msg: Park,
-        ) -> Result<(), ActorError> {
+        ) -> Result<(), ActorFailure> {
             msg.entered.add_permits(1);
             msg.release.acquire().await.unwrap().forget();
             Ok(())
@@ -57,7 +57,7 @@ async fn stop_child_waits_for_system_lane_capacity() {
             &mut self,
             _ctx: &mut HandlerContext<'_, Self>,
             _msg: OccupySystemLane,
-        ) -> Result<(), ActorError> {
+        ) -> Result<(), ActorFailure> {
             Ok(())
         }
     }
@@ -67,10 +67,10 @@ async fn stop_child_waits_for_system_lane_capacity() {
     }
 
     impl Actor for ParentActor {
-        type Error = ActorError;
+        type Error = ActorFailure;
         type Behavior = crate::state_machine::Stateless;
 
-        async fn started(&mut self, ctx: &mut ActorContext<Self>) -> Result<(), ActorError> {
+        async fn started(&mut self, ctx: &mut ActorContext<Self>) -> Result<(), ActorFailure> {
             self.child = Some(ctx.spawn_child(
                 ChildActorKey::new("child"),
                 ChildActor,
@@ -89,7 +89,7 @@ async fn stop_child_waits_for_system_lane_capacity() {
             _ctx: &mut HandlerContext<'_, Self>,
             _request: ChildHandle,
             reply_to: ReplyTo<ActorHandle<ChildActor>>,
-        ) -> Result<(), ActorError> {
+        ) -> Result<(), ActorFailure> {
             reply_to.send(self.child.clone().expect("child was spawned"))?;
             Ok(())
         }
@@ -100,7 +100,7 @@ async fn stop_child_waits_for_system_lane_capacity() {
             &mut self,
             ctx: &mut HandlerContext<'_, Self>,
             _msg: ReleaseChild,
-        ) -> Result<(), ActorError> {
+        ) -> Result<(), ActorFailure> {
             assert!(ctx.stop_child(&ChildActorKey::new("child")));
             Ok(())
         }

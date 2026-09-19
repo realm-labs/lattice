@@ -6,11 +6,16 @@ use crate::{runtime::ActorExecutionPolicy, traits::ActorLifecycleState};
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 #[error("{message}")]
-pub struct ActorError {
+/// Diagnostic summary of an Actor error that crossed a runtime boundary.
+///
+/// The concrete [`crate::traits::Actor::Error`] remains available to Actor error hooks. Once an
+/// unrecovered error is sent to a caller or activation coordinator, only this stable textual
+/// representation is retained.
+pub struct ActorFailure {
     message: String,
 }
 
-impl ActorError {
+impl ActorFailure {
     pub fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
@@ -23,6 +28,38 @@ impl ActorError {
 
     pub fn message(&self) -> &str {
         &self.message
+    }
+}
+
+/// A structured failure produced by an operation on [`crate::context::ActorContext`].
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum ActorContextError {
+    #[error("RestartChild supervision requires spawn_child_with_factory")]
+    RestartChildRequiresFactory,
+    #[error("child actor {key} already exists")]
+    DuplicateChild { key: String },
+    #[error("actor watch capacity {capacity} is exhausted")]
+    WatchCapacity { capacity: usize },
+    #[error("actor watch registration failed: {reason}")]
+    WatchRegistration { reason: String },
+    #[error(transparent)]
+    Spawn(#[from] ActorSpawnError),
+    #[error(transparent)]
+    Reply(#[from] ReplyError),
+    #[error(transparent)]
+    Deferred(#[from] PipeToSelfError),
+    #[error("actor mailbox is full")]
+    TellMailboxFull,
+    #[error("actor mailbox is closed")]
+    TellMailboxClosed,
+    #[error("actor does not admit business traffic while lifecycle state is {state:?}")]
+    TellLifecycleUnavailable { state: ActorLifecycleState },
+}
+
+impl From<ActorContextError> for ActorFailure {
+    fn from(value: ActorContextError) -> Self {
+        Self::from_error(value)
     }
 }
 
@@ -63,7 +100,7 @@ pub enum ActorCallError {
     #[error("actor does not handle the message in its current state")]
     UnhandledInCurrentState,
     #[error("actor handler failed: {0}")]
-    Handler(ActorError),
+    Handler(ActorFailure),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
@@ -76,7 +113,7 @@ pub enum ReplyError {
     DeadlineExceeded,
 }
 
-impl From<ReplyError> for ActorError {
+impl From<ReplyError> for ActorFailure {
     fn from(value: ReplyError) -> Self {
         Self::new(value.to_string())
     }
@@ -88,7 +125,7 @@ pub enum PipeToSelfError {
     Capacity { capacity: usize },
 }
 
-impl From<PipeToSelfError> for ActorError {
+impl From<PipeToSelfError> for ActorFailure {
     fn from(value: PipeToSelfError) -> Self {
         Self::new(value.to_string())
     }
@@ -173,13 +210,25 @@ pub enum ActorAdminError {
     ResponseDropped,
 }
 
-impl<M> From<ActorTellError<M>> for ActorError {
+impl<M> From<ActorTellError<M>> for ActorFailure {
     fn from(value: ActorTellError<M>) -> Self {
         Self::new(value.to_string())
     }
 }
 
-#[derive(Debug, Clone, Error)]
+impl<M> From<ActorTellError<M>> for ActorContextError {
+    fn from(value: ActorTellError<M>) -> Self {
+        match value {
+            ActorTellError::MailboxFull(_) => Self::TellMailboxFull,
+            ActorTellError::MailboxClosed(_) => Self::TellMailboxClosed,
+            ActorTellError::LifecycleUnavailable { state, .. } => {
+                Self::TellLifecycleUnavailable { state }
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum ActorSpawnError {
     #[error("unsupported actor execution policy: {policy:?}")]
     UnsupportedExecutionPolicy { policy: ActorExecutionPolicy },

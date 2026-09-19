@@ -7,7 +7,7 @@ use bytes::BytesMut;
 use lattice_actor_distributed::{
     actor_protocol,
     context::HandlerContext,
-    error::ActorError,
+    error::ActorFailure,
     protocol::{CodecDescriptor, DecodeError, EncodeError, WireCodec},
     registry::{ActorCreateContext, ActorLoader},
     reply::ReplyTo,
@@ -93,13 +93,13 @@ pub(super) struct PingLoader;
 
 #[async_trait]
 impl ActorLoader<PingActor> for PingLoader {
-    async fn load(&self, _ctx: ActorCreateContext) -> Result<PingActor, ActorError> {
+    async fn load(&self, _ctx: ActorCreateContext) -> Result<PingActor, ActorFailure> {
         Ok(PingActor)
     }
 }
 
 impl Actor for PingActor {
-    type Error = ActorError;
+    type Error = ActorFailure;
     type Behavior = ::lattice_actor::state_machine::Stateless;
 }
 
@@ -109,7 +109,7 @@ impl Responder<Ping> for PingActor {
         _ctx: &mut HandlerContext<'_, Self>,
         request: Ping,
         reply_to: ReplyTo<Pong>,
-    ) -> Result<(), ActorError> {
+    ) -> Result<(), ActorFailure> {
         let _ = reply_to.send(Pong(request.0 + 1));
         Ok(())
     }

@@ -8,7 +8,7 @@ use std::{
 };
 
 use lattice_actor::{
-    error::{ActorCallError, ActorError},
+    error::{ActorCallError, ActorFailure},
     handle::ActorHandle,
     mailbox::MailboxConfig,
     reply::ReplyTo,
@@ -25,7 +25,7 @@ struct DeferredActor {
 }
 
 impl Actor for DeferredActor {
-    type Error = ActorError;
+    type Error = ActorFailure;
     type Behavior = ::lattice_actor::state_machine::Stateless;
 }
 
@@ -52,7 +52,7 @@ impl Responder<Query> for DeferredActor {
         ctx: &mut HandlerContext<'_, Self>,
         request: Query,
         reply_to: ReplyTo<u64>,
-    ) -> Result<(), ActorError> {
+    ) -> Result<(), ActorFailure> {
         request.entered.add_permits(1);
         let gate = request.gate;
         let database_value = request.database_value;
@@ -78,7 +78,7 @@ impl Handler<QueryReady> for DeferredActor {
         &mut self,
         _ctx: &mut HandlerContext<'_, Self>,
         message: QueryReady,
-    ) -> Result<(), ActorError> {
+    ) -> Result<(), ActorFailure> {
         self.continuations.fetch_add(1, Ordering::SeqCst);
         message.reply_to.send(message.database_value + self.value)?;
         Ok(())
@@ -90,7 +90,7 @@ impl Handler<SetValue> for DeferredActor {
         &mut self,
         _ctx: &mut HandlerContext<'_, Self>,
         message: SetValue,
-    ) -> Result<(), ActorError> {
+    ) -> Result<(), ActorFailure> {
         self.value = message.0;
         Ok(())
     }
@@ -109,7 +109,7 @@ impl Responder<FailAfterPipe> for DeferredActor {
         ctx: &mut HandlerContext<'_, Self>,
         request: FailAfterPipe,
         reply_to: ReplyTo<u64>,
-    ) -> Result<(), ActorError> {
+    ) -> Result<(), ActorFailure> {
         request.entered.add_permits(1);
         let gate = request.gate;
         ctx.defer_reply(
@@ -125,7 +125,7 @@ impl Responder<FailAfterPipe> for DeferredActor {
                 reply_to,
             },
         )?;
-        Err(ActorError::new("responder failed after starting work"))
+        Err(ActorFailure::new("responder failed after starting work"))
     }
 }
 
@@ -143,9 +143,9 @@ impl Responder<ReplyThenFail> for DeferredActor {
         _ctx: &mut HandlerContext<'_, Self>,
         _request: ReplyThenFail,
         reply_to: ReplyTo<u64>,
-    ) -> Result<(), ActorError> {
+    ) -> Result<(), ActorFailure> {
         reply_to.send(42)?;
-        Err(ActorError::new("failure after provisional reply"))
+        Err(ActorFailure::new("failure after provisional reply"))
     }
 }
 
@@ -155,7 +155,7 @@ impl Responder<ForgetReply> for DeferredActor {
         _ctx: &mut HandlerContext<'_, Self>,
         _request: ForgetReply,
         _reply_to: ReplyTo<()>,
-    ) -> Result<(), ActorError> {
+    ) -> Result<(), ActorFailure> {
         Ok(())
     }
 }

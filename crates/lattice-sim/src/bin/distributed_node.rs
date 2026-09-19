@@ -17,7 +17,7 @@ use lattice_actor_distributed::{
     actor_protocol,
     context::ActorContext,
     directory::ActivationDirectory,
-    error::ActorError,
+    error::ActorFailure,
     protocol::{CodecDescriptor, DecodeError, EncodeError, WireCodec},
     registry::{
         ActorAddressConfig, ActorCreateContext, ActorLoader, ActorRegistry, ActorRegistryConfig,
@@ -282,7 +282,7 @@ struct PingLoader;
 
 #[async_trait]
 impl ActorLoader<PingActor> for PingLoader {
-    async fn load(&self, _context: ActorCreateContext) -> Result<PingActor, ActorError> {
+    async fn load(&self, _context: ActorCreateContext) -> Result<PingActor, ActorFailure> {
         Ok(PingActor)
     }
 }
@@ -319,7 +319,7 @@ impl EntityFixture {
 }
 
 impl Actor for PingActor {
-    type Error = ActorError;
+    type Error = ActorFailure;
     type Behavior = ::lattice_actor::state_machine::Stateless;
 }
 
@@ -329,7 +329,7 @@ impl Responder<Ping> for PingActor {
         _context: &mut HandlerContext<'_, Self>,
         request: Ping,
         reply_to: ReplyTo<Pong>,
-    ) -> Result<(), ActorError> {
+    ) -> Result<(), ActorFailure> {
         let _ = reply_to.send(Pong(request.0 + 1));
         Ok(())
     }
@@ -340,7 +340,7 @@ impl Handler<StopPing> for PingActor {
         &mut self,
         context: &mut HandlerContext<'_, Self>,
         _message: StopPing,
-    ) -> Result<(), ActorError> {
+    ) -> Result<(), ActorFailure> {
         context.request_stop();
         Ok(())
     }

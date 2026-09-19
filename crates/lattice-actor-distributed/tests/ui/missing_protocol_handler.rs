@@ -1,5 +1,5 @@
 use lattice_actor_distributed::actor_protocol;
-use lattice_actor::error::ActorError;
+use lattice_actor::error::ActorFailure;
 use lattice_actor_distributed::protocol::ProstCodec;
 use lattice_actor::traits::{Actor, Message};
 
@@ -22,7 +22,7 @@ actor_protocol! {
 struct MissingHandlerActor;
 
 impl Actor for MissingHandlerActor {
-    type Error = ActorError;
+    type Error = ActorFailure;
     type Behavior = ::lattice_actor::state_machine::Stateless;
 }
 

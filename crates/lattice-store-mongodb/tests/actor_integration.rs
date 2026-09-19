@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use lattice_actor::context::ActorContext;
-use lattice_actor::error::{ActorError, ActorStopError};
+use lattice_actor::error::{ActorFailure, ActorStopError};
 use lattice_actor::mailbox::MailboxConfig;
 use lattice_actor::runtime::spawn_actor;
 use lattice_actor::traits::{Actor, ActorLifecycleState, Handler, StopReason};
@@ -267,7 +267,7 @@ struct PersistenceActor {
 }
 
 impl Actor for PersistenceActor {
-    type Error = ActorError;
+    type Error = ActorFailure;
     type Behavior = ::lattice_actor::state_machine::Stateless;
 }
 
@@ -282,14 +282,14 @@ impl Handler<Persist> for PersistenceActor {
             .prepare(ScanBudget::generous(), |preparation| {
                 preparation.scan_tracked(&self.document)
             })
-            .map_err(ActorError::from_error)?;
+            .map_err(ActorFailure::from_error)?;
         self.generation = prepared.request.as_ref().map(|request| request.generation);
         match self
             .coordinator
             .dispatch_prepared(context, self.store.clone(), prepared)
         {
             Ok(PersistenceStatus::InFlight) => Ok(()),
-            Ok(other) => Err(ActorError::new(format!(
+            Ok(other) => Err(ActorFailure::new(format!(
                 "expected in-flight persistence, got {other:?}"
             ))),
             Err(_) => {
@@ -312,10 +312,10 @@ impl Handler<AbortPersist> for PersistenceActor {
         let generation = self
             .generation
             .take()
-            .ok_or_else(|| ActorError::new("no persistence generation to abort"))?;
+            .ok_or_else(|| ActorFailure::new("no persistence generation to abort"))?;
         self.coordinator
             .abort_in_flight_as_unknown(generation, "operator intervention")
-            .map_err(ActorError::from_error)?;
+            .map_err(ActorFailure::from_error)?;
         Ok(())
     }
 }
@@ -329,7 +329,7 @@ impl Handler<MongoFlushCompleted> for PersistenceActor {
         let status = self
             .coordinator
             .apply_completion(completion)
-            .map_err(ActorError::from_error)?;
+            .map_err(ActorFailure::from_error)?;
         let key = MongoDocumentKey::for_document::<TestDocument>(&42)
             .expect("test document ID should encode");
         *self.observed.lock().expect("result mutex poisoned") = Some(Observed::Completed {
@@ -380,7 +380,7 @@ struct SelfSchedulingActor {
 }
 
 impl Actor for SelfSchedulingActor {
-    type Error = ActorError;
+    type Error = ActorFailure;
     type Behavior = ::lattice_actor::state_machine::Stateless;
 
     fn started(
@@ -420,10 +420,10 @@ impl Handler<Persist> for SelfSchedulingActor {
             .prepare(budget, |preparation| {
                 preparation.scan_tracked(&self.document)
             })
-            .map_err(ActorError::from_error)?;
+            .map_err(ActorFailure::from_error)?;
         self.coordinator
             .dispatch_prepared_with_retry(context, self.store.clone(), prepared, Persist)
-            .map_err(ActorError::from_error)?;
+            .map_err(ActorFailure::from_error)?;
         Ok(())
     }
 }
@@ -436,7 +436,7 @@ impl Handler<MongoFlushCompleted> for SelfSchedulingActor {
     ) -> Result<(), Self::Error> {
         self.coordinator
             .apply_completion_with_retry(context, completion, Persist)
-            .map_err(ActorError::from_error)?;
+            .map_err(ActorFailure::from_error)?;
         Ok(())
     }
 }
@@ -617,7 +617,7 @@ struct StoppingDrainActor {
 }
 
 impl Actor for StoppingDrainActor {
-    type Error = ActorError;
+    type Error = ActorFailure;
     type Behavior = ::lattice_actor::state_machine::Stateless;
 
     async fn stopping(
@@ -648,10 +648,10 @@ impl Handler<Persist> for StoppingDrainActor {
             .prepare(ScanBudget::generous(), |preparation| {
                 preparation.scan_tracked(&self.document)
             })
-            .map_err(ActorError::from_error)?;
+            .map_err(ActorFailure::from_error)?;
         self.coordinator
             .dispatch_prepared(context, self.store.clone(), prepared)
-            .map_err(ActorError::from_error)?;
+            .map_err(ActorFailure::from_error)?;
         Ok(())
     }
 }
@@ -664,7 +664,7 @@ impl Handler<MongoFlushCompleted> for StoppingDrainActor {
     ) -> Result<(), Self::Error> {
         self.coordinator
             .apply_completion(completion)
-            .map_err(ActorError::from_error)?;
+            .map_err(ActorFailure::from_error)?;
         Ok(())
     }
 }

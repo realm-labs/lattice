@@ -11,7 +11,7 @@ use bytes::BytesMut;
 use lattice_actor_distributed::{
     actor_protocol,
     context::HandlerContext,
-    error::ActorError,
+    error::ActorFailure,
     protocol::{CodecDescriptor, DecodeError, EncodeError, WireCodec},
     registry::ActorCreateContext,
     reply::ReplyTo,
@@ -92,7 +92,7 @@ pub(super) struct EntityActor {
 }
 
 impl Actor for EntityActor {
-    type Error = ActorError;
+    type Error = ActorFailure;
     type Behavior = ::lattice_actor::state_machine::Stateless;
 }
 
@@ -102,7 +102,7 @@ impl Responder<GetValue> for EntityActor {
         _ctx: &mut HandlerContext<'_, Self>,
         request: GetValue,
         reply_to: ReplyTo<Value>,
-    ) -> Result<(), ActorError> {
+    ) -> Result<(), ActorFailure> {
         let _ = reply_to.send(Value(self.value + request.0));
         Ok(())
     }
@@ -126,7 +126,7 @@ pub(super) struct CountingLoader(pub(super) Arc<AtomicUsize>);
 
 #[async_trait]
 impl ActorLoader<EntityActor> for CountingLoader {
-    async fn load(&self, _ctx: ActorCreateContext) -> Result<EntityActor, ActorError> {
+    async fn load(&self, _ctx: ActorCreateContext) -> Result<EntityActor, ActorFailure> {
         self.0.fetch_add(1, Ordering::SeqCst);
         Ok(EntityActor { value: 40 })
     }
@@ -140,7 +140,7 @@ pub(super) struct TokenRecordingLoader {
 
 #[async_trait]
 impl ActorLoader<EntityActor> for TokenRecordingLoader {
-    async fn load(&self, ctx: ActorCreateContext) -> Result<EntityActor, ActorError> {
+    async fn load(&self, ctx: ActorCreateContext) -> Result<EntityActor, ActorFailure> {
         self.loads.fetch_add(1, Ordering::SeqCst);
         self.token.store(
             ctx.fencing_token().map_or(0, |token| token.get()),

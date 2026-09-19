@@ -13,7 +13,7 @@ use std::{
 use async_trait::async_trait;
 use lattice_actor_distributed::{
     actor_protocol,
-    error::ActorError,
+    error::ActorFailure,
     mailbox::MailboxConfig,
     protocol::ProstCodec,
     registry::{ActorCreateContext, ActorLoader},
@@ -70,7 +70,7 @@ struct WorldActor {
 }
 
 impl Actor for WorldActor {
-    type Error = ActorError;
+    type Error = ActorFailure;
     type Behavior = ::lattice_actor::state_machine::Stateless;
 }
 
@@ -80,7 +80,7 @@ impl Responder<EnterWorldRequest> for WorldActor {
         _ctx: &mut HandlerContext<'_, Self>,
         request: EnterWorldRequest,
         reply_to: ReplyTo<EnterWorldReply>,
-    ) -> Result<(), ActorError> {
+    ) -> Result<(), ActorFailure> {
         let ok = request.world_id == self.world_id;
         if ok {
             self.players.insert(request.player_id);
@@ -98,7 +98,7 @@ struct WorldLoader;
 
 #[async_trait]
 impl ActorLoader<WorldActor> for WorldLoader {
-    async fn load(&self, _ctx: ActorCreateContext) -> Result<WorldActor, ActorError> {
+    async fn load(&self, _ctx: ActorCreateContext) -> Result<WorldActor, ActorFailure> {
         Ok(WorldActor {
             world_id: 1,
             players: HashSet::new(),
@@ -125,7 +125,7 @@ struct ClockActor {
 }
 
 impl Actor for ClockActor {
-    type Error = ActorError;
+    type Error = ActorFailure;
     type Behavior = ::lattice_actor::state_machine::Stateless;
 }
 
@@ -135,7 +135,7 @@ impl Responder<GetClockRequest> for ClockActor {
         _ctx: &mut HandlerContext<'_, Self>,
         _request: GetClockRequest,
         reply_to: ReplyTo<GetClockReply>,
-    ) -> Result<(), ActorError> {
+    ) -> Result<(), ActorFailure> {
         self.tick += 1;
         let _ = reply_to.send(GetClockReply { tick: self.tick });
         Ok(())
@@ -147,7 +147,7 @@ struct ClockLoader;
 
 #[async_trait]
 impl ActorLoader<ClockActor> for ClockLoader {
-    async fn load(&self, _ctx: ActorCreateContext) -> Result<ClockActor, ActorError> {
+    async fn load(&self, _ctx: ActorCreateContext) -> Result<ClockActor, ActorFailure> {
         Ok(ClockActor::default())
     }
 }

@@ -5,7 +5,7 @@ use std::sync::{
 
 use lattice_actor::{
     context::HandlerContext,
-    error::ActorError,
+    error::ActorFailure,
     handle::ActorHandle,
     runtime::{ActorRuntime, ActorSpawnOptions},
     traits::{Actor, Handler},
@@ -22,12 +22,12 @@ struct SourceActor {
 }
 
 impl Actor for TargetActor {
-    type Error = ActorError;
+    type Error = ActorFailure;
     type Behavior = lattice_actor::state_machine::Stateless;
 }
 
 impl Actor for SourceActor {
-    type Error = ActorError;
+    type Error = ActorFailure;
     type Behavior = lattice_actor::state_machine::Stateless;
 }
 
@@ -42,7 +42,7 @@ impl Handler<Start> for SourceActor {
         &mut self,
         ctx: &mut HandlerContext<'_, Self>,
         _message: Start,
-    ) -> Result<(), ActorError> {
+    ) -> Result<(), ActorFailure> {
         ctx.tell(&self.target, Delivered).await?;
         Ok(())
     }
@@ -53,7 +53,7 @@ impl Handler<Delivered> for TargetActor {
         &mut self,
         _ctx: &mut HandlerContext<'_, Self>,
         _message: Delivered,
-    ) -> Result<(), ActorError> {
+    ) -> Result<(), ActorFailure> {
         self.deliveries.fetch_add(1, Ordering::Relaxed);
         self.delivered.notify_one();
         Ok(())

@@ -10,7 +10,7 @@ use tracing::Instrument;
 
 use super::ActorContext;
 use crate::{
-    error::{ActorCallError, ActorError, ActorTellError},
+    error::{ActorCallError, ActorContextError, ActorTellError},
     traits::{Actor, Handler, Message},
     watch::{ActorTerminated, TerminationSubscription, WatchId, WatchTarget},
 };
@@ -95,7 +95,7 @@ impl<A: Actor> ActorContext<A> {
         self.tasks.spawn(future)
     }
 
-    pub async fn watch<T>(&mut self, target: &T) -> Result<WatchId, ActorError>
+    pub async fn watch<T>(&mut self, target: &T) -> Result<WatchId, ActorContextError>
     where
         A: Handler<ActorTerminated>,
         <A as crate::traits::Actor>::Behavior: crate::state_machine::Accepts<ActorTerminated>,
@@ -103,14 +103,17 @@ impl<A: Actor> ActorContext<A> {
     {
         self.watches.retain(|_watch_id, task| !task.is_finished());
         if self.watches.len() >= MAX_ACTIVE_WATCHES {
-            return Err(ActorError::new(format!(
-                "actor watch capacity {MAX_ACTIVE_WATCHES} is exhausted"
-            )));
+            return Err(ActorContextError::WatchCapacity {
+                capacity: MAX_ACTIVE_WATCHES,
+            });
         }
-        let mut terminations = target
-            .watch()
-            .await
-            .map_err(|error| ActorError::new(error.to_string()))?;
+        let mut terminations =
+            target
+                .watch()
+                .await
+                .map_err(|error| ActorContextError::WatchRegistration {
+                    reason: error.to_string(),
+                })?;
         let watch_id = terminations.id();
         let self_handle = self.handle.clone();
         let span = tracing::info_span!(

@@ -8,7 +8,7 @@ use std::{
 
 use bytes::Bytes;
 use lattice_actor_distributed::{
-    error::{ActorError, ActorTellError},
+    error::{ActorFailure, ActorTellError},
     mailbox::MailboxConfig,
     registry::{ActorRegistry, ActorRegistryConfig},
     traits::{Actor, Handler, StopReason},
@@ -55,7 +55,7 @@ struct BenchActor;
 struct BenchTell;
 
 impl Actor for BenchActor {
-    type Error = ActorError;
+    type Error = ActorFailure;
     type Behavior = ::lattice_actor::state_machine::Stateless;
 }
 

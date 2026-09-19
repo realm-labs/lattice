@@ -257,7 +257,7 @@ struct SplitEntityLoader {
 
 #[async_trait]
 impl ActorLoader<SplitEntityActor> for SplitEntityLoader {
-    async fn load(&self, _context: ActorCreateContext) -> Result<SplitEntityActor, ActorError> {
+    async fn load(&self, _context: ActorCreateContext) -> Result<SplitEntityActor, ActorFailure> {
         Ok(SplitEntityActor {
             identity: ActivationIdentity {
                 node_id: self.node_id.clone(),
@@ -270,12 +270,12 @@ impl ActorLoader<SplitEntityActor> for SplitEntityLoader {
 }
 
 impl Actor for SplitEntityActor {
-    type Error = ActorError;
+    type Error = ActorFailure;
     type Behavior = ::lattice_actor::state_machine::Stateless;
 
     async fn started(&mut self, _context: &mut ActorContext<Self>) -> Result<(), Self::Error> {
         append_activation_event(&self.journal, "activated", &self.identity)
-            .map_err(ActorError::from_error)
+            .map_err(ActorFailure::from_error)
     }
 
     async fn stopping(
@@ -294,7 +294,7 @@ impl Responder<SplitProbe> for SplitEntityActor {
         _context: &mut HandlerContext<'_, Self>,
         request: SplitProbe,
         reply_to: ReplyTo<SplitProbeReply>,
-    ) -> Result<(), ActorError> {
+    ) -> Result<(), ActorFailure> {
         let _ = reply_to.send(SplitProbeReply {
             sequence: request.sequence,
             activation: self.identity.clone(),

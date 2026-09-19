@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use lattice_actor::context::ActorContext;
-use lattice_actor::error::ActorError;
+use lattice_actor::error::ActorFailure;
 use lattice_actor::mailbox::MailboxConfig;
 use lattice_actor::reply::ReplyTo;
 use lattice_actor::runtime::spawn_actor;
@@ -57,14 +57,14 @@ struct HookActor {
 }
 
 impl Actor for HookActor {
-    type Error = ActorError;
+    type Error = ActorFailure;
     type Behavior = ::lattice_actor::state_machine::Stateless;
 
     async fn dispatch_handler<M>(
         &mut self,
         ctx: &mut HandlerContext<'_, Self>,
         msg: M,
-    ) -> Result<(), ActorError>
+    ) -> Result<(), ActorFailure>
     where
         Self: Handler<M>,
         M: lattice_actor::traits::Message,
@@ -78,7 +78,7 @@ impl Actor for HookActor {
         ctx: &mut HandlerContext<'_, Self>,
         request: R,
         reply_to: ReplyTo<R::Response>,
-    ) -> Result<(), ActorError>
+    ) -> Result<(), ActorFailure>
     where
         Self: Responder<R>,
         R: lattice_actor::traits::Request,
@@ -135,7 +135,7 @@ impl Handler<PayloadTell> for HookActor {
         &mut self,
         _ctx: &mut HandlerContext<'_, Self>,
         _message: PayloadTell,
-    ) -> Result<(), ActorError> {
+    ) -> Result<(), ActorFailure> {
         Ok(())
     }
 }
@@ -146,7 +146,7 @@ impl Responder<PayloadRequest> for HookActor {
         _ctx: &mut HandlerContext<'_, Self>,
         request: PayloadRequest,
         reply_to: ReplyTo<String>,
-    ) -> Result<(), ActorError> {
+    ) -> Result<(), ActorFailure> {
         reply_to.send(format!("reply:{}", request.value))?;
         Ok(())
     }
@@ -157,8 +157,8 @@ impl Handler<FailingTell> for HookActor {
         &mut self,
         _ctx: &mut HandlerContext<'_, Self>,
         _message: FailingTell,
-    ) -> Result<(), ActorError> {
-        Err(ActorError::new("expected tell failure"))
+    ) -> Result<(), ActorFailure> {
+        Err(ActorFailure::new("expected tell failure"))
     }
 }
 
@@ -168,15 +168,15 @@ impl Responder<RecoveredRequest> for HookActor {
         _ctx: &mut HandlerContext<'_, Self>,
         _request: RecoveredRequest,
         _reply_to: ReplyTo<&'static str>,
-    ) -> Result<(), ActorError> {
-        Err(ActorError::new("expected request failure"))
+    ) -> Result<(), ActorFailure> {
+        Err(ActorFailure::new("expected request failure"))
     }
 
     async fn respond_error(
         &mut self,
         _ctx: &mut HandlerContext<'_, Self>,
-        _error: ActorError,
-    ) -> ResponderErrorAction<&'static str, ActorError> {
+        _error: ActorFailure,
+    ) -> ResponderErrorAction<&'static str, ActorFailure> {
         ResponderErrorAction::Respond("recovered")
     }
 }

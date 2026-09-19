@@ -18,7 +18,7 @@ use lattice_remoting::watch::{RegisteredWatch, WatchError};
 use thiserror::Error;
 
 use lattice_actor::{
-    error::ActorError,
+    error::ActorFailure,
     traits::{Message, Request},
     watch::{TerminatedReason, TerminationSubscription},
 };
@@ -502,7 +502,7 @@ pub(crate) fn deadline_from_timeout(timeout: Duration) -> Result<Instant, Recipi
         .ok_or(RecipientError::InvalidTimeout)
 }
 
-impl From<RecipientError> for ActorError {
+impl From<RecipientError> for ActorFailure {
     fn from(error: RecipientError) -> Self {
         Self::new(error.to_string())
     }

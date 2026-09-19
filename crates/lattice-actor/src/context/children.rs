@@ -14,7 +14,7 @@ use tokio::task::AbortHandle;
 use super::ActorContext;
 use crate::{
     attachments::ActorRuntimeAttachments,
-    error::{ActorError, ActorTellError},
+    error::{ActorContextError, ActorTellError},
     handle::ActorHandle,
     observation::ActorObserverHandle,
     runtime::{
@@ -33,20 +33,17 @@ impl<A: Actor> ActorContext<A> {
         key: ChildActorKey,
         actor: C,
         options: ChildActorOptions,
-    ) -> Result<ActorHandle<C>, ActorError>
+    ) -> Result<ActorHandle<C>, ActorContextError>
     where
         C: Actor,
     {
         if options.supervision == ChildSupervision::RestartChild {
-            return Err(ActorError::new(
-                "RestartChild supervision requires spawn_child_with_factory",
-            ));
+            return Err(ActorContextError::RestartChildRequiresFactory);
         }
         if self.children.contains_key(&key) {
-            return Err(ActorError::new(format!(
-                "child actor {} already exists",
-                key.as_str()
-            )));
+            return Err(ActorContextError::DuplicateChild {
+                key: key.as_str().to_owned(),
+            });
         }
 
         let span = tracing::info_span!(
@@ -70,16 +67,15 @@ impl<A: Actor> ActorContext<A> {
         key: ChildActorKey,
         mut factory: F,
         options: ChildActorOptions,
-    ) -> Result<ActorHandle<C>, ActorError>
+    ) -> Result<ActorHandle<C>, ActorContextError>
     where
         C: Actor,
         F: FnMut() -> C + Send + 'static,
     {
         if self.children.contains_key(&key) {
-            return Err(ActorError::new(format!(
-                "child actor {} already exists",
-                key.as_str()
-            )));
+            return Err(ActorContextError::DuplicateChild {
+                key: key.as_str().to_owned(),
+            });
         }
 
         let span = tracing::info_span!(
@@ -185,16 +181,7 @@ impl<A: Actor> ActorContext<A> {
                         }
                         // The replacement is a distinct activation, so it takes a fresh activation
                         // ID. References to the dead child must never resolve to it.
-                        reference = match next_child_reference(&reference) {
-                            Ok(reference) => reference,
-                            Err(error) => {
-                                tracing::warn!(
-                                    %error,
-                                    "supervised child replacement reference could not be derived"
-                                );
-                                break;
-                            }
-                        };
+                        reference = next_child_reference(&reference);
                         let replacement = match env.spawn(factory(), &options, reference.clone()) {
                             Ok(replacement) => replacement,
                             Err(error) => {
@@ -233,7 +220,7 @@ impl ChildSpawnEnv {
         actor: C,
         options: &ChildActorOptions,
         reference: ChildReference,
-    ) -> Result<ActorHandle<C>, ActorError>
+    ) -> Result<ActorHandle<C>, ActorContextError>
     where
         C: Actor,
     {
@@ -253,14 +240,13 @@ impl ChildSpawnEnv {
                 runtime_attachments: ActorRuntimeAttachments::empty(),
                 spawner: self.spawner.clone(),
             },
-        )
-        .map_err(|error| ActorError::new(error.to_string()))?;
+        )?;
         Ok(handle)
     }
 }
 
-fn next_child_reference(_previous: &ChildReference) -> Result<ChildReference, ActorError> {
-    Ok(ChildReference)
+fn next_child_reference(_previous: &ChildReference) -> ChildReference {
+    ChildReference
 }
 
 fn request_child_stop<C>(handle: ActorHandle<C>, reason: StopReason)

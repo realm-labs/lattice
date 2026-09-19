@@ -255,7 +255,7 @@ where
         ctx: &mut ActorContext<Self>,
         request: R,
         reply_to: ReplyTo<R::Response>,
-    ) -> impl Future<Output = Result<(), ActorError>> + Send;
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 }
 
 pub trait Handler<M>: Actor
@@ -266,7 +266,7 @@ where
         &mut self,
         ctx: &mut ActorContext<Self>,
         msg: M,
-    ) -> impl Future<Output = Result<(), ActorError>> + Send;
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 }
 ```
 
@@ -318,7 +318,7 @@ impl Responder<EnterWorld> for WorldActor {
         ctx: &mut ActorContext<Self>,
         request: EnterWorld,
         reply_to: ReplyTo<EnterWorldReply>,
-    ) -> Result<(), ActorError> {
+    ) -> Result<(), ActorFailure> {
         let player_id = request.player_id;
         self.players.insert(player_id, PlayerRuntimeState::default());
         ctx.notify_after(Duration::from_secs(1), WorldTick);
@@ -332,7 +332,7 @@ impl Handler<WorldTick> for WorldActor {
         &mut self,
         _ctx: &mut ActorContext<Self>,
         _message: WorldTick,
-    ) -> Result<(), ActorError> {
+    ) -> Result<(), ActorFailure> {
         self.advance_simulation();
         Ok(())
     }
@@ -394,7 +394,7 @@ impl Responder<GetPlayerView> for WorldActor {
         ctx: &mut ActorContext<Self>,
         request: GetPlayerView,
         reply_to: ReplyTo<GetPlayerViewResponse>,
-    ) -> Result<(), ActorError> {
+    ) -> Result<(), ActorFailure> {
         let db = self.db.clone();
         ctx.defer_reply(
             reply_to,
@@ -410,7 +410,7 @@ impl Handler<ProfileLoaded> for WorldActor {
         &mut self,
         _ctx: &mut ActorContext<Self>,
         loaded: ProfileLoaded,
-    ) -> Result<(), ActorError> {
+    ) -> Result<(), ActorFailure> {
         match loaded.result {
             Ok(profile) => loaded.reply_to.send(self.build_view(profile))?,
             Err(error) => loaded.reply_to.fail(error)?,

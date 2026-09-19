@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use lattice_actor::context::ActorContext;
-use lattice_actor::error::{ActorError, ActorSpawnError};
+use lattice_actor::error::{ActorFailure, ActorSpawnError};
 use lattice_actor::handle::ActorHandle;
 use lattice_actor::mailbox::MailboxConfig;
 use lattice_actor::reply::ReplyTo;
@@ -53,17 +53,17 @@ struct RestartingParent {
 }
 
 impl Actor for TestActor {
-    type Error = ActorError;
+    type Error = ActorFailure;
     type Behavior = ::lattice_actor::state_machine::Stateless;
 }
 
 impl Actor for OtherActor {
-    type Error = ActorError;
+    type Error = ActorFailure;
     type Behavior = ::lattice_actor::state_machine::Stateless;
 }
 
 impl Actor for ParentActor {
-    type Error = ActorError;
+    type Error = ActorFailure;
     type Behavior = ::lattice_actor::state_machine::Stateless;
 
     async fn started(&mut self, ctx: &mut ActorContext<Self>) -> Result<(), Self::Error> {
@@ -107,7 +107,7 @@ impl Actor for ParentActor {
 }
 
 impl Actor for ReportingChild {
-    type Error = ActorError;
+    type Error = ActorFailure;
     type Behavior = ::lattice_actor::state_machine::Stateless;
 
     async fn started(&mut self, _ctx: &mut ActorContext<Self>) -> Result<(), Self::Error> {
@@ -119,7 +119,7 @@ impl Actor for ReportingChild {
 }
 
 impl Actor for RestartingParent {
-    type Error = ActorError;
+    type Error = ActorFailure;
     type Behavior = ::lattice_actor::state_machine::Stateless;
 
     async fn started(&mut self, ctx: &mut ActorContext<Self>) -> Result<(), Self::Error> {
@@ -145,7 +145,7 @@ impl Handler<RestartChild> for RestartingParent {
         &mut self,
         _ctx: &mut HandlerContext<'_, Self>,
         _message: RestartChild,
-    ) -> Result<(), ActorError> {
+    ) -> Result<(), ActorFailure> {
         self.child
             .as_ref()
             .expect("child should be running")
@@ -160,14 +160,14 @@ impl Responder<ChildThreads> for ParentActor {
         _ctx: &mut HandlerContext<'_, Self>,
         _request: ChildThreads,
         reply_to: ReplyTo<Vec<String>>,
-    ) -> Result<(), ActorError> {
+    ) -> Result<(), ActorFailure> {
         let mut threads = Vec::with_capacity(self.children.len());
         for child in &self.children {
             threads.push(
                 child
                     .ask(CurrentThread, ASK_TIMEOUT)
                     .await
-                    .map_err(|error| ActorError::new(error.to_string()))?,
+                    .map_err(|error| ActorFailure::new(error.to_string()))?,
             );
         }
         let _ = reply_to.send(threads);
@@ -181,7 +181,7 @@ impl Responder<Ping> for TestActor {
         _ctx: &mut HandlerContext<'_, Self>,
         request: Ping,
         reply_to: ReplyTo<String>,
-    ) -> Result<(), ActorError> {
+    ) -> Result<(), ActorFailure> {
         self.events.lock().await.push(request.0);
         let _ = reply_to.send(format!("pong:{}", request.0));
         Ok(())
@@ -194,7 +194,7 @@ impl Responder<CurrentThread> for TestActor {
         _ctx: &mut HandlerContext<'_, Self>,
         _request: CurrentThread,
         reply_to: ReplyTo<String>,
-    ) -> Result<(), ActorError> {
+    ) -> Result<(), ActorFailure> {
         let _ = reply_to.send(format!("{:?}", std::thread::current().id()));
         Ok(())
     }
@@ -206,7 +206,7 @@ impl Responder<CurrentThread> for OtherActor {
         _ctx: &mut HandlerContext<'_, Self>,
         _request: CurrentThread,
         reply_to: ReplyTo<String>,
-    ) -> Result<(), ActorError> {
+    ) -> Result<(), ActorFailure> {
         let _ = reply_to.send(format!("{:?}", std::thread::current().id()));
         Ok(())
     }

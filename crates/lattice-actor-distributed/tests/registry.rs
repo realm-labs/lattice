@@ -12,7 +12,7 @@ use lattice_actor_distributed::{
     actor_protocol,
     context::ActorContext,
     directory::ActivationDirectory,
-    error::{ActorError, ActorStopError},
+    error::{ActorFailure, ActorStopError},
     mailbox::MailboxConfig,
     protocol::ProstCodec,
     registry::{
@@ -40,7 +40,7 @@ async fn cancelled_activation_releases_placeholder_and_notifies_existing_waiters
     ));
     let actor_id = ActorId::U64(71);
     let mut producer = Box::pin(registry.get_or_activate(actor_id.clone(), || async {
-        std::future::pending::<Result<SlowActor, ActorError>>().await
+        std::future::pending::<Result<SlowActor, ActorFailure>>().await
     }));
     assert!(futures_util::poll!(&mut producer).is_pending());
     let mut waiter = Box::pin(registry.get_or_activate(actor_id.clone(), || async {
@@ -122,7 +122,7 @@ async fn fencing_loading_activation_does_not_remove_a_replacement() {
     );
     let actor_id = ActorId::U64(74);
     let mut old = Box::pin(registry.get_or_activate(actor_id.clone(), || async {
-        std::future::pending::<Result<SlowActor, ActorError>>().await
+        std::future::pending::<Result<SlowActor, ActorFailure>>().await
     }));
     assert!(futures_util::poll!(&mut old).is_pending());
     registry
@@ -202,7 +202,7 @@ async fn current_generation_cancels_a_loading_predecessor_and_its_waiters() {
     });
     let actor_id = ActorId::U64(78);
     let mut old = Box::pin(registry.get_or_activate(actor_id.clone(), || async {
-        std::future::pending::<Result<SlowActor, ActorError>>().await
+        std::future::pending::<Result<SlowActor, ActorFailure>>().await
     }));
     assert!(futures_util::poll!(&mut old).is_pending());
     let mut waiter = Box::pin(registry.get_or_activate(actor_id.clone(), || async {
@@ -296,7 +296,7 @@ async fn wait_terminal_tracks_loading_until_invalidation() {
         ActorRegistry::<SlowActor>::new(actor_kind!("WaitLoading"), ActorRegistryConfig::default());
     let actor_id = ActorId::U64(76);
     let mut producer = Box::pin(registry.get_or_activate(actor_id.clone(), || async {
-        std::future::pending::<Result<SlowActor, ActorError>>().await
+        std::future::pending::<Result<SlowActor, ActorFailure>>().await
     }));
     assert!(futures_util::poll!(&mut producer).is_pending());
     let mut waiter = Box::pin(registry.wait_actor_ids_terminal([actor_id.clone()]));
@@ -372,9 +372,9 @@ async fn fast_fence_cleanup_cannot_leave_a_stopped_cell_in_quarantine() {
 }
 
 impl Actor for SlowActor {
-    type Error = ActorError;
+    type Error = ActorFailure;
     type Behavior = ::lattice_actor::state_machine::Stateless;
-    async fn started(&mut self, _ctx: &mut ActorContext<Self>) -> Result<(), ActorError> {
+    async fn started(&mut self, _ctx: &mut ActorContext<Self>) -> Result<(), ActorFailure> {
         Ok(())
     }
 }
@@ -462,7 +462,7 @@ impl Handler<Probe> for SelfRefActor {
         &mut self,
         _ctx: &mut HandlerContext<'_, Self>,
         _message: Probe,
-    ) -> Result<(), ActorError> {
+    ) -> Result<(), ActorFailure> {
         Ok(())
     }
 }
@@ -479,16 +479,16 @@ actor_protocol! {
 }
 
 impl Actor for SelfRefActor {
-    type Error = ActorError;
+    type Error = ActorFailure;
     type Behavior = ::lattice_actor::state_machine::Stateless;
-    async fn started(&mut self, ctx: &mut ActorContext<Self>) -> Result<(), ActorError> {
+    async fn started(&mut self, ctx: &mut ActorContext<Self>) -> Result<(), ActorFailure> {
         if let Some(tx) = self.tx.take() {
             let distributed = ctx
                 .require_distributed()
-                .map_err(|error| ActorError::new(error.to_string()))?;
+                .map_err(|error| ActorFailure::new(error.to_string()))?;
             let reference = distributed
                 .self_address()
-                .ok_or_else(|| ActorError::new("distributed actor has no exact address"))?;
+                .ok_or_else(|| ActorFailure::new("distributed actor has no exact address"))?;
             let _ = tx.send(reference.clone());
         }
         Ok(())
@@ -587,7 +587,7 @@ impl Drop for RetainedRegistryActor {
 }
 
 impl Actor for RetainedRegistryActor {
-    type Error = ActorError;
+    type Error = ActorFailure;
     type Behavior = ::lattice_actor::state_machine::Stateless;
 
     async fn stopping(
@@ -878,7 +878,7 @@ async fn authority_loss_during_stopping_finishes_in_non_authoritative_quarantine
     }
 
     impl Actor for ConcurrentFenceActor {
-        type Error = ActorError;
+        type Error = ActorFailure;
         type Behavior = ::lattice_actor::state_machine::Stateless;
 
         async fn stopping(
@@ -985,7 +985,7 @@ async fn concurrent_activation_never_produces_a_second_cell() {
     struct CountedActor;
 
     impl Actor for CountedActor {
-        type Error = ActorError;
+        type Error = ActorFailure;
         type Behavior = ::lattice_actor::state_machine::Stateless;
     }
 

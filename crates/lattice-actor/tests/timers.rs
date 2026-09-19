@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use lattice_actor::context::ActorContext;
-use lattice_actor::error::{ActorError, ActorStopError};
+use lattice_actor::error::{ActorFailure, ActorStopError};
 use lattice_actor::reply::ReplyTo;
 use lattice_actor::runtime::{ActorRuntime, ActorSpawnOptions};
 use lattice_actor::traits::{Actor, Handler, Responder, StopReason};
@@ -15,9 +15,9 @@ struct WorldActor {
 }
 
 impl Actor for WorldActor {
-    type Error = ActorError;
+    type Error = ActorFailure;
     type Behavior = ::lattice_actor::state_machine::Stateless;
-    async fn started(&mut self, ctx: &mut ActorContext<Self>) -> Result<(), ActorError> {
+    async fn started(&mut self, ctx: &mut ActorContext<Self>) -> Result<(), ActorFailure> {
         ctx.notify_interval(Duration::from_millis(5), || WorldTick { delta_ms: 5 });
         Ok(())
     }
@@ -48,7 +48,7 @@ impl Handler<WorldTick> for WorldActor {
         &mut self,
         ctx: &mut HandlerContext<'_, Self>,
         msg: WorldTick,
-    ) -> Result<(), ActorError> {
+    ) -> Result<(), ActorFailure> {
         assert_eq!(msg.delta_ms, 5);
         let mut ticks = self.ticks.lock().await;
         *ticks += 1;
@@ -65,7 +65,7 @@ impl Responder<InspectTicks> for WorldActor {
         _ctx: &mut HandlerContext<'_, Self>,
         _request: InspectTicks,
         reply_to: ReplyTo<u64>,
-    ) -> Result<(), ActorError> {
+    ) -> Result<(), ActorFailure> {
         let _ = reply_to.send(*self.ticks.lock().await);
         Ok(())
     }
@@ -102,9 +102,9 @@ async fn interval_timer_survives_a_transiently_full_mailbox() {
     }
 
     impl Actor for TickActor {
-        type Error = ActorError;
+        type Error = ActorFailure;
         type Behavior = ::lattice_actor::state_machine::Stateless;
-        async fn started(&mut self, ctx: &mut ActorContext<Self>) -> Result<(), ActorError> {
+        async fn started(&mut self, ctx: &mut ActorContext<Self>) -> Result<(), ActorFailure> {
             ctx.notify_interval(Duration::from_millis(2), || Tick);
             Ok(())
         }
@@ -124,7 +124,7 @@ async fn interval_timer_survives_a_transiently_full_mailbox() {
             &mut self,
             _ctx: &mut HandlerContext<'_, Self>,
             _msg: Tick,
-        ) -> Result<(), ActorError> {
+        ) -> Result<(), ActorFailure> {
             *self.ticks.lock().await += 1;
             Ok(())
         }
@@ -135,7 +135,7 @@ async fn interval_timer_survives_a_transiently_full_mailbox() {
             &mut self,
             _ctx: &mut HandlerContext<'_, Self>,
             msg: Block,
-        ) -> Result<(), ActorError> {
+        ) -> Result<(), ActorFailure> {
             msg.entered.add_permits(1);
             msg.release.acquire().await.unwrap().forget();
             Ok(())

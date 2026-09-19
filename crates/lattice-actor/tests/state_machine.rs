@@ -3,7 +3,7 @@ use std::collections::VecDeque;
 use std::time::Duration;
 
 use lattice_actor::actor_behavior;
-use lattice_actor::error::{ActorCallError, ActorError};
+use lattice_actor::error::{ActorCallError, ActorFailure};
 use lattice_actor::reply::ReplyTo;
 use lattice_actor::runtime::{ActorRuntime, ActorSpawnOptions};
 use lattice_actor::state_machine::Accepts;
@@ -26,7 +26,7 @@ struct MatchActor {
 }
 
 impl Actor for MatchActor {
-    type Error = ActorError;
+    type Error = ActorFailure;
     type Behavior = MatchState;
 }
 
@@ -75,7 +75,7 @@ impl Responder<StartMatch> for MatchActor {
         ctx: &mut HandlerContext<'_, Self>,
         request: StartMatch,
         reply_to: ReplyTo<StartMatchReply>,
-    ) -> Result<(), ActorError> {
+    ) -> Result<(), ActorFailure> {
         let reply = match ctx.behavior() {
             MatchState::Loading => {
                 self.pending_starts.push_back(request);
@@ -106,7 +106,7 @@ impl Handler<LoadingFinished> for MatchActor {
         &mut self,
         ctx: &mut HandlerContext<'_, Self>,
         _msg: LoadingFinished,
-    ) -> Result<(), ActorError> {
+    ) -> Result<(), ActorFailure> {
         ctx.transition_to(MatchState::WaitingPlayers);
         if self.pending_starts.pop_front().is_some() {
             ctx.transition_to(MatchState::Running { tick: 0 });
@@ -121,7 +121,7 @@ impl Handler<WorldTick> for MatchActor {
         &mut self,
         ctx: &mut HandlerContext<'_, Self>,
         _msg: WorldTick,
-    ) -> Result<(), ActorError> {
+    ) -> Result<(), ActorFailure> {
         let MatchState::Running { tick } = ctx.behavior_mut() else {
             unreachable!("state admission guarantees WorldTick is handled only while running")
         };
@@ -136,7 +136,7 @@ impl Responder<InspectState> for MatchActor {
         ctx: &mut HandlerContext<'_, Self>,
         _request: InspectState,
         reply_to: ReplyTo<(MatchState, Vec<u64>)>,
-    ) -> Result<(), ActorError> {
+    ) -> Result<(), ActorFailure> {
         let _ = reply_to.send((
             *ctx.behavior(),
             self.pending_starts
@@ -154,7 +154,7 @@ impl Responder<CurrentTick> for MatchActor {
         ctx: &mut HandlerContext<'_, Self>,
         _request: CurrentTick,
         reply_to: ReplyTo<u64>,
-    ) -> Result<(), ActorError> {
+    ) -> Result<(), ActorFailure> {
         let MatchState::Running { tick } = ctx.behavior() else {
             unreachable!("state admission guarantees CurrentTick is handled only while running")
         };

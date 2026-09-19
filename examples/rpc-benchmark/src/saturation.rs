@@ -8,7 +8,7 @@ use std::{
 use bytes::Bytes;
 use lattice_actor_distributed::{
     context::HandlerContext,
-    error::{ActorError, ActorTellError},
+    error::{ActorFailure, ActorTellError},
     handle::ActorHandle,
     mailbox::MailboxConfig,
     registry::{ActorRegistry, ActorRegistryConfig},
@@ -64,7 +64,7 @@ struct SaturationActor {
 }
 
 impl Actor for SaturationActor {
-    type Error = ActorError;
+    type Error = ActorFailure;
     type Behavior = ::lattice_actor::state_machine::Stateless;
 }
 

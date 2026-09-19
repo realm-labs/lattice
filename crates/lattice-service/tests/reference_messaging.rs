@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::BytesMut;
-use lattice_actor::error::ActorError;
+use lattice_actor::error::ActorFailure;
 use lattice_actor::traits::{Actor, Handler, StopReason};
 use lattice_actor_distributed::protocol::{
     ActorProtocolBinding, CodecDescriptor, DecodeError, EncodeError, Protocol, WireCodec,
@@ -74,7 +74,7 @@ impl WireCodec<Delivered> for DeliveredCodec {
 struct SourceActor;
 
 impl Actor for SourceActor {
-    type Error = ActorError;
+    type Error = ActorFailure;
     type Behavior = ::lattice_actor::state_machine::Stateless;
 }
 
@@ -83,13 +83,13 @@ impl Handler<SendTo> for SourceActor {
         &mut self,
         ctx: &mut HandlerContext<'_, Self>,
         message: SendTo,
-    ) -> Result<(), ActorError> {
+    ) -> Result<(), ActorFailure> {
         let target = ctx
             .bind_actor(message.target)
-            .map_err(|error| ActorError::new(error.to_string()))?;
+            .map_err(|error| ActorFailure::new(error.to_string()))?;
         ctx.tell(&target, Delivered)
             .await
-            .map_err(|error| ActorError::new(error.to_string()))?;
+            .map_err(|error| ActorFailure::new(error.to_string()))?;
         Ok(())
     }
 }
@@ -100,7 +100,7 @@ struct SinkActor {
 }
 
 impl Actor for SinkActor {
-    type Error = ActorError;
+    type Error = ActorFailure;
     type Behavior = ::lattice_actor::state_machine::Stateless;
 }
 
@@ -109,7 +109,7 @@ impl Handler<Delivered> for SinkActor {
         &mut self,
         _ctx: &mut HandlerContext<'_, Self>,
         _message: Delivered,
-    ) -> Result<(), ActorError> {
+    ) -> Result<(), ActorFailure> {
         if let Some(observed) = self.observed.lock().expect("observer poisoned").take() {
             let _ = observed.send(());
         }

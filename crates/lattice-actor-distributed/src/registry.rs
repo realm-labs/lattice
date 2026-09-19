@@ -25,7 +25,7 @@ use thiserror::Error;
 
 use lattice_actor::{
     attachments::ActorRuntimeAttachments,
-    error::{ActorAdminError, ActorError},
+    error::{ActorAdminError, ActorFailure},
     handle::{ActorHandle, StopFailureRecord},
     mailbox::MailboxConfig,
     observation::ActorObserverHandle,
@@ -56,7 +56,7 @@ pub enum ActorActivationError {
     #[error("timed out waiting {timeout:?} for actor activation")]
     WaiterTimeout { timeout: Duration },
     #[error("actor activation failed: {0}")]
-    ActivationFailed(ActorError),
+    ActivationFailed(ActorFailure),
     #[error("actor activation is retained after stopping persistence failed")]
     RetainedStopFailure,
     #[error("actor activation was cancelled before publication")]
@@ -750,7 +750,7 @@ impl<A: Actor> ActorRegistry<A> {
                             }
                         }
                     }
-                    _ => Err(ActorActivationError::ActivationFailed(ActorError::new(
+                    _ => Err(ActorActivationError::ActivationFailed(ActorFailure::new(
                         "actor registry entry removed during activation",
                     ))),
                 });
@@ -771,7 +771,7 @@ impl<A: Actor> ActorRegistry<A> {
                     matches!(entry, RegistryEntry::Activating(existing) if Arc::ptr_eq(existing, &activation))
                 });
                 Err(ActorActivationError::ActivationFailed(
-                    ActorError::from_error(error),
+                    ActorFailure::from_error(error),
                 ))
             }
         };
@@ -1023,7 +1023,7 @@ impl<A: Actor> ActorRegistry<A> {
             })
     }
 
-    fn spawn_actor(&self, actor_id: ActorId, actor: A) -> Result<ActorHandle<A>, ActorError> {
+    fn spawn_actor(&self, actor_id: ActorId, actor: A) -> Result<ActorHandle<A>, ActorFailure> {
         let self_address = self
             .actor_address_for(actor_id.clone())
             .map(|address| address.erase());
@@ -1051,7 +1051,7 @@ impl<A: Actor> ActorRegistry<A> {
         let mut runtime_attachments = ActorRuntimeAttachments::builder();
         runtime_attachments
             .insert(DistributedActorIdentity::new(self_address.clone()))
-            .map_err(|error| ActorError::new(error.to_string()))?;
+            .map_err(|error| ActorFailure::new(error.to_string()))?;
         let handle = self
             .runtime
             .spawn_managed_actor(
@@ -1065,14 +1065,14 @@ impl<A: Actor> ActorRegistry<A> {
                 runtime_attachments.build(),
                 Some(terminal_hook),
             )
-            .map_err(|error| ActorError::new(error.to_string()))?;
+            .map_err(|error| ActorFailure::new(error.to_string()))?;
         if let (Some(directory), Some(reference)) = (
             self.config.service.extension::<ActivationDirectory>(),
             self_address.as_ref(),
         ) && let Err(error) = directory.register(reference, &handle)
         {
             let _ = handle.try_stop_internal(StopReason::StartFailed);
-            return Err(ActorError::new(error.to_string()));
+            return Err(ActorFailure::new(error.to_string()));
         }
         if is_terminal(handle.lifecycle_state())
             && let Some(directory) = self.config.service.extension::<ActivationDirectory>()
@@ -1151,7 +1151,7 @@ fn is_terminal(state: ActorLifecycleState) -> bool {
 }
 
 fn authority_error(message: &'static str) -> ActorActivationError {
-    ActorActivationError::ActivationFailed(ActorError::new(message))
+    ActorActivationError::ActivationFailed(ActorFailure::new(message))
 }
 
 fn is_business_admitted(state: ActorLifecycleState) -> bool {

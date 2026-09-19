@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use lattice_actor::context::ActorContext;
-use lattice_actor::error::{ActorCallError, ActorError, ActorStopError};
+use lattice_actor::error::{ActorCallError, ActorFailure, ActorStopError};
 use lattice_actor::reply::ReplyTo;
 use lattice_actor::traits::{Actor, ActorLifecycleState, PassivationReason, Responder, StopReason};
 use lattice_actor_distributed::registry::ActorRegistry;
@@ -22,7 +22,7 @@ struct PassivatingActor {
 }
 
 impl Actor for PassivatingActor {
-    type Error = ActorError;
+    type Error = ActorFailure;
     type Behavior = ::lattice_actor::state_machine::Stateless;
 
     async fn stopping(
@@ -46,8 +46,8 @@ impl Responder<BeginPassivation> for PassivatingActor {
         ctx: &mut HandlerContext<'_, Self>,
         _request: BeginPassivation,
         reply_to: ReplyTo<()>,
-    ) -> Result<(), ActorError> {
-        ctx.request_passivation(PassivationReason::BusinessIdle)?;
+    ) -> Result<(), ActorFailure> {
+        ctx.request_passivation(PassivationReason::BusinessIdle);
         let _ = reply_to.send(());
         Ok(())
     }
@@ -63,7 +63,7 @@ impl Responder<Ping> for PassivatingActor {
         _ctx: &mut HandlerContext<'_, Self>,
         _request: Ping,
         reply_to: ReplyTo<()>,
-    ) -> Result<(), ActorError> {
+    ) -> Result<(), ActorFailure> {
         self.handled_pings.fetch_add(1, Ordering::SeqCst);
         let _ = reply_to.send(());
         Ok(())

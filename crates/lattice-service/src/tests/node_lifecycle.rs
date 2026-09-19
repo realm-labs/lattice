@@ -11,7 +11,7 @@ use std::{
 
 use lattice_actor_distributed::{
     context::{ActorContext, HandlerContext},
-    error::{ActorError, ActorStopError},
+    error::{ActorFailure, ActorStopError},
     recipient::ProtocolRegistrationError,
     registry::{ActorRegistry, ActorRegistryConfig},
     reply::ReplyTo,
@@ -79,7 +79,7 @@ async fn force_shutdown_forces_retained_actor_before_publishing_terminated() {
     }
 
     impl Actor for ForceShutdownActor {
-        type Error = ActorError;
+        type Error = ActorFailure;
         type Behavior = ::lattice_actor::state_machine::Stateless;
 
         async fn stopping(
@@ -97,7 +97,7 @@ async fn force_shutdown_forces_retained_actor_before_publishing_terminated() {
             _ctx: &mut HandlerContext<'_, Self>,
             request: Ping,
             reply_to: ReplyTo<Pong>,
-        ) -> Result<(), ActorError> {
+        ) -> Result<(), ActorFailure> {
             let _ = reply_to.send(Pong(request.0));
             Ok(())
         }
@@ -203,7 +203,7 @@ async fn service_retry_api_resolves_retained_actor_cell() {
     }
 
     impl Actor for RetryShutdownActor {
-        type Error = ActorError;
+        type Error = ActorFailure;
         type Behavior = ::lattice_actor::state_machine::Stateless;
 
         async fn stopping(
@@ -224,7 +224,7 @@ async fn service_retry_api_resolves_retained_actor_cell() {
             _ctx: &mut HandlerContext<'_, Self>,
             request: Ping,
             reply_to: ReplyTo<Pong>,
-        ) -> Result<(), ActorError> {
+        ) -> Result<(), ActorFailure> {
             let _ = reply_to.send(Pong(request.0));
             Ok(())
         }
@@ -278,7 +278,7 @@ async fn leave_deadline_retains_an_actor_waiting_for_its_stop_hook() {
     let _network = network_test_guard().await;
     struct SlowStopActor(Arc<tokio::sync::Notify>);
     impl Actor for SlowStopActor {
-        type Error = ActorError;
+        type Error = ActorFailure;
         type Behavior = ::lattice_actor::state_machine::Stateless;
 
         async fn stopping(
@@ -296,7 +296,7 @@ async fn leave_deadline_retains_an_actor_waiting_for_its_stop_hook() {
             _ctx: &mut HandlerContext<'_, Self>,
             request: Ping,
             reply_to: ReplyTo<Pong>,
-        ) -> Result<(), ActorError> {
+        ) -> Result<(), ActorFailure> {
             let _ = reply_to.send(Pong(request.0));
             Ok(())
         }
