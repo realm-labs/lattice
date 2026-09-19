@@ -2,7 +2,7 @@ use crate::actor_address::{
     ActivationId, ActorAddress, ActorPath, ClusterId, ConfigFingerprint, EntityAddress, EntityId,
     EntityType, NodeAddress, NodeIncarnation, PlacementDomainId, ProtocolId,
 };
-use crate::id::{ActorId, ActorKey, ActorKeyDecodeError, RouteKey};
+use crate::id::{ActorId, RouteKey};
 use crate::kind::{ActorKind, ServiceKind};
 use crate::trace::TraceContext;
 use crate::trace::TraceSpanKind;
@@ -11,28 +11,6 @@ use crate::{actor_kind, service_kind};
 const WORLD_SERVICE: ServiceKind = service_kind!("World");
 const WORLD_ACTOR: ActorKind = actor_kind!("World");
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct WorldId(u64);
-
-impl ActorKey for WorldId {
-    fn to_route_key(&self) -> RouteKey {
-        RouteKey::U64(self.0)
-    }
-
-    fn to_actor_id(&self) -> ActorId {
-        ActorId::U64(self.0)
-    }
-
-    fn try_from_actor_id(actor_id: &ActorId) -> Result<Self, ActorKeyDecodeError> {
-        match actor_id {
-            ActorId::U64(value) => Ok(Self(*value)),
-            _ => Err(ActorKeyDecodeError {
-                reason: "expected u64 actor id for WorldId".to_string(),
-            }),
-        }
-    }
-}
-
 #[test]
 fn actor_kind_and_service_kind_macros_are_const() {
     assert_eq!(WORLD_SERVICE.as_str(), "World");
@@ -40,14 +18,8 @@ fn actor_kind_and_service_kind_macros_are_const() {
 }
 
 #[test]
-fn actor_key_converts_through_framework_ids() {
-    let id = WorldId(42);
-
-    assert_eq!(id.to_route_key(), RouteKey::U64(42));
-    assert_eq!(id.to_actor_id(), ActorId::U64(42));
-    assert_eq!(id.to_actor_id().to_route_key(), RouteKey::U64(42));
-    assert_eq!(WorldId::try_from_actor_id(&ActorId::U64(42)), Ok(id));
-    assert!(WorldId::try_from_actor_id(&ActorId::Str("42".into())).is_err());
+fn actor_id_converts_to_route_key() {
+    assert_eq!(ActorId::U64(42).to_route_key(), RouteKey::U64(42));
 }
 
 #[test]
