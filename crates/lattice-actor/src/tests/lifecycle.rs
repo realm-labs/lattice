@@ -23,9 +23,11 @@ async fn stop_uses_system_lane_and_closes_actor() {
         stopped: Some(stopped.clone()),
     };
     let handle = spawn_actor(actor, MailboxConfig::bounded(8));
+    let mut terminated = handle.subscribe_terminated();
 
     handle.stop(StopReason::Requested).unwrap();
     stopped.acquire().await.unwrap().forget();
+    terminated.recv().await.unwrap();
 
     let result = handle.ask(Ping("after-stop"), ASK_TIMEOUT).await;
     assert!(matches!(
@@ -46,9 +48,11 @@ async fn business_passivation_happens_after_handler_response() {
         stopped: Some(stopped.clone()),
     };
     let handle = spawn_actor(actor, MailboxConfig::bounded(8));
+    let mut terminated = handle.subscribe_terminated();
 
     let reply = handle.ask(StopAfterReply, ASK_TIMEOUT).await.unwrap();
     stopped.acquire().await.unwrap().forget();
+    terminated.recv().await.unwrap();
     let after_stop = handle.tell(Record::new("after-stop")).await;
 
     assert_eq!(reply, "reply-before-stop");

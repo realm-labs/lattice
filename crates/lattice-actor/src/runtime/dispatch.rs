@@ -8,11 +8,10 @@ use crate::{
     error::ActorAdminError,
     handle::ActorHandle,
     mailbox::{ActorCommand, MailboxLane, QueuedRejection},
-    runtime::reject_prefetched_commands,
     traits::{Actor, MessageOutcome, StopReason},
 };
 
-use super::panic::ActorPanic;
+use super::{panic::ActorPanic, rejection::reject_prefetched_commands};
 
 pub(super) struct ActorInstance<'a, A: Actor> {
     pub(super) actor: &'a mut A,
