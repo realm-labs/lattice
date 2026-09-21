@@ -26,7 +26,7 @@ at the crate root:
 - `lattice-model::service` owns service and instance names;
 - `lattice-model::trace` owns propagation and telemetry resource values.
 
-Runtime containers such as `ServiceContext` remain in `lattice-actor`.
+Runtime containers such as `ActorEnvironment` remain in `lattice-actor`.
 Registry-local `ActorKey` and `ActorKind` remain in
 `lattice-actor-distributed`; they are not wire address primitives.
 

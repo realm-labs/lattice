@@ -1,4 +1,4 @@
-//! Runtime configuration, execution-policy defaults, and service-context propagation.
+//! Runtime configuration, execution-policy defaults, and Actor environment propagation.
 
 use std::sync::Arc;
 
@@ -11,10 +11,10 @@ use super::{
 use crate::{
     attachments::ActorRuntimeAttachments,
     context::ActorContext,
+    environment::ActorEnvironment,
     error::ActorFailure,
     mailbox::MailboxConfig,
     runtime::{ActorExecutionPolicy, ActorRuntime, ActorRuntimeConfig, ActorSpawnOptions},
-    service::ServiceContext,
     traits::{Actor, ChildActorKey, ChildActorOptions},
 };
 
@@ -47,7 +47,7 @@ async fn actor_runtime_spawns_task_per_actor() {
 }
 
 #[tokio::test]
-async fn standalone_actor_receives_empty_service_context() {
+async fn standalone_actor_receives_empty_environment() {
     let handle = spawn_actor(
         TestActor {
             events: Arc::new(Mutex::new(Vec::new())),
@@ -63,12 +63,12 @@ async fn standalone_actor_receives_empty_service_context() {
 }
 
 #[tokio::test]
-async fn actor_runtime_passes_service_context_to_handler_and_child() {
-    let service = ServiceContext::empty()
-        .with_extension(ContextMarker("world-service"))
+async fn actor_runtime_passes_environment_to_handler_and_child() {
+    let environment = ActorEnvironment::empty()
+        .with(ContextMarker("world-service"))
         .unwrap();
     let runtime = ActorRuntime::new(ActorRuntimeConfig {
-        service: service.clone(),
+        environment: environment.clone(),
         ..ActorRuntimeConfig::default()
     });
     let handle = runtime

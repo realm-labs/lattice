@@ -12,13 +12,13 @@ pub use lattice_actor_macros::{Message, Request, actor_behavior};
 
 pub mod attachments;
 pub mod context;
+pub mod environment;
 pub mod error;
 pub mod handle;
 pub mod mailbox;
 pub mod observation;
 pub mod reply;
 pub mod runtime;
-pub mod service;
 pub mod state_machine;
 pub mod traits;
 pub mod watch;

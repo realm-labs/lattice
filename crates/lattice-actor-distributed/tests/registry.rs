@@ -7,7 +7,7 @@ use std::{
     time::Duration,
 };
 
-use lattice_actor::service::ServiceContext;
+use lattice_actor::environment::ActorEnvironment;
 use lattice_actor_distributed::{ActorKey, actor_kind};
 use lattice_actor_distributed::{
     activation::DistributedActorContextExt,
@@ -391,7 +391,7 @@ async fn activation_waiter_times_out_while_activation_is_loading() {
             waiter_timeout: Duration::from_millis(10),
             quarantine_capacity: 8,
             address: None,
-            service: ServiceContext::empty(),
+            environment: ActorEnvironment::empty(),
         },
     ));
     let actor_id = ActorKey::U64(7);
@@ -937,12 +937,12 @@ async fn authority_loss_during_stopping_finishes_in_non_authoritative_quarantine
 
 #[tokio::test]
 async fn idle_passivation_eagerly_releases_registry_and_directory_capacity() {
-    let mut service = ServiceContext::builder();
-    service
-        .insert_extension(ActivationDirectory::new(1).unwrap())
+    let mut environment = ActorEnvironment::builder();
+    environment
+        .insert(ActivationDirectory::new(1).unwrap())
         .unwrap();
-    let service = service.build();
-    let directory = service.extension::<ActivationDirectory>().unwrap();
+    let environment = environment.build();
+    let directory = environment.get::<ActivationDirectory>().unwrap();
     let protocol = SelfRefProtocol::bind::<SelfRefActor>().unwrap();
     let registry = ActorRegistry::<SelfRefActor>::new_bound(
         actor_kind!("GatewaySession"),
@@ -953,7 +953,7 @@ async fn idle_passivation_eagerly_releases_registry_and_directory_capacity() {
                 node_address: NodeEndpoint::new("127.0.0.1", 19091).unwrap(),
                 node_incarnation: NodeIncarnation::new(8).unwrap(),
             }),
-            service,
+            environment,
             ..ActorRegistryConfig::default()
         },
         &protocol,

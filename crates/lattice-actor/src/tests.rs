@@ -269,8 +269,8 @@ impl Responder<ReadContextExtension> for TestActor {
         reply_to: ReplyTo<Option<&'static str>>,
     ) -> Result<(), ActorFailure> {
         let marker = ctx
-            .service()
-            .extension::<ContextMarker>()
+            .environment()
+            .get::<ContextMarker>()
             .map(|marker| marker.0);
         let _ = reply_to.send(marker);
         Ok(())

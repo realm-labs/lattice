@@ -578,8 +578,8 @@ impl SplitHost {
         let entity = split_entity_config(&self.domain)?;
         let placement_domain = entity.domain.clone();
         let protocol = Arc::new(SplitProtocol::bind::<SplitEntityActor>()?);
-        let mut context = ServiceContext::builder();
-        context.insert_extension(ActivationDirectory::new(8)?)?;
+        let mut environment = ActorEnvironment::builder();
+        environment.insert(ActivationDirectory::new(8)?)?;
         let registry = Arc::new(ActorRegistry::new_bound(
             actor_kind!("DistributedSplitFixture"),
             ActorRegistryConfig {
@@ -588,7 +588,7 @@ impl SplitHost {
                     node_address: config.address.clone(),
                     node_incarnation: incarnation,
                 }),
-                service: context.build(),
+                environment: environment.build(),
                 ..ActorRegistryConfig::default()
             },
             protocol.as_ref(),

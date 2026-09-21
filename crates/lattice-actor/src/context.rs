@@ -16,7 +16,7 @@ use std::{
     time::Instant,
 };
 
-use crate::service::ServiceContext;
+use crate::environment::ActorEnvironment;
 use tokio::task::{JoinHandle, JoinSet};
 
 use crate::{
@@ -50,7 +50,7 @@ pub struct PipeTaskHandle {
 
 pub struct ActorContext<A: Actor> {
     handle: ActorHandle<A>,
-    service: ServiceContext,
+    environment: ActorEnvironment,
     runtime_attachments: ActorRuntimeAttachments,
     spawner: ActorSpawner,
     lifecycle_request: Option<StopReason>,
@@ -69,7 +69,7 @@ impl<A: Actor> fmt::Debug for ActorContext<A> {
         let mut debug = formatter.debug_struct("ActorContext");
         debug.field("handle", &self.handle);
         debug
-            .field("service", &self.service)
+            .field("environment", &self.environment)
             .field("runtime_attachments", &self.runtime_attachments)
             .field("lifecycle_request", &self.lifecycle_request)
             .field("task_count", &self.tasks.len())
@@ -91,14 +91,14 @@ impl<A: Actor> fmt::Debug for ActorContext<A> {
 impl<A: Actor> ActorContext<A> {
     pub(crate) fn new(
         handle: ActorHandle<A>,
-        service: ServiceContext,
+        environment: ActorEnvironment,
         runtime_attachments: ActorRuntimeAttachments,
         spawner: ActorSpawner,
         deferred_capacity: usize,
     ) -> Self {
         Self {
             handle,
-            service,
+            environment,
             runtime_attachments,
             spawner,
             lifecycle_request: None,
@@ -117,8 +117,9 @@ impl<A: Actor> ActorContext<A> {
         self.handle.clone()
     }
 
-    pub fn service(&self) -> &ServiceContext {
-        &self.service
+    /// Returns the immutable environment shared by Actors in this runtime.
+    pub fn environment(&self) -> &ActorEnvironment {
+        &self.environment
     }
 
     /// Returns immutable activation metadata installed by a runtime integration.

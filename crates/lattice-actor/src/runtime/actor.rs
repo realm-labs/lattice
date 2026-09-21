@@ -37,7 +37,7 @@ pub(super) async fn run_actor<A>(
         handle,
         mut normal_rx,
         mut system_rx,
-        service,
+        environment,
         runtime_attachments,
         spawner,
         deferred_capacity,
@@ -45,7 +45,7 @@ pub(super) async fn run_actor<A>(
     } = parts;
     let mut ctx = ActorContext::new(
         handle.clone(),
-        service,
+        environment,
         runtime_attachments,
         spawner,
         deferred_capacity,

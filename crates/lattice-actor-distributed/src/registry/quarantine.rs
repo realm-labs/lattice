@@ -168,7 +168,7 @@ impl<A: Actor> ActorRegistry<A> {
         handle.fence_business_admission();
         let capacity_exhausted = self.quarantined.len() >= self.config.quarantine_capacity;
         let exact_reference = self.remove_exact(&handle);
-        if let Some(directory) = self.config.service.extension::<ActivationDirectory>()
+        if let Some(directory) = self.config.environment.get::<ActivationDirectory>()
             && let Some(reference) = exact_reference.as_ref()
         {
             directory.remove(reference);

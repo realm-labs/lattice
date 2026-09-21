@@ -121,7 +121,7 @@ pub trait DistributedActorContextExt<A: Actor> {
 
 impl<A: Actor> DistributedActorContextExt<A> for ActorContext<A> {
     fn distributed(&self) -> Option<Arc<DistributedActorContext>> {
-        let runtime = self.service().extension::<DistributedActorRuntime>()?;
+        let runtime = self.environment().get::<DistributedActorRuntime>()?;
         let self_address = self
             .runtime_attachment::<DistributedActorIdentity>()
             .and_then(|identity| identity.self_address.clone());

@@ -4,7 +4,7 @@
 //! bookkeeping, and stop propagation all observe the same activation, even after a replacement
 //! takes over the slot.
 
-use crate::service::ServiceContext;
+use crate::environment::ActorEnvironment;
 use std::{
     any::type_name,
     sync::{Arc, Mutex},
@@ -118,7 +118,7 @@ impl<A: Actor> ActorContext<A> {
 
     fn child_spawn_env(&self) -> ChildSpawnEnv {
         ChildSpawnEnv {
-            service: self.service.clone(),
+            environment: self.environment.clone(),
             observer: self.handle.observer().clone(),
             spawner: self.spawner.clone(),
         }
@@ -209,7 +209,7 @@ pub(super) trait ChildStop: Send {
 /// Shared spawn inputs for a parent's children, usable from a supervision task
 /// that no longer holds the [`ActorContext`].
 struct ChildSpawnEnv {
-    service: ServiceContext,
+    environment: ActorEnvironment,
     observer: ActorObserverHandle,
     spawner: ActorSpawner,
 }
@@ -234,7 +234,7 @@ impl ChildSpawnEnv {
                     scheduler_key: options.scheduler_key.clone(),
                     passivation: PassivationPolicy::Disabled,
                 },
-                service: self.service.clone(),
+                environment: self.environment.clone(),
                 observer: self.observer.clone(),
                 terminal_hook: None,
                 runtime_attachments: ActorRuntimeAttachments::empty(),

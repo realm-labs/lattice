@@ -240,8 +240,8 @@ async fn domain_logic(
     let mut scale_actor = None;
     if membership_only {
         let protocol = Arc::new(FixtureProtocol::bind::<PingActor>()?);
-        let mut context = ServiceContext::builder();
-        context.insert_extension(ActivationDirectory::new(8)?)?;
+        let mut environment = ActorEnvironment::builder();
+        environment.insert(ActivationDirectory::new(8)?)?;
         let registry = Arc::new(ActorRegistry::new_bound(
             actor_kind!("DistributedScaleFixture"),
             ActorRegistryConfig {
@@ -250,7 +250,7 @@ async fn domain_logic(
                     node_address: address,
                     node_incarnation: incarnation,
                 }),
-                service: context.build(),
+                environment: environment.build(),
                 ..ActorRegistryConfig::default()
             },
             protocol.as_ref(),

@@ -21,12 +21,12 @@ use thiserror::Error;
 
 use lattice_actor::{
     attachments::ActorRuntimeAttachments,
+    environment::ActorEnvironment,
     error::{ActorAdminError, ActorFailure},
     handle::{ActorHandle, StopFailureRecord},
     mailbox::MailboxConfig,
     observation::ActorObserverHandle,
     runtime::{ActorRuntime, ActorRuntimeConfig, ActorSpawnOptions, PassivationPolicy},
-    service::ServiceContext,
     traits::{Actor, ActorLifecycleState, PassivationReason, StopReason},
     watch::LocalActorRef,
 };
@@ -81,7 +81,7 @@ pub struct ActorRegistryConfig {
     pub waiter_timeout: Duration,
     pub quarantine_capacity: usize,
     pub address: Option<ActorAddressConfig>,
-    pub service: ServiceContext,
+    pub environment: ActorEnvironment,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -101,7 +101,7 @@ impl Default for ActorRegistryConfig {
             waiter_timeout: Duration::from_secs(5),
             quarantine_capacity: 1024,
             address: None,
-            service: ServiceContext::empty(),
+            environment: ActorEnvironment::empty(),
         }
     }
 }
@@ -171,7 +171,7 @@ impl<A: Actor> fmt::Debug for ActorRegistry<A> {
 pub struct ActorCreateContext {
     pub actor_kind: ActorKind,
     pub actor_id: ActorKey,
-    pub service: ServiceContext,
+    pub environment: ActorEnvironment,
     fencing_token: Option<ActorFencingToken>,
 }
 
@@ -270,12 +270,12 @@ impl<A: Actor> ActorRegistry<A> {
             "quarantine capacity must be nonzero"
         );
         let actor_system = Arc::new(OnceLock::new());
-        config.service = config
-            .service
-            .with_extension(DistributedActorRuntime::new(actor_system.clone()))
-            .expect("distributed Actor runtime extension is private to ActorRegistry");
+        config.environment = config
+            .environment
+            .with(DistributedActorRuntime::new(actor_system.clone()))
+            .expect("distributed Actor runtime value is private to ActorRegistry");
         let runtime = ActorRuntime::new(ActorRuntimeConfig {
-            service: config.service.clone(),
+            environment: config.environment.clone(),
             ..ActorRuntimeConfig::default()
         });
         Self {
@@ -305,12 +305,12 @@ impl<A: Actor> ActorRegistry<A> {
             "quarantine capacity must be nonzero"
         );
         let actor_system = Arc::new(OnceLock::new());
-        config.service = config
-            .service
-            .with_extension(DistributedActorRuntime::new(actor_system.clone()))
-            .expect("distributed Actor runtime extension is private to ActorRegistry");
+        config.environment = config
+            .environment
+            .with(DistributedActorRuntime::new(actor_system.clone()))
+            .expect("distributed Actor runtime value is private to ActorRegistry");
         let runtime = ActorRuntime::new(ActorRuntimeConfig {
-            service: config.service.clone(),
+            environment: config.environment.clone(),
             ..ActorRuntimeConfig::default()
         });
         Self {
@@ -331,7 +331,7 @@ impl<A: Actor> ActorRegistry<A> {
         self.observer = observer.clone();
         self.runtime = ActorRuntime::new(ActorRuntimeConfig {
             observer,
-            service: self.config.service.clone(),
+            environment: self.config.environment.clone(),
             ..ActorRuntimeConfig::default()
         });
         self
@@ -452,7 +452,7 @@ impl<A: Actor> ActorRegistry<A> {
         }) {
             return None;
         }
-        if let Some(directory) = self.config.service.extension::<ActivationDirectory>()
+        if let Some(directory) = self.config.environment.get::<ActivationDirectory>()
             && let Some(handle) = directory.resolve(address)
         {
             return Some(handle);
@@ -879,7 +879,7 @@ impl<A: Actor> ActorRegistry<A> {
         ActorCreateContext {
             actor_kind: self.kind.clone(),
             actor_id: actor_id.clone(),
-            service: self.config.service.clone(),
+            environment: self.config.environment.clone(),
             fencing_token,
         }
     }
@@ -976,7 +976,7 @@ impl<A: Actor> ActorRegistry<A> {
         });
         if let Some((_, RegistryEntry::Running(handle, _))) = removed
             && let Some(reference) = self.remove_exact(&handle)
-            && let Some(directory) = self.config.service.extension::<ActivationDirectory>()
+            && let Some(directory) = self.config.environment.get::<ActivationDirectory>()
         {
             directory.remove(&reference);
         }
@@ -1031,7 +1031,7 @@ impl<A: Actor> ActorRegistry<A> {
         let exact_entries = self.exact_entries.clone();
         let quarantined = self.quarantined.clone();
         let terminal_actor_id = actor_id.clone();
-        let directory = self.config.service.extension::<ActivationDirectory>();
+        let directory = self.config.environment.get::<ActivationDirectory>();
         let terminal_reference = self_address.clone();
         let terminal_activation = self_address.as_ref().map(ActorAddress::activation_id);
         let terminal_hook = Box::new(move |local_ref| {
@@ -1067,7 +1067,7 @@ impl<A: Actor> ActorRegistry<A> {
             )
             .map_err(|error| ActorFailure::new(error.to_string()))?;
         if let (Some(directory), Some(reference)) = (
-            self.config.service.extension::<ActivationDirectory>(),
+            self.config.environment.get::<ActivationDirectory>(),
             self_address.as_ref(),
         ) && let Err(error) = directory.register(reference, &handle)
         {
@@ -1075,7 +1075,7 @@ impl<A: Actor> ActorRegistry<A> {
             return Err(ActorFailure::new(error.to_string()));
         }
         if is_terminal(handle.lifecycle_state())
-            && let Some(directory) = self.config.service.extension::<ActivationDirectory>()
+            && let Some(directory) = self.config.environment.get::<ActivationDirectory>()
             && let Some(reference) = self_address.as_ref()
         {
             directory.remove(reference);

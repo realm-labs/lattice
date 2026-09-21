@@ -13,7 +13,7 @@ use std::{
 use async_trait::async_trait;
 use bytes::BytesMut;
 use clap::{Parser, ValueEnum};
-use lattice_actor::service::ServiceContext;
+use lattice_actor::environment::ActorEnvironment;
 use lattice_actor_distributed::{ActorKey, actor_kind};
 use lattice_actor_distributed::{
     actor_protocol,
@@ -613,8 +613,8 @@ async fn server(reference: PathBuf) -> Result<(), Box<dyn Error>> {
     let address = NodeEndpoint::new("fixture-server", 25520)?;
     let incarnation = NodeIncarnation::generate();
     let protocol = Arc::new(FixtureProtocol::bind::<PingActor>()?);
-    let mut service_context = ServiceContext::builder();
-    service_context.insert_extension(ActivationDirectory::new(64)?)?;
+    let mut environment = ActorEnvironment::builder();
+    environment.insert(ActivationDirectory::new(64)?)?;
     let registry = Arc::new(ActorRegistry::new_bound(
         actor_kind!("DistributedFixture"),
         ActorRegistryConfig {
@@ -623,7 +623,7 @@ async fn server(reference: PathBuf) -> Result<(), Box<dyn Error>> {
                 node_address: address.clone(),
                 node_incarnation: incarnation,
             }),
-            service: service_context.build(),
+            environment: environment.build(),
             ..ActorRegistryConfig::default()
         },
         protocol.as_ref(),
@@ -937,8 +937,8 @@ fn entity_service(
     slot: &PlacementSlot,
     owns_slot: bool,
 ) -> Result<EntityServiceFixture, Box<dyn Error>> {
-    let mut context = ServiceContext::builder();
-    context.insert_extension(ActivationDirectory::new(64)?)?;
+    let mut environment = ActorEnvironment::builder();
+    environment.insert(ActivationDirectory::new(64)?)?;
     let protocol = Arc::new(FixtureProtocol::bind::<PingActor>()?);
     let registry = Arc::new(ActorRegistry::new_bound(
         actor_kind!("DistributedEntityFixture"),
@@ -948,7 +948,7 @@ fn entity_service(
                 node_address: node.address.clone(),
                 node_incarnation: node.incarnation,
             }),
-            service: context.build(),
+            environment: environment.build(),
             ..ActorRegistryConfig::default()
         },
         protocol.as_ref(),

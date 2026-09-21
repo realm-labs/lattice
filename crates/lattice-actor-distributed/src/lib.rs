@@ -7,8 +7,8 @@
 #![cfg_attr(not(test), deny(clippy::wildcard_imports))]
 
 pub use lattice_actor::{
-    Message, Request, actor_behavior, attachments, context, error, handle, mailbox, observation,
-    reply, runtime, service, state_machine, traits, watch,
+    Message, Request, actor_behavior, attachments, context, environment, error, handle, mailbox,
+    observation, reply, runtime, state_machine, traits, watch,
 };
 
 pub mod activation;

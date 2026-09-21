@@ -16,6 +16,7 @@ use tracing::Instrument;
 
 use crate::{
     attachments::ActorRuntimeAttachments,
+    environment::ActorEnvironment,
     error::ActorSpawnError,
     handle::{ActorHandle, ActorHandleInit, TerminalHook},
     mailbox::{
@@ -23,7 +24,6 @@ use crate::{
         channel::{self, Receiver},
     },
     observation::ActorObserverHandle,
-    service::ServiceContext,
     traits::{Actor, ActorLifecycleState},
     watch::LocalActorRef,
 };
@@ -165,8 +165,8 @@ pub struct ActorRuntimeConfig {
     /// Number of worker threads in the dedicated Tokio runtime used by `TaskPerActor`.
     pub task_worker_count: usize,
     pub observer: ActorObserverHandle,
-    /// Shared environment inherited by every Actor spawned by this runtime.
-    pub service: ServiceContext,
+    /// Immutable environment inherited by every Actor spawned by this runtime.
+    pub environment: ActorEnvironment,
 }
 
 impl Default for ActorRuntimeConfig {
@@ -175,7 +175,7 @@ impl Default for ActorRuntimeConfig {
             default_execution: ActorExecutionPolicy::TaskPerActor,
             task_worker_count: std::thread::available_parallelism().map_or(1, NonZeroUsize::get),
             observer: ActorObserverHandle::default(),
-            service: ServiceContext::empty(),
+            environment: ActorEnvironment::empty(),
         }
     }
 }
@@ -282,7 +282,7 @@ impl ActorRuntime {
             actor,
             ActorSpawnContext {
                 options,
-                service: self.config.service.clone(),
+                environment: self.config.environment.clone(),
                 observer: self.config.observer.clone(),
                 terminal_hook,
                 runtime_attachments,
@@ -497,7 +497,7 @@ fn stable_scheduler_key_hash(scheduler_key: &SchedulerKey) -> u64 {
 
 pub(crate) struct ActorSpawnContext {
     pub(crate) options: ActorSpawnOptions,
-    pub(crate) service: ServiceContext,
+    pub(crate) environment: ActorEnvironment,
     pub(crate) observer: ActorObserverHandle,
     pub(crate) terminal_hook: Option<TerminalHook>,
     pub(crate) runtime_attachments: ActorRuntimeAttachments,
@@ -517,7 +517,7 @@ impl ActorSpawnContext {
     {
         let ActorSpawnContext {
             options,
-            service,
+            environment,
             observer,
             terminal_hook,
             runtime_attachments,
@@ -532,7 +532,7 @@ impl ActorSpawnContext {
         (
             create_actor_parts(
                 mailbox,
-                service,
+                environment,
                 observer,
                 terminal_hook,
                 runtime_attachments,
@@ -559,7 +559,7 @@ struct ActorRuntimeParts<A: Actor> {
     handle: ActorHandle<A>,
     normal_rx: Receiver<ActorCommand<A>>,
     system_rx: Receiver<ActorCommand<A>>,
-    service: ServiceContext,
+    environment: ActorEnvironment,
     runtime_attachments: ActorRuntimeAttachments,
     spawner: ActorSpawner,
     deferred_capacity: usize,
@@ -568,7 +568,7 @@ struct ActorRuntimeParts<A: Actor> {
 
 fn create_actor_parts<A>(
     mailbox: MailboxConfig,
-    service: ServiceContext,
+    environment: ActorEnvironment,
     observer: ActorObserverHandle,
     terminal_hook: Option<TerminalHook>,
     runtime_attachments: ActorRuntimeAttachments,
@@ -601,7 +601,7 @@ where
         handle,
         normal_rx,
         system_rx,
-        service,
+        environment,
         runtime_attachments,
         spawner,
         deferred_capacity: mailbox.deferred_capacity(),

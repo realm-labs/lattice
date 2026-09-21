@@ -78,11 +78,12 @@ Cross-process messages use ActorRef, EntityRef, or SingletonRef through lattice-
 Async tasks are created through ActorContext so they can be cancelled or isolated during stop/passivation.
 ```
 
-`ServiceContext` is the immutable, type-indexed bridge to application infrastructure. One
-`ActorRuntime` owns one context and shares it across all Actors it spawns. Runtime integrations may
-also install immutable `ActorRuntimeAttachments` for one activation, such as its distributed self
-address. Attachments are frozen before start and are not inherited by child Actors. Mutable
-business state belongs directly on the Actor.
+`ActorEnvironment` is the immutable, type-indexed bridge from Actors to application
+infrastructure. One `ActorRuntime` owns one environment and shares it across all Actors it spawns,
+including local-only runtimes. Runtime integrations may also install immutable
+`ActorRuntimeAttachments` for one activation, such as its distributed self address. Attachments
+are frozen before start and are not inherited by child Actors. Mutable business state belongs
+directly on the Actor.
 
 ### 7.2 Actor Scheduling Model
 
@@ -121,7 +122,7 @@ pub struct ActorRuntimeConfig {
     pub default_execution: ActorExecutionPolicy,
     pub task_worker_count: usize,
     pub observer: ActorObserverHandle,
-    pub service: ServiceContext,
+    pub environment: ActorEnvironment,
 }
 
 pub struct ActorRuntime {
@@ -199,7 +200,7 @@ Actor tasks are spawned by lattice ActorRuntime, not directly by business code.
 ActorRuntime owns task naming, lifecycle, cancellation, metrics, tracing, and drain integration.
 ActorRuntime must be retained for the lifetime of its Actors; dropping it shuts down its execution resources.
 ActorContext creates scoped tasks through the actor runtime so they can be cancelled or isolated.
-Service-scoped task ownership belongs to the service runtime, not to `ServiceContext`.
+Application-scoped task ownership belongs to its owning runtime, not to `ActorEnvironment`.
 CPU-heavy or blocking work must not run directly on Tokio worker threads; use a named worker pool, blocking pool, or external compute service.
 ActorRegistry stores actor ownership independently from the concrete execution policy.
 Mailbox semantics are identical across execution policies.
@@ -656,7 +657,7 @@ Entity activation is serialized per `(EntityType, EntityId)` at the owning shard
 
 The local registry prevents duplicate local activation and maps actor references to mailboxes. It is not a distributed placement store.
 
-Every registry in one service shares a bounded `ActivationDirectory` through `ServiceContext`.
+Every registry environment may share a bounded `ActivationDirectory` through `ActorEnvironment`.
 Registry-hosted activations register the exact `(ActorPath, ActivationId, protocol)` and typed local
 handle; remote protocol dispatch resolves through this directory. Core supervision children remain
 local and do not automatically register distributed addresses. Successful stop, passivation,
