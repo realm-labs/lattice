@@ -1,14 +1,15 @@
-use lattice_core::actor_address::{AddressError, ProtocolTag};
+use lattice_model::ModelError;
+use lattice_model::actor::ProtocolTag;
 
 use super::{
-    ActivationId, ActorAddress, ActorPath, Bytes, ClusterId, Duration, EntityAddress, NodeAddress,
+    ActivationId, ActorAddress, ActorPath, Bytes, ClusterId, Duration, EntityAddress, NodeEndpoint,
     NodeIncarnation, ProtocolId, SingletonAddress, error::RemoteFailureCode,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct ExactActorTarget {
     pub cluster_id: ClusterId,
-    pub node_address: NodeAddress,
+    pub node_address: NodeEndpoint,
     pub actor_path: ActorPath,
     pub activation_id: ActivationId,
     pub protocol_id: ProtocolId,
@@ -31,7 +32,7 @@ impl ExactActorTarget {
         self.activation_id.node_incarnation()
     }
 
-    pub fn actor_address<A: ProtocolTag>(&self) -> Result<ActorAddress<A>, AddressError> {
+    pub fn actor_address<A: ProtocolTag>(&self) -> Result<ActorAddress<A>, ModelError> {
         ActorAddress::new(
             self.cluster_id.clone(),
             self.node_address.clone(),
@@ -128,7 +129,7 @@ pub struct InboundAsk {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LogicalEntityTarget {
     pub reference: EntityAddress,
-    pub owner_address: NodeAddress,
+    pub owner_address: NodeEndpoint,
     pub owner_incarnation: NodeIncarnation,
     pub assignment_generation: u64,
 }
@@ -150,7 +151,7 @@ impl LogicalEntityTarget {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LogicalSingletonTarget {
     pub reference: SingletonAddress,
-    pub owner_address: NodeAddress,
+    pub owner_address: NodeEndpoint,
     pub owner_incarnation: NodeIncarnation,
     pub assignment_generation: u64,
 }

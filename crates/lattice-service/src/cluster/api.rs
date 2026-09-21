@@ -3,7 +3,7 @@ use std::{
     time::Duration,
 };
 
-use lattice_core::actor_address::ClusterId;
+use lattice_model::cluster::ClusterId;
 use lattice_placement::{
     coordinator::{MemberEvent, MemberRecord},
     types::{MembershipVersion, NodeKey},

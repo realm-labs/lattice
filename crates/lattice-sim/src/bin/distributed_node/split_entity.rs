@@ -55,17 +55,17 @@ struct ReleaseIdentity {
 }
 
 impl ReleaseIdentity {
-    fn manifest(&self) -> Result<lattice_core::release::ReleaseManifest, String> {
-        let mut compatibility = lattice_core::release::ReleaseCompatibility::development();
+    fn manifest(&self) -> Result<lattice_model::cluster::ReleaseManifest, String> {
+        let mut compatibility = lattice_model::cluster::ReleaseCompatibility::development();
         if let Some(byte) = self.protocol_fingerprint {
             compatibility.actor_protocol_fingerprint = [byte; 32];
         }
         if let Some(generation) = self.control_generation {
             compatibility.control_generation = generation;
         }
-        let release_id = lattice_core::release::ReleaseId::new(self.release_id)
+        let release_id = lattice_model::cluster::ReleaseId::new(self.release_id)
             .ok_or_else(|| "release id must be nonzero".to_owned())?;
-        lattice_core::release::ReleaseManifest::new(release_id, compatibility)
+        lattice_model::cluster::ReleaseManifest::new(release_id, compatibility)
             .map_err(|error| error.to_string())
     }
 }
@@ -142,11 +142,11 @@ enum ClusterReleaseArtifact {
 impl ClusterReleaseArtifact {
     fn observe(service: &LatticeService) -> Self {
         match service.cluster_release_state() {
-            Ok(lattice_core::release::ClusterReleaseState::Empty) => Self::Empty,
-            Ok(lattice_core::release::ClusterReleaseState::Stable { release }) => Self::Stable {
+            Ok(lattice_model::cluster::ClusterReleaseState::Empty) => Self::Empty,
+            Ok(lattice_model::cluster::ClusterReleaseState::Stable { release }) => Self::Stable {
                 release_id: release.release_id.get(),
             },
-            Ok(lattice_core::release::ClusterReleaseState::Rolling { from, to }) => Self::Rolling {
+            Ok(lattice_model::cluster::ClusterReleaseState::Rolling { from, to }) => Self::Rolling {
                 from: from.release_id.get(),
                 to: to.release_id.get(),
             },
@@ -545,7 +545,7 @@ impl SplitHost {
         let mut config = node_config(
             ClusterId::new("docker-domain-e2e").map_err(StartupErrorArtifact::from_error)?,
             &self.node_id,
-            NodeAddress::new(self.node_id.clone(), self.port)
+            NodeEndpoint::new(self.node_id.clone(), self.port)
                 .map_err(StartupErrorArtifact::from_error)?,
             NodeIncarnation::generate(),
         );

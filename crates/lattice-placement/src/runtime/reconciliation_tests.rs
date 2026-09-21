@@ -4,11 +4,9 @@ use std::{
     time::Duration,
 };
 
-use lattice_core::{
-    actor_address::{
-        ConfigFingerprint, EntityType, NodeAddress, NodeIncarnation, PlacementDomainId,
-    },
-    coordinator::CoordinatorScope,
+use lattice_model::{
+    cluster::CoordinatorScope,
+    cluster::{ConfigFingerprint, EntityType, NodeEndpoint, NodeIncarnation, PlacementDomainId},
 };
 use lattice_remoting::{association::AssociationManager, config::RemotingConfig};
 
@@ -33,7 +31,7 @@ use crate::{
 fn node(id: &str, incarnation: u128, port: u16) -> NodeKey {
     NodeKey {
         node_id: id.to_owned(),
-        address: NodeAddress::new("127.0.0.1", port).unwrap(),
+        address: NodeEndpoint::new("127.0.0.1", port).unwrap(),
         incarnation: NodeIncarnation::new(incarnation).unwrap(),
     }
 }
@@ -94,7 +92,7 @@ async fn persist_authority_records(
     let global = MemberRecord {
         node: owner.clone(),
         hello: MemberHello {
-            release: lattice_core::release::ReleaseManifest::development(1),
+            release: lattice_model::cluster::ReleaseManifest::development(1),
             rollout_participant: true,
             node: owner.clone(),
             roles: BTreeSet::new(),

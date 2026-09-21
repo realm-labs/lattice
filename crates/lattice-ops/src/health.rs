@@ -16,7 +16,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::get,
 };
-use lattice_core::{actor_address::PlacementDomainId, coordinator::CoordinatorScope};
+use lattice_model::{cluster::CoordinatorScope, cluster::PlacementDomainId};
 use lattice_service::{
     builder::LatticeService,
     deployment::LatticeApplication,

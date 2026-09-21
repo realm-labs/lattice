@@ -3,9 +3,10 @@ use std::{
     collections::{BTreeMap, BTreeSet},
 };
 
-use lattice_core::{
-    actor_address::{EntityType, NodeIncarnation, PlacementDomainId, ProtocolId},
-    release::ReleaseId,
+use lattice_model::{
+    actor::ProtocolId,
+    cluster::ReleaseId,
+    cluster::{EntityType, NodeIncarnation, PlacementDomainId},
 };
 
 use thiserror::Error;
@@ -639,7 +640,7 @@ pub enum AllocationError {
 
 #[cfg(test)]
 mod tests {
-    use lattice_core::actor_address::{NodeAddress, NodeIncarnation, PlacementDomainId};
+    use lattice_model::cluster::{NodeEndpoint, NodeIncarnation, PlacementDomainId};
 
     use super::*;
     use crate::types::{CoordinatorTerm, PlacementVersion, Revision};
@@ -647,7 +648,7 @@ mod tests {
     fn node(id: &str, incarnation: u128) -> NodeKey {
         NodeKey {
             node_id: id.to_owned(),
-            address: NodeAddress::new("127.0.0.1", 27000 + incarnation as u16).unwrap(),
+            address: NodeEndpoint::new("127.0.0.1", 27000 + incarnation as u16).unwrap(),
             incarnation: NodeIncarnation::new(incarnation).unwrap(),
         }
     }
@@ -660,7 +661,7 @@ mod tests {
         let target = node("target", 2);
         let placement_node = |key: NodeKey, weight| PlacementNode {
             key: key.clone(),
-            release_id: lattice_core::release::ReleaseId::new(1).unwrap(),
+            release_id: lattice_model::cluster::ReleaseId::new(1).unwrap(),
             ready: true,
             eligible_entity_types: [entity.clone()].into_iter().collect(),
             protocols: [protocol].into_iter().collect(),
@@ -879,11 +880,11 @@ mod tests {
         let (entity, protocol, source, target, mut view) = automatic_view();
         view.nodes[0].load.as_mut().unwrap().weight = 1;
         view.nodes[1].load.as_mut().unwrap().weight = 100;
-        view.nodes[1].release_id = lattice_core::release::ReleaseId::new(2).unwrap();
+        view.nodes[1].release_id = lattice_model::cluster::ReleaseId::new(2).unwrap();
         let mut unrelated_proxy = view.nodes[1].clone();
         unrelated_proxy.key = node("proxy", 3);
         unrelated_proxy.load.as_mut().unwrap().boot_incarnation = unrelated_proxy.key.incarnation;
-        unrelated_proxy.release_id = lattice_core::release::ReleaseId::new(99).unwrap();
+        unrelated_proxy.release_id = lattice_model::cluster::ReleaseId::new(99).unwrap();
         unrelated_proxy.eligible_entity_types.clear();
         view.nodes.push(unrelated_proxy);
 
@@ -930,7 +931,7 @@ mod tests {
             };
             nodes.push(PlacementNode {
                 key: key.clone(),
-                release_id: lattice_core::release::ReleaseId::new(if index == 0 { 2 } else { 1 })
+                release_id: lattice_model::cluster::ReleaseId::new(if index == 0 { 2 } else { 1 })
                     .unwrap(),
                 ready: true,
                 eligible_entity_types: [entity.clone()].into_iter().collect(),
@@ -1035,7 +1036,7 @@ mod tests {
         let strategy = WeightedLeastLoad::default();
         let (entity, protocol, _upgraded, mut view) = partially_upgraded_view(0);
         for node in &mut view.nodes {
-            node.release_id = lattice_core::release::ReleaseId::new(1).unwrap();
+            node.release_id = lattice_model::cluster::ReleaseId::new(1).unwrap();
         }
         view.nodes.truncate(3);
         let source = view.nodes[0].key.clone();

@@ -14,7 +14,7 @@ All business messages use the actor runtime locally and `lattice-remoting` remot
 ```rust
 pub struct ActorRef<A: Actor> {
     cluster_id: ClusterId,
-    node_address: NodeAddress,
+    node_address: NodeEndpoint,
     node_incarnation: NodeIncarnation,
     actor_path: ActorPath,
     activation_id: ActivationId,
@@ -249,7 +249,7 @@ Messages from the same sender to the same recipient on one stable physical lane 
 ```rust
 pub struct AssociationKey {
     pub local_incarnation: NodeIncarnation,
-    pub remote_address: NodeAddress,
+    pub remote_address: NodeEndpoint,
     pub remote_incarnation: NodeIncarnation,
 }
 ```

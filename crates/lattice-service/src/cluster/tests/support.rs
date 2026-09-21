@@ -17,9 +17,9 @@ use lattice_actor_distributed::{
     reply::ReplyTo,
     traits::Responder,
 };
-use lattice_core::{
-    actor_address::{ClusterId, EntityType, NodeAddress, NodeIncarnation, SingletonKind},
-    coordinator::CoordinatorScope,
+use lattice_model::{
+    cluster::CoordinatorScope,
+    cluster::{ClusterId, EntityType, NodeEndpoint, NodeIncarnation, SingletonKind},
 };
 use lattice_placement::{
     control::{DEFAULT_MAX_CONTROL_PAYLOAD, PlacementControlCommand, PlacementControlRouter},
@@ -154,7 +154,7 @@ pub(super) fn attach_coordinator(
     associations: &AssociationManager,
     cluster_id: &ClusterId,
     local_incarnation: NodeIncarnation,
-    coordinator_address: NodeAddress,
+    coordinator_address: NodeEndpoint,
     coordinator_incarnation: NodeIncarnation,
 ) -> AssociationKey {
     let association = associations
@@ -200,7 +200,7 @@ pub(super) fn test_hello(
 ) -> TestHello {
     TestHello {
         member: MemberHello {
-            release: lattice_core::release::ReleaseManifest::development(1),
+            release: lattice_model::cluster::ReleaseManifest::development(1),
             rollout_participant: true,
             node: node.clone(),
             roles: BTreeSet::new(),

@@ -1,6 +1,6 @@
-use std::collections::BTreeSet;
+use crate::failpoints;
 
-use lattice_core::failpoint::Failpoint;
+use std::collections::BTreeSet;
 
 use super::{
     Bytes, ClaimGrant, CoordinatorLeaseStore, CoordinatorRuntimeError, GrantSequence,
@@ -9,6 +9,7 @@ use super::{
     PlacementSlotKey, PlacementSlotState, PlanReason, ScopedElectionStore, SnapshotRecord,
     membership::{send_control_with_backpressure, slot_record_key},
 };
+
 use crate::{
     coordinator::CoordinatorDelta,
     storage::{
@@ -156,8 +157,8 @@ where
             .await?;
         let plan = committed.plan;
         let slot = committed.slot;
-        super::post_commit_failpoint(Failpoint::RebalanceAfterReservationBeforeHandoff)?;
-        super::post_commit_failpoint(Failpoint::HandoffAfterBeginPersist)?;
+        super::post_commit_failpoint(failpoints::REBALANCE_AFTER_RESERVATION_BEFORE_HANDOFF)?;
+        super::post_commit_failpoint(failpoints::HANDOFF_AFTER_BEGIN_PERSIST)?;
         self.version = barrier_version.clone();
         let mut handoff = HandoffMachine::begin(
             key.clone(),
@@ -173,7 +174,7 @@ where
         self.plans.insert(plan_id, plan);
         self.handoffs.insert(key.clone(), handoff);
         self.publish_slot_delta(&slot).await?;
-        super::post_commit_failpoint(Failpoint::HandoffAfterPartialBarrier)?;
+        super::post_commit_failpoint(failpoints::HANDOFF_AFTER_PARTIAL_BARRIER)?;
         Box::pin(self.apply_handoff_effects(key, effects)).await
     }
 
@@ -184,7 +185,7 @@ where
         slot: &PlacementSlot,
     ) -> Result<(), CoordinatorRuntimeError> {
         self.observe_slot(slot);
-        if super::dropped_by_failpoint(Failpoint::CoordinatorAfterEtcdCommitBeforeDelta) {
+        if super::dropped_by_failpoint(failpoints::COORDINATOR_AFTER_ETCD_COMMIT_BEFORE_DELTA) {
             return Ok(());
         }
         let record = SnapshotRecord {
@@ -302,7 +303,7 @@ where
                 .associations
                 .get(&session.association)
                 .ok_or(CoordinatorRuntimeError::AssociationUnavailable)?;
-            if !super::dropped_by_failpoint(Failpoint::HandoffAfterDrainSend) {
+            if !super::dropped_by_failpoint(failpoints::HANDOFF_AFTER_DRAIN_SEND) {
                 send_control_with_backpressure(
                     &association,
                     &self.version.domain,
@@ -380,7 +381,9 @@ where
             .await?
             .ok_or(CoordinatorRuntimeError::UnknownSlot)?;
         if slot.state != PlacementSlotState::Fenced {
-            super::guarded_commit_failpoint(Failpoint::HandoffAfterShardDrainedBeforeClaimRevoke)?;
+            super::guarded_commit_failpoint(
+                failpoints::HANDOFF_AFTER_SHARD_DRAINED_BEFORE_CLAIM_REVOKE,
+            )?;
             let old_claim = self.store.get_claim(key).await?;
             if let Some(old_claim) = &old_claim
                 && (old_claim.grant.owner != handoff.source
@@ -413,7 +416,7 @@ where
                 )
                 .await?
                 .slot;
-            super::post_commit_failpoint(Failpoint::FenceAuthorityAfterCommitBeforeEffect)?;
+            super::post_commit_failpoint(failpoints::FENCE_AUTHORITY_AFTER_COMMIT_BEFORE_EFFECT)?;
             self.version = slot.version.clone();
             let old_lease = self.release_claim(key).map(|claim| claim.lease_id);
             self.publish_slot_delta(&slot).await?;
@@ -484,11 +487,11 @@ where
         let slot = committed.slot;
         let leased_claim = committed.claim;
         self.version = slot.version.clone();
-        super::post_commit_failpoint(Failpoint::HandoffAfterNewClaimBeforeGrantSend)?;
+        super::post_commit_failpoint(failpoints::HANDOFF_AFTER_NEW_CLAIM_BEFORE_GRANT_SEND)?;
         self.remember_claim(leased_claim.lease_id, leased_claim.grant.clone());
         self.publish_slot_delta(&slot).await?;
         self.grant_authority(&leased_claim.grant)?;
-        super::post_commit_failpoint(Failpoint::HandoffAfterGrantBeforeShardReady)?;
+        super::post_commit_failpoint(failpoints::HANDOFF_AFTER_GRANT_BEFORE_SHARD_READY)?;
         let effects = self
             .handoffs
             .get_mut(key)
@@ -577,7 +580,7 @@ where
                 .await?;
             (committed.slot, None)
         };
-        super::post_commit_failpoint(Failpoint::HandoffAfterActivePersistBeforeDelta)?;
+        super::post_commit_failpoint(failpoints::HANDOFF_AFTER_ACTIVE_PERSIST_BEFORE_DELTA)?;
         self.version = slot.version.clone();
         self.slot_assigned_at.insert(key.clone(), self.now());
         self.handoffs.remove(key);

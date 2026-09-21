@@ -4,7 +4,7 @@
 //! bookkeeping, and stop propagation all observe the same activation, even after a replacement
 //! takes over the slot.
 
-use lattice_core::service_context::ServiceContext;
+use crate::service::ServiceContext;
 use std::{
     any::type_name,
     sync::{Arc, Mutex},

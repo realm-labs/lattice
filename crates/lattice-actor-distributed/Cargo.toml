@@ -11,13 +11,13 @@ bytes.workspace = true
 dashmap.workspace = true
 futures-util.workspace = true
 lattice-actor.workspace = true
-lattice-core.workspace = true
+lattice-model.workspace = true
 lattice-remoting.workspace = true
 prost.workspace = true
+serde.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
-serde.workspace = true
 trybuild.workspace = true

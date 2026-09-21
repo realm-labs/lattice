@@ -3,6 +3,7 @@ use std::{
     time::Duration,
 };
 
+use lattice_actor_distributed::{ActorKey, actor_kind};
 use lattice_actor_distributed::{
     actor_protocol,
     context::HandlerContext,
@@ -14,12 +15,9 @@ use lattice_actor_distributed::{
     runtime::{ActorRuntime, ActorSpawnOptions},
     traits::{Actor, Handler, Message, StopReason},
 };
-use lattice_core::{
-    actor_address::{
-        ActivationId, ActorAddress, ActorPath, ClusterId, NodeAddress, NodeIncarnation, ProtocolId,
-    },
-    actor_kind,
-    id::ActorId,
+use lattice_model::{
+    actor::{ActivationId, ActorAddress, ActorPath, ProtocolId},
+    cluster::{ClusterId, NodeEndpoint, NodeIncarnation},
 };
 
 struct TestActor;
@@ -55,7 +53,7 @@ fn address(sequence: u64) -> ActorAddress {
     let incarnation = NodeIncarnation::new(301).unwrap();
     ActorAddress::new(
         ClusterId::new("review").unwrap(),
-        NodeAddress::new("127.0.0.1", 19301).unwrap(),
+        NodeEndpoint::new("127.0.0.1", 19301).unwrap(),
         ActorPath::user([format!("actor-{sequence}")]).unwrap(),
         ActivationId::new(incarnation, sequence).unwrap(),
         ProtocolId::new(301).unwrap(),
@@ -120,7 +118,7 @@ async fn duplicate_host_registration_preserves_original_routing_and_drain() {
     let config = ActorRegistryConfig {
         address: Some(ActorAddressConfig {
             cluster_id: ClusterId::new("review").unwrap(),
-            node_address: NodeAddress::new("127.0.0.1", 19301).unwrap(),
+            node_address: NodeEndpoint::new("127.0.0.1", 19301).unwrap(),
             node_incarnation: NodeIncarnation::new(301).unwrap(),
         }),
         ..Default::default()
@@ -135,7 +133,7 @@ async fn duplicate_host_registration_preserves_original_routing_and_drain() {
         config,
         &protocol,
     ));
-    let actor_id = ActorId::U64(1);
+    let actor_id = ActorKey::U64(1);
     let handle = original.start(actor_id.clone(), TestActor).await.unwrap();
     let reference = original.exact_address(&actor_id).unwrap();
     let mut hosts = ProtocolHostRegistry::new(2).unwrap();

@@ -13,7 +13,7 @@ use hickory_resolver::{
     TokioResolver,
     proto::rr::{RData, RecordType},
 };
-use lattice_core::{actor_address::NodeAddress, coordinator::CoordinatorScope};
+use lattice_model::{cluster::CoordinatorScope, cluster::NodeEndpoint};
 
 use crate::provider::{
     CoordinatorDirectorySnapshot, CoordinatorDiscovery, DiscoveryError, DiscoveryOrigin,
@@ -224,7 +224,7 @@ async fn resolve_once(
     resolver: &dyn DnsResolver,
     config: &DnsDiscoveryConfig,
 ) -> Result<DnsResolution, DiscoveryError> {
-    let mut targets = BTreeMap::<NodeAddress, DiscoveryTarget>::new();
+    let mut targets = BTreeMap::<NodeEndpoint, DiscoveryTarget>::new();
     let mut failures = Vec::new();
     let mut ttl = config.max_refresh;
     match &config.mode {
@@ -280,7 +280,7 @@ async fn resolve_once(
 }
 
 fn insert_dns_target(
-    targets: &mut BTreeMap<NodeAddress, DiscoveryTarget>,
+    targets: &mut BTreeMap<NodeEndpoint, DiscoveryTarget>,
     ip: IpAddr,
     port: u16,
     priority: u16,
@@ -288,7 +288,7 @@ fn insert_dns_target(
     server_name: &str,
     weight: u16,
 ) -> Result<(), DiscoveryError> {
-    let address = NodeAddress::new(ip.to_string(), port)
+    let address = NodeEndpoint::new(ip.to_string(), port)
         .map_err(|error| provider_error(error.to_string()))?;
     let source = DiscoverySource::single(DiscoveryOrigin::Dns {
         query: query.to_string(),

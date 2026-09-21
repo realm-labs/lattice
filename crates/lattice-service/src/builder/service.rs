@@ -10,9 +10,10 @@ use lattice_actor_distributed::{
     recipient::{WatchSubscription, WatchTarget},
     registry::ActorCellDiagnostics,
 };
-use lattice_core::{
-    actor_address::{ActorAddress, ClusterId, EntityAddress, SingletonAddress},
-    release::{ClusterReleaseState, ReleaseError, ReleaseManifest},
+use lattice_model::{
+    actor::{ActorAddress, EntityAddress, SingletonAddress},
+    cluster::ClusterId,
+    cluster::{ClusterReleaseState, ReleaseError, ReleaseManifest},
 };
 use lattice_placement::{membership_session::MembershipCoordinatorHandle, types::PlacementSlotKey};
 use tokio::{sync::broadcast::Receiver, time::Instant};
@@ -851,7 +852,7 @@ impl LatticeService {
 #[cfg(test)]
 mod drain_deadline_tests {
     use super::*;
-    use lattice_core::actor_address::{NodeAddress, NodeIncarnation};
+    use lattice_model::cluster::{NodeEndpoint, NodeIncarnation};
     use lattice_placement::{coordinator::MemberHello, membership_session::MembershipSession};
     use lattice_remoting::config::RemotingConfig;
 
@@ -859,7 +860,7 @@ mod drain_deadline_tests {
         let mut service = LatticeService::builder(NodeConfig {
             cluster_id: ClusterId::new("leave-deadline").unwrap(),
             node_id: "departing".to_owned(),
-            address: NodeAddress::new("127.0.0.1", 34801).unwrap(),
+            address: NodeEndpoint::new("127.0.0.1", 34801).unwrap(),
             incarnation: NodeIncarnation::new(1).unwrap(),
             release: ReleaseManifest::development(1),
             roles: BTreeSet::new(),
@@ -923,7 +924,7 @@ mod drain_deadline_tests {
             .associations
             .get_or_create(
                 service.cluster_id.clone(),
-                NodeAddress::new("127.0.0.1", 34802).unwrap(),
+                NodeEndpoint::new("127.0.0.1", 34802).unwrap(),
                 NodeIncarnation::new(2).unwrap(),
             )
             .unwrap();
@@ -976,7 +977,7 @@ mod drain_deadline_tests {
     #[tokio::test(start_paused = true)]
     async fn leave_retries_the_replacement_membership_session_with_the_same_operation_and_deadline()
     {
-        use lattice_core::coordinator::CoordinatorScope;
+        use lattice_model::cluster::CoordinatorScope;
         use lattice_placement::control::{
             PlacementControlCommand, PlacementControlRouter, control_stream_id,
             decode_control_command, encode_control_command_for_term,
@@ -1001,7 +1002,7 @@ mod drain_deadline_tests {
             .associations
             .get_or_create(
                 service.cluster_id.clone(),
-                NodeAddress::new("127.0.0.1", 34802).unwrap(),
+                NodeEndpoint::new("127.0.0.1", 34802).unwrap(),
                 NodeIncarnation::new(2).unwrap(),
             )
             .unwrap();
@@ -1024,7 +1025,7 @@ mod drain_deadline_tests {
             .associations
             .get_or_create(
                 service.cluster_id.clone(),
-                NodeAddress::new("127.0.0.1", 34803).unwrap(),
+                NodeEndpoint::new("127.0.0.1", 34803).unwrap(),
                 NodeIncarnation::new(3).unwrap(),
             )
             .unwrap();

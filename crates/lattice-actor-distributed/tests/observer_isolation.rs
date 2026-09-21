@@ -6,6 +6,7 @@ use std::{
     time::Duration,
 };
 
+use lattice_actor_distributed::{ActorKey, actor_kind};
 use lattice_actor_distributed::{
     context::HandlerContext,
     error::ActorFailure,
@@ -16,7 +17,6 @@ use lattice_actor_distributed::{
     reply::ReplyTo,
     traits::{Actor, ActorLifecycleState, MessageMetadata, MessageOutcome, Responder, StopReason},
 };
-use lattice_core::{actor_kind, id::ActorId};
 
 const TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -118,7 +118,7 @@ async fn observer_panics_preserve_messaging_registry_cleanup_and_deathwatch() {
             phase,
             panics: panics.clone(),
         }));
-        let actor_id = ActorId::U64(1);
+        let actor_id = ActorKey::U64(1);
         let handle = registry
             .start(actor_id.clone(), HealthyActor)
             .await

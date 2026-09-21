@@ -1,6 +1,6 @@
 use std::ops::Bound;
 
-use lattice_core::actor_address::PlacementDomainId;
+use lattice_model::cluster::PlacementDomainId;
 use serde::{Serialize, de::DeserializeOwned};
 
 use super::{

@@ -7,7 +7,7 @@
 //! walks it through allocation, handoff, reconciliation and admin work so an armed failpoint has
 //! to change what the leader persists or sends.
 
-use lattice_core::failpoint::Failpoint;
+use crate::failpoints::Failpoint;
 use lattice_placement::runtime::{CoordinatorRuntimeError, harness::DomainHarness};
 
 use crate::fault::{

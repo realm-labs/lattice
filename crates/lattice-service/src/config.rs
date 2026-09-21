@@ -1,8 +1,8 @@
 use std::{collections::BTreeSet, time::Duration};
 
-use lattice_core::{
-    actor_address::{ClusterId, NodeAddress, NodeIncarnation},
-    release::ReleaseManifest,
+use lattice_model::{
+    cluster::ReleaseManifest,
+    cluster::{ClusterId, NodeEndpoint, NodeIncarnation},
 };
 use lattice_remoting::config::{RemotingConfig, RemotingConfigError};
 use thiserror::Error;
@@ -85,7 +85,7 @@ pub enum ClusterJoinConfigError {
 pub struct NodeConfig {
     pub cluster_id: ClusterId,
     pub node_id: String,
-    pub address: NodeAddress,
+    pub address: NodeEndpoint,
     pub incarnation: NodeIncarnation,
     pub release: ReleaseManifest,
     pub roles: BTreeSet<String>,
@@ -105,7 +105,7 @@ impl NodeConfig {
                 lattice_placement::storage::etcd::STORAGE_SCHEMA_GENERATION,
             )
             .map_err(|error| match error {
-                lattice_core::release::ReleaseError::FrameworkGenerationMismatch => {
+                lattice_model::cluster::ReleaseError::FrameworkGenerationMismatch => {
                     NodeConfigError::ReleaseGenerationMismatch
                 }
                 _ => NodeConfigError::InvalidRelease,

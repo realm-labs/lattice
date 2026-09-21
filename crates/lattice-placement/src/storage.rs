@@ -5,9 +5,9 @@ use std::{
 };
 
 use async_trait::async_trait;
-use lattice_core::{
-    actor_address::{EntityType, PlacementDomainId, SingletonKind},
-    coordinator::CoordinatorScope,
+use lattice_model::{
+    cluster::CoordinatorScope,
+    cluster::{EntityType, PlacementDomainId, SingletonKind},
 };
 use thiserror::Error;
 

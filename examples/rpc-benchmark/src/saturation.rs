@@ -6,6 +6,7 @@ use std::{
 };
 
 use bytes::Bytes;
+use lattice_actor_distributed::{ActorKey, actor_kind};
 use lattice_actor_distributed::{
     context::HandlerContext,
     error::{ActorFailure, ActorTellError},
@@ -14,7 +15,6 @@ use lattice_actor_distributed::{
     registry::{ActorRegistry, ActorRegistryConfig},
     traits::{Actor, Handler},
 };
-use lattice_core::{actor_kind, id::ActorId};
 use tokio::sync::Notify;
 
 use crate::metrics::percentile_duration;
@@ -160,7 +160,7 @@ impl SaturationTopology {
         let state = Arc::new(SaturationState::default());
         let handle = registry
             .start(
-                ActorId::U64(1),
+                ActorKey::U64(1),
                 SaturationActor {
                     state: state.clone(),
                     processed_bytes: 0,

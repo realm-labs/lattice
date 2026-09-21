@@ -1,9 +1,10 @@
 use std::{fmt, sync::Arc};
 
 use lattice_actor::mailbox::MailboxConfig;
+use lattice_actor_distributed::ActorKind;
 use lattice_actor_distributed::registry::ActorRegistryConfig;
-use lattice_core::actor_address::{EntityType, PlacementDomainId, ProtocolId, SingletonKind};
-use lattice_core::kind::ActorKind;
+use lattice_model::actor::ProtocolId;
+use lattice_model::cluster::{EntityType, PlacementDomainId, SingletonKind};
 use lattice_placement::coordinator::SingletonConfig;
 use lattice_placement::{
     allocation::ShardAllocationStrategy,
@@ -156,7 +157,8 @@ impl SingletonOptions {
 
 #[cfg(test)]
 mod tests {
-    use lattice_core::actor_address::{EntityId, ProtocolId};
+    use lattice_model::actor::ProtocolId;
+    use lattice_model::cluster::EntityId;
     use lattice_placement::{
         allocation::{
             AllocationDecision, AllocationError, AllocationRequest, PlacementView, RebalanceLimits,

@@ -22,7 +22,7 @@ use lattice_actor_distributed::{
     protocol::{SupportsAsk, SupportsTell},
     recipient::{ActorSystem, RecipientError},
 };
-use lattice_core::actor_address::RecipientAddress;
+use lattice_model::actor::RecipientAddress;
 use lattice_remoting::messaging::error::{AskError, RemoteMessageError, TellError};
 use thiserror::Error;
 

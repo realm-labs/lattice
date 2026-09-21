@@ -5,10 +5,12 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use lattice_core::actor_address::{
-    ActivationId, ActorAddress, ActorPath, ClusterId, ConfigFingerprint, EntityAddress, EntityId,
-    EntityType, NodeAddress, NodeIncarnation, PlacementDomainId, ProtocolId, ProtocolTag,
-    SingletonAddress, SingletonKind,
+use lattice_model::actor::{
+    ActivationId, ActorAddress, ActorPath, EntityAddress, ProtocolId, ProtocolTag, SingletonAddress,
+};
+use lattice_model::cluster::{
+    ClusterId, ConfigFingerprint, EntityId, EntityType, NodeEndpoint, NodeIncarnation,
+    PlacementDomainId, SingletonKind,
 };
 use prost::Message;
 use thiserror::Error;

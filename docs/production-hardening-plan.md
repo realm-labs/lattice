@@ -225,7 +225,7 @@ membership Gossip, remote deployment, Streams, persistence, or source-compatible
 ### 3.1 Actor Identity
 
 ```rust
-struct NodeAddress { host, port }
+struct NodeEndpoint { host, port }
 struct NodeIncarnation(u128);
 struct ActorPath { segments: Vec<ActorPathSegment> }
 struct ActivationId { node_incarnation, local_sequence }

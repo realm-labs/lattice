@@ -5,9 +5,10 @@ use std::{
 };
 
 use bytes::Bytes;
-use lattice_core::actor_address::{
-    AddressError, ClusterId, ConfigFingerprint, EntityAddress, EntityId, EntityType,
-    NodeIncarnation, PlacementDomainId, ProtocolId, ProtocolTag,
+use lattice_model::ModelError;
+use lattice_model::actor::{EntityAddress, ProtocolId, ProtocolTag};
+use lattice_model::cluster::{
+    ClusterId, ConfigFingerprint, EntityId, EntityType, NodeIncarnation, PlacementDomainId,
 };
 use thiserror::Error;
 
@@ -218,7 +219,7 @@ impl EntityConfig {
         &self,
         cluster_id: ClusterId,
         entity_id: EntityId,
-    ) -> Result<EntityAddress<P>, AddressError> {
+    ) -> Result<EntityAddress<P>, ModelError> {
         EntityAddress::new(
             cluster_id,
             self.domain.clone(),
@@ -603,7 +604,8 @@ pub enum RegionError {
 
 #[cfg(test)]
 mod tests {
-    use lattice_core::actor_address::{NodeAddress, ProtocolId};
+    use lattice_model::actor::ProtocolId;
+    use lattice_model::cluster::NodeEndpoint;
 
     use super::*;
 
@@ -838,7 +840,7 @@ mod tests {
                 ShardHome {
                     owner: NodeKey {
                         node_id: "remote".to_owned(),
-                        address: NodeAddress::new("127.0.0.1", 2552).unwrap(),
+                        address: NodeEndpoint::new("127.0.0.1", 2552).unwrap(),
                         incarnation: remote,
                     },
                     generation: AssignmentGeneration::new(1).unwrap(),
@@ -880,7 +882,7 @@ mod tests {
         let home = |revision: u64| ShardHome {
             owner: NodeKey {
                 node_id: "remote".to_owned(),
-                address: NodeAddress::new("127.0.0.1", 2552).unwrap(),
+                address: NodeEndpoint::new("127.0.0.1", 2552).unwrap(),
                 incarnation: remote,
             },
             generation: AssignmentGeneration::new(1).unwrap(),

@@ -841,7 +841,7 @@ async fn deliver(subscriber: &NatsSubscriber, event: EventEnvelope) {
 mod tests {
     use std::sync::Arc;
 
-    use lattice_core::{instance::InstanceId, service_kind, trace::TraceContext};
+    use lattice_model::{service::ServiceInstanceId, service_name, trace::TraceContext};
     use tokio::sync::Mutex;
 
     use super::*;
@@ -1018,8 +1018,8 @@ mod tests {
             event_id: EventId::new(event_id),
             subject: Subject::new("game.world.player_entered"),
             event_type: "PlayerEntered".to_string(),
-            source_service: service_kind!("World"),
-            source_instance: InstanceId::new("world-a"),
+            source_service: service_name!("World"),
+            source_instance: ServiceInstanceId::new("world-a"),
             recipient: None,
             correlation_id: None,
             trace: TraceContext::default(),

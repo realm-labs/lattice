@@ -12,15 +12,8 @@ use std::{
 };
 
 use futures_util::Stream;
+use lattice_actor_distributed::actor_kind;
 use lattice_actor_distributed::registry::{ActorAddressConfig, ActorRegistry, ActorRegistryConfig};
-use lattice_core::{
-    actor_address::{
-        ClusterId, EntityAddress, EntityId, EntityType, NodeAddress, NodeIncarnation, ProtocolId,
-    },
-    actor_kind,
-    coordinator::CoordinatorScope,
-    failpoint::Failpoint,
-};
 use lattice_discovery::{
     provider::{
         CoordinatorDirectorySnapshot, CoordinatorDiscovery, DiscoveryError, DiscoveryOrigin,
@@ -28,9 +21,15 @@ use lattice_discovery::{
     },
     static_provider::{StaticDiscovery, StaticEndpoint},
 };
+use lattice_model::{
+    actor::{EntityAddress, ProtocolId},
+    cluster::CoordinatorScope,
+    cluster::{ClusterId, EntityId, EntityType, NodeEndpoint, NodeIncarnation},
+};
 use lattice_placement::{
     control::{DEFAULT_MAX_CONTROL_PAYLOAD, PlacementControlRouter},
     coordinator::MemberStatus,
+    failpoints,
     region::EntityConfig,
     runtime::{
         PlacementDomainLeaderConfig,
@@ -81,7 +80,7 @@ impl CoordinatorDiscovery for WatchDiscovery {
 fn discovery_snapshot(
     generation: u64,
     node_id: &str,
-    address: NodeAddress,
+    address: NodeEndpoint,
 ) -> CoordinatorDirectorySnapshot {
     CoordinatorDirectorySnapshot {
         scope: CoordinatorScope::Placement(placement_domain()),
@@ -286,7 +285,7 @@ async fn two_discovered_members_leave_sequentially_without_losing_coordinator_se
             .unwrap(),
         )
     };
-    let member = |node_id: &str, address: NodeAddress, incarnation: u128| {
+    let member = |node_id: &str, address: NodeEndpoint, incarnation: u128| {
         LatticeService::builder(node_config(
             cluster_id.clone(),
             node_id,
@@ -609,8 +608,9 @@ async fn coordinator_rollover_recovers_after_blocked_session_registration() {
     let release = registration_release_rx.clone();
     let block_once = Arc::new(AtomicBool::new(true));
     let block = block_once.clone();
-    let failpoint = lattice_core::failpoint::install_hook(move |point| {
-        if point == Failpoint::MemberBeforeGuardedCommit && block.swap(false, Ordering::AcqRel) {
+    let failpoint = lattice_failpoint::install_hook(move |point| {
+        if point == failpoints::MEMBER_BEFORE_GUARDED_COMMIT && block.swap(false, Ordering::AcqRel)
+        {
             registration_reached_tx
                 .send(())
                 .expect("blocked registration observer dropped");
@@ -940,7 +940,7 @@ async fn a_member_hosting_a_shard_leaves_by_handing_it_over_rather_than_timing_o
         Vec::new(),
     )
     .unwrap();
-    let host = |node_id: &str, address: NodeAddress, incarnation: u128| {
+    let host = |node_id: &str, address: NodeEndpoint, incarnation: u128| {
         let incarnation = NodeIncarnation::new(incarnation).unwrap();
         let binding = Arc::new(PingProtocol::bind::<PingActor>().unwrap());
         let registry = Arc::new(ActorRegistry::new_bound(

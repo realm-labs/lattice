@@ -196,7 +196,7 @@ The following are source-confirmed, without dedicated runtime reproductions. The
 | Layer | Assessment and rationale |
 |---|---|
 | `lattice-actor` local kernel | Sound. It has no remoting dependency; local mailboxes, tasks, supervision, and DeathWatch can be used independently |
-| `lattice-core` address data and distributed bound references | Sound. Serializable addresses are separated from sending capabilities, avoiding persistence of runtime resources |
+| `lattice-model` address data and distributed bound references | Sound. Serializable addresses are separated from sending capabilities, avoiding persistence of runtime resources |
 | `lattice-remoting` | Sound. One association model with bounded control, interactive, and bulk lanes avoids another application-facing transport |
 | `lattice-placement` | Sound. etcd authority, leader guards, generation/claims, handoff, and pure state transitions serve explicit consistency requirements |
 | Membership and placement domains | Sound. Member authority is isolated from each domain's placement authority, so a domain-local failure need not clear all data-plane state |

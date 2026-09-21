@@ -19,7 +19,7 @@ dashmap.workspace = true
 futures-util.workspace = true
 lattice-actor.workspace = true
 lattice-actor-distributed.workspace = true
-lattice-core.workspace = true
+lattice-model.workspace = true
 lattice-discovery.workspace = true
 lattice-placement.workspace = true
 lattice-remoting.workspace = true
@@ -30,7 +30,7 @@ tracing.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
-lattice-core = { workspace = true, features = ["test-failpoints"] }
+lattice-failpoint = { workspace = true, features = ["enabled"] }
 prost.workspace = true
 serde.workspace = true
 trybuild.workspace = true

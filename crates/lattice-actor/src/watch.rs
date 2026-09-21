@@ -5,7 +5,7 @@ use crate::{
     traits::{Actor, PassivationReason, StopReason},
 };
 
-pub use lattice_core::watch::{TerminatedReason, WatchId, WatchStatus};
+pub use lattice_model::actor::{TerminatedReason, WatchId, WatchStatus};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct LocalActorRef {

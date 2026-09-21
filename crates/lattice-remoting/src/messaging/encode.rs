@@ -1,5 +1,5 @@
 use bytes::{BufMut, Bytes, BytesMut};
-use lattice_core::actor_address::{ActorAddress, ActorPath, ProtocolTag};
+use lattice_model::actor::{ActorAddress, ActorPath, ProtocolTag};
 use std::sync::Arc;
 
 use super::target::{CorrelationId, LogicalEntityTarget, LogicalSingletonTarget};
@@ -461,10 +461,10 @@ const fn encoded_varint_len(value: u64) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use lattice_core::actor_address::{
-        ActivationId, ClusterId, ConfigFingerprint, EntityAddress, EntityId, EntityType,
-        NodeAddress, NodeIncarnation, PlacementDomainId, ProtocolId, SingletonAddress,
-        SingletonKind,
+    use lattice_model::actor::{ActivationId, EntityAddress, ProtocolId, SingletonAddress};
+    use lattice_model::cluster::{
+        ClusterId, ConfigFingerprint, EntityId, EntityType, NodeEndpoint, NodeIncarnation,
+        PlacementDomainId, SingletonKind,
     };
 
     use super::*;
@@ -478,7 +478,7 @@ mod tests {
         let incarnation = NodeIncarnation::new(incarnation).unwrap();
         ActorAddress::new(
             ClusterId::new("test-cluster").unwrap(),
-            NodeAddress::new(host, 25520).unwrap(),
+            NodeEndpoint::new(host, 25520).unwrap(),
             ActorPath::user(["user", "玩家", "one"]).unwrap(),
             ActivationId::new(incarnation, sequence).unwrap(),
             ProtocolId::new(7).unwrap(),
@@ -497,7 +497,7 @@ mod tests {
                 ConfigFingerprint::new([3; 32]),
             )
             .unwrap(),
-            owner_address: NodeAddress::new("entity-owner", 25521).unwrap(),
+            owner_address: NodeEndpoint::new("entity-owner", 25521).unwrap(),
             owner_incarnation: NodeIncarnation::new(12).unwrap(),
             assignment_generation: 9,
         }
@@ -513,7 +513,7 @@ mod tests {
                 ConfigFingerprint::new([4; 32]),
             )
             .unwrap(),
-            owner_address: NodeAddress::new("singleton-owner", 25522).unwrap(),
+            owner_address: NodeEndpoint::new("singleton-owner", 25522).unwrap(),
             owner_incarnation: NodeIncarnation::new(13).unwrap(),
             assignment_generation: 10,
         }

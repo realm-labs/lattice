@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::actor_address::PlacementDomainId;
+use crate::primitives::PlacementDomainId;
 
 /// Independently elected control-plane scope.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]

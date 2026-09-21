@@ -12,7 +12,7 @@ use std::{
 use async_trait::async_trait;
 use futures_util::{Stream, StreamExt};
 use lattice_config::store::{ConfigStore, ConfigStoreError, ConfigWatch, LocalConfigStore};
-use lattice_core::{actor_address::NodeAddress, coordinator::CoordinatorScope};
+use lattice_model::{cluster::CoordinatorScope, cluster::NodeEndpoint};
 use serde_json::json;
 use tokio::sync::{Mutex, watch::Sender};
 
@@ -602,7 +602,7 @@ fn document(generation: u64, endpoints: Vec<(&str, u16, &str, u16)>) -> serde_js
 
 fn target(host: &str, port: u16, node_id: Option<&str>, priority: u16) -> DiscoveryTarget {
     DiscoveryTarget {
-        address: NodeAddress::new(host, port).unwrap(),
+        address: NodeEndpoint::new(host, port).unwrap(),
         expected_node_id: node_id.map(str::to_string),
         source: DiscoverySource::single(DiscoveryOrigin::Static {
             name: "test".to_string(),
@@ -613,7 +613,7 @@ fn target(host: &str, port: u16, node_id: Option<&str>, priority: u16) -> Discov
 
 fn static_endpoint(host: &str, port: u16, node_id: Option<&str>, priority: u16) -> StaticEndpoint {
     StaticEndpoint {
-        address: NodeAddress::new(host, port).unwrap(),
+        address: NodeEndpoint::new(host, port).unwrap(),
         expected_node_id: node_id.map(str::to_string),
         priority,
     }
@@ -621,7 +621,7 @@ fn static_endpoint(host: &str, port: u16, node_id: Option<&str>, priority: u16) 
 
 fn config_target(host: &str, port: u16, node_id: Option<&str>, priority: u16) -> DiscoveryTarget {
     DiscoveryTarget {
-        address: NodeAddress::new(host, port).unwrap(),
+        address: NodeEndpoint::new(host, port).unwrap(),
         expected_node_id: node_id.map(str::to_string),
         source: DiscoverySource::single(DiscoveryOrigin::ConfigStore {
             key: "/discovery".to_string(),

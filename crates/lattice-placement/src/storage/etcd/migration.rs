@@ -1,3 +1,5 @@
+use crate::failpoints;
+
 use std::{
     collections::BTreeMap,
     io::{Error as IoError, Write},
@@ -7,11 +9,15 @@ use std::{
 use etcd_client::{
     Client, Compare, CompareOp, GetOptions, PutOptions, SortOrder, SortTarget, Txn, TxnOp,
 };
-use lattice_core::{actor_address::PlacementDomainId, failpoint::Failpoint};
+
+use lattice_model::cluster::PlacementDomainId;
+
 use serde::{Deserialize, Serialize};
+
 use thiserror::Error;
 
 use super::STORAGE_SCHEMA_GENERATION;
+
 use crate::{
     coordinator::SingletonConfig,
     plan::{MoveProgress, PlanStatus, RebalancePlan},
@@ -525,12 +531,12 @@ pub async fn execute(
             if !response.succeeded() {
                 return Err(MigrationError::ProgressCompareFailed);
             }
-            lattice_core::failpoint::hit(Failpoint::MigrationAfterCommitBeforeProgress);
+            lattice_failpoint::hit(failpoints::MIGRATION_AFTER_COMMIT_BEFORE_PROGRESS);
             marker = Some(next_marker);
         }
     }
     if matches!(mode, MigrationMode::Apply | MigrationMode::Resume) {
-        lattice_core::failpoint::hit(Failpoint::MigrationBeforeFinalize);
+        lattice_failpoint::hit(failpoints::MIGRATION_BEFORE_FINALIZE);
         let finalize_context = FinalizeContext {
             schema_key: &schema_key,
             marker_key: &marker_key,
@@ -1035,8 +1041,8 @@ fn parse_usize(value: &[u8]) -> Result<usize, MigrationError> {
 
 #[cfg(test)]
 mod tests {
-    use lattice_core::actor_address::{
-        ConfigFingerprint, EntityType, NodeAddress, NodeIncarnation, PlacementDomainId,
+    use lattice_model::cluster::{
+        ConfigFingerprint, EntityType, NodeEndpoint, NodeIncarnation, PlacementDomainId,
     };
 
     use super::{
@@ -1061,7 +1067,7 @@ mod tests {
             config_fingerprint: ConfigFingerprint::new([4; 32]),
             owner: Some(NodeKey {
                 node_id: "old-owner".to_owned(),
-                address: NodeAddress::new("127.0.0.1", 29001).unwrap(),
+                address: NodeEndpoint::new("127.0.0.1", 29001).unwrap(),
                 incarnation: NodeIncarnation::new(1).unwrap(),
             }),
             target: None,

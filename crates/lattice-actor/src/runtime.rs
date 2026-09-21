@@ -10,7 +10,6 @@ use std::{
     time::Duration,
 };
 
-use lattice_core::service_context::ServiceContext;
 use thiserror::Error;
 use tokio::sync::{broadcast, watch};
 use tracing::Instrument;
@@ -24,6 +23,7 @@ use crate::{
         channel::{self, Receiver},
     },
     observation::ActorObserverHandle,
+    service::ServiceContext,
     traits::{Actor, ActorLifecycleState},
     watch::LocalActorRef,
 };

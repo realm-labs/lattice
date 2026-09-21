@@ -7,7 +7,7 @@ use std::{
 };
 
 use futures_util::{Stream, StreamExt};
-use lattice_core::coordinator::CoordinatorScope;
+use lattice_model::cluster::CoordinatorScope;
 
 use crate::provider::{
     CoordinatorDirectorySnapshot, CoordinatorDiscovery, DiscoveryError, DiscoveryTarget,

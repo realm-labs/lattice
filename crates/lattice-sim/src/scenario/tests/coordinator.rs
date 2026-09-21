@@ -5,7 +5,7 @@
 //! truth the leader no longer tracks, or a control command that never reached a member lane. Only
 //! then is evidence recorded, so the matrix cannot count a boundary the coordinator ignored.
 
-use lattice_core::failpoint::Failpoint;
+use crate::failpoints::Failpoint;
 use lattice_placement::{
     control::PlacementControlCommand,
     handoff::HandoffPhase,

@@ -15,9 +15,8 @@ pub mod suite;
 use std::{sync::Arc, time::Instant};
 
 use bytes::Bytes;
-use lattice_core::actor_address::{
-    ActivationId, ActorAddress, ActorPath, ClusterId, NodeAddress, NodeIncarnation, ProtocolId,
-};
+use lattice_model::actor::{ActivationId, ActorAddress, ActorPath, ProtocolId};
+use lattice_model::cluster::{ClusterId, NodeEndpoint, NodeIncarnation};
 use lattice_remoting::{
     association::{Association, AssociationKey, LaneAttachment, LaneKind},
     config::RemotingConfig,
@@ -78,7 +77,7 @@ impl RemotingTopology {
         let cluster_id = ClusterId::new("remoting-benchmark")?;
         let local_incarnation = NodeIncarnation::generate();
         let remote_incarnation = NodeIncarnation::generate();
-        let remote_address = NodeAddress::new("127.0.0.1", 25541)?;
+        let remote_address = NodeEndpoint::new("127.0.0.1", 25541)?;
         let remoting = RemotingConfig {
             bulk_stripes: config.bulk_stripes,
             ..RemotingConfig::default()

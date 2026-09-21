@@ -1,4 +1,4 @@
-use lattice_core::actor_address::ProtocolId;
+use lattice_model::actor::ProtocolId;
 
 use super::{Association, AssociationError, AssociationState};
 use crate::{

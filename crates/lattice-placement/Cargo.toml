@@ -6,7 +6,7 @@ license.workspace = true
 repository.workspace = true
 
 [features]
-test-failpoints = ["lattice-core/test-failpoints"]
+test-failpoints = ["lattice-failpoint/enabled"]
 test-harness = []
 
 [dependencies]
@@ -16,7 +16,8 @@ bytes = { workspace = true, features = ["serde"] }
 dashmap.workspace = true
 etcd-client.workspace = true
 http.workspace = true
-lattice-core.workspace = true
+lattice-failpoint.workspace = true
+lattice-model.workspace = true
 lattice-remoting.workspace = true
 prost.workspace = true
 serde.workspace = true

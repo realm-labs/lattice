@@ -1,8 +1,8 @@
 use std::time::Duration;
 
-use lattice_core::instance::InstanceId;
-use lattice_core::kind::ServiceKind;
-use lattice_core::trace::TelemetryResource;
+use lattice_model::service::ServiceInstanceId;
+use lattice_model::service::ServiceName;
+use lattice_model::trace::TelemetryResource;
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::trace::SdkTracerProvider;
@@ -27,13 +27,13 @@ impl LatticeTelemetry {
     }
 
     pub fn from_config(
-        service_kind: ServiceKind,
-        instance_id: InstanceId,
+        service_name: ServiceName,
+        instance_id: ServiceInstanceId,
         config: TelemetryConfig,
     ) -> Self {
         Self::new(
             TelemetryResource {
-                service_kind,
+                service_name,
                 instance_id,
                 service_version: config.service_version.clone(),
             },

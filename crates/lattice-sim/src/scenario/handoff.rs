@@ -5,7 +5,8 @@
 //! transition is a legitimate outcome the workload retries; only a rejection that still moved the
 //! reducer forward is a fault.
 
-use lattice_core::failpoint::{self, Failpoint};
+use crate::failpoints::Failpoint;
+use lattice_failpoint as failpoint;
 use lattice_placement::{
     handoff::{HandoffEffect, HandoffError, HandoffEvent},
     types::{AssignmentGeneration, CoordinatorTerm, PlacementVersion, Revision},

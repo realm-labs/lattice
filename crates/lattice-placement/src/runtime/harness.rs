@@ -12,12 +12,11 @@ use std::{
     time::Duration,
 };
 
-use lattice_core::{
-    actor_address::{
-        ClusterId, EntityType, NodeAddress, NodeIncarnation, PlacementDomainId, ProtocolId,
-    },
-    coordinator::CoordinatorScope,
-    release::ReleaseManifest,
+use lattice_model::{
+    actor::ProtocolId,
+    cluster::CoordinatorScope,
+    cluster::ReleaseManifest,
+    cluster::{ClusterId, EntityType, NodeEndpoint, NodeIncarnation, PlacementDomainId},
 };
 use lattice_remoting::{
     association::{AssociationKey, AssociationManager, LaneAttachment, LaneKind},
@@ -427,7 +426,7 @@ fn rejected<E>(_: E) -> CoordinatorRuntimeError {
 fn node(id: &str, port: u16, incarnation: u128) -> Result<NodeKey, CoordinatorRuntimeError> {
     Ok(NodeKey {
         node_id: id.to_owned(),
-        address: NodeAddress::new("127.0.0.1", port).map_err(rejected)?,
+        address: NodeEndpoint::new("127.0.0.1", port).map_err(rejected)?,
         incarnation: NodeIncarnation::new(incarnation).map_err(rejected)?,
     })
 }

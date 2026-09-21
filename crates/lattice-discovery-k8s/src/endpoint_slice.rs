@@ -14,11 +14,11 @@ use kube::{
     config::KubeConfigOptions,
     runtime::{WatchStreamExt, watcher},
 };
-use lattice_core::{actor_address::NodeAddress, coordinator::CoordinatorScope};
 use lattice_discovery::provider::{
     CoordinatorDirectorySnapshot, CoordinatorDiscovery, DiscoveryError, DiscoveryOrigin,
     DiscoverySource, DiscoveryTarget,
 };
+use lattice_model::{cluster::CoordinatorScope, cluster::NodeEndpoint};
 
 const SERVICE_LABEL: &str = "kubernetes.io/service-name";
 const MAX_LABEL_VALUE_BYTES: usize = 63;
@@ -276,7 +276,7 @@ impl EndpointSliceState {
     }
 
     fn targets(&mut self, config: &KubernetesEndpointSliceConfig) -> Vec<DiscoveryTarget> {
-        let mut targets = BTreeMap::<NodeAddress, DiscoveryTarget>::new();
+        let mut targets = BTreeMap::<NodeEndpoint, DiscoveryTarget>::new();
         let mut rejected = 0_usize;
         let mut sample = None;
         for slice in self.live.values() {
@@ -305,7 +305,7 @@ impl EndpointSliceState {
                     continue;
                 }
                 for host in &endpoint.addresses {
-                    let Ok(address) = NodeAddress::new(host.clone(), port) else {
+                    let Ok(address) = NodeEndpoint::new(host.clone(), port) else {
                         rejected += 1;
                         sample.get_or_insert_with(|| host.clone());
                         continue;

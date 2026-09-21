@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
-use lattice_core::instance::InstanceId;
-use lattice_core::service_kind;
-use lattice_core::trace::TraceContext;
+use lattice_model::service::ServiceInstanceId;
+use lattice_model::service_name;
+use lattice_model::trace::TraceContext;
 use tokio::sync::Mutex;
 
 use crate::local::{EventBus, LocalEventBus};
@@ -27,7 +27,11 @@ async fn local_event_bus_publishes_typed_envelope() {
         )
         .await
         .unwrap();
-    let publisher = EventPublisher::new(bus, service_kind!("World"), InstanceId::new("world-a"));
+    let publisher = EventPublisher::new(
+        bus,
+        service_name!("World"),
+        ServiceInstanceId::new("world-a"),
+    );
     publisher
         .publish_bytes(
             Subject::new("world.login"),

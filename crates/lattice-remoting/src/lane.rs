@@ -5,9 +5,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::failpoints;
 use bytes::Bytes;
 use futures_util::{FutureExt, StreamExt, stream::FuturesUnordered};
-use lattice_core::failpoint::Failpoint;
 use thiserror::Error;
 #[cfg(test)]
 use tokio::task::JoinSet;
@@ -504,8 +504,8 @@ where
                     .iter()
                     .any(|frame| frame.kind == FrameKind::ControlEnvelope)
                 {
-                    lattice_core::failpoint::hit(
-                        Failpoint::ControlAfterOutboxBeforeSocketWrite,
+                    lattice_failpoint::hit(
+                        failpoints::CONTROL_AFTER_OUTBOX_BEFORE_SOCKET_WRITE,
                     );
                 }
                 let frame_count = outbound_batch.len();

@@ -16,7 +16,7 @@ use std::{
     time::Instant,
 };
 
-use lattice_core::service_context::ServiceContext;
+use crate::service::ServiceContext;
 use tokio::task::{JoinHandle, JoinSet};
 
 use crate::{

@@ -6,15 +6,16 @@ use std::time::Duration;
 use bytes::BytesMut;
 use lattice_actor::error::ActorFailure;
 use lattice_actor::traits::{Actor, Handler, StopReason};
+use lattice_actor_distributed::ActorKey;
+use lattice_actor_distributed::ActorKind;
+use lattice_actor_distributed::actor_kind;
 use lattice_actor_distributed::protocol::{
     ActorProtocolBinding, CodecDescriptor, DecodeError, EncodeError, Protocol, WireCodec,
 };
 use lattice_actor_distributed::registry::{ActorAddressConfig, ActorRegistry, ActorRegistryConfig};
 use lattice_actor_distributed::{activation::DistributedActorContextExt, actor_protocol};
-use lattice_core::actor_address::{ActorAddress, ClusterId, NodeAddress, NodeIncarnation};
-use lattice_core::actor_kind;
-use lattice_core::id::ActorId;
-use lattice_core::kind::ActorKind;
+use lattice_model::actor::ActorAddress;
+use lattice_model::cluster::{ClusterId, NodeEndpoint, NodeIncarnation};
 use lattice_remoting::config::RemotingConfig;
 use lattice_service::builder::LatticeService;
 use lattice_service::config::NodeConfig;
@@ -142,7 +143,7 @@ actor_protocol! {
 fn registry<A: Actor, P: Protocol>(
     kind: ActorKind,
     cluster_id: &ClusterId,
-    address: &NodeAddress,
+    address: &NodeEndpoint,
     incarnation: NodeIncarnation,
     protocol: &ActorProtocolBinding<A, P>,
 ) -> Arc<ActorRegistry<A>> {
@@ -163,7 +164,7 @@ fn registry<A: Actor, P: Protocol>(
 #[tokio::test]
 async fn deserialized_actor_address_is_bound_at_the_actor_boundary() {
     let cluster_id = ClusterId::new("reference-messaging").unwrap();
-    let address = NodeAddress::new("127.0.0.1", 25261).unwrap();
+    let address = NodeEndpoint::new("127.0.0.1", 25261).unwrap();
     let incarnation = NodeIncarnation::new(1).unwrap();
     let source_protocol = Arc::new(SourceProtocol::bind::<SourceActor>().unwrap());
     let sink_protocol = Arc::new(SinkProtocol::bind::<SinkActor>().unwrap());
@@ -184,7 +185,7 @@ async fn deserialized_actor_address_is_bound_at_the_actor_boundary() {
     let (observed_tx, observed_rx) = oneshot::channel();
     let sink_handle = sink_registry
         .start(
-            ActorId::U64(1),
+            ActorKey::U64(1),
             SinkActor {
                 observed: Arc::new(Mutex::new(Some(observed_tx))),
             },
@@ -192,18 +193,18 @@ async fn deserialized_actor_address_is_bound_at_the_actor_boundary() {
         .await
         .unwrap();
     let source_handle = source_registry
-        .start(ActorId::U64(1), SourceActor)
+        .start(ActorKey::U64(1), SourceActor)
         .await
         .unwrap();
     let sink_ref: ActorAddress<SinkProtocol> =
-        sink_registry.address(&ActorId::U64(1)).unwrap().unwrap();
+        sink_registry.address(&ActorKey::U64(1)).unwrap().unwrap();
     let source_ref: ActorAddress<SourceProtocol> =
-        source_registry.address(&ActorId::U64(1)).unwrap().unwrap();
+        source_registry.address(&ActorKey::U64(1)).unwrap().unwrap();
     let decoded_sink: ActorAddress<SinkProtocol> =
         serde_json::from_slice(&serde_json::to_vec(&sink_ref).unwrap()).unwrap();
 
     let service = LatticeService::builder(NodeConfig {
-        release: lattice_core::release::ReleaseManifest::development(1),
+        release: lattice_model::cluster::ReleaseManifest::development(1),
         cluster_id,
         node_id: "reference-node".to_owned(),
         address,

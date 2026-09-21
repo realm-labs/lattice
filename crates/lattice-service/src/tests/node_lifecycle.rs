@@ -9,6 +9,7 @@ use std::{
     time::Duration,
 };
 
+use lattice_actor_distributed::{ActorKey, actor_kind};
 use lattice_actor_distributed::{
     context::{ActorContext, HandlerContext},
     error::{ActorFailure, ActorStopError},
@@ -17,11 +18,7 @@ use lattice_actor_distributed::{
     reply::ReplyTo,
     traits::{Actor, ActorLifecycleState, Responder, StopReason},
 };
-use lattice_core::{
-    actor_address::{ClusterId, NodeAddress, NodeIncarnation},
-    actor_kind,
-    id::ActorId,
-};
+use lattice_model::cluster::{ClusterId, NodeEndpoint, NodeIncarnation};
 use lattice_placement::{
     control::{DEFAULT_MAX_CONTROL_PAYLOAD, PlacementControlRouter},
     runtime::host::{CoordinatorHost, CoordinatorHostConfig},
@@ -49,7 +46,7 @@ fn actor_registration_rejects_a_registry_bound_to_another_protocol() {
     let config = node_config(
         ClusterId::new("service-test").unwrap(),
         "protocol-mismatch",
-        NodeAddress::new("127.0.0.1", 25250).unwrap(),
+        NodeEndpoint::new("127.0.0.1", 25250).unwrap(),
         NodeIncarnation::new(1).unwrap(),
     );
 
@@ -112,7 +109,7 @@ async fn force_shutdown_forces_retained_actor_before_publishing_terminated() {
     let dropped = Arc::new(AtomicUsize::new(0));
     let handle = registry
         .start(
-            ActorId::U64(1),
+            ActorKey::U64(1),
             ForceShutdownActor {
                 dropped: dropped.clone(),
             },
@@ -170,7 +167,7 @@ async fn terminal_shutdown_drains_local_actors_without_a_migration_target() {
         ActorRegistryConfig::default(),
         binding.as_ref(),
     ));
-    let handle = registry.start(ActorId::U64(1), PingActor).await.unwrap();
+    let handle = registry.start(ActorKey::U64(1), PingActor).await.unwrap();
     let config = node_config(
         ClusterId::new("terminal-shutdown-test").unwrap(),
         "terminal-shutdown",
@@ -239,7 +236,7 @@ async fn service_retry_api_resolves_retained_actor_cell() {
     let persistence_available = Arc::new(AtomicBool::new(false));
     let handle = registry
         .start(
-            ActorId::U64(1),
+            ActorKey::U64(1),
             RetryShutdownActor {
                 persistence_available: persistence_available.clone(),
             },
@@ -309,7 +306,7 @@ async fn leave_deadline_retains_an_actor_waiting_for_its_stop_hook() {
         binding.as_ref(),
     ));
     let handle = registry
-        .start(ActorId::U64(1), SlowStopActor(finish.clone()))
+        .start(ActorKey::U64(1), SlowStopActor(finish.clone()))
         .await
         .unwrap();
     let service = LatticeService::builder(node_config(
@@ -357,7 +354,7 @@ async fn repeated_start_is_rejected_without_stopping_a_ready_node() {
         ActorRegistryConfig::default(),
         binding.as_ref(),
     ));
-    let handle = registry.start(ActorId::U64(1), PingActor).await.unwrap();
+    let handle = registry.start(ActorKey::U64(1), PingActor).await.unwrap();
     let address = unused_address().await;
     let config = node_config(
         ClusterId::new("repeated-start-test").unwrap(),

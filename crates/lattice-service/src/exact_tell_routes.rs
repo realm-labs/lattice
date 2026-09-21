@@ -9,7 +9,7 @@ use std::{
 use arc_swap::ArcSwapOption;
 use bytes::Bytes;
 use dashmap::{DashMap, mapref::entry::Entry};
-use lattice_core::actor_address::ActorAddress;
+use lattice_model::actor::ActorAddress;
 use lattice_remoting::{
     association::{Association, AssociationError, AssociationId},
     messaging::{
@@ -353,9 +353,9 @@ fn is_inactive_error(error: &TellError) -> bool {
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use lattice_core::actor_address::{
-        ActivationId, ActorPath, ClusterId, NodeAddress, NodeIncarnation, ProtocolId,
-    };
+    use lattice_model::actor::{ActivationId, ActorPath, ProtocolId};
+
+    use lattice_model::cluster::{ClusterId, NodeEndpoint, NodeIncarnation};
     use lattice_remoting::{
         association::{AssociationKey, LaneAttachment, LaneKind},
         config::RemotingConfig,
@@ -372,7 +372,7 @@ mod tests {
         let key = AssociationKey {
             cluster_id: ClusterId::new("test").unwrap(),
             local_incarnation: NodeIncarnation::new(1).unwrap(),
-            remote_address: NodeAddress::new("remote", 25520).unwrap(),
+            remote_address: NodeEndpoint::new("remote", 25520).unwrap(),
             remote_incarnation: NodeIncarnation::new(2).unwrap(),
         };
         let association = Arc::new(
@@ -412,7 +412,7 @@ mod tests {
         let incarnation = NodeIncarnation::new(2).unwrap();
         ActorAddress::new(
             ClusterId::new("test").unwrap(),
-            NodeAddress::new("remote", 25520).unwrap(),
+            NodeEndpoint::new("remote", 25520).unwrap(),
             ActorPath::user(["user", &format!("target-{sequence}")]).unwrap(),
             ActivationId::new(incarnation, sequence).unwrap(),
             protocol_id,

@@ -209,7 +209,7 @@ mod tests {
     use std::{sync::Arc, time::Duration};
 
     use bytes::Bytes;
-    use lattice_core::actor_address::{ClusterId, NodeAddress, NodeIncarnation};
+    use lattice_model::cluster::{ClusterId, NodeEndpoint, NodeIncarnation};
 
     use super::*;
     use crate::{
@@ -222,7 +222,7 @@ mod tests {
         AssociationKey {
             cluster_id: ClusterId::new("test").unwrap(),
             local_incarnation: NodeIncarnation::new(1).unwrap(),
-            remote_address: NodeAddress::new("remote", 25520).unwrap(),
+            remote_address: NodeEndpoint::new("remote", 25520).unwrap(),
             remote_incarnation: NodeIncarnation::new(2).unwrap(),
         }
     }

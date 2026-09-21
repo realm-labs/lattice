@@ -8,8 +8,8 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use lattice_core::actor_address::{EntityType, PlacementDomainId};
-use lattice_core::release::ClusterReleaseState;
+use lattice_model::cluster::ClusterReleaseState;
+use lattice_model::cluster::{EntityType, PlacementDomainId};
 use lattice_placement::{
     allocation::RebalanceTrigger,
     plan::RebalancePlan,

@@ -5,7 +5,8 @@
 //! lost or duplicated frame, a rejected commit — and records the evidence that proves the boundary
 //! was exercised.
 
-use lattice_core::failpoint::{self, Failpoint};
+use crate::failpoints::Failpoint;
+use lattice_failpoint as failpoint;
 
 use super::{HandoffStep, Scenario, ScenarioEvent, incarnation};
 use crate::fault::{FailAction, FaultEvidence, FaultOrigin, FaultOutcome, FaultTarget};

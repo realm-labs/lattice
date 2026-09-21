@@ -13,8 +13,8 @@ use lattice_actor_distributed::{
     reply::ReplyTo,
     traits::{Actor, Responder},
 };
-use lattice_core::actor_address::{
-    ClusterId, EntityType, NodeAddress, NodeIncarnation, PlacementDomainId,
+use lattice_model::cluster::{
+    ClusterId, EntityType, NodeEndpoint, NodeIncarnation, PlacementDomainId,
 };
 use lattice_placement::{
     control::{DEFAULT_MAX_CONTROL_PAYLOAD, PlacementControlRouter},
@@ -144,11 +144,11 @@ actor_protocol! {
 pub(super) fn node_config(
     cluster_id: ClusterId,
     node_id: &str,
-    address: NodeAddress,
+    address: NodeEndpoint,
     incarnation: NodeIncarnation,
 ) -> NodeConfig {
     NodeConfig {
-        release: lattice_core::release::ReleaseManifest::development(1),
+        release: lattice_model::cluster::ReleaseManifest::development(1),
         cluster_id,
         node_id: node_id.to_owned(),
         address,
@@ -170,7 +170,7 @@ pub(super) async fn coordinator_service(
     store: Arc<InMemoryPlacementStore>,
     cluster_id: ClusterId,
     node_id: &str,
-    address: NodeAddress,
+    address: NodeEndpoint,
     incarnation: NodeIncarnation,
     _term: u64,
 ) -> LatticeService {
@@ -189,7 +189,7 @@ pub(super) async fn coordinator_service_for_domains(
     store: Arc<InMemoryPlacementStore>,
     cluster_id: ClusterId,
     node_id: &str,
-    address: NodeAddress,
+    address: NodeEndpoint,
     incarnation: NodeIncarnation,
     domains: BTreeSet<PlacementDomainId>,
 ) -> LatticeService {

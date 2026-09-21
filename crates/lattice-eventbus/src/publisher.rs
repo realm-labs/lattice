@@ -7,10 +7,10 @@ use lattice_actor::state_machine::Accepts;
 use lattice_actor::traits::{Actor, Handler, Message};
 use lattice_actor_distributed::protocol::SupportsTell;
 use lattice_actor_distributed::recipient::ActorSystem;
-use lattice_core::actor_address::ActorAddress;
-use lattice_core::instance::InstanceId;
-use lattice_core::kind::ServiceKind;
-use lattice_core::trace::TraceContext;
+use lattice_model::actor::ActorAddress;
+use lattice_model::service::ServiceInstanceId;
+use lattice_model::service::ServiceName;
+use lattice_model::trace::TraceContext;
 use prost::Message as ProstMessage;
 use uuid::Uuid;
 
@@ -21,8 +21,8 @@ use crate::types::{EventEnvelope, EventId, EventSubscription, Subject};
 #[derive(Debug, Clone)]
 pub struct EventPublisher<B> {
     bus: B,
-    source_service: ServiceKind,
-    source_instance: InstanceId,
+    source_service: ServiceName,
+    source_instance: ServiceInstanceId,
     incarnation: Arc<str>,
     next_id: Arc<AtomicU64>,
 }
@@ -165,7 +165,7 @@ impl<B> EventPublisher<B>
 where
     B: EventBus,
 {
-    pub fn new(bus: B, source_service: ServiceKind, source_instance: InstanceId) -> Self {
+    pub fn new(bus: B, source_service: ServiceName, source_instance: ServiceInstanceId) -> Self {
         Self {
             bus,
             source_service,
@@ -225,7 +225,7 @@ mod tests {
         state_machine::Stateless,
         traits::{Actor, ActorLifecycleState, Handler, Message, StopReason},
     };
-    use lattice_core::{instance::InstanceId, service_kind, trace::TraceContext};
+    use lattice_model::{service::ServiceInstanceId, service_name, trace::TraceContext};
     use prost::Message as ProstMessage;
     use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 
@@ -306,8 +306,8 @@ mod tests {
             event_id: EventId::new(event_id),
             subject: Subject::new(subject),
             event_type: "test".to_owned(),
-            source_service: service_kind!("Test"),
-            source_instance: InstanceId::new("test-a"),
+            source_service: service_name!("Test"),
+            source_instance: ServiceInstanceId::new("test-a"),
             recipient: None,
             correlation_id: None,
             trace: TraceContext::default(),

@@ -5,7 +5,8 @@ members = [
     "crates/lattice-actor-macros",
     "crates/lattice-config",
     "crates/lattice-config-etcd",
-    "crates/lattice-core",
+    "crates/lattice-failpoint",
+    "crates/lattice-model",
     "crates/lattice-discovery",
     "crates/lattice-discovery-k8s",
     "crates/lattice-codegen",
@@ -52,7 +53,8 @@ hickory-resolver = "0.26.1"
 http = "1.4.2"
 lattice-config = { path = "crates/lattice-config" }
 lattice-config-etcd = { path = "crates/lattice-config-etcd" }
-lattice-core = { path = "crates/lattice-core" }
+lattice-failpoint = { path = "crates/lattice-failpoint" }
+lattice-model = { path = "crates/lattice-model" }
 lattice-discovery = { path = "crates/lattice-discovery" }
 lattice-discovery-k8s = { path = "crates/lattice-discovery-k8s" }
 lattice-actor = { path = "crates/lattice-actor", version = "0.1.0", default-features = false }

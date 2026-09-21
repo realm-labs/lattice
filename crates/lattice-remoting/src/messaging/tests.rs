@@ -28,7 +28,7 @@ fn active_association(
     let key = AssociationKey {
         cluster_id: ClusterId::new("test").unwrap(),
         local_incarnation: NodeIncarnation::new(1).unwrap(),
-        remote_address: NodeAddress::new("remote", 25520).unwrap(),
+        remote_address: NodeEndpoint::new("remote", 25520).unwrap(),
         remote_incarnation: NodeIncarnation::new(2).unwrap(),
     };
     let association = Arc::new(Association::new(key.clone(), RemotingConfig::default()).unwrap());
@@ -60,7 +60,7 @@ fn target(protocol_id: ProtocolId) -> ActorAddress {
     let node = NodeIncarnation::new(2).unwrap();
     ActorAddress::new(
         ClusterId::new("test").unwrap(),
-        NodeAddress::new("remote", 25520).unwrap(),
+        NodeEndpoint::new("remote", 25520).unwrap(),
         ActorPath::user(["user", "target"]).unwrap(),
         ActivationId::new(node, 1).unwrap(),
         protocol_id,

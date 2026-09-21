@@ -13,13 +13,13 @@ All framework identifiers are explicit newtypes. Business identifiers such as `W
 
 ```rust
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct ServiceKind(std::borrow::Cow<'static, str>);
+pub struct ServiceName(std::borrow::Cow<'static, str>);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ActorKind(std::borrow::Cow<'static, str>);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct InstanceId(String);
+pub struct ServiceInstanceId(String);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct NodeIncarnation(Uuid);
@@ -34,10 +34,10 @@ pub struct ActorPath(String);
 pub struct EntityId(Bytes);
 ```
 
-`ActorKind` and `ServiceKind` are opaque framework identifiers. They can be constructed from constants through macros:
+`ActorKind` and `ServiceName` are opaque framework identifiers. They can be constructed from constants through macros:
 
 ```rust
-pub const WORLD_SERVICE: ServiceKind = service_kind!("World");
+pub const WORLD_SERVICE: ServiceName = service_name!("World");
 pub const WORLD_ACTOR: ActorKind = actor_kind!("World");
 ```
 
@@ -78,12 +78,11 @@ Cross-process messages use ActorRef, EntityRef, or SingletonRef through lattice-
 Async tasks are created through ActorContext so they can be cancelled or isolated during stop/passivation.
 ```
 
-`ActorContext::local_extensions` provides type-indexed, activation-local state for framework adapters
-and actor helpers that must not become fields on the Actor itself. Each concrete Rust type has at
-most one value. Extensions survive `started`, message turns, continuations, `stopping`, and
-`StopFailed` retries because those phases share one `ActorContext`. They are process-local only:
-values are not shared, cloned, serialized, or persisted, and a passivated, terminated, or
-supervision-restarted Actor receives a new empty extension set with its new context.
+`ServiceContext` is the immutable, type-indexed bridge to application infrastructure. One
+`ActorRuntime` owns one context and shares it across all Actors it spawns. Runtime integrations may
+also install immutable `ActorRuntimeAttachments` for one activation, such as its distributed self
+address. Attachments are frozen before start and are not inherited by child Actors. Mutable
+business state belongs directly on the Actor.
 
 ### 7.2 Actor Scheduling Model
 
@@ -200,7 +199,7 @@ Actor tasks are spawned by lattice ActorRuntime, not directly by business code.
 ActorRuntime owns task naming, lifecycle, cancellation, metrics, tracing, and drain integration.
 ActorRuntime must be retained for the lifetime of its Actors; dropping it shuts down its execution resources.
 ActorContext creates scoped tasks through the actor runtime so they can be cancelled or isolated.
-ServiceContext creates service-scoped tasks through the service runtime.
+Service-scoped task ownership belongs to the service runtime, not to `ServiceContext`.
 CPU-heavy or blocking work must not run directly on Tokio worker threads; use a named worker pool, blocking pool, or external compute service.
 ActorRegistry stores actor ownership independently from the concrete execution policy.
 Mailbox semantics are identical across execution policies.

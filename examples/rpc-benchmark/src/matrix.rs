@@ -7,18 +7,16 @@ use std::{
 };
 
 use bytes::Bytes;
+use lattice_actor_distributed::{ActorKey, actor_kind};
 use lattice_actor_distributed::{
     error::{ActorFailure, ActorTellError},
     mailbox::MailboxConfig,
     registry::{ActorRegistry, ActorRegistryConfig},
     traits::{Actor, Handler, StopReason},
 };
-use lattice_core::{
-    actor_address::{
-        EntityId, EntityType, NodeAddress, NodeIncarnation, PlacementDomainId, ProtocolId,
-    },
-    actor_kind,
-    id::ActorId,
+use lattice_model::{
+    actor::ProtocolId,
+    cluster::{EntityId, EntityType, NodeEndpoint, NodeIncarnation, PlacementDomainId},
 };
 use lattice_placement::{
     allocation::{
@@ -77,7 +75,7 @@ pub async fn local_actor_admission(operations: usize) -> Result<MatrixMeasuremen
             ..ActorRegistryConfig::default()
         },
     ));
-    let handle = registry.start(ActorId::U64(1), BenchActor).await?;
+    let handle = registry.start(ActorKey::U64(1), BenchActor).await?;
     let started = Instant::now();
     for _ in 0..operations {
         let mut message = BenchTell;
@@ -244,7 +242,7 @@ fn allocation_fixture(
 ) -> Result<(AllocationRequest, PlacementView), Box<dyn Error>> {
     let placement_node = |key: NodeKey, weight| PlacementNode {
         key: key.clone(),
-        release_id: lattice_core::release::ReleaseId::new(1).unwrap(),
+        release_id: lattice_model::cluster::ReleaseId::new(1).unwrap(),
         ready: true,
         eligible_entity_types: BTreeSet::from([entity_type.clone()]),
         protocols: BTreeSet::from([protocol]),
@@ -367,7 +365,7 @@ fn reduce_reconnect(command: u128) -> Result<(), Box<dyn Error>> {
 fn node(node_id: &str, incarnation: u128, port: u16) -> Result<NodeKey, Box<dyn Error>> {
     Ok(NodeKey {
         node_id: node_id.to_owned(),
-        address: NodeAddress::new("127.0.0.1", port)?,
+        address: NodeEndpoint::new("127.0.0.1", port)?,
         incarnation: NodeIncarnation::new(incarnation)?,
     })
 }

@@ -98,15 +98,15 @@ mod tests {
         local::{EventBus, LocalEventBus},
         types::{EventEnvelope, EventId, EventSubscription, Subject, SubjectFilter},
     };
-    use lattice_core::{instance::InstanceId, service_kind, trace::TraceContext};
+    use lattice_model::{service::ServiceInstanceId, service_name, trace::TraceContext};
 
     fn event(subject: &str) -> EventEnvelope {
         EventEnvelope {
             event_id: EventId::new(format!("event-{subject}")),
             subject: Subject::new(subject),
             event_type: "test".to_owned(),
-            source_service: service_kind!("Test"),
-            source_instance: InstanceId::new("test-a"),
+            source_service: service_name!("Test"),
+            source_instance: ServiceInstanceId::new("test-a"),
             recipient: None,
             correlation_id: None,
             trace: TraceContext::default(),

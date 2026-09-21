@@ -22,7 +22,7 @@ async fn coordinator(artifact: PathBuf, node_id: String, port: u16) -> Result<()
         .await?,
     );
     let incarnation = NodeIncarnation::generate();
-    let address = NodeAddress::new(node_id.clone(), port)?;
+    let address = NodeEndpoint::new(node_id.clone(), port)?;
     let associations = Arc::new(AssociationManager::new(
         address.clone(),
         incarnation,

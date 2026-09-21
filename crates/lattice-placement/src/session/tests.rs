@@ -1,5 +1,5 @@
-use lattice_core::actor_address::{
-    ClusterId, ConfigFingerprint, EntityType, NodeAddress, NodeIncarnation,
+use lattice_model::cluster::{
+    ClusterId, ConfigFingerprint, EntityType, NodeEndpoint, NodeIncarnation,
 };
 use lattice_remoting::{
     association::{LaneAttachment, LaneKind},
@@ -25,7 +25,7 @@ async fn admission_closes_on_the_installed_deadline_even_though_no_tick_ran() {
     let domain = PlacementDomainId::new("frozen-owner").unwrap();
     let local = NodeKey {
         node_id: "owner".to_owned(),
-        address: NodeAddress::new("127.0.0.1", 34200).unwrap(),
+        address: NodeEndpoint::new("127.0.0.1", 34200).unwrap(),
         incarnation: NodeIncarnation::new(1).unwrap(),
     };
     let key = PlacementSlotKey::Shard {
@@ -98,10 +98,10 @@ async fn effect_backpressure_waits_for_capacity_without_terminating_the_session(
     let domain = PlacementDomainId::new("effect-backpressure").unwrap();
     let local = NodeKey {
         node_id: "logic".to_owned(),
-        address: NodeAddress::new("127.0.0.1", 34080).unwrap(),
+        address: NodeEndpoint::new("127.0.0.1", 34080).unwrap(),
         incarnation: NodeIncarnation::new(1).unwrap(),
     };
-    let remote_address = NodeAddress::new("127.0.0.1", 34081).unwrap();
+    let remote_address = NodeEndpoint::new("127.0.0.1", 34081).unwrap();
     let remote_incarnation = NodeIncarnation::new(2).unwrap();
     let associations = Arc::new(
         AssociationManager::new(
@@ -166,10 +166,10 @@ async fn control_queue_backpressure_does_not_terminate_the_session() {
     let domain = PlacementDomainId::new("control-admission-backpressure").unwrap();
     let local = NodeKey {
         node_id: "logic".to_owned(),
-        address: NodeAddress::new("127.0.0.1", 34082).unwrap(),
+        address: NodeEndpoint::new("127.0.0.1", 34082).unwrap(),
         incarnation: NodeIncarnation::new(1).unwrap(),
     };
-    let remote_address = NodeAddress::new("127.0.0.1", 34083).unwrap();
+    let remote_address = NodeEndpoint::new("127.0.0.1", 34083).unwrap();
     let remote_incarnation = NodeIncarnation::new(2).unwrap();
     let associations = Arc::new(
         AssociationManager::new(
@@ -250,10 +250,10 @@ async fn reliable_outbox_backpressure_does_not_terminate_the_session() {
     let domain = PlacementDomainId::new("control-outbox-backpressure").unwrap();
     let local = NodeKey {
         node_id: "logic".to_owned(),
-        address: NodeAddress::new("127.0.0.1", 34084).unwrap(),
+        address: NodeEndpoint::new("127.0.0.1", 34084).unwrap(),
         incarnation: NodeIncarnation::new(1).unwrap(),
     };
-    let remote_address = NodeAddress::new("127.0.0.1", 34085).unwrap();
+    let remote_address = NodeEndpoint::new("127.0.0.1", 34085).unwrap();
     let remote_incarnation = NodeIncarnation::new(2).unwrap();
     let associations = Arc::new(
         AssociationManager::new(
@@ -343,10 +343,10 @@ async fn runtime_progress_never_consumes_the_reliable_control_outbox() {
     let domain = PlacementDomainId::new("runtime-progress-outbox").unwrap();
     let local = NodeKey {
         node_id: "logic".to_owned(),
-        address: NodeAddress::new("127.0.0.1", 34085).unwrap(),
+        address: NodeEndpoint::new("127.0.0.1", 34085).unwrap(),
         incarnation: NodeIncarnation::new(1).unwrap(),
     };
-    let remote_address = NodeAddress::new("127.0.0.1", 34086).unwrap();
+    let remote_address = NodeEndpoint::new("127.0.0.1", 34086).unwrap();
     let remote_incarnation = NodeIncarnation::new(2).unwrap();
     let associations = Arc::new(
         AssociationManager::new(
@@ -447,10 +447,10 @@ async fn stale_generation_does_not_terminate_the_session() {
     let domain = PlacementDomainId::new("stale-generation-session").unwrap();
     let local = NodeKey {
         node_id: "logic".to_owned(),
-        address: NodeAddress::new("127.0.0.1", 34090).unwrap(),
+        address: NodeEndpoint::new("127.0.0.1", 34090).unwrap(),
         incarnation: NodeIncarnation::new(1).unwrap(),
     };
-    let remote_address = NodeAddress::new("127.0.0.1", 34091).unwrap();
+    let remote_address = NodeEndpoint::new("127.0.0.1", 34091).unwrap();
     let remote_incarnation = NodeIncarnation::new(2).unwrap();
     let associations = Arc::new(
         AssociationManager::new(
@@ -542,10 +542,10 @@ async fn an_unacknowledged_drain_completion_gives_up_instead_of_polling_forever(
     let cluster_id = ClusterId::new("drain-timeout").unwrap();
     let local = NodeKey {
         node_id: "logic".to_owned(),
-        address: NodeAddress::new("127.0.0.1", 34100).unwrap(),
+        address: NodeEndpoint::new("127.0.0.1", 34100).unwrap(),
         incarnation: NodeIncarnation::new(1).unwrap(),
     };
-    let remote_address = NodeAddress::new("127.0.0.1", 34101).unwrap();
+    let remote_address = NodeEndpoint::new("127.0.0.1", 34101).unwrap();
     let remote_incarnation = NodeIncarnation::new(2).unwrap();
     let associations = Arc::new(
         AssociationManager::new(
@@ -620,10 +620,10 @@ async fn heartbeat_publishes_a_fresh_baseline_node_load_sample() {
     let cluster_id = ClusterId::new("automatic-node-load").unwrap();
     let local = NodeKey {
         node_id: "logic".to_owned(),
-        address: NodeAddress::new("127.0.0.1", 34300).unwrap(),
+        address: NodeEndpoint::new("127.0.0.1", 34300).unwrap(),
         incarnation: NodeIncarnation::new(11).unwrap(),
     };
-    let remote_address = NodeAddress::new("127.0.0.1", 34301).unwrap();
+    let remote_address = NodeEndpoint::new("127.0.0.1", 34301).unwrap();
     let remote_incarnation = NodeIncarnation::new(12).unwrap();
     let associations = Arc::new(
         AssociationManager::new(

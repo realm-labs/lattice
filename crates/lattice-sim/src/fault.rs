@@ -3,9 +3,11 @@ use std::{
     sync::{Arc, Mutex, MutexGuard, OnceLock},
 };
 
-use lattice_core::failpoint::{self, Failpoint, FailpointGuard};
+use lattice_failpoint::{self as failpoint, FailpointGuard};
 
-pub use lattice_core::failpoint::FailpointAction as FailAction;
+pub use lattice_failpoint::FailpointAction as FailAction;
+
+use crate::failpoints::Failpoint;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum FaultTarget {
@@ -149,10 +151,12 @@ impl SharedFaultInjector {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let inner = self.inner.clone();
         let hook = failpoint::install_decision_hook(move |point| {
-            inner
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .hit(point)
+            Failpoint::from_id(point).map_or(FailAction::Continue, |point| {
+                inner
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .hit(point)
+            })
         });
         InstalledFaultInjector { hook, exclusive }
     }

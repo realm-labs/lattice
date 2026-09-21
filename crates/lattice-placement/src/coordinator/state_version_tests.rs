@@ -1,4 +1,4 @@
-use lattice_core::{actor_address::NodeAddress, coordinator::CoordinatorScope};
+use lattice_model::{cluster::CoordinatorScope, cluster::NodeEndpoint};
 
 use super::*;
 use crate::control::{
@@ -44,7 +44,7 @@ fn placement_domain_hello_builder_preserves_defaults_and_configuration() {
     let domain = PlacementDomainId::new("battle").unwrap();
     let node = NodeKey {
         node_id: "node-a".to_owned(),
-        address: NodeAddress::new("127.0.0.1", 25520).unwrap(),
+        address: NodeEndpoint::new("127.0.0.1", 25520).unwrap(),
         incarnation: NodeIncarnation::new(1).unwrap(),
     };
     let empty = PlacementDomainHello::builder(node.clone(), domain.clone(), 1).build();

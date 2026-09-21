@@ -1,5 +1,5 @@
+use crate::ActorKey;
 use dashmap::mapref::entry::{Entry, OccupiedEntry};
-use lattice_core::id::ActorId;
 
 use lattice_actor::{
     handle::ActorHandle,
@@ -81,7 +81,7 @@ impl<A: Actor> ActorRegistry<A> {
         cells
     }
 
-    pub fn inspect_quarantined(&self, actor_id: &ActorId) -> Option<QuarantineDiagnostics> {
+    pub fn inspect_quarantined(&self, actor_id: &ActorKey) -> Option<QuarantineDiagnostics> {
         self.quarantined
             .iter()
             .filter(|entry| &entry.value().actor_id == actor_id)
@@ -98,7 +98,7 @@ impl<A: Actor> ActorRegistry<A> {
             .and_then(|entry| self.quarantine_diagnostics(entry.value()))
     }
 
-    pub fn quarantined_activations(&self, actor_id: &ActorId) -> Vec<QuarantineDiagnostics> {
+    pub fn quarantined_activations(&self, actor_id: &ActorKey) -> Vec<QuarantineDiagnostics> {
         let mut diagnostics = self
             .quarantined
             .iter()
@@ -115,7 +115,7 @@ impl<A: Actor> ActorRegistry<A> {
 
     fn handle_quarantine_diagnostics(
         &self,
-        actor_id: ActorId,
+        actor_id: ActorKey,
         handle: &ActorHandle<A>,
     ) -> Option<QuarantineDiagnostics> {
         Some(QuarantineDiagnostics {
@@ -126,14 +126,14 @@ impl<A: Actor> ActorRegistry<A> {
         })
     }
 
-    pub fn export_quarantine_diagnostics(&self, actor_id: &ActorId) -> Option<String> {
+    pub fn export_quarantine_diagnostics(&self, actor_id: &ActorKey) -> Option<String> {
         self.inspect_quarantined(actor_id)
             .map(|diagnostics| format!("{diagnostics:#?}"))
     }
 
     pub async fn quarantine_after_authority_loss(
         &self,
-        actor_id: &ActorId,
+        actor_id: &ActorKey,
     ) -> Result<QuarantineDiagnostics, ActorQuarantineError> {
         self.fence_after_authority_loss(actor_id).await?;
         self.inspect_quarantined(actor_id)
@@ -142,7 +142,7 @@ impl<A: Actor> ActorRegistry<A> {
 
     pub async fn fence_after_authority_loss(
         &self,
-        actor_id: &ActorId,
+        actor_id: &ActorKey,
     ) -> Result<(), ActorQuarantineError> {
         let Entry::Occupied(entry) = self.entries.entry(actor_id.clone()) else {
             return Err(ActorQuarantineError::NotRetained);
@@ -152,7 +152,7 @@ impl<A: Actor> ActorRegistry<A> {
 
     pub(super) fn fence_entry(
         &self,
-        entry: OccupiedEntry<'_, ActorId, RegistryEntry<A>>,
+        entry: OccupiedEntry<'_, ActorKey, RegistryEntry<A>>,
     ) -> Result<(), ActorQuarantineError> {
         let actor_id = entry.key().clone();
         let handle = match entry.get() {
@@ -197,7 +197,7 @@ impl<A: Actor> ActorRegistry<A> {
         Ok(())
     }
 
-    pub async fn retry_quarantined(&self, actor_id: &ActorId) -> Result<(), ActorQuarantineError> {
+    pub async fn retry_quarantined(&self, actor_id: &ActorKey) -> Result<(), ActorQuarantineError> {
         let handle = self
             .quarantined
             .iter()
@@ -235,7 +235,7 @@ impl<A: Actor> ActorRegistry<A> {
 
     pub async fn force_discard_quarantined(
         &self,
-        actor_id: &ActorId,
+        actor_id: &ActorKey,
         reason: impl Into<String>,
         ticket: impl Into<String>,
     ) -> Result<(), ActorQuarantineError> {

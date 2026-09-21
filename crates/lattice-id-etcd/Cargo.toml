@@ -17,4 +17,4 @@ tracing.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
-lattice-core.workspace = true
+lattice-model.workspace = true

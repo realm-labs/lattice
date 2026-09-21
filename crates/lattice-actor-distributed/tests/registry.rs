@@ -7,6 +7,8 @@ use std::{
     time::Duration,
 };
 
+use lattice_actor::service::ServiceContext;
+use lattice_actor_distributed::{ActorKey, actor_kind};
 use lattice_actor_distributed::{
     activation::DistributedActorContextExt,
     actor_protocol,
@@ -22,11 +24,9 @@ use lattice_actor_distributed::{
     runtime::PassivationPolicy,
     traits::{Actor, ActorLifecycleState, Handler, Message, StopReason},
 };
-use lattice_core::{
-    actor_address::{ActorAddress, ClusterId, NodeAddress, NodeIncarnation, ProtocolId},
-    actor_kind,
-    id::ActorId,
-    service_context::ServiceContext,
+use lattice_model::{
+    actor::{ActorAddress, ProtocolId},
+    cluster::{ClusterId, NodeEndpoint, NodeIncarnation},
 };
 use tokio::sync::{Semaphore, oneshot};
 
@@ -38,7 +38,7 @@ async fn cancelled_activation_releases_placeholder_and_notifies_existing_waiters
         actor_kind!("Cancelled"),
         ActorRegistryConfig::default(),
     ));
-    let actor_id = ActorId::U64(71);
+    let actor_id = ActorKey::U64(71);
     let mut producer = Box::pin(registry.get_or_activate(actor_id.clone(), || async {
         std::future::pending::<Result<SlowActor, ActorFailure>>().await
     }));
@@ -72,7 +72,7 @@ async fn panicking_loader_releases_its_activation_placeholder() {
     assert!(
         tokio::spawn(async move {
             task_registry
-                .get_or_activate(ActorId::U64(72), || async { panic!("loader panic") })
+                .get_or_activate(ActorKey::U64(72), || async { panic!("loader panic") })
                 .await
         })
         .await
@@ -82,7 +82,7 @@ async fn panicking_loader_releases_its_activation_placeholder() {
     assert!(registry.active_actor_ids().is_empty());
     tokio::time::timeout(
         Duration::from_millis(100),
-        registry.get_or_activate(ActorId::U64(72), || async { Ok(SlowActor) }),
+        registry.get_or_activate(ActorKey::U64(72), || async { Ok(SlowActor) }),
     )
     .await
     .expect("panic cleanup must permit retry")
@@ -96,7 +96,7 @@ async fn draining_loading_activation_prevents_late_publication() {
         actor_kind!("DrainLoading"),
         ActorRegistryConfig::default(),
     );
-    let actor_id = ActorId::U64(73);
+    let actor_id = ActorKey::U64(73);
     let (release, ready) = oneshot::channel();
     let mut producer = Box::pin(registry.get_or_activate(actor_id.clone(), || async {
         ready.await.unwrap();
@@ -120,7 +120,7 @@ async fn fencing_loading_activation_does_not_remove_a_replacement() {
         actor_kind!("FenceLoading"),
         ActorRegistryConfig::default(),
     );
-    let actor_id = ActorId::U64(74);
+    let actor_id = ActorKey::U64(74);
     let mut old = Box::pin(registry.get_or_activate(actor_id.clone(), || async {
         std::future::pending::<Result<SlowActor, ActorFailure>>().await
     }));
@@ -155,7 +155,7 @@ async fn authority_change_during_loading_rejects_publication_and_allows_retry() 
             publish(*generation);
         }
     });
-    let actor_id = ActorId::U64(75);
+    let actor_id = ActorKey::U64(75);
     for new_generation in [None, Some(2)] {
         *generation.lock().unwrap() = Some(1);
         let (release, ready) = oneshot::channel();
@@ -200,7 +200,7 @@ async fn current_generation_cancels_a_loading_predecessor_and_its_waiters() {
         let generation = generation.clone();
         move |_, publish| publish(*generation.lock().unwrap())
     });
-    let actor_id = ActorId::U64(78);
+    let actor_id = ActorKey::U64(78);
     let mut old = Box::pin(registry.get_or_activate(actor_id.clone(), || async {
         std::future::pending::<Result<SlowActor, ActorFailure>>().await
     }));
@@ -234,7 +234,7 @@ async fn new_generation_preserves_an_old_stop_failure_in_quarantine() {
         let generation = generation.clone();
         move |_, publish| publish(*generation.lock().unwrap())
     });
-    let actor_id = ActorId::U64(79);
+    let actor_id = ActorKey::U64(79);
     let persistence_available = Arc::new(AtomicBool::new(false));
     let dropped = Arc::new(AtomicUsize::new(0));
     let old = registry
@@ -294,7 +294,7 @@ async fn new_generation_preserves_an_old_stop_failure_in_quarantine() {
 async fn wait_terminal_tracks_loading_until_invalidation() {
     let registry =
         ActorRegistry::<SlowActor>::new(actor_kind!("WaitLoading"), ActorRegistryConfig::default());
-    let actor_id = ActorId::U64(76);
+    let actor_id = ActorKey::U64(76);
     let mut producer = Box::pin(registry.get_or_activate(actor_id.clone(), || async {
         std::future::pending::<Result<SlowActor, ActorFailure>>().await
     }));
@@ -322,7 +322,7 @@ async fn activation_waiter_revalidates_authority_after_publication() {
             publish(*generation);
         }
     });
-    let actor_id = ActorId::U64(77);
+    let actor_id = ActorKey::U64(77);
     let (release, ready) = oneshot::channel();
     let mut producer = Box::pin(registry.get_or_activate(actor_id.clone(), || async {
         ready.await.unwrap();
@@ -350,7 +350,7 @@ async fn fast_fence_cleanup_cannot_leave_a_stopped_cell_in_quarantine() {
     for id in 0..128 {
         let registry = registry.clone();
         tasks.spawn(async move {
-            let actor_id = ActorId::U64(id);
+            let actor_id = ActorKey::U64(id);
             let handle = registry.start(actor_id.clone(), SlowActor).await.unwrap();
             let mut terminated = handle.subscribe_terminated();
             registry
@@ -394,7 +394,7 @@ async fn activation_waiter_times_out_while_activation_is_loading() {
             service: ServiceContext::empty(),
         },
     ));
-    let actor_id = ActorId::U64(7);
+    let actor_id = ActorKey::U64(7);
     let activation_entered = Arc::new(Semaphore::new(0));
     let release_activation = Arc::new(Semaphore::new(0));
 
@@ -435,7 +435,7 @@ async fn activation_waiter_times_out_while_activation_is_loading() {
 async fn remove_running_actor_allows_restart_with_same_id() {
     let registry =
         ActorRegistry::<SlowActor>::new(actor_kind!("Slow"), ActorRegistryConfig::default());
-    let actor_id = ActorId::U64(9);
+    let actor_id = ActorKey::U64(9);
 
     let first = registry.start(actor_id.clone(), SlowActor).await.unwrap();
     let removed = registry.remove(&actor_id).await.unwrap();
@@ -504,7 +504,7 @@ async fn registry_injects_exact_actor_address_into_context() {
         ActorRegistryConfig {
             address: Some(ActorAddressConfig {
                 cluster_id: ClusterId::new("test").unwrap(),
-                node_address: NodeAddress::new("127.0.0.1", 19090).unwrap(),
+                node_address: NodeEndpoint::new("127.0.0.1", 19090).unwrap(),
                 node_incarnation,
             }),
             ..ActorRegistryConfig::default()
@@ -515,7 +515,7 @@ async fn registry_injects_exact_actor_address_into_context() {
 
     registry
         .start(
-            ActorId::Str("session-1".to_string()),
+            ActorKey::Str("session-1".to_string()),
             SelfRefActor { tx: Some(tx) },
         )
         .await
@@ -529,13 +529,13 @@ async fn registry_injects_exact_actor_address_into_context() {
     assert!(registry.get_exact(&actor_address).is_some());
 
     let typed = registry
-        .address::<SelfRefProtocol>(&ActorId::Str("session-1".to_owned()))
+        .address::<SelfRefProtocol>(&ActorKey::Str("session-1".to_owned()))
         .unwrap()
         .unwrap();
     assert!(typed.same_activation(&actor_address));
 
     let old = actor_address.clone();
-    let actor_id = ActorId::Str("session-1".to_string());
+    let actor_id = ActorKey::Str("session-1".to_string());
     let first = registry.remove(&actor_id).await.unwrap();
     let mut lifecycle = first.subscribe_lifecycle();
     while *lifecycle.borrow() != ActorLifecycleState::Stopped {
@@ -558,7 +558,7 @@ async fn registry_keeps_unaddressable_identities_node_local() {
         ActorRegistryConfig {
             address: Some(ActorAddressConfig {
                 cluster_id: ClusterId::new("test").unwrap(),
-                node_address: NodeAddress::new("127.0.0.1", 19090).unwrap(),
+                node_address: NodeEndpoint::new("127.0.0.1", 19090).unwrap(),
                 node_incarnation: NodeIncarnation::new(7).unwrap(),
             }),
             ..ActorRegistryConfig::default()
@@ -566,7 +566,7 @@ async fn registry_keeps_unaddressable_identities_node_local() {
         &protocol,
     );
 
-    let actor_id = ActorId::Str("s".repeat(64));
+    let actor_id = ActorKey::Str("s".repeat(64));
     registry
         .start(actor_id.clone(), SelfRefActor { tx: None })
         .await
@@ -609,7 +609,7 @@ async fn voluntary_stop_failed_blocks_replacement_until_same_actor_retries() {
         actor_kind!("RetainedRegistryActor"),
         ActorRegistryConfig::default(),
     );
-    let actor_id = ActorId::U64(44);
+    let actor_id = ActorKey::U64(44);
     let persistence_available = Arc::new(AtomicBool::new(false));
     let dropped = Arc::new(AtomicUsize::new(0));
     let handle = registry
@@ -661,7 +661,7 @@ async fn external_authority_loss_quarantines_old_actor_and_allows_replacement() 
             ..ActorRegistryConfig::default()
         },
     );
-    let actor_id = ActorId::U64(45);
+    let actor_id = ActorKey::U64(45);
     let persistence_available = Arc::new(AtomicBool::new(false));
     let dropped = Arc::new(AtomicUsize::new(0));
     let old = registry
@@ -730,8 +730,8 @@ async fn quarantine_capacity_exhaustion_is_explicit_and_never_drops_retained_sta
             ..ActorRegistryConfig::default()
         },
     );
-    let first_id = ActorId::U64(46);
-    let second_id = ActorId::U64(47);
+    let first_id = ActorKey::U64(46);
+    let second_id = ActorKey::U64(47);
     let first_dropped = Arc::new(AtomicUsize::new(0));
     let second_dropped = Arc::new(AtomicUsize::new(0));
     let unavailable = Arc::new(AtomicBool::new(false));
@@ -807,7 +807,7 @@ async fn repeated_authority_loss_retains_every_exact_activation() {
             ..ActorRegistryConfig::default()
         },
     );
-    let actor_id = ActorId::U64(48);
+    let actor_id = ActorKey::U64(48);
     let persistence_available = Arc::new(AtomicBool::new(false));
     let first = registry
         .start(
@@ -896,7 +896,7 @@ async fn authority_loss_during_stopping_finishes_in_non_authoritative_quarantine
         actor_kind!("ConcurrentFenceActor"),
         ActorRegistryConfig::default(),
     );
-    let actor_id = ActorId::U64(49);
+    let actor_id = ActorKey::U64(49);
     let stopping_entered = Arc::new(Semaphore::new(0));
     let release_stopping = Arc::new(Semaphore::new(0));
     let handle = registry
@@ -950,7 +950,7 @@ async fn idle_passivation_eagerly_releases_registry_and_directory_capacity() {
             passivation: PassivationPolicy::IdleTimeout(Duration::from_millis(10)),
             address: Some(ActorAddressConfig {
                 cluster_id: ClusterId::new("test").unwrap(),
-                node_address: NodeAddress::new("127.0.0.1", 19091).unwrap(),
+                node_address: NodeEndpoint::new("127.0.0.1", 19091).unwrap(),
                 node_incarnation: NodeIncarnation::new(8).unwrap(),
             }),
             service,
@@ -959,7 +959,7 @@ async fn idle_passivation_eagerly_releases_registry_and_directory_capacity() {
         &protocol,
     );
 
-    let first_id = ActorId::Str("idle-1".to_owned());
+    let first_id = ActorKey::Str("idle-1".to_owned());
     let first = registry
         .start(first_id.clone(), SelfRefActor { tx: None })
         .await
@@ -971,7 +971,7 @@ async fn idle_passivation_eagerly_releases_registry_and_directory_capacity() {
     assert!(registry.get_running(&first_id).is_none());
     assert!(directory.is_empty());
 
-    let second_id = ActorId::Str("idle-2".to_owned());
+    let second_id = ActorKey::Str("idle-2".to_owned());
     registry
         .start(second_id.clone(), SelfRefActor { tx: None })
         .await
@@ -995,7 +995,7 @@ async fn concurrent_activation_never_produces_a_second_cell() {
     ));
 
     for round in 0..256u64 {
-        let actor_id = ActorId::U64(round);
+        let actor_id = ActorKey::U64(round);
         let activations = Arc::new(AtomicUsize::new(0));
         let mut callers = Vec::new();
         for _ in 0..4 {

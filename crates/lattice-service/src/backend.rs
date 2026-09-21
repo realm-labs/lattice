@@ -10,12 +10,10 @@ use lattice_actor_distributed::{
     host::ProtocolHostRegistry,
     recipient::{ImmediateRecipientTellDispatch, RecipientBackend, RecipientTell},
 };
-use lattice_core::{
-    actor_address::{
-        ActorAddress, ClusterId, EntityAddress, NodeAddress, NodeIncarnation, PlacementDomainId,
-        RecipientAddress, SingletonAddress,
-    },
-    watch::WatchId,
+use lattice_model::{
+    actor::WatchId,
+    actor::{ActorAddress, EntityAddress, RecipientAddress, SingletonAddress},
+    cluster::{ClusterId, NodeEndpoint, NodeIncarnation, PlacementDomainId},
 };
 use lattice_placement::types::PlacementSlotKey;
 use lattice_remoting::{
@@ -590,7 +588,7 @@ impl InboundDispatch for ServiceInboundDispatch {
 
 pub(crate) struct ServiceRecipientBackend {
     pub local_cluster: ClusterId,
-    pub local_address: NodeAddress,
+    pub local_address: NodeEndpoint,
     pub local_incarnation: NodeIncarnation,
     pub hosts: Arc<ProtocolHostRegistry>,
     pub associations: Arc<AssociationManager>,

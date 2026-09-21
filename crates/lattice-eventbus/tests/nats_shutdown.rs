@@ -6,12 +6,12 @@ use std::{
     time::Duration,
 };
 
-use lattice_core::{instance::InstanceId, service_kind, trace::TraceContext};
 use lattice_eventbus::{
     local::EventBus,
     nats::{NatsEventBus, NatsEventBusConfig},
     types::{EventEnvelope, EventId, EventSubscription, Subject, SubjectFilter},
 };
+use lattice_model::{service::ServiceInstanceId, service_name, trace::TraceContext};
 use tokio::sync::Semaphore;
 
 fn event(id: &str, subject: &str) -> EventEnvelope {
@@ -19,8 +19,8 @@ fn event(id: &str, subject: &str) -> EventEnvelope {
         event_id: EventId::new(id),
         subject: Subject::new(subject),
         event_type: "drain-contract".to_owned(),
-        source_service: service_kind!("Test"),
-        source_instance: InstanceId::new("nats-drain"),
+        source_service: service_name!("Test"),
+        source_instance: ServiceInstanceId::new("nats-drain"),
         recipient: None,
         correlation_id: None,
         trace: TraceContext::default(),

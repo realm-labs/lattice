@@ -87,7 +87,7 @@ impl ServiceControlDispatch {
     fn supervise_termination(
         &self,
         association_id: lattice_remoting::association::AssociationId,
-        watch_id: lattice_core::watch::WatchId,
+        watch_id: lattice_model::actor::WatchId,
         target: ExactActorTarget,
         mut terminated: ActorTerminationSubscription,
     ) -> Result<(), ControlDispatchError> {

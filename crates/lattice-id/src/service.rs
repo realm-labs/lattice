@@ -828,7 +828,7 @@ mod tests {
     };
 
     use async_trait::async_trait;
-    use lattice_core::actor_address::{ClusterId, NodeIncarnation};
+    use lattice_model::cluster::{ClusterId, NodeIncarnation};
     use tokio::sync::Notify;
 
     use super::{

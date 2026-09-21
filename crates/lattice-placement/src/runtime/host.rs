@@ -5,9 +5,9 @@ use std::{
 };
 
 use broadcast::error::RecvError;
-use lattice_core::{
-    actor_address::{NodeIncarnation, PlacementDomainId},
-    coordinator::CoordinatorScope,
+use lattice_model::{
+    cluster::CoordinatorScope,
+    cluster::{NodeIncarnation, PlacementDomainId},
 };
 use lattice_remoting::association::{AssociationKey, AssociationManager};
 use tokio::{

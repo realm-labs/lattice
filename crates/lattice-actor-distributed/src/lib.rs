@@ -8,7 +8,7 @@
 
 pub use lattice_actor::{
     Message, Request, actor_behavior, attachments, context, error, handle, mailbox, observation,
-    reply, runtime, state_machine, traits, watch,
+    reply, runtime, service, state_machine, traits, watch,
 };
 
 pub mod activation;
@@ -22,3 +22,4 @@ pub mod registry;
 
 pub use entity::{EntityActivationState, EntityKey, EntityKeyDecodeError, ShardedActor};
 pub use reference::{ActorRef, EntityRef, Recipient, SingletonRef};
+pub use registry::{ActorKey, ActorKind};

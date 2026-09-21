@@ -3,12 +3,12 @@ use std::sync::{
     atomic::{AtomicU8, Ordering},
 };
 
+use crate::ActorKey;
 use dashmap::{DashMap, mapref::entry::Entry};
 use lattice_actor::{
     handle::ActorHandle,
     traits::{Actor, ActorLifecycleState},
 };
-use lattice_core::id::ActorId;
 use tokio::sync::{Semaphore, watch};
 
 use super::{
@@ -25,8 +25,8 @@ pub(super) struct ActivationState<A: Actor> {
 }
 
 pub(super) struct ActivationCleanup<A: Actor> {
-    pub(super) entries: Arc<DashMap<ActorId, RegistryEntry<A>>>,
-    pub(super) actor_id: ActorId,
+    pub(super) entries: Arc<DashMap<ActorKey, RegistryEntry<A>>>,
+    pub(super) actor_id: ActorKey,
     pub(super) activation: Arc<ActivationState<A>>,
 }
 
@@ -94,7 +94,7 @@ impl<A: Actor> ActorRegistry<A> {
     // Fence it before admitting the replacement; retain any failed persistence in quarantine.
     pub(super) fn lookup_activation(
         &self,
-        actor_id: &ActorId,
+        actor_id: &ActorKey,
         fencing_token: Option<ActorFencingToken>,
     ) -> Result<RegistryLookup<A>, ActorActivationError> {
         loop {
@@ -162,7 +162,7 @@ impl<A: Actor> ActorRegistry<A> {
     // The producer's cleanup guard uses identity, so it cannot remove a later activation.
     pub(super) fn cancel_loading_or_handle(
         &self,
-        actor_id: &ActorId,
+        actor_id: &ActorKey,
     ) -> Option<Option<ActorHandle<A>>> {
         let Entry::Occupied(entry) = self.entries.entry(actor_id.clone()) else {
             return None;

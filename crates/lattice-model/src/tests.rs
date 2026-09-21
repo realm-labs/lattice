@@ -1,19 +1,17 @@
-use crate::actor_address::{
-    ActivationId, ActorAddress, ActorPath, ClusterId, ConfigFingerprint, EntityAddress, EntityId,
-    EntityType, NodeAddress, NodeIncarnation, PlacementDomainId, ProtocolId,
+use crate::actor::{ActivationId, ActorAddress, ActorPath, EntityAddress, ProtocolId};
+use crate::cluster::{
+    ClusterId, ConfigFingerprint, EntityId, EntityType, NodeEndpoint, NodeIncarnation,
+    PlacementDomainId,
 };
-use crate::kind::{ActorKind, ServiceKind};
+use crate::service::ServiceName;
+use crate::service_name;
 use crate::trace::TraceContext;
-use crate::trace::TraceSpanKind;
-use crate::{actor_kind, service_kind};
 
-const WORLD_SERVICE: ServiceKind = service_kind!("World");
-const WORLD_ACTOR: ActorKind = actor_kind!("World");
+const WORLD_SERVICE: ServiceName = service_name!("World");
 
 #[test]
-fn actor_kind_and_service_kind_macros_are_const() {
+fn service_name_macro_is_const() {
     assert_eq!(WORLD_SERVICE.as_str(), "World");
-    assert_eq!(WORLD_ACTOR.as_str(), "World");
 }
 
 #[test]
@@ -22,7 +20,7 @@ fn actor_and_entity_refs_have_distinct_exact_and_logical_identity() {
     let protocol = ProtocolId::new(11).unwrap();
     let actor = ActorAddress::new(
         ClusterId::new("test").unwrap(),
-        NodeAddress::new("127.0.0.1", 19083).unwrap(),
+        NodeEndpoint::new("127.0.0.1", 19083).unwrap(),
         ActorPath::user(["user", "session-1"]).unwrap(),
         ActivationId::new(node, 1).unwrap(),
         protocol,
@@ -46,15 +44,15 @@ fn actor_and_entity_refs_have_distinct_exact_and_logical_identity() {
 
 #[test]
 fn node_address_supports_canonical_ipv6_literals() {
-    let address = NodeAddress::new("2001:db8::1", 7447).unwrap();
+    let address = NodeEndpoint::new("2001:db8::1", 7447).unwrap();
 
     assert_eq!(address.host(), "2001:db8::1");
     assert_eq!(address.to_string(), "[2001:db8::1]:7447");
-    assert!(NodeAddress::new("[2001:db8::1]", 7447).is_err());
+    assert!(NodeEndpoint::new("[2001:db8::1]", 7447).is_err());
 }
 
 #[test]
-fn trace_context_reports_empty_and_span_kind_names() {
+fn trace_context_reports_whether_propagation_fields_are_empty() {
     let empty = TraceContext::default();
     let trace = TraceContext {
         traceparent: Some("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-00".into()),
@@ -63,7 +61,4 @@ fn trace_context_reports_empty_and_span_kind_names() {
 
     assert!(empty.is_empty());
     assert!(!trace.is_empty());
-    assert_eq!(TraceSpanKind::Client.as_str(), "client");
-    assert_eq!(TraceSpanKind::Consumer.as_str(), "consumer");
-    let _span = trace.span("rpc.client", TraceSpanKind::Client);
 }

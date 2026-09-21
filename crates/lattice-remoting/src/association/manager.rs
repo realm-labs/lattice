@@ -3,7 +3,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use lattice_core::actor_address::{ClusterId, NodeAddress, NodeIncarnation};
+use lattice_model::cluster::{ClusterId, NodeEndpoint, NodeIncarnation};
 
 use super::{
     Association, AssociationError, AssociationId, AssociationKey, AssociationManager,
@@ -13,7 +13,7 @@ use crate::config::RemotingConfig;
 
 impl AssociationManager {
     pub fn new(
-        local_address: NodeAddress,
+        local_address: NodeEndpoint,
         local_incarnation: NodeIncarnation,
         config: RemotingConfig,
     ) -> Result<Self, AssociationError> {
@@ -31,7 +31,7 @@ impl AssociationManager {
     pub fn get_or_create(
         &self,
         cluster_id: ClusterId,
-        remote_address: NodeAddress,
+        remote_address: NodeEndpoint,
         remote_incarnation: NodeIncarnation,
     ) -> Result<Arc<Association>, AssociationError> {
         {
@@ -78,7 +78,7 @@ impl AssociationManager {
     pub fn get_or_accept(
         &self,
         cluster_id: ClusterId,
-        remote_address: NodeAddress,
+        remote_address: NodeEndpoint,
         remote_incarnation: NodeIncarnation,
         association_id: AssociationId,
     ) -> Result<Arc<Association>, AssociationError> {
@@ -145,7 +145,7 @@ impl AssociationManager {
 
     pub fn should_dial(
         &self,
-        remote_address: &NodeAddress,
+        remote_address: &NodeEndpoint,
         remote_incarnation: NodeIncarnation,
     ) -> bool {
         (&self.local_address, self.local_incarnation.get())
@@ -183,7 +183,7 @@ impl AssociationManager {
     pub fn get_exact(
         &self,
         cluster_id: &ClusterId,
-        remote_address: &NodeAddress,
+        remote_address: &NodeEndpoint,
         remote_incarnation: NodeIncarnation,
     ) -> Option<Arc<Association>> {
         self.get(&AssociationKey {
@@ -204,7 +204,7 @@ impl AssociationManager {
     }
 
     /// The incarnation this address is currently bound to, if it is bound at all.
-    pub fn remote_incarnation(&self, address: &NodeAddress) -> Option<NodeIncarnation> {
+    pub fn remote_incarnation(&self, address: &NodeEndpoint) -> Option<NodeIncarnation> {
         self.remote_incarnations
             .lock()
             .expect("remote incarnation registry poisoned")
@@ -221,7 +221,7 @@ impl AssociationManager {
     /// a later incarnation and is left alone.
     pub fn forget_remote_incarnation(
         &self,
-        address: &NodeAddress,
+        address: &NodeEndpoint,
         incarnation: NodeIncarnation,
     ) -> bool {
         let mut incarnations = self
@@ -237,7 +237,7 @@ impl AssociationManager {
 
     pub fn replace_remote_incarnation(
         &self,
-        address: NodeAddress,
+        address: NodeEndpoint,
         incarnation: NodeIncarnation,
     ) -> usize {
         self.remote_incarnations

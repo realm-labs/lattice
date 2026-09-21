@@ -5,8 +5,8 @@ use k8s_openapi::{
     api::discovery::v1::{Endpoint, EndpointConditions, EndpointPort, EndpointSlice},
     apimachinery::pkg::apis::meta::v1::ObjectMeta,
 };
-use lattice_core::coordinator::CoordinatorScope;
 use lattice_discovery::provider::{CoordinatorDiscovery, DiscoveryError};
+use lattice_model::cluster::CoordinatorScope;
 
 use crate::endpoint_slice::{
     EndpointSliceSource, KubernetesCredentials, KubernetesEndpointSliceConfig,

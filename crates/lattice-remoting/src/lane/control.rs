@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use lattice_core::failpoint::Failpoint;
+use crate::failpoints;
 
 use super::LaneError;
 use crate::{
@@ -45,7 +45,7 @@ pub(super) async fn apply_control_frame(
                         }
                         Err(error) => return Err(error.into()),
                     }
-                    lattice_core::failpoint::hit(Failpoint::ControlAfterRemoteApplyBeforeAck);
+                    lattice_failpoint::hit(failpoints::CONTROL_AFTER_REMOTE_APPLY_BEFORE_ACK);
                     let ack = association.commit_control(envelope);
                     Ok(Some(control_ack_frame(ack)))
                 }

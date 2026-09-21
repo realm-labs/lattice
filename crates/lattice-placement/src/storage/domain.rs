@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 
-use lattice_core::actor_address::{EntityType, NodeIncarnation};
+use lattice_model::cluster::{EntityType, NodeIncarnation};
 use serde::{Deserialize, Serialize};
 
 use crate::{

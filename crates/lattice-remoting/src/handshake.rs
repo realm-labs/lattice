@@ -1,4 +1,4 @@
-use lattice_core::actor_address::{ClusterId, NodeAddress, NodeIncarnation};
+use lattice_model::cluster::{ClusterId, NodeEndpoint, NodeIncarnation};
 use prost::Message;
 use thiserror::Error;
 
@@ -42,7 +42,7 @@ impl FeatureBits {
 pub struct NodeIdentity {
     pub cluster_id: ClusterId,
     pub node_id: String,
-    pub address: NodeAddress,
+    pub address: NodeEndpoint,
     pub incarnation: NodeIncarnation,
 }
 
@@ -322,9 +322,9 @@ fn validate_node(identity: &NodeIdentity) -> Result<(), HandshakeError> {
     Ok(())
 }
 
-fn node_address(host: String, port: u32) -> Result<NodeAddress, HandshakeError> {
+fn node_address(host: String, port: u32) -> Result<NodeEndpoint, HandshakeError> {
     let port = u16::try_from(port).map_err(|_| HandshakeError::InvalidIdentity)?;
-    NodeAddress::new(host, port).map_err(|_| HandshakeError::InvalidIdentity)
+    NodeEndpoint::new(host, port).map_err(|_| HandshakeError::InvalidIdentity)
 }
 
 fn parse_u128(bytes: &[u8]) -> Result<u128, HandshakeError> {
@@ -383,7 +383,7 @@ mod tests {
         NodeIdentity {
             cluster_id: ClusterId::new("test").unwrap(),
             node_id: name.to_owned(),
-            address: NodeAddress::new("127.0.0.1", port).unwrap(),
+            address: NodeEndpoint::new("127.0.0.1", port).unwrap(),
             incarnation: NodeIncarnation::new(incarnation).unwrap(),
         }
     }

@@ -5,9 +5,9 @@ use std::{
 };
 
 use bytes::Bytes;
-use lattice_core::{
-    actor_address::{EntityType, NodeIncarnation, PlacementDomainId, SingletonKind},
-    coordinator::CoordinatorScope,
+use lattice_model::{
+    cluster::CoordinatorScope,
+    cluster::{EntityType, NodeIncarnation, PlacementDomainId, SingletonKind},
 };
 use lattice_remoting::association::{
     Association, AssociationError, AssociationKey, AssociationManager, AssociationState,
@@ -64,11 +64,11 @@ mod rebalance;
 mod reconciliation;
 
 pub(crate) fn guarded_commit_failpoint(
-    point: lattice_core::failpoint::Failpoint,
+    point: lattice_failpoint::FailpointId,
 ) -> Result<(), StorageError> {
-    match lattice_core::failpoint::hit_decision(point) {
-        lattice_core::failpoint::FailpointAction::StoreFailure => Err(StorageError::Unavailable),
-        lattice_core::failpoint::FailpointAction::Crash => Err(StorageError::OutcomeUnknown),
+    match lattice_failpoint::hit_decision(point) {
+        lattice_failpoint::FailpointAction::StoreFailure => Err(StorageError::Unavailable),
+        lattice_failpoint::FailpointAction::Crash => Err(StorageError::OutcomeUnknown),
         _ => Ok(()),
     }
 }
@@ -78,19 +78,19 @@ pub(crate) fn guarded_commit_failpoint(
 /// effect, the published delta and the outbound grant did not, which is exactly the divergence
 /// reconciliation has to repair.
 pub(crate) fn post_commit_failpoint(
-    point: lattice_core::failpoint::Failpoint,
+    point: lattice_failpoint::FailpointId,
 ) -> Result<(), StorageError> {
-    match lattice_core::failpoint::hit_decision(point) {
-        lattice_core::failpoint::FailpointAction::StoreFailure
-        | lattice_core::failpoint::FailpointAction::Crash => Err(StorageError::OutcomeUnknown),
+    match lattice_failpoint::hit_decision(point) {
+        lattice_failpoint::FailpointAction::StoreFailure
+        | lattice_failpoint::FailpointAction::Crash => Err(StorageError::OutcomeUnknown),
         _ => Ok(()),
     }
 }
 
-pub(crate) fn dropped_by_failpoint(point: lattice_core::failpoint::Failpoint) -> bool {
+pub(crate) fn dropped_by_failpoint(point: lattice_failpoint::FailpointId) -> bool {
     matches!(
-        lattice_core::failpoint::hit_decision(point),
-        lattice_core::failpoint::FailpointAction::Drop
+        lattice_failpoint::hit_decision(point),
+        lattice_failpoint::FailpointAction::Drop
     )
 }
 
@@ -852,7 +852,7 @@ pub enum CoordinatorRuntimeError {
     #[error("Coordinator reducer rejected state: {0}")]
     Coordinator(#[source] CoordinatorError),
     #[error("application release is not eligible for a code-only rolling upgrade: {0}")]
-    Release(#[from] lattice_core::release::ReleaseError),
+    Release(#[from] lattice_model::cluster::ReleaseError),
     #[error("Coordinator control codec failed: {0}")]
     Control(#[source] PlacementControlError),
     #[error("Coordinator snapshot record codec failed")]

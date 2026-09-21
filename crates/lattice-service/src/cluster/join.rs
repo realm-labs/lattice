@@ -5,10 +5,10 @@ use std::{
 };
 
 use futures_util::{StreamExt, stream};
-use lattice_core::coordinator::CoordinatorScope;
 use lattice_discovery::provider::{
     CoordinatorDirectorySnapshot, CoordinatorDiscovery, DiscoveryTarget,
 };
+use lattice_model::cluster::CoordinatorScope;
 use lattice_remoting::{
     association::{Association, AssociationManager, AssociationState},
     bootstrap::{
@@ -547,11 +547,11 @@ mod tests {
 
     use async_trait::async_trait;
     use bytes::Bytes;
-    use lattice_core::{
-        actor_address::{ClusterId, NodeAddress, NodeIncarnation},
-        coordinator::CoordinatorScope,
-    };
     use lattice_discovery::static_provider::{StaticDiscovery, StaticEndpoint};
+    use lattice_model::{
+        cluster::CoordinatorScope,
+        cluster::{ClusterId, NodeEndpoint, NodeIncarnation},
+    };
     use lattice_remoting::{
         association::{AssociationManager, AssociationState},
         bootstrap::BootstrapLeader,
@@ -579,7 +579,7 @@ mod tests {
             identity: NodeIdentity {
                 cluster_id: ClusterId::new("cluster").unwrap(),
                 node_id: node.to_string(),
-                address: NodeAddress::new(node, 7447).unwrap(),
+                address: NodeEndpoint::new(node, 7447).unwrap(),
                 incarnation: NodeIncarnation::new(u128::from(term + generation)).unwrap(),
             },
             term,

@@ -1,4 +1,4 @@
-use lattice_core::actor_address::{NodeAddress, NodeIncarnation};
+use lattice_model::cluster::{NodeEndpoint, NodeIncarnation};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ProcessState {
@@ -10,7 +10,7 @@ pub enum ProcessState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SimProcess {
     pub node_id: String,
-    pub address: NodeAddress,
+    pub address: NodeEndpoint,
     pub incarnation: NodeIncarnation,
     pub state: ProcessState,
 }

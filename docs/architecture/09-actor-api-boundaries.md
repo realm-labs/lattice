@@ -9,7 +9,7 @@ This document is the canonical API model after the local/distributed hard switch
 lifecycle management. It has no remoting feature and contains no address,
 protocol, registry, shard, singleton or cluster-authority state.
 
-`lattice-core::actor_address` contains serializable identity data:
+`lattice-model::actor` contains serializable actor identity data:
 
 - `ActorAddress<P>` identifies one exact activation;
 - `EntityAddress<P>` identifies one logical sharded entity;
@@ -18,6 +18,17 @@ protocol, registry, shard, singleton or cluster-authority state.
 
 Addresses contain no sending capability. They are the values stored in config,
 persisted, or carried in wire messages.
+
+The rest of the shared value model is grouped by domain rather than flattened
+at the crate root:
+
+- `lattice-model::cluster` owns node, placement, coordination, and release values;
+- `lattice-model::service` owns service and instance names;
+- `lattice-model::trace` owns propagation and telemetry resource values.
+
+Runtime containers such as `ServiceContext` remain in `lattice-actor`.
+Registry-local `ActorKey` and `ActorKind` remain in
+`lattice-actor-distributed`; they are not wire address primitives.
 
 `lattice-actor-distributed` owns protocols, activation registries, hosting,
 routing and bound references:

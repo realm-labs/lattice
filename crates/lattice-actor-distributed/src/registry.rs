@@ -12,14 +12,10 @@ use std::{
 
 use async_trait::async_trait;
 use dashmap::{DashMap, mapref::entry::Entry};
-use lattice_core::{
-    actor_address::{
-        ActivationId, ActorAddress, ActorPath, AddressError, ClusterId, NodeAddress,
-        NodeIncarnation, ProtocolId, ProtocolTag,
-    },
-    id::ActorId,
-    kind::ActorKind,
-    service_context::ServiceContext,
+use lattice_model::{
+    ModelError,
+    actor::{ActivationId, ActorAddress, ActorPath, ProtocolId, ProtocolTag},
+    cluster::{ClusterId, NodeEndpoint, NodeIncarnation},
 };
 use thiserror::Error;
 
@@ -30,6 +26,7 @@ use lattice_actor::{
     mailbox::MailboxConfig,
     observation::ActorObserverHandle,
     runtime::{ActorRuntime, ActorRuntimeConfig, ActorSpawnOptions, PassivationPolicy},
+    service::ServiceContext,
     traits::{Actor, ActorLifecycleState, PassivationReason, StopReason},
     watch::LocalActorRef,
 };
@@ -43,7 +40,10 @@ use crate::{
 };
 
 mod activation;
+pub mod key;
 mod quarantine;
+
+pub use key::{ActorKey, ActorKind};
 
 use activation::{ActivationCleanup, ActivationState};
 
@@ -87,7 +87,7 @@ pub struct ActorRegistryConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActorAddressConfig {
     pub cluster_id: ClusterId,
-    pub node_address: NodeAddress,
+    pub node_address: NodeEndpoint,
     pub node_incarnation: NodeIncarnation,
 }
 
@@ -110,7 +110,7 @@ pub struct ActorRegistry<A: Actor> {
     kind: ActorKind,
     config: ActorRegistryConfig,
     protocol_id: Option<ProtocolId>,
-    entries: Arc<DashMap<ActorId, RegistryEntry<A>>>,
+    entries: Arc<DashMap<ActorKey, RegistryEntry<A>>>,
     exact_entries: Arc<DashMap<ActivationId, ExactRegistryEntry<A>>>,
     quarantined: Arc<DashMap<LocalActorRef, QuarantinedEntry<A>>>,
     actor_system: Arc<OnceLock<ActorSystem>>,
@@ -120,7 +120,7 @@ pub struct ActorRegistry<A: Actor> {
 }
 
 type ActorFencingTokenResolver =
-    Arc<dyn Fn(&ActorId, &mut dyn FnMut(Option<u64>)) + Send + Sync + 'static>;
+    Arc<dyn Fn(&ActorKey, &mut dyn FnMut(Option<u64>)) + Send + Sync + 'static>;
 
 /// Monotonic authority generation attached to one placement-managed Actor activation.
 ///
@@ -145,7 +145,7 @@ impl ActorFencingToken {
 /// [`ActorRegistry::get_or_load`], which resolves authority automatically.
 #[doc(hidden)]
 pub struct ValidatedActorAuthority {
-    actor_id: ActorId,
+    actor_id: ActorKey,
     fencing_token: ActorFencingToken,
     registry_identity: usize,
 }
@@ -170,7 +170,7 @@ impl<A: Actor> fmt::Debug for ActorRegistry<A> {
 #[derive(Debug, Clone)]
 pub struct ActorCreateContext {
     pub actor_kind: ActorKind,
-    pub actor_id: ActorId,
+    pub actor_id: ActorKey,
     pub service: ServiceContext,
     fencing_token: Option<ActorFencingToken>,
 }
@@ -185,7 +185,7 @@ impl ActorCreateContext {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RetainedActorFailure {
-    pub actor_id: ActorId,
+    pub actor_id: ActorKey,
     pub local_ref: LocalActorRef,
     pub failure: StopFailureRecord,
 }
@@ -195,12 +195,12 @@ pub struct RegistryDrainResult {
     pub requested: usize,
     pub stopped: usize,
     pub retained_failures: Vec<RetainedActorFailure>,
-    pub request_failures: Vec<ActorId>,
+    pub request_failures: Vec<ActorKey>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QuarantineDiagnostics {
-    pub actor_id: ActorId,
+    pub actor_id: ActorKey,
     pub local_ref: LocalActorRef,
     pub actor_address: Option<ActorAddress>,
     pub failure: StopFailureRecord,
@@ -208,7 +208,7 @@ pub struct QuarantineDiagnostics {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActorCellDiagnostics {
-    pub actor_id: ActorId,
+    pub actor_id: ActorKey,
     pub local_ref: LocalActorRef,
     pub lifecycle: ActorLifecycleState,
     pub quarantined: bool,
@@ -216,7 +216,7 @@ pub struct ActorCellDiagnostics {
 }
 
 struct QuarantinedEntry<A: Actor> {
-    actor_id: ActorId,
+    actor_id: ActorKey,
     handle: ActorHandle<A>,
 }
 
@@ -356,7 +356,7 @@ impl<A: Actor> ActorRegistry<A> {
     #[doc(hidden)]
     pub fn install_fencing_token_resolver<F>(&self, resolver_name: impl Into<String>, resolver: F)
     where
-        F: Fn(&ActorId, &mut dyn FnMut(Option<u64>)) + Send + Sync + 'static,
+        F: Fn(&ActorKey, &mut dyn FnMut(Option<u64>)) + Send + Sync + 'static,
     {
         self.fencing_token_resolvers
             .write()
@@ -372,7 +372,7 @@ impl<A: Actor> ActorRegistry<A> {
         self.config.shard_migration
     }
 
-    pub fn running_actor_ids(&self) -> Vec<ActorId> {
+    pub fn running_actor_ids(&self) -> Vec<ActorKey> {
         self.entries
             .iter()
             .filter_map(|entry| match entry.value() {
@@ -391,7 +391,7 @@ impl<A: Actor> ActorRegistry<A> {
     ///
     /// This includes loading placeholders and Starting, Passivating, Stopping, and StopFailed
     /// cells so drain and authority fencing cannot miss in-flight work.
-    pub fn active_actor_ids(&self) -> Vec<ActorId> {
+    pub fn active_actor_ids(&self) -> Vec<ActorKey> {
         self.entries
             .iter()
             .filter_map(|entry| match entry.value() {
@@ -404,7 +404,7 @@ impl<A: Actor> ActorRegistry<A> {
             .collect()
     }
 
-    pub fn activation_state(&self, actor_id: &ActorId) -> EntityActivationState {
+    pub fn activation_state(&self, actor_id: &ActorKey) -> EntityActivationState {
         match self.entries.get(actor_id).as_deref() {
             Some(RegistryEntry::Running(_, _)) => EntityActivationState::Active,
             Some(RegistryEntry::Activating(activation)) => activation.state(),
@@ -412,7 +412,7 @@ impl<A: Actor> ActorRegistry<A> {
         }
     }
 
-    pub fn get_running(&self, actor_id: &ActorId) -> Option<ActorHandle<A>> {
+    pub fn get_running(&self, actor_id: &ActorKey) -> Option<ActorHandle<A>> {
         let token = self.resolve_fencing_token(actor_id).ok()?;
         self.with_actor_authority(actor_id, token, || {
             Ok(match self.entries.get(actor_id).as_deref() {
@@ -429,15 +429,15 @@ impl<A: Actor> ActorRegistry<A> {
         .flatten()
     }
 
-    pub fn exact_address(&self, actor_id: &ActorId) -> Option<ActorAddress> {
+    pub fn exact_address(&self, actor_id: &ActorKey) -> Option<ActorAddress> {
         let handle = self.get_running(actor_id)?;
         self.exact_reference(&handle)
     }
 
     pub fn address<P: ProtocolTag>(
         &self,
-        actor_id: &ActorId,
-    ) -> Result<Option<ActorAddress<P>>, AddressError> {
+        actor_id: &ActorKey,
+    ) -> Result<Option<ActorAddress<P>>, ModelError> {
         self.exact_address(actor_id)
             .map(|address| address.try_typed::<P>())
             .transpose()
@@ -467,7 +467,7 @@ impl<A: Actor> ActorRegistry<A> {
         }
     }
 
-    pub async fn remove(&self, actor_id: &ActorId) -> Option<ActorHandle<A>> {
+    pub async fn remove(&self, actor_id: &ActorKey) -> Option<ActorHandle<A>> {
         let handle = self.cancel_loading_or_handle(actor_id)??;
         if is_business_admitted(handle.lifecycle_state()) {
             let _ = handle.stop(StopReason::Requested);
@@ -514,7 +514,7 @@ impl<A: Actor> ActorRegistry<A> {
 
     pub async fn drain_actor_ids<I>(&self, actor_ids: I) -> RegistryDrainResult
     where
-        I: IntoIterator<Item = ActorId>,
+        I: IntoIterator<Item = ActorKey>,
     {
         let mut result = RegistryDrainResult::default();
         for actor_id in actor_ids {
@@ -584,7 +584,7 @@ impl<A: Actor> ActorRegistry<A> {
     /// StopFailed is deliberately nonterminal and keeps this future pending.
     pub async fn wait_actor_ids_terminal<I>(&self, actor_ids: I)
     where
-        I: IntoIterator<Item = ActorId>,
+        I: IntoIterator<Item = ActorKey>,
     {
         let entries = actor_ids
             .into_iter()
@@ -616,7 +616,7 @@ impl<A: Actor> ActorRegistry<A> {
 
     pub async fn passivate_actor_ids<I>(&self, actor_ids: I, reason: PassivationReason) -> usize
     where
-        I: IntoIterator<Item = ActorId>,
+        I: IntoIterator<Item = ActorKey>,
     {
         let mut passivated = 0;
         for actor_id in actor_ids {
@@ -653,7 +653,7 @@ impl<A: Actor> ActorRegistry<A> {
 
     pub async fn start(
         &self,
-        actor_id: ActorId,
+        actor_id: ActorKey,
         actor: A,
     ) -> Result<ActorHandle<A>, ActorActivationError> {
         self.remove_stopped_running_entry(&actor_id);
@@ -676,7 +676,7 @@ impl<A: Actor> ActorRegistry<A> {
 
     pub async fn get_or_activate<F, Fut>(
         &self,
-        actor_id: ActorId,
+        actor_id: ActorKey,
         activate: F,
     ) -> Result<ActorHandle<A>, ActorActivationError>
     where
@@ -690,7 +690,7 @@ impl<A: Actor> ActorRegistry<A> {
 
     async fn get_or_activate_with_token<F, Fut>(
         &self,
-        actor_id: ActorId,
+        actor_id: ActorKey,
         fencing_token: Option<ActorFencingToken>,
         activate: F,
     ) -> Result<ActorHandle<A>, ActorActivationError>
@@ -782,7 +782,7 @@ impl<A: Actor> ActorRegistry<A> {
 
     pub async fn get_or_create<F>(
         &self,
-        actor_id: ActorId,
+        actor_id: ActorKey,
         factory: F,
     ) -> Result<ActorHandle<A>, ActorActivationError>
     where
@@ -797,7 +797,7 @@ impl<A: Actor> ActorRegistry<A> {
 
     pub async fn get_or_load<L>(
         &self,
-        actor_id: ActorId,
+        actor_id: ActorKey,
         loader: L,
     ) -> Result<ActorHandle<A>, ActorActivationError>
     where
@@ -814,7 +814,7 @@ impl<A: Actor> ActorRegistry<A> {
     #[doc(hidden)]
     pub fn validate_actor_authority(
         &self,
-        actor_id: ActorId,
+        actor_id: ActorKey,
         expected_generation: u64,
     ) -> Result<ValidatedActorAuthority, ActorActivationError> {
         let fencing_token = self
@@ -857,7 +857,7 @@ impl<A: Actor> ActorRegistry<A> {
 
     fn create_context(
         &self,
-        actor_id: &ActorId,
+        actor_id: &ActorKey,
     ) -> Result<ActorCreateContext, ActorActivationError> {
         let fencing_token = self.resolve_fencing_token(actor_id)?;
         Ok(self.create_context_optional(actor_id, fencing_token))
@@ -865,7 +865,7 @@ impl<A: Actor> ActorRegistry<A> {
 
     fn create_context_with_token(
         &self,
-        actor_id: &ActorId,
+        actor_id: &ActorKey,
         fencing_token: ActorFencingToken,
     ) -> ActorCreateContext {
         self.create_context_optional(actor_id, Some(fencing_token))
@@ -873,7 +873,7 @@ impl<A: Actor> ActorRegistry<A> {
 
     fn create_context_optional(
         &self,
-        actor_id: &ActorId,
+        actor_id: &ActorKey,
         fencing_token: Option<ActorFencingToken>,
     ) -> ActorCreateContext {
         ActorCreateContext {
@@ -886,14 +886,14 @@ impl<A: Actor> ActorRegistry<A> {
 
     fn resolve_fencing_token(
         &self,
-        actor_id: &ActorId,
+        actor_id: &ActorKey,
     ) -> Result<Option<ActorFencingToken>, ActorActivationError> {
         self.resolve_authority(actor_id).map(|(token, _)| token)
     }
 
     fn resolve_authority(
         &self,
-        actor_id: &ActorId,
+        actor_id: &ActorKey,
     ) -> Result<(Option<ActorFencingToken>, Option<ActorFencingTokenResolver>), ActorActivationError>
     {
         let resolvers = self
@@ -929,7 +929,7 @@ impl<A: Actor> ActorRegistry<A> {
 
     fn with_actor_authority<R>(
         &self,
-        actor_id: &ActorId,
+        actor_id: &ActorKey,
         expected: Option<ActorFencingToken>,
         operation: impl FnOnce() -> Result<R, ActorActivationError>,
     ) -> Result<R, ActorActivationError> {
@@ -966,7 +966,7 @@ impl<A: Actor> ActorRegistry<A> {
         Arc::as_ptr(&self.entries) as usize
     }
 
-    fn remove_stopped_running_entry(&self, actor_id: &ActorId) {
+    fn remove_stopped_running_entry(&self, actor_id: &ActorKey) {
         let removed = self.entries.remove_if(actor_id, |_, entry| {
             matches!(
                 entry,
@@ -1000,7 +1000,7 @@ impl<A: Actor> ActorRegistry<A> {
         })
     }
 
-    fn entry_handle(&self, actor_id: &ActorId) -> Option<ActorHandle<A>> {
+    fn entry_handle(&self, actor_id: &ActorKey) -> Option<ActorHandle<A>> {
         match self.entries.get(actor_id).as_deref() {
             Some(RegistryEntry::Running(handle, _)) => Some(handle.clone()),
             Some(RegistryEntry::Activating(_)) | None => None,
@@ -1023,7 +1023,7 @@ impl<A: Actor> ActorRegistry<A> {
             })
     }
 
-    fn spawn_actor(&self, actor_id: ActorId, actor: A) -> Result<ActorHandle<A>, ActorFailure> {
+    fn spawn_actor(&self, actor_id: ActorKey, actor: A) -> Result<ActorHandle<A>, ActorFailure> {
         let self_address = self
             .actor_address_for(actor_id.clone())
             .map(|address| address.erase());
@@ -1095,7 +1095,7 @@ impl<A: Actor> ActorRegistry<A> {
         Ok(handle)
     }
 
-    fn actor_address_for(&self, actor_id: ActorId) -> Option<ActorAddress> {
+    fn actor_address_for(&self, actor_id: ActorKey) -> Option<ActorAddress> {
         let config = self.config.address.as_ref()?;
         let protocol_id = self.protocol_id?;
         let path = ActorPath::user([
@@ -1122,12 +1122,12 @@ impl<A: Actor> ActorRegistry<A> {
     }
 }
 
-fn encode_actor_id(actor_id: &ActorId) -> String {
+fn encode_actor_id(actor_id: &ActorKey) -> String {
     match actor_id {
-        ActorId::Str(value) => format!("s-{}", encode_segment(value.as_bytes())),
-        ActorId::U64(value) => format!("u-{value}"),
-        ActorId::I64(value) => format!("i-{value}"),
-        ActorId::Bytes(value) => format!("b-{}", encode_segment(value)),
+        ActorKey::Str(value) => format!("s-{}", encode_segment(value.as_bytes())),
+        ActorKey::U64(value) => format!("u-{value}"),
+        ActorKey::I64(value) => format!("i-{value}"),
+        ActorKey::Bytes(value) => format!("b-{}", encode_segment(value)),
     }
 }
 

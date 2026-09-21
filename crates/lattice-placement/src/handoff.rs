@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 
-use lattice_core::actor_address::NodeIncarnation;
+use lattice_model::cluster::NodeIncarnation;
 use thiserror::Error;
 
 use crate::types::{
@@ -234,9 +234,7 @@ pub enum HandoffError {
 
 #[cfg(test)]
 mod tests {
-    use lattice_core::actor_address::{
-        EntityType, NodeAddress, NodeIncarnation, PlacementDomainId,
-    };
+    use lattice_model::cluster::{EntityType, NodeEndpoint, NodeIncarnation, PlacementDomainId};
 
     use super::*;
     use crate::types::{CoordinatorTerm, Revision, ShardId};
@@ -244,7 +242,7 @@ mod tests {
     fn node(id: &str, incarnation: u128) -> NodeKey {
         NodeKey {
             node_id: id.to_owned(),
-            address: NodeAddress::new("127.0.0.1", 2500 + incarnation as u16).unwrap(),
+            address: NodeEndpoint::new("127.0.0.1", 2500 + incarnation as u16).unwrap(),
             incarnation: NodeIncarnation::new(incarnation).unwrap(),
         }
     }

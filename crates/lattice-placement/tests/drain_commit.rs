@@ -4,10 +4,10 @@ use std::{
     time::Duration,
 };
 
-use lattice_core::{
-    actor_address::{ClusterId, NodeAddress, NodeIncarnation, PlacementDomainId},
-    coordinator::CoordinatorScope,
-    release::ReleaseManifest,
+use lattice_model::{
+    cluster::CoordinatorScope,
+    cluster::ReleaseManifest,
+    cluster::{ClusterId, NodeEndpoint, NodeIncarnation, PlacementDomainId},
 };
 use lattice_placement::{
     control::{
@@ -29,7 +29,7 @@ use tokio::sync::watch;
 fn setup() -> (NodeKey, Arc<AssociationManager>, Arc<Association>) {
     let node = NodeKey {
         node_id: "departing".to_owned(),
-        address: NodeAddress::new("127.0.0.1", 34501).unwrap(),
+        address: NodeEndpoint::new("127.0.0.1", 34501).unwrap(),
         incarnation: NodeIncarnation::new(1).unwrap(),
     };
     let associations = Arc::new(
@@ -43,7 +43,7 @@ fn setup() -> (NodeKey, Arc<AssociationManager>, Arc<Association>) {
     let association = associations
         .get_or_create(
             ClusterId::new("drain-commit").unwrap(),
-            NodeAddress::new("127.0.0.1", 34502).unwrap(),
+            NodeEndpoint::new("127.0.0.1", 34502).unwrap(),
             NodeIncarnation::new(2).unwrap(),
         )
         .unwrap();

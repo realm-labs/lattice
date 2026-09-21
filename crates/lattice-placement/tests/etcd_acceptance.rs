@@ -8,15 +8,16 @@ use std::{
 use std::sync::Mutex;
 
 use etcd_client::Client;
-#[cfg(feature = "test-failpoints")]
-use lattice_core::failpoint::Failpoint;
-use lattice_core::{
-    actor_address::{
-        ConfigFingerprint, EntityType, NodeAddress, NodeIncarnation, PlacementDomainId, ProtocolId,
+use lattice_model::{
+    actor::ProtocolId,
+    cluster::CoordinatorScope,
+    cluster::{
+        ConfigFingerprint, EntityType, NodeEndpoint, NodeIncarnation, PlacementDomainId,
         SingletonKind,
     },
-    coordinator::CoordinatorScope,
 };
+#[cfg(feature = "test-failpoints")]
+use lattice_placement::failpoints;
 use lattice_placement::{
     allocation::{ProposedMove, RebalanceProposal, RebalanceTrigger},
     coordinator::{
@@ -72,14 +73,14 @@ fn migrating_storage_schema() -> String {
 fn node(id: &str, incarnation: u128, port: u16) -> NodeKey {
     NodeKey {
         node_id: id.to_owned(),
-        address: NodeAddress::new("127.0.0.1", port).unwrap(),
+        address: NodeEndpoint::new("127.0.0.1", port).unwrap(),
         incarnation: NodeIncarnation::new(incarnation).unwrap(),
     }
 }
 
 fn member_hello(node: NodeKey) -> MemberHello {
     MemberHello {
-        release: lattice_core::release::ReleaseManifest::development(1),
+        release: lattice_model::cluster::ReleaseManifest::development(1),
         rollout_participant: true,
         node,
         roles: BTreeSet::new(),
@@ -875,8 +876,8 @@ async fn real_etcd_migration_finalization_compare_failure_is_atomic_and_resumabl
     let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(1);
     let resume_rx = Arc::new(Mutex::new(resume_rx));
     let hook_resume = Arc::clone(&resume_rx);
-    let guard = lattice_core::failpoint::install_hook(move |point| {
-        if point == Failpoint::MigrationBeforeFinalize {
+    let guard = lattice_failpoint::install_hook(move |point| {
+        if point == failpoints::MIGRATION_BEFORE_FINALIZE {
             reached_tx.send(()).unwrap();
             hook_resume.lock().unwrap().recv().unwrap();
         }

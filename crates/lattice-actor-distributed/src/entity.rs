@@ -1,7 +1,7 @@
 //! Distributed entity identity and activation concepts.
 
 use lattice_actor::traits::Actor;
-use lattice_core::actor_address::EntityId;
+use lattice_model::cluster::EntityId;
 use thiserror::Error;
 
 /// Stable conversion between a domain key and its distributed entity ID.

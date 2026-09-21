@@ -4,9 +4,9 @@ use std::{
 };
 
 use lattice_actor_distributed::host::ProtocolHostRegistry;
-use lattice_core::{
-    actor_address::{ClusterId, NodeIncarnation},
-    release::ReleaseManifest,
+use lattice_model::{
+    cluster::ReleaseManifest,
+    cluster::{ClusterId, NodeIncarnation},
 };
 use lattice_placement::{
     coordinator::{MemberChange, MemberEvent, MemberHello, MemberRecord, MemberStatus},

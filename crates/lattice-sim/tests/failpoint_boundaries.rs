@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use lattice_core::failpoint::Failpoint;
+use lattice_sim::failpoints::Failpoint;
 
 const PRODUCTION_CRATES: [&str; 3] = ["lattice-remoting", "lattice-placement", "lattice-service"];
 
@@ -68,8 +68,9 @@ fn decision_call(production: &str, point: Failpoint) -> bool {
 }
 
 fn calls(production: &str, function: &str, point: Failpoint) -> bool {
+    let constant = point.name().to_ascii_uppercase();
     [")", ","].into_iter().any(|terminator| {
-        production.contains(&format!("{function}(Failpoint::{point:?}{terminator}"))
+        production.contains(&format!("{function}(failpoints::{constant}{terminator}"))
     })
 }
 

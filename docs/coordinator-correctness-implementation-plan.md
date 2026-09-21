@@ -289,7 +289,7 @@ session. Member registration resends pending effects but is not the only repair 
 | Authority/handoff reducers | `authority.rs`, `handoff.rs` | `StateVersion` checks and forward-only recovery effects |
 | Service lifecycle | `crates/lattice-service/src/cluster/*.rs`, `builder.rs` | new-term fresh sessions, generation hard switch, retryable incarnation state |
 | Operations | `crates/lattice-ops/src/admin.rs`, new offline migration binary | durable operation semantics and explicit migration command |
-| Failpoints | `crates/lattice-core/src/failpoint.rs` | post-atomic-commit/pre-effect and leadership-loss boundaries |
+| Failpoints | `crates/lattice-model/src/failpoint.rs` | post-atomic-commit/pre-effect and leadership-loss boundaries |
 | Simulation | `crates/lattice-sim/src/{store,scenario,explorer}.rs` | atomic transaction model, invariants, liveness, replay |
 | Real acceptance | `crates/lattice-placement/tests/etcd_acceptance.rs`, `tests/distributed/`, `lattice-sim testctl` | real etcd, process failover, chaos, artifacts |
 

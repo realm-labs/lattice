@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use lattice_core::coordinator::CoordinatorScope;
+use lattice_model::cluster::CoordinatorScope;
 
 use super::{InMemoryPlacementStore, LeaseState, StorageError, etcd, initial_revision};
 use crate::coordinator::LeaderRecord;

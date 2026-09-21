@@ -6,8 +6,9 @@
 //! partitioned away or queued. Delivery decodes the frame on the far side and acknowledges it back
 //! over the same simulated topology.
 
+use crate::failpoints::Failpoint;
 use bytes::Bytes;
-use lattice_core::failpoint::{self, Failpoint};
+use lattice_failpoint as failpoint;
 use lattice_remoting::{
     control::{
         CommandId, ControlApply, ControlStreamId, ReliableControlError, control_ack_frame,

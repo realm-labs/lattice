@@ -3,7 +3,7 @@ use std::io::{Error, ErrorKind, IoSlice};
 use std::sync::Arc;
 
 use bytes::{BufMut, Bytes, BytesMut};
-use lattice_core::{actor_address::NodeAddress, failpoint::Failpoint};
+use lattice_model::cluster::NodeEndpoint;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::{TcpListener, TcpStream},
@@ -21,6 +21,7 @@ use x509_parser::{
     parse_x509_certificate,
 };
 
+use crate::failpoints;
 #[cfg(feature = "tls")]
 use crate::handshake::NodeIdentity;
 use crate::{
@@ -457,7 +458,7 @@ where
     if handshake.lane != LaneKind::Control {
         return Ok(Vec::new());
     }
-    lattice_core::failpoint::hit(Failpoint::AssociationAfterHandshakeBeforeCatalogue);
+    lattice_failpoint::hit(failpoints::ASSOCIATION_AFTER_HANDSHAKE_BEFORE_CATALOGUE);
     connection
         .write_frame(&catalogue_frame(local_catalogue))
         .await?;
@@ -504,7 +505,7 @@ where
     if handshake.lane != LaneKind::Control {
         return Ok((handshake, Vec::new()));
     }
-    lattice_core::failpoint::hit(Failpoint::AssociationAfterHandshakeBeforeCatalogue);
+    lattice_failpoint::hit(failpoints::ASSOCIATION_AFTER_HANDSHAKE_BEFORE_CATALOGUE);
     let peer = decode_catalogue_frame(&connection.read_frame().await?, maximum_protocols)?;
     connection
         .write_frame(&catalogue_frame(local_catalogue))
@@ -523,7 +524,7 @@ pub enum NegotiationError {
 }
 
 pub async fn connect_tcp(
-    address: &NodeAddress,
+    address: &NodeEndpoint,
     codec: FrameCodec,
 ) -> Result<FramedConnection<TcpStream>, WireError> {
     let stream = TcpStream::connect((address.host(), address.port())).await?;
@@ -531,7 +532,7 @@ pub async fn connect_tcp(
     Ok(FramedConnection::new(stream, codec))
 }
 
-pub async fn bind_tcp(address: &NodeAddress) -> Result<TcpListener, WireError> {
+pub async fn bind_tcp(address: &NodeEndpoint) -> Result<TcpListener, WireError> {
     TcpListener::bind((address.host(), address.port()))
         .await
         .map_err(WireError::Io)
@@ -539,7 +540,7 @@ pub async fn bind_tcp(address: &NodeAddress) -> Result<TcpListener, WireError> {
 
 #[cfg(feature = "tls")]
 pub async fn connect_tls(
-    address: &NodeAddress,
+    address: &NodeEndpoint,
     server_name: String,
     config: Arc<ClientConfig>,
     expected_peer: &NodeIdentity,
@@ -567,7 +568,7 @@ pub async fn connect_tls(
 
 #[cfg(feature = "tls")]
 pub async fn connect_tls_candidate(
-    address: &NodeAddress,
+    address: &NodeEndpoint,
     server_name: String,
     config: Arc<ClientConfig>,
     codec: FrameCodec,
@@ -658,7 +659,8 @@ mod tests {
     };
 
     use bytes::Bytes;
-    use lattice_core::actor_address::{ClusterId, NodeAddress, NodeIncarnation, ProtocolId};
+    use lattice_model::actor::ProtocolId;
+    use lattice_model::cluster::{ClusterId, NodeEndpoint, NodeIncarnation};
     #[cfg(feature = "tls")]
     use rcgen::{CertificateParams, KeyPair, SanType};
     use tokio::{
@@ -1009,13 +1011,13 @@ mod tests {
         let server_identity = NodeIdentity {
             cluster_id: cluster_id.clone(),
             node_id: "server".to_owned(),
-            address: NodeAddress::new("127.0.0.1", socket.port()).unwrap(),
+            address: NodeEndpoint::new("127.0.0.1", socket.port()).unwrap(),
             incarnation: NodeIncarnation::new(2).unwrap(),
         };
         let client_identity = NodeIdentity {
             cluster_id,
             node_id: "client".to_owned(),
-            address: NodeAddress::new("127.0.0.1", 25548).unwrap(),
+            address: NodeEndpoint::new("127.0.0.1", 25548).unwrap(),
             incarnation: NodeIncarnation::new(1).unwrap(),
         };
         let client_protocol = ProtocolDescriptor {
@@ -1067,7 +1069,7 @@ mod tests {
         let expected = NodeIdentity {
             cluster_id: ClusterId::new("test").unwrap(),
             node_id: "node-a".to_owned(),
-            address: NodeAddress::new("127.0.0.1", 25520).unwrap(),
+            address: NodeEndpoint::new("127.0.0.1", 25520).unwrap(),
             incarnation: NodeIncarnation::new(7).unwrap(),
         };
         let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
@@ -1099,13 +1101,13 @@ mod tests {
         let client_identity = NodeIdentity {
             cluster_id: cluster_id.clone(),
             node_id: "client".to_owned(),
-            address: NodeAddress::new("127.0.0.1", socket.port() - 1).unwrap(),
+            address: NodeEndpoint::new("127.0.0.1", socket.port() - 1).unwrap(),
             incarnation: NodeIncarnation::new(11).unwrap(),
         };
         let server_identity = NodeIdentity {
             cluster_id,
             node_id: "server".to_owned(),
-            address: NodeAddress::new("127.0.0.1", socket.port()).unwrap(),
+            address: NodeEndpoint::new("127.0.0.1", socket.port()).unwrap(),
             incarnation: NodeIncarnation::new(12).unwrap(),
         };
         let (client_certificate, client_key) = test_certificate(&client_identity);

@@ -1,8 +1,8 @@
 use std::collections::BTreeSet;
 use std::time::Duration;
 
-use lattice_core::actor_address::{
-    ConfigFingerprint, EntityType, NodeAddress, NodeIncarnation, PlacementDomainId, SingletonKind,
+use lattice_model::cluster::{
+    ConfigFingerprint, EntityType, NodeEndpoint, NodeIncarnation, PlacementDomainId, SingletonKind,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -145,7 +145,7 @@ impl MonotonicTime {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct NodeKey {
     pub node_id: String,
-    pub address: NodeAddress,
+    pub address: NodeEndpoint,
     pub incarnation: NodeIncarnation,
 }
 

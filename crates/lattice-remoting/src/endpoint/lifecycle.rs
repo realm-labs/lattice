@@ -4,7 +4,7 @@ use std::{
     task::Poll,
 };
 
-use lattice_core::failpoint::Failpoint;
+use crate::failpoints;
 use tokio::{sync::watch, time::Instant};
 
 use super::{EndpointError, RemotingEndpoint};
@@ -14,7 +14,7 @@ impl RemotingEndpoint {
     /// error leaves unfinished tasks owned by the endpoint so a later call can continue cleanup.
     pub async fn shutdown(&self) -> Result<(), EndpointError> {
         self.shutdown_tx.send_replace(true);
-        lattice_core::failpoint::hit(Failpoint::ShutdownAfterFenceBeforeTaskJoin);
+        lattice_failpoint::hit(failpoints::SHUTDOWN_AFTER_FENCE_BEFORE_TASK_JOIN);
         let deadline = Instant::now() + self.config.shutdown_timeout;
         let _shutdown = tokio::time::timeout_at(deadline, self.shutdown_lock.lock())
             .await

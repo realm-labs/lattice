@@ -262,7 +262,7 @@ lattice-discovery-k8s
   endpoint_slice.rs Kubernetes EndpointSlice provider
 ```
 
-`lattice-discovery` depends on `lattice-core`, `lattice-config`, Tokio and a proven DNS resolver.
+`lattice-discovery` depends on `lattice-model`, `lattice-config`, Tokio and a proven DNS resolver.
 Use `hickory-resolver` for TTL-aware asynchronous DNS resolution. The Kubernetes crate depends on
 `lattice-discovery`, `kube` and `k8s-openapi`; this prevents Kubernetes dependencies from entering
 the normal `lattice-service` dependency graph unless an application selects the provider.
@@ -276,7 +276,7 @@ Define these public types under `lattice_discovery::provider`:
 
 ```rust
 pub struct DiscoveryTarget {
-    pub address: NodeAddress,
+    pub address: NodeEndpoint,
     pub expected_node_id: Option<String>,
     pub source: DiscoverySource,
     pub priority: u16,
@@ -300,7 +300,7 @@ Providers reconnect internally after transient errors and retain their last vali
 failure or temporary empty response is not interpreted as authoritative member removal.
 
 `AggregateDiscovery` accepts an ordered list of providers. It keeps the latest valid snapshot from
-each provider, merges targets by `NodeAddress`, retains all source metadata, and chooses the lowest
+each provider, merges targets by `NodeEndpoint`, retains all source metadata, and chooses the lowest
 numeric priority for a duplicate address. Candidate selection rotates targets within one priority so
 the first configured endpoint does not become a permanent hotspot. Provider errors are observable
 but do not erase healthy targets from other providers.
@@ -401,7 +401,7 @@ The probe performs transport/TLS negotiation first, then identity discovery:
 No Association is inserted into `AssociationManager` before these checks pass. Probe sockets accept
 only bootstrap frames and close immediately after the response.
 
-After learning the exact identity, apply the existing deterministic `(NodeAddress, incarnation)`
+After learning the exact identity, apply the existing deterministic `(NodeEndpoint, incarnation)`
 dial direction. If the probing node is the designated dialer, it opens the normal lanes. Otherwise
 the response schedules a reverse connection using the exact source identity from the probe. A stale
 Association for the same address and a different incarnation is fenced and disconnected before the
@@ -623,7 +623,7 @@ failure and passes aggregation/deduplication tests without depending on service 
 - Implement identity/certificate binding, leader redirect and reverse dial.
 - Fence stale incarnations before activating a replacement Association.
 
-Exit condition: a caller can turn an untrusted discovered `NodeAddress` into a validated exact
+Exit condition: a caller can turn an untrusted discovered `NodeEndpoint` into a validated exact
 `NodeIdentity`, while failed probes create no Association and carry no business frames.
 
 ### Batch C: membership state and storage

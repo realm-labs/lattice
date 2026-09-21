@@ -67,11 +67,11 @@ const FIXTURE_RELEASE_ID: u64 = 1;
 fn node_config(
     cluster_id: ClusterId,
     node_id: &str,
-    address: NodeAddress,
+    address: NodeEndpoint,
     incarnation: NodeIncarnation,
 ) -> NodeConfig {
     NodeConfig {
-        release: lattice_core::release::ReleaseManifest::development(FIXTURE_RELEASE_ID),
+        release: lattice_model::cluster::ReleaseManifest::development(FIXTURE_RELEASE_ID),
         cluster_id,
         node_id: node_id.to_owned(),
         address,

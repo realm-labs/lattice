@@ -5,9 +5,8 @@ use std::{
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use lattice_core::actor_address::{
-    ActivationId, ActorAddress, ActorPath, ClusterId, NodeAddress, NodeIncarnation, ProtocolId,
-};
+use lattice_model::actor::{ActivationId, ActorAddress, ActorPath, ProtocolId};
+use lattice_model::cluster::{ClusterId, NodeEndpoint, NodeIncarnation};
 use tokio::net::TcpListener;
 
 use super::RemotingEndpoint;
@@ -96,13 +95,13 @@ async fn idle_data_lanes_sleep_until_either_side_wakes_them() {
     let client_identity = NodeIdentity {
         cluster_id: cluster_id.clone(),
         node_id: "client".to_owned(),
-        address: NodeAddress::new("127.0.0.1", client_port).unwrap(),
+        address: NodeEndpoint::new("127.0.0.1", client_port).unwrap(),
         incarnation: NodeIncarnation::new(1).unwrap(),
     };
     let server_identity = NodeIdentity {
         cluster_id: cluster_id.clone(),
         node_id: "server".to_owned(),
-        address: NodeAddress::new("127.0.0.1", server_port).unwrap(),
+        address: NodeEndpoint::new("127.0.0.1", server_port).unwrap(),
         incarnation: NodeIncarnation::new(2).unwrap(),
     };
     let protocol_id = ProtocolId::new(7).unwrap();

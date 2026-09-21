@@ -11,6 +11,7 @@ use std::{
 };
 
 use async_trait::async_trait;
+use lattice_actor_distributed::actor_kind;
 use lattice_actor_distributed::{
     actor_protocol,
     error::ActorFailure,
@@ -21,19 +22,19 @@ use lattice_actor_distributed::{
     traits::{Actor, Responder},
 };
 use lattice_config::source::ConfigSource;
-use lattice_core::{
-    actor_address::{
-        ClusterId, EntityAddress, EntityId, EntityType, NodeAddress, NodeIncarnation,
-        PlacementDomainId, ProtocolId, RecipientAddress, SingletonAddress, SingletonKind,
-    },
-    actor_kind,
-    instance::InstanceId,
-    service_kind,
-    trace::{TelemetryResource, TraceContext},
-};
 use lattice_eventbus::{
     local::{EventBus, LocalEventBus},
     types::{EventEnvelope, EventId, EventSubscription, Subject, SubjectFilter},
+};
+use lattice_model::{
+    actor::{EntityAddress, ProtocolId, RecipientAddress, SingletonAddress},
+    cluster::{
+        ClusterId, EntityId, EntityType, NodeEndpoint, NodeIncarnation, PlacementDomainId,
+        SingletonKind,
+    },
+    service::ServiceInstanceId,
+    service_name,
+    trace::{TelemetryResource, TraceContext},
 };
 use lattice_ops::{
     admin::{AdminAuth, AdminHttpAdapter, AdminSnapshot, CoordinatorAdminHandler},
@@ -173,21 +174,21 @@ struct WorldConfig {
     capacity_units: u64,
 }
 
-fn reserve_address() -> Result<NodeAddress, Box<dyn StdError>> {
+fn reserve_address() -> Result<NodeEndpoint, Box<dyn StdError>> {
     let listener = StdTcpListener::bind("127.0.0.1:0")?;
     let port = listener.local_addr()?.port();
     drop(listener);
-    Ok(NodeAddress::new("127.0.0.1", port)?)
+    Ok(NodeEndpoint::new("127.0.0.1", port)?)
 }
 
 fn node_config(
     cluster_id: ClusterId,
     node_id: &str,
-    address: NodeAddress,
+    address: NodeEndpoint,
     incarnation: NodeIncarnation,
 ) -> NodeConfig {
     NodeConfig {
-        release: lattice_core::release::ReleaseManifest::development(1),
+        release: lattice_model::cluster::ReleaseManifest::development(1),
         cluster_id,
         node_id: node_id.to_owned(),
         address,
@@ -345,8 +346,8 @@ async fn main() -> Result<(), Box<dyn StdError>> {
         event_id: EventId::new("entered-1001"),
         subject: Subject::new("world.entered"),
         event_type: "player-entered".to_owned(),
-        source_service: service_kind!("World"),
-        source_instance: InstanceId::new("world-a"),
+        source_service: service_name!("World"),
+        source_instance: ServiceInstanceId::new("world-a"),
         recipient: Some(RecipientAddress::from(&world_ref).erase()),
         correlation_id: Some("minimal-world-run".to_owned()),
         trace: TraceContext::default(),
@@ -400,8 +401,8 @@ async fn main() -> Result<(), Box<dyn StdError>> {
     let exporter = InMemoryTelemetryExporter::default();
     OpenTelemetryPipeline::new(
         TelemetryResource {
-            service_kind: service_kind!("World"),
-            instance_id: InstanceId::new("world-a"),
+            service_name: service_name!("World"),
+            instance_id: ServiceInstanceId::new("world-a"),
             service_version: env!("CARGO_PKG_VERSION").to_owned(),
         },
         exporter.clone(),

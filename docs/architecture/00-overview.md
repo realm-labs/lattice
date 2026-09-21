@@ -694,7 +694,7 @@ etcd is control-plane storage, never a per-message routing database.
 ## 7. Workspace Boundaries
 
 ```text
-lattice-core
+lattice-model
   ids, paths, serializable ActorAddress/EntityAddress/SingletonAddress values, shared types
 
 lattice-actor

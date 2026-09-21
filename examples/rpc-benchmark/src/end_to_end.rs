@@ -11,6 +11,7 @@ use std::{
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::{StreamExt as _, stream::FuturesUnordered};
+use lattice_actor_distributed::{ActorKey, actor_kind};
 use lattice_actor_distributed::{
     error::{ActorCallError, ActorFailure},
     handle::ActorHandle,
@@ -18,12 +19,9 @@ use lattice_actor_distributed::{
     reply::ReplyTo,
     traits::{Actor, Handler, Request, Responder},
 };
-use lattice_core::{
-    actor_address::{
-        ActivationId, ActorAddress, ActorPath, ClusterId, NodeAddress, NodeIncarnation, ProtocolId,
-    },
-    actor_kind,
-    id::ActorId,
+use lattice_model::{
+    actor::{ActivationId, ActorAddress, ActorPath, ProtocolId},
+    cluster::{ClusterId, NodeEndpoint, NodeIncarnation},
 };
 use lattice_remoting::{
     association::{Association, AssociationManager},
@@ -241,7 +239,7 @@ impl RemoteActorTopology {
         let tell_completion = Arc::new(TellCompletion::default());
         let actor = actor_registry
             .start(
-                ActorId::U64(1),
+                ActorKey::U64(1),
                 EchoActor {
                     tell_completion: tell_completion.clone(),
                     processed_bytes: 0,
@@ -487,7 +485,7 @@ async fn available_identity(
     Ok(NodeIdentity {
         cluster_id,
         node_id: node_id.to_owned(),
-        address: NodeAddress::new("127.0.0.1", port)?,
+        address: NodeEndpoint::new("127.0.0.1", port)?,
         incarnation: NodeIncarnation::new(incarnation)?,
     })
 }

@@ -1,11 +1,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
-use lattice_core::actor_address::{
-    ConfigFingerprint, EntityType, NodeAddress, NodeIncarnation, PlacementDomainId, ProtocolId,
-    SingletonKind,
+use lattice_model::actor::ProtocolId;
+
+use lattice_model::cluster::CoordinatorScope;
+use lattice_model::cluster::{
+    ConfigFingerprint, EntityType, NodeEndpoint, NodeIncarnation, PlacementDomainId, SingletonKind,
 };
-use lattice_core::coordinator::CoordinatorScope;
 
 use super::domain::{
     ActivateAuthority, AllocateInitial, CreateDomainMember, CreateMember, CreatePlan, LeasedClaim,
@@ -34,14 +35,14 @@ fn domain() -> PlacementDomainId {
 fn node(id: &str, incarnation: u128, port: u16) -> NodeKey {
     NodeKey {
         node_id: id.to_owned(),
-        address: NodeAddress::new("127.0.0.1", port).unwrap(),
+        address: NodeEndpoint::new("127.0.0.1", port).unwrap(),
         incarnation: NodeIncarnation::new(incarnation).unwrap(),
     }
 }
 
 fn hello(node: NodeKey) -> MemberHello {
     MemberHello {
-        release: lattice_core::release::ReleaseManifest::development(1),
+        release: lattice_model::cluster::ReleaseManifest::development(1),
         rollout_participant: true,
         node,
         roles: BTreeSet::new(),

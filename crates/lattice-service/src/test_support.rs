@@ -3,7 +3,7 @@ use std::{
     sync::{Mutex, OnceLock},
 };
 
-use lattice_core::actor_address::NodeAddress;
+use lattice_model::cluster::NodeEndpoint;
 use tokio::{
     net::TcpListener,
     sync::{Mutex as AsyncMutex, MutexGuard},
@@ -19,7 +19,7 @@ pub async fn network_test_guard() -> MutexGuard<'static, ()> {
         .await
 }
 
-pub async fn unused_address() -> NodeAddress {
+pub async fn unused_address() -> NodeEndpoint {
     loop {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -30,7 +30,7 @@ pub async fn unused_address() -> NodeAddress {
             .insert(port);
         drop(listener);
         if unique {
-            return NodeAddress::new("127.0.0.1", port).unwrap();
+            return NodeEndpoint::new("127.0.0.1", port).unwrap();
         }
     }
 }

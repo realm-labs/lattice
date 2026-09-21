@@ -2,8 +2,8 @@ use std::collections::BTreeSet;
 use std::pin::Pin;
 
 use futures_util::Stream;
-use lattice_core::actor_address::NodeAddress;
-use lattice_core::coordinator::CoordinatorScope;
+use lattice_model::cluster::CoordinatorScope;
+use lattice_model::cluster::NodeEndpoint;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum DiscoveryOrigin {
@@ -74,7 +74,7 @@ impl DiscoverySource {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiscoveryTarget {
-    pub address: NodeAddress,
+    pub address: NodeEndpoint,
     pub expected_node_id: Option<String>,
     pub source: DiscoverySource,
     pub priority: u16,

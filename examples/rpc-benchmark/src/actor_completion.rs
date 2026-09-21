@@ -8,6 +8,7 @@ use std::{
 
 use bytes::Bytes;
 use futures_util::{StreamExt as _, stream::FuturesUnordered};
+use lattice_actor_distributed::{ActorKey, actor_kind};
 use lattice_actor_distributed::{
     error::{ActorFailure, ActorTellError},
     mailbox::MailboxConfig,
@@ -16,7 +17,6 @@ use lattice_actor_distributed::{
     reply::ReplyTo,
     traits::{Actor, Handler, MessageMetadata, MessageOutcome, Request, Responder},
 };
-use lattice_core::{actor_kind, id::ActorId};
 use tokio::sync::Notify;
 use tokio::sync::mpsc;
 
@@ -217,7 +217,7 @@ impl ActorCompletionTopology {
         };
         let registry = Arc::new(registry);
         let handle = registry
-            .start(ActorId::U64(1), CompletionActor::default())
+            .start(ActorKey::U64(1), CompletionActor::default())
             .await?;
         Ok(Self {
             registry,

@@ -8,12 +8,10 @@
 
 use std::collections::BTreeSet;
 
-use lattice_core::{
-    actor_address::{
-        ActivationId, ActorAddress, ActorPath, ClusterId, EntityType, NodeAddress, NodeIncarnation,
-        PlacementDomainId, ProtocolId,
-    },
-    watch::{WatchId, WatchStatus},
+use lattice_model::{
+    actor::{ActivationId, ActorAddress, ActorPath, ProtocolId},
+    actor::{WatchId, WatchStatus},
+    cluster::{ClusterId, EntityType, NodeEndpoint, NodeIncarnation, PlacementDomainId},
 };
 use lattice_placement::{
     handoff::{HandoffError, HandoffMachine, HandoffPhase},
@@ -330,7 +328,7 @@ fn incarnation(value: u128) -> NodeIncarnation {
 fn node(id: &str, value: u128, port: u16) -> NodeKey {
     NodeKey {
         node_id: id.to_owned(),
-        address: NodeAddress::new("127.0.0.1", port).unwrap(),
+        address: NodeEndpoint::new("127.0.0.1", port).unwrap(),
         incarnation: incarnation(value),
     }
 }
@@ -338,7 +336,7 @@ fn node(id: &str, value: u128, port: u16) -> NodeKey {
 fn process(id: &str, value: u128, port: u16) -> SimProcess {
     SimProcess {
         node_id: id.to_owned(),
-        address: NodeAddress::new("127.0.0.1", port).unwrap(),
+        address: NodeEndpoint::new("127.0.0.1", port).unwrap(),
         incarnation: incarnation(value),
         state: ProcessState::Running,
     }

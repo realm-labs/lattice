@@ -6,11 +6,11 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use lattice_core::{
-    actor_address::{
+use lattice_model::{
+    actor::{
         ActorAddress, EntityAddress, ProtocolId, ProtocolTag, RecipientAddress, SingletonAddress,
     },
-    watch::{WatchId, WatchStatus},
+    actor::{WatchId, WatchStatus},
 };
 use lattice_remoting::messaging::error::{AskError, TellError};
 use lattice_remoting::protocol::ProtocolFingerprint;
@@ -474,7 +474,7 @@ pub enum ProtocolRegistrationError {
 #[derive(Debug, Error)]
 pub enum RecipientError {
     #[error("actor address is invalid for the requested protocol")]
-    Address(#[from] lattice_core::actor_address::AddressError),
+    Address(#[from] lattice_model::ModelError),
     #[error("actor ask timeout cannot be represented as a deadline")]
     InvalidTimeout,
     #[error("actor protocol {protocol_id} is not registered with this actor system")]

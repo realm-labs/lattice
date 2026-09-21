@@ -5,13 +5,14 @@ use std::{
     time::Duration,
 };
 
+use lattice_actor_distributed::actor_kind;
 use lattice_actor_distributed::{
     host::ProtocolHostRegistry,
     registry::{ActorAddressConfig, ActorRegistryConfig},
 };
-use lattice_core::{
-    actor_address::{ClusterId, EntityId, EntityType, NodeAddress, NodeIncarnation, ProtocolId},
-    actor_kind,
+use lattice_model::{
+    actor::ProtocolId,
+    cluster::{ClusterId, EntityId, EntityType, NodeEndpoint, NodeIncarnation},
 };
 use lattice_placement::{
     control::PlacementControlRouter,
@@ -159,7 +160,7 @@ async fn remote_entity_ask_reaches_only_claimed_owner() {
     let binding = Arc::new(EntityProtocol::bind::<EntityActor>().unwrap());
     let source_loads = Arc::new(AtomicUsize::new(0));
     let owner_loads = Arc::new(AtomicUsize::new(0));
-    let registry = |address: NodeAddress, incarnation: NodeIncarnation| {
+    let registry = |address: NodeEndpoint, incarnation: NodeIncarnation| {
         Arc::new(ActorRegistry::new_bound(
             actor_kind!("RemoteEntity"),
             ActorRegistryConfig {

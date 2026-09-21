@@ -5,9 +5,10 @@ use std::{
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use lattice_core::{
-    actor_address::{ClusterId, NodeAddress, NodeIncarnation, ProtocolId},
-    coordinator::CoordinatorScope,
+use lattice_model::{
+    actor::ProtocolId,
+    cluster::CoordinatorScope,
+    cluster::{ClusterId, NodeEndpoint, NodeIncarnation},
 };
 use lattice_remoting::{
     association::{AssociationManager, AssociationState},
@@ -866,7 +867,7 @@ fn identity(cluster_id: ClusterId, node_id: &str, incarnation: u128, port: u16) 
     NodeIdentity {
         cluster_id,
         node_id: node_id.to_string(),
-        address: NodeAddress::new("127.0.0.1", port).unwrap(),
+        address: NodeEndpoint::new("127.0.0.1", port).unwrap(),
         incarnation: NodeIncarnation::new(incarnation).unwrap(),
     }
 }

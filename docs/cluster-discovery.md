@@ -11,7 +11,7 @@ is allowed, but collapsing those streams into one unscoped candidate set is not.
 
 Applications construct providers through their defining module paths and may combine them with
 `lattice_discovery::aggregate::AggregateDiscovery`. Aggregation deduplicates by canonical
-`NodeAddress`, retains every source origin, selects the lowest numeric priority, rejects conflicting
+`NodeEndpoint`, retains every source origin, selects the lowest numeric priority, rejects conflicting
 expected node IDs, and rotates candidates within one priority.
 
 ## Configuration

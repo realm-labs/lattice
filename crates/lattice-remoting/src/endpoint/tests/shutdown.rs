@@ -5,7 +5,7 @@ fn shutdown_endpoint(timeout: Duration) -> Arc<RemotingEndpoint> {
         NodeIdentity {
             cluster_id: ClusterId::new("shutdown").unwrap(),
             node_id: "shutdown".to_owned(),
-            address: NodeAddress::new("127.0.0.1", 32101).unwrap(),
+            address: NodeEndpoint::new("127.0.0.1", 32101).unwrap(),
             incarnation: NodeIncarnation::new(1).unwrap(),
         },
         ProtocolDescriptor {

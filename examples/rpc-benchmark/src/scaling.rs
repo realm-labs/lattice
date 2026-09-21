@@ -5,6 +5,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use lattice_actor_distributed::{ActorKey, actor_kind};
 use lattice_actor_distributed::{
     context::HandlerContext,
     error::{ActorFailure, ActorTellError},
@@ -13,7 +14,6 @@ use lattice_actor_distributed::{
     registry::{ActorRegistry, ActorRegistryConfig},
     traits::{Actor, Handler},
 };
-use lattice_core::{actor_kind, id::ActorId};
 use tokio::sync::Notify;
 
 #[derive(lattice_actor::Message)]
@@ -125,7 +125,7 @@ impl ActorScaleTopology {
         for index in 0..actor_count {
             handles.push(
                 registry
-                    .start(ActorId::U64((index + 1) as u64), ScaleActor::default())
+                    .start(ActorKey::U64((index + 1) as u64), ScaleActor::default())
                     .await?,
             );
         }

@@ -1,5 +1,5 @@
 use super::{
-    Actor, ActorAddress, ActorId, ActorLoader, ActorProtocolBinding, ActorRegistry, Arc, AskError,
+    Actor, ActorAddress, ActorKey, ActorLoader, ActorProtocolBinding, ActorRegistry, Arc, AskError,
     AssociationKey, AssociationManager, BTreeMap, Bytes, ClusterRouterError, DomainLogicalRouter,
     EntityAddress, EntityConfig, Instant, LOGICAL_RESOLVE_MESSAGE_ID, LogicPlacementState,
     LogicalBufferConfig, LogicalEntityTarget, LogicalRouter, LogicalSingletonTarget, Mutex,
@@ -114,11 +114,10 @@ impl DomainLogicalRouter {
         registry.install_fencing_token_resolver(
             authority_resolver_name,
             move |actor_id, publish| {
-                let ActorId::Bytes(entity_id) = actor_id else {
+                let ActorKey::Bytes(entity_id) = actor_id else {
                     return publish(None);
                 };
-                let Ok(entity_id) = lattice_core::actor_address::EntityId::new(entity_id.clone())
-                else {
+                let Ok(entity_id) = lattice_model::cluster::EntityId::new(entity_id.clone()) else {
                     return publish(None);
                 };
                 let Ok(shard_id) = authority_mapper.shard_for(&entity_id) else {
@@ -242,7 +241,7 @@ impl DomainLogicalRouter {
         registry.install_fencing_token_resolver(
             authority_resolver_name,
             move |actor_id, publish| {
-                let ActorId::Str(actor_kind) = actor_id else {
+                let ActorKey::Str(actor_kind) = actor_id else {
                     return publish(None);
                 };
                 if actor_kind != authority_kind.as_str() {

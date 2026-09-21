@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use lattice_core::coordinator::CoordinatorScope;
+use lattice_model::cluster::CoordinatorScope;
 use lattice_placement::control::PlacementControlCommand;
 use lattice_remoting::{association::Association, messaging::error::RemoteFailureCode};
 

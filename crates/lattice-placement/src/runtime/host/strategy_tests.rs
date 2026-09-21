@@ -1,8 +1,8 @@
 use std::{collections::BTreeSet, sync::Arc, time::Duration};
 
-use lattice_core::actor_address::{
-    EntityType, NodeAddress, NodeIncarnation, PlacementDomainId, ProtocolId,
-};
+use lattice_model::actor::ProtocolId;
+
+use lattice_model::cluster::{EntityType, NodeEndpoint, NodeIncarnation, PlacementDomainId};
 use lattice_remoting::{association::AssociationManager, config::RemotingConfig};
 
 use super::{CoordinatorHost, CoordinatorHostConfig};
@@ -50,7 +50,7 @@ impl ShardAllocationStrategy for TestAllocationStrategy {
 fn node() -> NodeKey {
     NodeKey {
         node_id: "strategy-host".to_owned(),
-        address: NodeAddress::new("127.0.0.1", 33011).unwrap(),
+        address: NodeEndpoint::new("127.0.0.1", 33011).unwrap(),
         incarnation: NodeIncarnation::new(11).unwrap(),
     }
 }

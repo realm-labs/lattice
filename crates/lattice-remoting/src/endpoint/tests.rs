@@ -17,9 +17,8 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use lattice_core::actor_address::{
-    ActivationId, ActorAddress, ActorPath, ClusterId, NodeAddress, NodeIncarnation, ProtocolId,
-};
+use lattice_model::actor::{ActivationId, ActorAddress, ActorPath, ProtocolId};
+use lattice_model::cluster::{ClusterId, NodeEndpoint, NodeIncarnation};
 
 use crate::{
     association::AssociationKey,
@@ -353,7 +352,7 @@ async fn accept_loop_sheds_connections_at_the_cap_and_keeps_accepting() {
     let server_identity = NodeIdentity {
         cluster_id: ClusterId::new("accept-cap-test").unwrap(),
         node_id: "server".to_owned(),
-        address: NodeAddress::new("127.0.0.1", server_address.port()).unwrap(),
+        address: NodeEndpoint::new("127.0.0.1", server_address.port()).unwrap(),
         incarnation: NodeIncarnation::new(1).unwrap(),
     };
     let descriptor = ProtocolDescriptor {
@@ -402,7 +401,7 @@ async fn a_stalled_peer_dial_does_not_block_other_peers() {
     let identity = |node_id: &str, port: u16, incarnation: u128| NodeIdentity {
         cluster_id: cluster_id.clone(),
         node_id: node_id.to_owned(),
-        address: NodeAddress::new("127.0.0.1", port).unwrap(),
+        address: NodeEndpoint::new("127.0.0.1", port).unwrap(),
         incarnation: NodeIncarnation::new(incarnation).unwrap(),
     };
     let client_identity = identity("client", client_port, 1);
@@ -464,13 +463,13 @@ async fn an_association_that_never_activates_is_abandoned_and_releases_its_permi
     let client_identity = NodeIdentity {
         cluster_id: cluster_id.clone(),
         node_id: "client".to_owned(),
-        address: NodeAddress::new("127.0.0.1", client_port).unwrap(),
+        address: NodeEndpoint::new("127.0.0.1", client_port).unwrap(),
         incarnation: NodeIncarnation::new(1).unwrap(),
     };
     let server_identity = NodeIdentity {
         cluster_id: cluster_id.clone(),
         node_id: "server".to_owned(),
-        address: NodeAddress::new("127.0.0.1", server_port).unwrap(),
+        address: NodeEndpoint::new("127.0.0.1", server_port).unwrap(),
         incarnation: NodeIncarnation::new(2).unwrap(),
     };
     let descriptor = ProtocolDescriptor {
@@ -536,13 +535,13 @@ async fn an_accepting_peer_admits_a_new_association_after_the_dialer_dropped_its
     let client_identity = NodeIdentity {
         cluster_id: cluster_id.clone(),
         node_id: "client".to_owned(),
-        address: NodeAddress::new("127.0.0.1", client_port).unwrap(),
+        address: NodeEndpoint::new("127.0.0.1", client_port).unwrap(),
         incarnation: NodeIncarnation::new(1).unwrap(),
     };
     let server_identity = NodeIdentity {
         cluster_id: cluster_id.clone(),
         node_id: "server".to_owned(),
-        address: NodeAddress::new("127.0.0.1", server_port).unwrap(),
+        address: NodeEndpoint::new("127.0.0.1", server_port).unwrap(),
         incarnation: NodeIncarnation::new(2).unwrap(),
     };
     assert!(
@@ -628,13 +627,13 @@ async fn backlogged_duplicate_dials_do_not_fence_a_same_incarnation_rejoin() {
     let client_identity = NodeIdentity {
         cluster_id: cluster_id.clone(),
         node_id: "client".to_owned(),
-        address: NodeAddress::new("127.0.0.1", client_port).unwrap(),
+        address: NodeEndpoint::new("127.0.0.1", client_port).unwrap(),
         incarnation: NodeIncarnation::new(1).unwrap(),
     };
     let server_identity = NodeIdentity {
         cluster_id: cluster_id.clone(),
         node_id: "server".to_owned(),
-        address: NodeAddress::new("127.0.0.1", server_port).unwrap(),
+        address: NodeEndpoint::new("127.0.0.1", server_port).unwrap(),
         incarnation: NodeIncarnation::new(2).unwrap(),
     };
     let descriptor = ProtocolDescriptor {
@@ -751,13 +750,13 @@ async fn real_tcp_endpoint_establishes_all_lanes_and_delivers_ask() {
     let client_identity = NodeIdentity {
         cluster_id: cluster_id.clone(),
         node_id: "client".to_owned(),
-        address: NodeAddress::new("127.0.0.1", client_port).unwrap(),
+        address: NodeEndpoint::new("127.0.0.1", client_port).unwrap(),
         incarnation: NodeIncarnation::new(1).unwrap(),
     };
     let server_identity = NodeIdentity {
         cluster_id: cluster_id.clone(),
         node_id: "server".to_owned(),
-        address: NodeAddress::new("127.0.0.1", server_port).unwrap(),
+        address: NodeEndpoint::new("127.0.0.1", server_port).unwrap(),
         incarnation: NodeIncarnation::new(2).unwrap(),
     };
     assert!(

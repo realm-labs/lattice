@@ -1,10 +1,11 @@
-use lattice_core::failpoint::Failpoint;
+use crate::failpoints;
 
 use super::{
     AllocationRequest, ClaimGrant, CoordinatorLeaseStore, CoordinatorRuntimeError, GrantSequence,
     HandoffEvent, Instant, MemberRemovalReason, MembershipStore, PlacementDomainLeader,
     PlacementDomainStore, PlacementSlot, PlacementSlotKey, PlacementSlotState, ScopedElectionStore,
 };
+
 use crate::{
     allocation::AllocationError,
     coordinator::MemberStatus,
@@ -314,7 +315,9 @@ where
             .await;
         match result {
             Ok(committed) => {
-                super::post_commit_failpoint(Failpoint::ReconciliationAfterCommitBeforeEffect)?;
+                super::post_commit_failpoint(
+                    failpoints::RECONCILIATION_AFTER_COMMIT_BEFORE_EFFECT,
+                )?;
                 let _ = self.store.revoke_lease(previous.lease_id).await;
                 self.remember_claim(committed.lease_id, committed.grant.clone());
                 self.replay_claim_if_connected(&committed.grant)?;

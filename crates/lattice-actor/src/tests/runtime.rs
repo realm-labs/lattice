@@ -2,7 +2,6 @@
 
 use std::sync::Arc;
 
-use lattice_core::service_context::ServiceContext;
 use tokio::sync::{Mutex, oneshot};
 
 use super::{
@@ -15,6 +14,7 @@ use crate::{
     error::ActorFailure,
     mailbox::MailboxConfig,
     runtime::{ActorExecutionPolicy, ActorRuntime, ActorRuntimeConfig, ActorSpawnOptions},
+    service::ServiceContext,
     traits::{Actor, ChildActorKey, ChildActorOptions},
 };
 

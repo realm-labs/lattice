@@ -3,9 +3,7 @@
 use std::sync::{Arc, OnceLock};
 
 use lattice_actor::{context::ActorContext, traits::Actor};
-use lattice_core::actor_address::{
-    ActorAddress, EntityAddress, RecipientAddress, SingletonAddress,
-};
+use lattice_model::actor::{ActorAddress, EntityAddress, RecipientAddress, SingletonAddress};
 
 use crate::{
     protocol::Protocol,

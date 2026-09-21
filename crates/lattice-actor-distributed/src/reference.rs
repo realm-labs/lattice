@@ -7,7 +7,7 @@ use lattice_actor::{
     traits::{Message, Request},
     watch::WatchTarget,
 };
-use lattice_core::actor_address::{
+use lattice_model::actor::{
     ActorAddress, EntityAddress, ProtocolTag, RecipientAddress, SingletonAddress,
 };
 

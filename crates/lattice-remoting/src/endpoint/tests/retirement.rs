@@ -9,7 +9,7 @@ async fn endpoints(config: RemotingConfig) -> (Arc<RemotingEndpoint>, Arc<Remoti
     let identity = |name: &str, port, incarnation| NodeIdentity {
         cluster_id: ClusterId::new("retirement").unwrap(),
         node_id: name.to_owned(),
-        address: NodeAddress::new("127.0.0.1", port).unwrap(),
+        address: NodeEndpoint::new("127.0.0.1", port).unwrap(),
         incarnation: NodeIncarnation::new(incarnation).unwrap(),
     };
     let descriptor = ProtocolDescriptor {

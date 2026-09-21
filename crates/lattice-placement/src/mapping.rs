@@ -1,6 +1,6 @@
 use std::{fmt, sync::Arc};
 
-use lattice_core::actor_address::EntityId;
+use lattice_model::cluster::EntityId;
 use thiserror::Error;
 use xxhash_rust::xxh3::xxh3_64_with_seed;
 

@@ -25,7 +25,7 @@
 //! ```
 //! use std::sync::Arc;
 //!
-//! use lattice_core::actor_address::{ClusterId, NodeIncarnation};
+//! use lattice_model::cluster::{ClusterId, NodeIncarnation};
 //! use lattice_id::{
 //!     service::{DistributedIdConfig, DistributedIdService},
 //!     worker::{InMemoryWorkerIdLeaseStore, WorkerIdOwner},

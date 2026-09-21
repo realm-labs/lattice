@@ -1,8 +1,8 @@
 use std::{collections::BTreeSet, sync::Arc, time::Duration};
 
-use lattice_core::{
-    actor_address::{NodeAddress, NodeIncarnation, PlacementDomainId},
-    coordinator::CoordinatorScope,
+use lattice_model::{
+    cluster::CoordinatorScope,
+    cluster::{NodeEndpoint, NodeIncarnation, PlacementDomainId},
 };
 use lattice_remoting::{
     association::{AssociationKey, AssociationManager},
@@ -28,7 +28,7 @@ use crate::{
 fn node(id: &str, incarnation: u128, port: u16) -> NodeKey {
     NodeKey {
         node_id: id.to_owned(),
-        address: NodeAddress::new("127.0.0.1", port).unwrap(),
+        address: NodeEndpoint::new("127.0.0.1", port).unwrap(),
         incarnation: NodeIncarnation::new(incarnation).unwrap(),
     }
 }
@@ -139,7 +139,7 @@ async fn stale_coordinator_term_is_fenced_before_membership_dispatch() {
     host.route_control(PlacementControlEvent {
         kind: PlacementControlEventKind::Command(Box::new(InboundPlacementControl {
             association: AssociationKey {
-                cluster_id: lattice_core::actor_address::ClusterId::new("term-fencing").unwrap(),
+                cluster_id: lattice_model::cluster::ClusterId::new("term-fencing").unwrap(),
                 local_incarnation: local.incarnation,
                 remote_address: remote.address,
                 remote_incarnation: remote.incarnation,
@@ -195,8 +195,7 @@ async fn standby_scope_fences_old_control_instead_of_retrying_it() {
         .route_control(PlacementControlEvent {
             kind: PlacementControlEventKind::Command(Box::new(InboundPlacementControl {
                 association: AssociationKey {
-                    cluster_id: lattice_core::actor_address::ClusterId::new("standby-fencing")
-                        .unwrap(),
+                    cluster_id: lattice_model::cluster::ClusterId::new("standby-fencing").unwrap(),
                     local_incarnation: standby_node.incarnation,
                     remote_address: remote.address,
                     remote_incarnation: remote.incarnation,

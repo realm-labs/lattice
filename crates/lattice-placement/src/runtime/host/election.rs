@@ -1,6 +1,6 @@
 use std::{collections::BTreeSet, sync::Arc, time::Duration};
 
-use lattice_core::{actor_address::PlacementDomainId, coordinator::CoordinatorScope};
+use lattice_model::{cluster::CoordinatorScope, cluster::PlacementDomainId};
 use lattice_remoting::association::AssociationManager;
 use tokio::sync::{mpsc, watch};
 
@@ -235,7 +235,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use lattice_core::actor_address::{NodeAddress, NodeIncarnation, PlacementDomainId};
+    use lattice_model::cluster::{NodeEndpoint, NodeIncarnation, PlacementDomainId};
 
     use super::*;
 
@@ -243,7 +243,7 @@ mod tests {
     fn candidate_preference_is_deterministic_scoped_and_bounded() {
         let local = NodeKey {
             node_id: "candidate".to_owned(),
-            address: NodeAddress::new("127.0.0.1", 33009).unwrap(),
+            address: NodeEndpoint::new("127.0.0.1", 33009).unwrap(),
             incarnation: NodeIncarnation::new(9).unwrap(),
         };
         let maximum = Duration::from_millis(10_000);

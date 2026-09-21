@@ -18,6 +18,7 @@ pub mod mailbox;
 pub mod observation;
 pub mod reply;
 pub mod runtime;
+pub mod service;
 pub mod state_machine;
 pub mod traits;
 pub mod watch;

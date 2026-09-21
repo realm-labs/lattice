@@ -4,7 +4,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use lattice_core::actor_address::{NodeIncarnation, PlacementDomainId};
+use lattice_model::cluster::{NodeIncarnation, PlacementDomainId};
 use lattice_placement::{
     authority::AuthorityEffect,
     control::PlacementControlEvent,

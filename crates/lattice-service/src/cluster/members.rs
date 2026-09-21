@@ -3,7 +3,7 @@ use std::{
     sync::Mutex,
 };
 
-use lattice_core::actor_address::NodeIncarnation;
+use lattice_model::cluster::NodeIncarnation;
 use lattice_placement::{
     coordinator::{MemberChange, MemberEvent, MemberRecord, MemberStatus},
     types::{MembershipVersion, NodeKey},
@@ -175,7 +175,7 @@ pub enum MemberDirectoryError {
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
 
-    use lattice_core::actor_address::{NodeAddress, NodeIncarnation};
+    use lattice_model::cluster::{NodeEndpoint, NodeIncarnation};
     use lattice_placement::{
         coordinator::{
             MemberChange, MemberEvent, MemberHello, MemberRecord, MemberRemovalReason, MemberStatus,
@@ -188,13 +188,13 @@ mod tests {
     fn member(revision: u64, incarnation: u64) -> MemberRecord {
         let node = NodeKey {
             node_id: "node-a".to_string(),
-            address: NodeAddress::new("127.0.0.1", 7447).unwrap(),
+            address: NodeEndpoint::new("127.0.0.1", 7447).unwrap(),
             incarnation: NodeIncarnation::new(u128::from(incarnation)).unwrap(),
         };
         MemberRecord {
             node: node.clone(),
             hello: MemberHello {
-                release: lattice_core::release::ReleaseManifest::development(1),
+                release: lattice_model::cluster::ReleaseManifest::development(1),
                 rollout_participant: true,
                 node,
                 roles: BTreeSet::new(),

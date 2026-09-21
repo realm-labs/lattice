@@ -10,7 +10,7 @@ use super::target_cache::ExactTargetCache;
 use super::target_dictionary::ExactTargetDictionary;
 use super::{
     ActivationId, ActorPath, Bytes, ClusterId, ConfigFingerprint, Duration, EntityAddress,
-    EntityId, EntityType, Frame, FrameKind, Message, NodeAddress, NodeIncarnation,
+    EntityId, EntityType, Frame, FrameKind, Message, NodeEndpoint, NodeIncarnation,
     PlacementDomainId, ProtocolId, SingletonAddress, SingletonKind,
 };
 
@@ -397,7 +397,7 @@ pub(super) struct FailureWire {
 }
 
 #[cfg(test)]
-pub(super) fn target_to_wire<A: lattice_core::actor_address::ProtocolTag>(
+pub(super) fn target_to_wire<A: lattice_model::actor::ProtocolTag>(
     target: &ActorAddress<A>,
 ) -> ExactActorTargetWire {
     ExactActorTargetWire {
@@ -425,7 +425,7 @@ pub(super) fn target_from_wire(
     Ok(ExactActorTarget {
         cluster_id: ClusterId::new(decode_wire_string(wire.cluster_id)?)
             .map_err(|_| RemoteMessageError::InvalidPayload)?,
-        node_address: NodeAddress::new(decode_wire_string(wire.host)?, port)
+        node_address: NodeEndpoint::new(decode_wire_string(wire.host)?, port)
             .map_err(|_| RemoteMessageError::InvalidPayload)?,
         actor_path: ActorPath::try_from(decode_wire_string(wire.actor_path)?)
             .map_err(|_| RemoteMessageError::InvalidPayload)?,
@@ -483,7 +483,7 @@ pub(super) fn entity_target_from_wire(
             ConfigFingerprint::new(fingerprint),
         )
         .map_err(|_| RemoteMessageError::InvalidPayload)?,
-        owner_address: NodeAddress::new(wire.owner_host, owner_port)
+        owner_address: NodeEndpoint::new(wire.owner_host, owner_port)
             .map_err(|_| RemoteMessageError::InvalidPayload)?,
         owner_incarnation,
         assignment_generation: wire.assignment_generation,
@@ -531,7 +531,7 @@ pub(super) fn singleton_target_from_wire(
             ConfigFingerprint::new(fingerprint),
         )
         .map_err(|_| RemoteMessageError::InvalidPayload)?,
-        owner_address: NodeAddress::new(wire.owner_host, owner_port)
+        owner_address: NodeEndpoint::new(wire.owner_host, owner_port)
             .map_err(|_| RemoteMessageError::InvalidPayload)?,
         owner_incarnation,
         assignment_generation: wire.assignment_generation,

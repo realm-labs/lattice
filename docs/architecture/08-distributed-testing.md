@@ -229,9 +229,11 @@ shutdown_after_fence_before_task_join
 
 Failpoint behavior is test-only and cannot be enabled by unauthenticated production traffic. Each critical boundary is exercised against the relevant fault set:
 
-The stable names live in `lattice-core::failpoint::Failpoint` behind the `test-failpoints` feature.
-Production remoting, placement, watch, and shutdown code calls this shared catalogue at all 27
-boundaries, and `lattice-sim` machine-checks that every name has a call site.
+`lattice-failpoint` owns only the hook mechanism and `FailpointId`. Stable IDs live beside their
+production boundaries in `lattice-remoting::failpoints` and `lattice-placement::failpoints`.
+Enabling `lattice-failpoint/enabled` installs test hooks; the default production build reduces a
+hit to a no-op. `lattice-sim::failpoints` aggregates the subsystem IDs into its exhaustive
+27-boundary catalogue and machine-checks that every name has a call site.
 
 Reaching a boundary is weaker than injecting at it. `hit` only observes, so a hook can block or
 panic but cannot change what the caller does; `hit_decision` returns a `FailpointAction` the call

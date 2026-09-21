@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use lattice_core::actor_address::{NodeAddress, NodeIncarnation};
+use lattice_model::cluster::{NodeEndpoint, NodeIncarnation};
 use lattice_placement::coordinator::{
     MemberChange, MemberEvent, MemberHello, MemberRecord, MemberRemovalReason, MemberStatus,
 };
@@ -280,13 +280,13 @@ impl LifecycleScenario {
 fn member(node_id: &str, incarnation: u128, port: u16, revision: u64) -> MemberRecord {
     let node = NodeKey {
         node_id: node_id.to_owned(),
-        address: NodeAddress::new("127.0.0.1", port).unwrap(),
+        address: NodeEndpoint::new("127.0.0.1", port).unwrap(),
         incarnation: NodeIncarnation::new(incarnation).unwrap(),
     };
     MemberRecord {
         node: node.clone(),
         hello: MemberHello {
-            release: lattice_core::release::ReleaseManifest::development(1),
+            release: lattice_model::cluster::ReleaseManifest::development(1),
             rollout_participant: true,
             node,
             roles: BTreeSet::new(),

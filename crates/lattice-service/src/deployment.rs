@@ -1,7 +1,7 @@
 use std::{collections::BTreeSet, sync::Arc, time::Duration};
 
-use lattice_core::{actor_address::PlacementDomainId, coordinator::CoordinatorScope};
 use lattice_discovery::static_provider::{StaticDiscovery, StaticEndpoint};
+use lattice_model::{cluster::CoordinatorScope, cluster::PlacementDomainId};
 use lattice_placement::{
     control::{DEFAULT_MAX_CONTROL_PAYLOAD, PlacementControlRouter},
     runtime::host::{CoordinatorHost, CoordinatorHostConfig},
@@ -334,7 +334,7 @@ where
 mod tests {
     use std::{collections::BTreeSet, net::TcpListener, sync::Arc, time::Duration};
 
-    use lattice_core::actor_address::{ClusterId, NodeAddress, NodeIncarnation};
+    use lattice_model::cluster::{ClusterId, NodeEndpoint, NodeIncarnation};
     use lattice_placement::{
         runtime::host::CoordinatorHostConfig, storage::InMemoryPlacementStore,
     };
@@ -347,16 +347,16 @@ mod tests {
         lifecycle::{CoordinatorScopeState, NodeLifecycleState},
     };
 
-    fn unused_address() -> NodeAddress {
+    fn unused_address() -> NodeEndpoint {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         drop(listener);
-        NodeAddress::new("127.0.0.1", port).unwrap()
+        NodeEndpoint::new("127.0.0.1", port).unwrap()
     }
 
     fn node(cluster: &ClusterId, node_id: &str) -> NodeConfig {
         NodeConfig {
-            release: lattice_core::release::ReleaseManifest::development(1),
+            release: lattice_model::cluster::ReleaseManifest::development(1),
             cluster_id: cluster.clone(),
             node_id: node_id.to_owned(),
             address: unused_address(),

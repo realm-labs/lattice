@@ -1,3 +1,5 @@
+//! Immutable service-scoped dependencies shared by Actors in one runtime.
+
 use std::any::{Any, TypeId, type_name};
 use std::collections::HashMap;
 use std::fmt;
@@ -11,6 +13,13 @@ pub enum ServiceContextError {
     DuplicateExtension { type_name: &'static str },
 }
 
+/// Type-indexed bridge from an Actor runtime to application infrastructure.
+///
+/// A context is configured on [`crate::runtime::ActorRuntimeConfig`] and cloned
+/// into every Actor spawned by that runtime. Values are immutable and shared by
+/// `Arc`; activation-specific integration metadata belongs in
+/// [`crate::attachments::ActorRuntimeAttachments`], while mutable business state
+/// belongs on the Actor itself.
 #[derive(Clone)]
 pub struct ServiceContext {
     inner: Arc<ServiceContextInner>,

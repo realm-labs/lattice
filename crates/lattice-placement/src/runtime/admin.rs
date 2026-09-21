@@ -1,6 +1,8 @@
+use crate::failpoints;
+
 use std::time::SystemTime;
 
-use lattice_core::{actor_address::EntityType, failpoint::Failpoint};
+use lattice_model::cluster::EntityType;
 
 use super::{
     BTreeMap, CoordinatorInspection, CoordinatorLeaseStore, CoordinatorOperation,
@@ -9,6 +11,7 @@ use super::{
     PlacementSlotState, PlanReason, PlanStatus, RebalancePlan, RebalanceProposal, RebalanceTrigger,
     ScopedElectionStore, membership::plan_priority,
 };
+
 use crate::{
     allocation::{AllocationError, ProposedMove},
     coordinator::MemberRemovalReason,
@@ -195,7 +198,7 @@ where
             AdminOperationResult::AutomaticBalanceUpdated,
             self.version.clone(),
         )?;
-        super::guarded_commit_failpoint(Failpoint::AdminBeforeGuardedCommit)?;
+        super::guarded_commit_failpoint(failpoints::ADMIN_BEFORE_GUARDED_COMMIT)?;
         let settings = self
             .store
             .commit_automatic_settings(
@@ -207,7 +210,7 @@ where
                 },
             )
             .await?;
-        super::post_commit_failpoint(Failpoint::AdminAfterCommitBeforeResponse)?;
+        super::post_commit_failpoint(failpoints::ADMIN_AFTER_COMMIT_BEFORE_RESPONSE)?;
         self.automatic_globally_paused = settings.globally_paused;
         self.paused_entity_types = settings.paused_entity_types.clone();
         self.automatic_settings = Some(settings);
@@ -708,7 +711,7 @@ where
                 )
             })
             .transpose()?;
-        super::guarded_commit_failpoint(Failpoint::PlanBeforeGuardedCommit)?;
+        super::guarded_commit_failpoint(failpoints::PLAN_BEFORE_GUARDED_COMMIT)?;
         if let Some(operation) = operation.clone() {
             self.store
                 .create_plan_with_operation(
@@ -726,7 +729,7 @@ where
                 .create_plan(&self.leader_guard, CreatePlan { plan: plan.clone() })
                 .await?;
         }
-        super::post_commit_failpoint(Failpoint::RebalanceAfterPlanPersist)?;
+        super::post_commit_failpoint(failpoints::REBALANCE_AFTER_PLAN_PERSIST)?;
         self.plans.insert(plan_id, plan);
         self.start_pending_moves(plan_id).await?;
         if operation.is_some() {

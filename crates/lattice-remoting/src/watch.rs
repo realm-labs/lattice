@@ -5,14 +5,12 @@ use std::{
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use lattice_core::{
-    actor_address::{
-        ActivationId, ActorAddress, ActorPath, ClusterId, EntityAddress, NodeAddress,
-        NodeIncarnation, ProtocolId, ProtocolTag, SingletonAddress,
-    },
-    failpoint::{Failpoint, FailpointAction},
-    watch::{TerminatedReason, WatchId, WatchStatus},
+use lattice_failpoint::FailpointAction;
+use lattice_model::actor::{
+    ActivationId, ActorAddress, ActorPath, EntityAddress, ProtocolId, ProtocolTag,
+    SingletonAddress, TerminatedReason, WatchId, WatchStatus,
 };
+use lattice_model::cluster::{ClusterId, NodeEndpoint, NodeIncarnation};
 use prost::{Enumeration, Message};
 use thiserror::Error;
 use tokio::{
@@ -20,7 +18,7 @@ use tokio::{
     task::AbortHandle,
 };
 
-use crate::{association::AssociationId, messaging::target::ExactActorTarget};
+use crate::{association::AssociationId, failpoints, messaging::target::ExactActorTarget};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WatchCommand {
@@ -275,7 +273,7 @@ fn target_from_wire(wire: Option<ExactActorTargetWire>) -> Result<ExactActorTarg
     let port = u16::try_from(wire.port).map_err(|_| WatchError::InvalidCommand)?;
     Ok(ExactActorTarget {
         cluster_id: ClusterId::new(wire.cluster_id).map_err(|_| WatchError::InvalidCommand)?,
-        node_address: NodeAddress::new(wire.host, port).map_err(|_| WatchError::InvalidCommand)?,
+        node_address: NodeEndpoint::new(wire.host, port).map_err(|_| WatchError::InvalidCommand)?,
         actor_path: ActorPath::try_from(wire.actor_path).map_err(|_| WatchError::InvalidCommand)?,
         activation_id: ActivationId::new(node_incarnation, wire.activation_sequence)
             .map_err(|_| WatchError::InvalidCommand)?,
@@ -465,7 +463,7 @@ impl WatchRegistry {
                 task: None,
             },
         );
-        lattice_core::failpoint::hit(Failpoint::WatchAfterInstallBeforeAck);
+        lattice_failpoint::hit(failpoints::WATCH_AFTER_INSTALL_BEFORE_ACK);
         Ok(WatchCommand::WatchAck { watch_id, target })
     }
 
@@ -548,7 +546,7 @@ impl WatchRegistry {
         let Some(watches) = self.target_watches.remove(&target.actor_path.to_string()) else {
             return Vec::new();
         };
-        if lattice_core::failpoint::hit_decision(Failpoint::WatchAfterTerminatedBeforeAck)
+        if lattice_failpoint::hit_decision(failpoints::WATCH_AFTER_TERMINATED_BEFORE_ACK)
             == FailpointAction::Drop
         {
             return Vec::new();
@@ -728,9 +726,8 @@ pub enum WatchError {
 
 #[cfg(test)]
 mod tests {
-    use lattice_core::actor_address::{
-        ActivationId, ActorPath, ClusterId, NodeAddress, ProtocolId,
-    };
+    use lattice_model::actor::{ActivationId, ActorPath, ProtocolId};
+    use lattice_model::cluster::{ClusterId, NodeEndpoint};
 
     use super::*;
 
@@ -738,7 +735,7 @@ mod tests {
         let node = NodeIncarnation::new(2).unwrap();
         ActorAddress::new(
             ClusterId::new("test").unwrap(),
-            NodeAddress::new("remote", 25520).unwrap(),
+            NodeEndpoint::new("remote", 25520).unwrap(),
             ActorPath::user(["user", "actor"]).unwrap(),
             ActivationId::new(node, sequence).unwrap(),
             ProtocolId::new(7).unwrap(),

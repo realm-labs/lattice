@@ -2,7 +2,7 @@ use std::{fmt::Display, pin::Pin, time::Duration};
 
 use futures_util::Stream;
 use lattice_config::store::ConfigStore;
-use lattice_core::{actor_address::NodeAddress, coordinator::CoordinatorScope};
+use lattice_model::{cluster::CoordinatorScope, cluster::NodeEndpoint};
 use serde::Deserialize;
 
 use crate::provider::{
@@ -224,7 +224,7 @@ fn parse_update(
 
     let mut targets = Vec::with_capacity(document.endpoints.len());
     for endpoint in document.endpoints {
-        let address = NodeAddress::new(endpoint.host, endpoint.port).map_err(|error| {
+        let address = NodeEndpoint::new(endpoint.host, endpoint.port).map_err(|error| {
             DiscoveryError::Provider {
                 provider: "config_store",
                 message: format!("invalid endpoint: {error}"),

@@ -1,4 +1,4 @@
-use lattice_core::actor_address::ProtocolId;
+use lattice_model::actor::ProtocolId;
 use lattice_remoting::{
     association::Association,
     protocol::{ProtocolDescriptor, ProtocolFingerprint},

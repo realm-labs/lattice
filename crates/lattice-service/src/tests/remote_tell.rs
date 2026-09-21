@@ -7,6 +7,7 @@ use std::{
 };
 
 use bytes::BytesMut;
+use lattice_actor_distributed::{ActorKey, actor_kind};
 use lattice_actor_distributed::{
     actor_protocol,
     context::HandlerContext,
@@ -16,10 +17,9 @@ use lattice_actor_distributed::{
     registry::{ActorAddressConfig, ActorRegistry, ActorRegistryConfig},
     traits::{Actor, Handler},
 };
-use lattice_core::{
-    actor_address::{ActorAddress, ClusterId, NodeIncarnation},
-    actor_kind,
-    id::ActorId,
+use lattice_model::{
+    actor::ActorAddress,
+    cluster::{ClusterId, NodeIncarnation},
 };
 use lattice_remoting::handshake::NodeIdentity;
 use tokio::sync::Notify;
@@ -115,7 +115,7 @@ async fn remote_tell_waits_for_mailbox_capacity_without_losing_messages() {
     let completed = Arc::new(Notify::new());
     registry
         .start(
-            ActorId::U64(1),
+            ActorKey::U64(1),
             FloodActor {
                 processed: processed.clone(),
                 completed: completed.clone(),
@@ -123,7 +123,7 @@ async fn remote_tell_waits_for_mailbox_capacity_without_losing_messages() {
         )
         .await
         .unwrap();
-    let target: ActorAddress<FloodProtocol> = registry.address(&ActorId::U64(1)).unwrap().unwrap();
+    let target: ActorAddress<FloodProtocol> = registry.address(&ActorKey::U64(1)).unwrap().unwrap();
     let server = LatticeService::builder(node_config(
         cluster_id.clone(),
         "server",

@@ -5,7 +5,9 @@
 
 use std::collections::BTreeSet;
 
-use lattice_core::{failpoint::Failpoint, watch::TerminatedReason};
+use lattice_model::actor::TerminatedReason;
+
+use crate::failpoints::Failpoint;
 use lattice_placement::{
     coordinator::MemberHello,
     runtime::membership_plane::{MembershipLeader, MembershipLeaderConfig},
@@ -297,7 +299,7 @@ async fn production_membership_commit_fails_under_an_injected_store_failure() {
 fn member_hello() -> MemberHello {
     MemberHello {
         node: node("member", 11, 29301),
-        release: lattice_core::release::ReleaseManifest::development(1),
+        release: lattice_model::cluster::ReleaseManifest::development(1),
         rollout_participant: true,
         roles: Default::default(),
         failure_domains: Default::default(),

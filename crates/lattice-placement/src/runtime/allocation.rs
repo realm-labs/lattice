@@ -1,9 +1,8 @@
+use crate::failpoints;
+
 use std::collections::BTreeSet;
 
-use lattice_core::{
-    actor_address::{EntityType, PlacementDomainId, SingletonKind},
-    failpoint::Failpoint,
-};
+use lattice_model::cluster::{EntityType, PlacementDomainId, SingletonKind};
 
 use super::{
     AllocationRequest, BTreeMap, ClaimGrant, CoordinatorLeaseStore, CoordinatorRuntimeError,
@@ -11,6 +10,7 @@ use super::{
     PlacementDomainLeader, PlacementDomainStore, PlacementNode, PlacementSlot, PlacementSlotKey,
     PlacementSlotState, PlacementView, ScopedElectionStore, SingletonConfig,
 };
+
 use crate::{
     storage::{
         StorageError,
@@ -294,7 +294,7 @@ where
                 lease_id,
             },
         };
-        super::guarded_commit_failpoint(Failpoint::AuthorityBeforeGuardedCommit)?;
+        super::guarded_commit_failpoint(failpoints::AUTHORITY_BEFORE_GUARDED_COMMIT)?;
         let committed = match self
             .store
             .allocate_initial(&self.leader_guard, request)
@@ -325,7 +325,7 @@ where
         };
         let slot = committed.slot;
         let leased_claim = committed.claim;
-        super::post_commit_failpoint(Failpoint::InitialAuthorityAfterCommitBeforeEffect)?;
+        super::post_commit_failpoint(failpoints::INITIAL_AUTHORITY_AFTER_COMMIT_BEFORE_EFFECT)?;
         self.version = slot.version.clone();
         self.remember_claim(leased_claim.lease_id, leased_claim.grant.clone());
         self.publish_slot_delta(&slot).await?;

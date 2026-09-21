@@ -6,6 +6,7 @@ use std::{
     time::Duration,
 };
 
+use lattice_actor_distributed::{ActorKey, actor_kind};
 use lattice_actor_distributed::{
     actor_protocol,
     error::ActorFailure,
@@ -14,10 +15,9 @@ use lattice_actor_distributed::{
     reply::ReplyTo,
     traits::{Actor, Responder},
 };
-use lattice_core::{
-    actor_address::{ActorAddress, ClusterId, NodeAddress, NodeIncarnation},
-    actor_kind,
-    id::ActorId,
+use lattice_model::{
+    actor::ActorAddress,
+    cluster::{ClusterId, NodeEndpoint, NodeIncarnation},
 };
 use lattice_remoting::config::RemotingConfig;
 use lattice_service::{builder::LatticeService, config::NodeConfig};
@@ -126,7 +126,7 @@ actor_protocol! {
 
 pub async fn run_demo() -> Result<LoginAcceptedReply, Box<dyn StdError>> {
     let cluster_id = ClusterId::new("distributed-login")?;
-    let address = NodeAddress::new("127.0.0.1", 25530)?;
+    let address = NodeEndpoint::new("127.0.0.1", 25530)?;
     let incarnation = NodeIncarnation::generate();
     let protocol = Arc::new(WorldProtocol::bind::<WorldActor>()?);
     let registry = Arc::new(ActorRegistry::new_bound(
@@ -141,7 +141,7 @@ pub async fn run_demo() -> Result<LoginAcceptedReply, Box<dyn StdError>> {
         },
         protocol.as_ref(),
     ));
-    let actor_id = ActorId::U64(7);
+    let actor_id = ActorKey::U64(7);
     registry
         .start(
             actor_id.clone(),
@@ -155,7 +155,7 @@ pub async fn run_demo() -> Result<LoginAcceptedReply, Box<dyn StdError>> {
         .address(&actor_id)?
         .ok_or_else(|| IoError::other("missing exact World ActorAddress"))?;
     let service = LatticeService::builder(NodeConfig {
-        release: lattice_core::release::ReleaseManifest::development(1),
+        release: lattice_model::cluster::ReleaseManifest::development(1),
         cluster_id,
         node_id: "world-a".to_owned(),
         address,

@@ -5,6 +5,7 @@ pub mod authority;
 pub mod control;
 pub mod coordinator;
 mod drain;
+pub mod failpoints;
 pub mod handoff;
 pub mod mapping;
 pub mod membership_session;
@@ -23,9 +24,11 @@ mod tests {
         time::Duration,
     };
 
-    use lattice_core::actor_address::{
-        ClusterId, ConfigFingerprint, EntityAddress, EntityId, EntityType, NodeAddress,
-        NodeIncarnation, PlacementDomainId, ProtocolId,
+    use lattice_model::actor::{EntityAddress, ProtocolId};
+
+    use lattice_model::cluster::{
+        ClusterId, ConfigFingerprint, EntityId, EntityType, NodeEndpoint, NodeIncarnation,
+        PlacementDomainId,
     };
 
     use crate::{allocation::*, authority::*, region::*, types::*};
@@ -33,7 +36,7 @@ mod tests {
     fn node(name: &str, incarnation: u128, port: u16) -> NodeKey {
         NodeKey {
             node_id: name.to_owned(),
-            address: NodeAddress::new("127.0.0.1", port).unwrap(),
+            address: NodeEndpoint::new("127.0.0.1", port).unwrap(),
             incarnation: NodeIncarnation::new(incarnation).unwrap(),
         }
     }
@@ -205,7 +208,7 @@ mod tests {
         let b = node("b", 2, 1002);
         let placement_node = |key: NodeKey, capacity, weight| PlacementNode {
             key: key.clone(),
-            release_id: lattice_core::release::ReleaseId::new(1).unwrap(),
+            release_id: lattice_model::cluster::ReleaseId::new(1).unwrap(),
             ready: true,
             eligible_entity_types: BTreeSet::from([entity_type.clone()]),
             protocols: BTreeSet::from([protocol]),

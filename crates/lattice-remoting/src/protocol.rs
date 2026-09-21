@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use lattice_core::actor_address::ProtocolId;
+use lattice_model::actor::ProtocolId;
 use prost::Message;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;

@@ -5,7 +5,7 @@ use std::{
     time::Duration,
 };
 
-use lattice_core::{actor_address::NodeIncarnation, coordinator::CoordinatorScope};
+use lattice_model::{cluster::CoordinatorScope, cluster::NodeIncarnation};
 use lattice_remoting::{
     association::{AssociationKey, AssociationManager, AssociationState},
     control::ControlDispatchError,
@@ -504,9 +504,9 @@ mod tests {
         coordinator::build_snapshot,
         types::{CoordinatorTerm, MembershipVersion, Revision},
     };
-    use lattice_core::{
-        actor_address::{ClusterId, NodeAddress},
-        release::ReleaseManifest,
+    use lattice_model::{
+        cluster::ReleaseManifest,
+        cluster::{ClusterId, NodeEndpoint},
     };
     use lattice_remoting::{config::RemotingConfig, control::CommandId};
 
@@ -516,7 +516,7 @@ mod tests {
         for placement in [false, true] {
             let local = NodeKey {
                 node_id: "paused".to_owned(),
-                address: NodeAddress::new("127.0.0.1", 34611).unwrap(),
+                address: NodeEndpoint::new("127.0.0.1", 34611).unwrap(),
                 incarnation: NodeIncarnation::new(1).unwrap(),
             };
             let associations = Arc::new(
@@ -530,7 +530,7 @@ mod tests {
             let association = associations
                 .get_or_create(
                     ClusterId::new("paused-session").unwrap(),
-                    NodeAddress::new("127.0.0.1", 34612).unwrap(),
+                    NodeEndpoint::new("127.0.0.1", 34612).unwrap(),
                     NodeIncarnation::new(2).unwrap(),
                 )
                 .unwrap();
@@ -558,7 +558,7 @@ mod tests {
                 let (session, _effects) = crate::session::PlacementDomainSession::new(
                     crate::coordinator::PlacementDomainHello::builder(
                         local,
-                        lattice_core::actor_address::PlacementDomainId::new("paused").unwrap(),
+                        lattice_model::cluster::PlacementDomainId::new("paused").unwrap(),
                         1,
                     )
                     .build(),
@@ -606,7 +606,7 @@ mod tests {
     async fn membership_snapshot_staging_expires_on_the_real_monotonic_clock() {
         let local = NodeKey {
             node_id: "joining".to_owned(),
-            address: NodeAddress::new("127.0.0.1", 34601).unwrap(),
+            address: NodeEndpoint::new("127.0.0.1", 34601).unwrap(),
             incarnation: NodeIncarnation::new(1).unwrap(),
         };
         let associations = Arc::new(
@@ -620,7 +620,7 @@ mod tests {
         let association = associations
             .get_or_create(
                 ClusterId::new("snapshot-timeout").unwrap(),
-                NodeAddress::new("127.0.0.1", 34602).unwrap(),
+                NodeEndpoint::new("127.0.0.1", 34602).unwrap(),
                 NodeIncarnation::new(2).unwrap(),
             )
             .unwrap();

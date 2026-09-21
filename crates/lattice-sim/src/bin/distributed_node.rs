@@ -13,6 +13,8 @@ use std::{
 use async_trait::async_trait;
 use bytes::BytesMut;
 use clap::{Parser, ValueEnum};
+use lattice_actor::service::ServiceContext;
+use lattice_actor_distributed::{ActorKey, actor_kind};
 use lattice_actor_distributed::{
     actor_protocol,
     context::ActorContext,
@@ -27,20 +29,15 @@ use lattice_actor_distributed::{
 };
 use lattice_config::store::ConfigStore;
 use lattice_config_etcd::{config::EtcdConfigStoreConfig, store::EtcdConfigStore};
-use lattice_core::{
-    actor_address::{
-        ActorAddress, ClusterId, EntityAddress, EntityId, EntityType, NodeAddress, NodeIncarnation,
-        PlacementDomainId, ProtocolId,
-    },
-    actor_kind,
-    coordinator::CoordinatorScope,
-    id::ActorId,
-    service_context::ServiceContext,
-};
 use lattice_discovery::{
     config_store::ConfigStoreDiscovery,
     provider::CoordinatorDiscovery,
     static_provider::{StaticDiscovery, StaticEndpoint},
+};
+use lattice_model::{
+    actor::{ActorAddress, EntityAddress, ProtocolId},
+    cluster::CoordinatorScope,
+    cluster::{ClusterId, EntityId, EntityType, NodeEndpoint, NodeIncarnation, PlacementDomainId},
 };
 use lattice_placement::{
     control::{
@@ -290,7 +287,7 @@ impl ActorLoader<PingActor> for PingLoader {
 #[derive(Serialize, Deserialize)]
 struct EntityFixture {
     owner_node_id: String,
-    owner_address: NodeAddress,
+    owner_address: NodeEndpoint,
     owner_incarnation: String,
     reference: EntityAddress<FixtureProtocol>,
 }
@@ -409,7 +406,7 @@ async fn discovery_coordinator(
     port: u16,
 ) -> Result<(), Box<dyn Error>> {
     let cluster = ClusterId::new("docker-discovery")?;
-    let address = NodeAddress::new(node_id.clone(), port)?;
+    let address = NodeEndpoint::new(node_id.clone(), port)?;
     let incarnation = NodeIncarnation::generate();
     let builder =
         LatticeService::builder(node_config(cluster, &node_id, address.clone(), incarnation))?;
@@ -458,7 +455,7 @@ async fn discovery_member(
     port: u16,
     config_store: bool,
 ) -> Result<(), Box<dyn Error>> {
-    let coordinator = NodeAddress::new("discovery-coordinator", 29200)?;
+    let coordinator = NodeEndpoint::new("discovery-coordinator", 29200)?;
     let scope = CoordinatorScope::Membership;
     let discovery: Arc<dyn CoordinatorDiscovery> = if config_store {
         let run_id = std::env::var("LATTICE_RUN_ID")?;
@@ -508,7 +505,7 @@ async fn discovery_member(
     } else {
         "discovery-static-member"
     };
-    let address = NodeAddress::new(advertised_host, port)?;
+    let address = NodeEndpoint::new(advertised_host, port)?;
     let join_config = ClusterJoinConfig {
         retry_initial: Duration::from_millis(25),
         retry_max: Duration::from_millis(250),
@@ -613,7 +610,7 @@ fn write_discovery_artifact(
 
 async fn server(reference: PathBuf) -> Result<(), Box<dyn Error>> {
     let cluster = ClusterId::new("docker-e2e")?;
-    let address = NodeAddress::new("fixture-server", 25520)?;
+    let address = NodeEndpoint::new("fixture-server", 25520)?;
     let incarnation = NodeIncarnation::generate();
     let protocol = Arc::new(FixtureProtocol::bind::<PingActor>()?);
     let mut service_context = ServiceContext::builder();
@@ -631,12 +628,12 @@ async fn server(reference: PathBuf) -> Result<(), Box<dyn Error>> {
         },
         protocol.as_ref(),
     ));
-    let actor_id = ActorId::U64(1);
+    let actor_id = ActorKey::U64(1);
     registry.start(actor_id.clone(), PingActor).await?;
     let target: ActorAddress<FixtureProtocol> = registry
         .address(&actor_id)?
         .ok_or("missing actor address")?;
-    let child_id = ActorId::U64(2);
+    let child_id = ActorKey::U64(2);
     registry.start(child_id.clone(), PingActor).await?;
     let child: ActorAddress<FixtureProtocol> = registry
         .address(&child_id)?
@@ -669,7 +666,7 @@ async fn client(reference: PathBuf, expect_failure: bool) -> Result<(), Box<dyn 
     };
     let target: ActorAddress<FixtureProtocol> = serde_json::from_slice(&encoded)?;
     let cluster = ClusterId::new("docker-e2e")?;
-    let client_address = NodeAddress::new("aaa-client", 25521)?;
+    let client_address = NodeEndpoint::new("aaa-client", 25521)?;
     let client_incarnation = NodeIncarnation::new(200)?;
     let service = LatticeService::builder(node_config(
         cluster.clone(),
@@ -737,7 +734,7 @@ async fn monitor(reference: PathBuf) -> Result<(), Box<dyn Error>> {
     let encoded = wait_for_file(&reference).await?;
     let target: ActorAddress<FixtureProtocol> = serde_json::from_slice(&encoded)?;
     let cluster = ClusterId::new("docker-e2e")?;
-    let address = NodeAddress::new("aaa-monitor", 25522)?;
+    let address = NodeEndpoint::new("aaa-monitor", 25522)?;
     let incarnation = NodeIncarnation::generate();
     let service = LatticeService::builder(node_config(
         cluster.clone(),
@@ -815,7 +812,7 @@ async fn entity_owner(reference: PathBuf) -> Result<(), Box<dyn Error>> {
     let incarnation = NodeIncarnation::generate();
     let owner = NodeKey {
         node_id: "entity-owner".to_owned(),
-        address: NodeAddress::new("entity-owner", 25530)?,
+        address: NodeEndpoint::new("entity-owner", 25530)?,
         incarnation,
     };
     let entity_config = fixture_entity_config()?;
@@ -878,7 +875,7 @@ async fn gateway(reference: PathBuf) -> Result<(), Box<dyn Error>> {
     let cluster = ClusterId::new("docker-e2e")?;
     let local = NodeKey {
         node_id: "gateway".to_owned(),
-        address: NodeAddress::new("aaa-client", 25531)?,
+        address: NodeEndpoint::new("aaa-client", 25531)?,
         incarnation: NodeIncarnation::generate(),
     };
     let entity_config = fixture_entity_config()?;
@@ -965,7 +962,7 @@ fn entity_service(
     let associations = builder.association_manager();
     let messaging = builder.outbound_messaging();
     let coordinator_incarnation = NodeIncarnation::new(999)?;
-    let coordinator_address = NodeAddress::new("coordinator-fixture", 25999)?;
+    let coordinator_address = NodeEndpoint::new("coordinator-fixture", 25999)?;
     let coordinator_association = associations.get_or_create(
         cluster.clone(),
         coordinator_address.clone(),
@@ -990,7 +987,7 @@ fn entity_service(
         })?;
     }
     let member_hello = MemberHello {
-        release: lattice_core::release::ReleaseManifest::development(1),
+        release: lattice_model::cluster::ReleaseManifest::development(1),
         rollout_participant: true,
         node: node.clone(),
         roles: BTreeSet::from([if owns_slot { "entity" } else { "gateway" }.to_owned()]),

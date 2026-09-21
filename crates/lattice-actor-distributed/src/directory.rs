@@ -2,7 +2,7 @@ use std::any::Any;
 use std::sync::Mutex;
 
 use dashmap::DashMap;
-use lattice_core::actor_address::{ActorAddress, ActorPath, ProtocolTag};
+use lattice_model::actor::{ActorAddress, ActorPath, ProtocolTag};
 use thiserror::Error;
 
 use lattice_actor::{

@@ -4,13 +4,20 @@ crates/lattice-actor/src/lib.rs	pub use lattice_actor_macros::{Message, Request,
 crates/lattice-actor-distributed/src/lib.rs	pub use lattice_actor::{	The distributed facade exposes the complete local Actor API plus distributed addressing and protocols from one dependency.
 crates/lattice-actor-distributed/src/lib.rs	pub use reference::{ActorRef, EntityRef, Recipient, SingletonRef};	Bound distributed references are the primary location-transparent messaging API.
 crates/lattice-actor-distributed/src/lib.rs	pub use entity::{EntityActivationState, EntityKey, EntityKeyDecodeError, ShardedActor};	Distributed entity identity and activation traits are exposed from the distributed facade.
+crates/lattice-actor-distributed/src/lib.rs	pub use registry::{ActorKey, ActorKind};	Registry keys and kinds are distributed-runtime concepts exposed by the distributed facade.
+crates/lattice-actor-distributed/src/registry.rs	pub use key::{ActorKey, ActorKind};	The registry module owns and exposes its application-facing key and kind types.
 crates/lattice-actor/src/context.rs	pub use messaging::{AskTarget, TellTarget};	The context facade exposes transport-independent typed messaging capabilities while implementations remain grouped with messaging behavior.
-crates/lattice-actor/src/watch.rs	pub use lattice_core::watch::{TerminatedReason, WatchId, WatchStatus};	Actor-facing DeathWatch uses the shared core identities and states without defining a second public model.
-crates/lattice-actor-distributed/src/protocol.rs	pub use lattice_core::actor_address::ProtocolTag as __ProtocolTag;	The public protocol macro expansion requires a stable hidden facade path.
+crates/lattice-actor/src/watch.rs	pub use lattice_model::actor::{TerminatedReason, WatchId, WatchStatus};	Actor-facing DeathWatch uses the shared wire model without defining a second public identity.
+crates/lattice-actor-distributed/src/protocol.rs	pub use lattice_model::actor::ProtocolTag as __ProtocolTag;	The public protocol macro expansion requires a stable hidden facade path.
 crates/lattice-store-mongodb/src/lib.rs	pub use lattice_store_mongodb_macros::{MongoDocument, MongoDocumentSet, MongoScan};	Derive macros are intentionally available from the lattice-store-mongodb facade.
 crates/lattice-service/src/builder.rs	pub use service::LatticeService;	The service implementation is split into its own module; the builder facade keeps the published path.
 crates/lattice-store-mongodb/src/lib.rs	pub use tokio::try_join;	Generated document-set loads join their queries without forcing callers to depend on tokio.
 crates/lattice-store-mongodb/src/store/mod.rs	pub use write::{ActivationFence, ActivationFenceSummary};	Activation fencing results are part of the store API and are defined next to the write path.
-crates/lattice-sim/src/fault.rs	pub use lattice_core::failpoint::FailpointAction as FailAction;	The simulator names the shared injection decision rather than defining a second enum that could drift.
-crates/lattice-core/src/actor_address/mod.rs	pub use identity::*;	The addressing module is split into identity primitives and address types; the facade keeps the published path.
-crates/lattice-core/src/actor_address/mod.rs	pub use addresses::*;	The addressing module is split into identity primitives and address types; the facade keeps the published path.
+crates/lattice-sim/src/fault.rs	pub use lattice_failpoint::FailpointAction as FailAction;	The simulator names the shared injection decision rather than defining a second enum that could drift.
+crates/lattice-model/src/actor.rs	pub use crate::actor_watch::{TerminatedReason, WatchId, WatchStatus};	The actor domain exposes its wire-level DeathWatch values from one coherent public module.
+crates/lattice-model/src/actor.rs	pub use crate::addresses::{ActorAddress, EntityAddress, RecipientAddress, SingletonAddress};	The actor domain exposes serializable address values while keeping implementation files private.
+crates/lattice-model/src/actor.rs	pub use crate::primitives::{ActivationId, ActorPath, ErasedProtocol, ProtocolId, ProtocolTag};	The actor domain explicitly exposes actor identity and protocol primitives without a wildcard facade.
+crates/lattice-model/src/cluster.rs	pub use crate::coordination::CoordinatorScope;	The cluster domain owns the serializable coordination scope.
+crates/lattice-model/src/cluster.rs	pub use crate::primitives::{	The cluster domain explicitly exposes node and placement primitives without a wildcard facade.
+crates/lattice-model/src/cluster.rs	pub use crate::release_model::{	The cluster domain explicitly exposes release-state models without a wildcard facade.
+crates/lattice-model/src/lib.rs	pub use primitives::ModelError;	All validated model domains share one construction error at the crate boundary.

@@ -252,7 +252,7 @@ impl EventBus for LocalEventBus {
 mod tests {
     use std::sync::atomic::AtomicBool;
 
-    use lattice_core::{instance::InstanceId, service_kind, trace::TraceContext};
+    use lattice_model::{service::ServiceInstanceId, service_name, trace::TraceContext};
 
     use super::*;
     use crate::types::{EventId, Subject, SubjectFilter};
@@ -421,8 +421,8 @@ mod tests {
             event_id: EventId::new("event-1"),
             subject: Subject::new("game.world.entered"),
             event_type: "WorldEntered".to_string(),
-            source_service: service_kind!("World"),
-            source_instance: InstanceId::new("world-a"),
+            source_service: service_name!("World"),
+            source_instance: ServiceInstanceId::new("world-a"),
             recipient: None,
             correlation_id: None,
             trace: TraceContext::default(),

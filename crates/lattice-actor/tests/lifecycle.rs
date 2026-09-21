@@ -708,6 +708,7 @@ async fn passivation_policy_idle_timeout_stops_idle_actor() {
             },
         )
         .unwrap();
+    let mut lifecycle = handle.subscribe_lifecycle();
 
     tokio::time::timeout(Duration::from_millis(100), stopped.acquire())
         .await
@@ -715,6 +716,13 @@ async fn passivation_policy_idle_timeout_stops_idle_actor() {
         .unwrap()
         .forget();
 
+    tokio::time::timeout(
+        Duration::from_millis(100),
+        lifecycle.wait_for(|state| *state == ActorLifecycleState::Stopped),
+    )
+    .await
+    .unwrap()
+    .unwrap();
     assert_eq!(handle.lifecycle_state(), ActorLifecycleState::Stopped);
 }
 

@@ -3,11 +3,11 @@
 use std::{error::Error as StdError, io::Error as IoError, path::Path, sync::Arc};
 
 use futures_util::StreamExt;
-use lattice_core::coordinator::CoordinatorScope;
 use lattice_discovery::provider::CoordinatorDiscovery;
 use lattice_discovery_k8s::endpoint_slice::{
     KubernetesCredentials, KubernetesEndpointSliceConfig, KubernetesEndpointSliceDiscovery,
 };
+use lattice_model::cluster::CoordinatorScope;
 use serde::Serialize;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},

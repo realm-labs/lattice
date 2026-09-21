@@ -48,9 +48,8 @@ impl ExactTargetDictionary {
 
 #[cfg(test)]
 mod tests {
-    use lattice_core::actor_address::{
-        ActivationId, ActorAddress, ActorPath, ClusterId, NodeAddress, NodeIncarnation, ProtocolId,
-    };
+    use lattice_model::actor::{ActivationId, ActorAddress, ActorPath, ProtocolId};
+    use lattice_model::cluster::{ClusterId, NodeEndpoint, NodeIncarnation};
 
     use super::*;
     use crate::messaging::codec::target_to_wire;
@@ -59,7 +58,7 @@ mod tests {
         let incarnation = NodeIncarnation::new(1).unwrap();
         ActorAddress::new(
             ClusterId::new("dictionary-test").unwrap(),
-            NodeAddress::new("127.0.0.1", 25520).unwrap(),
+            NodeEndpoint::new("127.0.0.1", 25520).unwrap(),
             ActorPath::user(["user", "target"]).unwrap(),
             ActivationId::new(incarnation, sequence).unwrap(),
             ProtocolId::new(7).unwrap(),

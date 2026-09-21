@@ -2,8 +2,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use lattice_core::actor_address::PlacementDomainId;
-use lattice_core::trace::{TelemetryResource, TraceContext};
+use lattice_model::cluster::PlacementDomainId;
+use lattice_model::trace::{TelemetryResource, TraceContext};
 use serde::Serialize;
 use tokio::sync::Mutex;
 
@@ -11,8 +11,8 @@ use crate::error::OpsError;
 
 /// Lattice subsystem a recorded span originated from.
 ///
-/// This is orthogonal to `lattice_core::trace::TraceSpanKind`, which carries the
-/// OpenTelemetry client/server/producer/consumer role.
+/// Exporters may attach an OpenTelemetry client/server/producer/consumer role
+/// independently; this value only identifies the Lattice subsystem.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub enum TraceSpanSubsystem {
     Rpc,

@@ -4,6 +4,7 @@ pub mod clock;
 pub mod coordinator;
 pub mod domains;
 pub mod explorer;
+pub mod failpoints;
 pub mod fault;
 pub mod lifecycle;
 pub mod network;

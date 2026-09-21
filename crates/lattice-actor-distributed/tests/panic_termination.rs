@@ -8,6 +8,7 @@ use std::{
     time::Duration,
 };
 
+use lattice_actor_distributed::{ActorKey, actor_kind};
 use lattice_actor_distributed::{
     context::ActorContext,
     error::{ActorCallError, ActorFailure, ActorStopError},
@@ -28,7 +29,6 @@ use lattice_actor_distributed::{
     },
     watch::TerminatedReason,
 };
-use lattice_core::{actor_kind, id::ActorId};
 use tokio::sync::Semaphore;
 
 const TIMEOUT: Duration = Duration::from_secs(2);
@@ -600,7 +600,7 @@ impl Actor for StartActor {
 async fn start_panic_releases_registry_activation_for_replacement() {
     let registry =
         ActorRegistry::<StartActor>::new(actor_kind!("PanicStart"), ActorRegistryConfig::default());
-    let actor_id = ActorId::U64(99);
+    let actor_id = ActorKey::U64(99);
     let first = registry
         .start(
             actor_id.clone(),

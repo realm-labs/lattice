@@ -1,4 +1,4 @@
-use lattice_core::{actor_address::NodeIncarnation, coordinator::CoordinatorScope};
+use lattice_model::{cluster::CoordinatorScope, cluster::NodeIncarnation};
 use lattice_remoting::{
     association::AssociationKey,
     control::{ControlDispatchError, ControlRetryReason},
@@ -423,7 +423,7 @@ fn complete_route_error(error: mpsc::error::TrySendError<PlacementControlEvent>)
 
 #[cfg(test)]
 mod routing_backpressure_tests {
-    use lattice_core::actor_address::{NodeAddress, NodeIncarnation};
+    use lattice_model::cluster::{NodeEndpoint, NodeIncarnation};
 
     use super::*;
     use crate::types::NodeKey;
@@ -438,7 +438,7 @@ mod routing_backpressure_tests {
                 kind: PlacementControlEventKind::GlobalMemberRemoved {
                     node: NodeKey {
                         node_id: "node".to_owned(),
-                        address: NodeAddress::new("127.0.0.1", 25520).unwrap(),
+                        address: NodeEndpoint::new("127.0.0.1", 25520).unwrap(),
                         incarnation: NodeIncarnation::new(1).unwrap(),
                     },
                     reason: MemberRemovalReason::FailureDetected,
@@ -471,7 +471,7 @@ mod routing_backpressure_tests {
             control::decode_control_command, runtime::host::CoordinatorHostConfig,
             storage::InMemoryPlacementStore,
         };
-        use lattice_core::{actor_address::ClusterId, release::ReleaseManifest};
+        use lattice_model::{cluster::ClusterId, cluster::ReleaseManifest};
         use lattice_remoting::{
             association::AssociationManager, config::RemotingConfig,
             control::decode_control_envelope,
@@ -481,12 +481,12 @@ mod routing_backpressure_tests {
         let store = Arc::new(InMemoryPlacementStore::new(16, 16).unwrap());
         let local = NodeKey {
             node_id: "leader".to_owned(),
-            address: NodeAddress::new("127.0.0.1", 34701).unwrap(),
+            address: NodeEndpoint::new("127.0.0.1", 34701).unwrap(),
             incarnation: NodeIncarnation::new(1).unwrap(),
         };
         let departing = NodeKey {
             node_id: "departing".to_owned(),
-            address: NodeAddress::new("127.0.0.1", 34702).unwrap(),
+            address: NodeEndpoint::new("127.0.0.1", 34702).unwrap(),
             incarnation: NodeIncarnation::new(2).unwrap(),
         };
         let associations = Arc::new(

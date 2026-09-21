@@ -1,9 +1,10 @@
 use std::{collections::BTreeSet, time::Instant as StdInstant};
 
 use async_trait::async_trait;
-use lattice_core::actor_address::{
-    ClusterId, ConfigFingerprint, EntityType, NodeAddress, NodeIncarnation, PlacementDomainId,
-    ProtocolId, SingletonKind,
+use lattice_model::actor::ProtocolId;
+use lattice_model::cluster::{
+    ClusterId, ConfigFingerprint, EntityType, NodeEndpoint, NodeIncarnation, PlacementDomainId,
+    SingletonKind,
 };
 use lattice_remoting::{
     association::{AssociationKey, LaneAttachment, LaneKind},
@@ -183,7 +184,7 @@ async fn seed_running_slot(
     let member_hello = authority_hello
         .map(|hello| hello.member.clone())
         .unwrap_or_else(|| MemberHello {
-            release: lattice_core::release::ReleaseManifest::development(1),
+            release: lattice_model::cluster::ReleaseManifest::development(1),
             rollout_participant: true,
             node: owner.clone(),
             roles: BTreeSet::new(),
@@ -318,7 +319,7 @@ fn node(
     port: u16,
     incarnation: u128,
 ) -> (NodeKey, NodeIdentity) {
-    let address = NodeAddress::new("127.0.0.1", port).unwrap();
+    let address = NodeEndpoint::new("127.0.0.1", port).unwrap();
     let incarnation = NodeIncarnation::new(incarnation).unwrap();
     (
         NodeKey {
@@ -357,7 +358,7 @@ struct TestHelloSpec {
 fn test_hello(node: NodeKey, spec: TestHelloSpec) -> TestHello {
     TestHello {
         member: MemberHello {
-            release: lattice_core::release::ReleaseManifest::development(1),
+            release: lattice_model::cluster::ReleaseManifest::development(1),
             rollout_participant: true,
             node: node.clone(),
             roles: spec.roles,

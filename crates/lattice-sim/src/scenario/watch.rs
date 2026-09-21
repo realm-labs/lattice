@@ -5,7 +5,9 @@
 //! registry still produced means production ignored the injected decision, which the scenario
 //! records so [`check_invariants`](Scenario::check_invariants) can reject it.
 
-use lattice_core::{failpoint::Failpoint, watch::TerminatedReason};
+use lattice_model::actor::TerminatedReason;
+
+use crate::failpoints::Failpoint;
 use lattice_remoting::{association::AssociationId, watch::WatchCommand};
 
 use super::{Scenario, ScenarioError};

@@ -1,6 +1,6 @@
 use std::sync::Barrier;
 
-use lattice_core::actor_address::ProtocolId;
+use lattice_model::actor::ProtocolId;
 
 use super::*;
 use crate::protocol::{CatalogueDecision, ProtocolDescriptor, ProtocolFingerprint};
@@ -10,7 +10,7 @@ fn key() -> AssociationKey {
     AssociationKey {
         cluster_id: ClusterId::new("test").unwrap(),
         local_incarnation: NodeIncarnation::new(1).unwrap(),
-        remote_address: NodeAddress::new("remote", 25520).unwrap(),
+        remote_address: NodeEndpoint::new("remote", 25520).unwrap(),
         remote_incarnation: NodeIncarnation::new(2).unwrap(),
     }
 }
@@ -21,7 +21,7 @@ fn manager() -> AssociationManager {
 
 fn manager_with_config(config: RemotingConfig) -> AssociationManager {
     AssociationManager::new(
-        NodeAddress::new("local", 25519).unwrap(),
+        NodeEndpoint::new("local", 25519).unwrap(),
         NodeIncarnation::new(1).unwrap(),
         config,
     )
@@ -395,12 +395,12 @@ fn reused_address_rejects_old_incarnation_after_explicit_replacement() {
         ..RemotingConfig::default()
     };
     let manager = AssociationManager::new(
-        NodeAddress::new("local", 25519).unwrap(),
+        NodeEndpoint::new("local", 25519).unwrap(),
         NodeIncarnation::new(1).unwrap(),
         config,
     )
     .unwrap();
-    let address = NodeAddress::new("remote", 25520).unwrap();
+    let address = NodeEndpoint::new("remote", 25520).unwrap();
     manager
         .get_or_create(
             ClusterId::new("test").unwrap(),
@@ -674,7 +674,7 @@ fn node_byte_budget_is_shared_across_associations() {
         ..RemotingConfig::default()
     };
     let manager = AssociationManager::new(
-        NodeAddress::new("local", 25519).unwrap(),
+        NodeEndpoint::new("local", 25519).unwrap(),
         NodeIncarnation::new(1).unwrap(),
         config,
     )
@@ -683,14 +683,14 @@ fn node_byte_budget_is_shared_across_associations() {
     let first = manager
         .get_or_create(
             cluster.clone(),
-            NodeAddress::new("first", 25520).unwrap(),
+            NodeEndpoint::new("first", 25520).unwrap(),
             NodeIncarnation::new(2).unwrap(),
         )
         .unwrap();
     let second = manager
         .get_or_create(
             cluster,
-            NodeAddress::new("second", 25521).unwrap(),
+            NodeEndpoint::new("second", 25521).unwrap(),
             NodeIncarnation::new(3).unwrap(),
         )
         .unwrap();

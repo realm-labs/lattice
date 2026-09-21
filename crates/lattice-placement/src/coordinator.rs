@@ -4,13 +4,11 @@ use std::{
 };
 
 use bytes::Bytes;
-use lattice_core::{
-    actor_address::{
-        ConfigFingerprint, EntityType, NodeIncarnation, PlacementDomainId, ProtocolId,
-        SingletonKind,
-    },
-    coordinator::CoordinatorScope,
-    release::ReleaseManifest,
+use lattice_model::{
+    actor::ProtocolId,
+    cluster::CoordinatorScope,
+    cluster::ReleaseManifest,
+    cluster::{ConfigFingerprint, EntityType, NodeIncarnation, PlacementDomainId, SingletonKind},
 };
 use lattice_remoting::protocol::ProtocolDescriptor;
 use serde::{Deserialize, Serialize};

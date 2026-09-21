@@ -9,17 +9,18 @@ use std::{
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use lattice_actor_distributed::ActorKey;
 use lattice_actor_distributed::{error::ActorCallError, handle::ActorHandle, traits::Actor};
 use lattice_actor_distributed::{
     protocol::{ActorProtocolBinding, DispatchError, DispatchMode, DispatchReply, Protocol},
     registry::{ActorLoader, ActorRegistry},
 };
-use lattice_core::{
-    actor_address::{
-        ActorAddress, ClusterId, ConfigFingerprint, EntityAddress, EntityType, NodeAddress,
-        NodeIncarnation, PlacementDomainId, ProtocolId, SingletonAddress, SingletonKind,
+use lattice_model::{
+    actor::{ActorAddress, EntityAddress, ProtocolId, SingletonAddress},
+    cluster::{
+        ClusterId, ConfigFingerprint, EntityType, NodeEndpoint, NodeIncarnation, PlacementDomainId,
+        SingletonKind,
     },
-    id::ActorId,
 };
 use lattice_placement::{
     coordinator::SingletonConfig,
@@ -122,7 +123,7 @@ async fn drain_actor_ids<A, I>(
 ) -> Result<bool, RemoteMessageError>
 where
     A: Actor,
-    I: IntoIterator<Item = ActorId>,
+    I: IntoIterator<Item = ActorKey>,
 {
     let _ = timeout;
     Ok(registry.drain_actor_ids(actor_ids).await.completed())
@@ -150,7 +151,7 @@ fn map_dispatch(error: DispatchError) -> RemoteMessageError {
 fn decode_resolved_actor(
     payload: &[u8],
     cluster: &ClusterId,
-    address: &NodeAddress,
+    address: &NodeEndpoint,
     incarnation: NodeIncarnation,
     protocol_id: ProtocolId,
 ) -> Result<ActorAddress, WatchError> {

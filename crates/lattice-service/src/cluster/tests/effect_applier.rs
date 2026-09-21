@@ -7,7 +7,7 @@ use std::{
 
 use async_trait::async_trait;
 use lattice_actor_distributed::host::ProtocolHostRegistry;
-use lattice_core::actor_address::{ClusterId, NodeIncarnation};
+use lattice_model::cluster::{ClusterId, NodeIncarnation};
 use lattice_placement::session::{
     LogicCoordinatorConfig, LogicCoordinatorHandle, LogicPlacementEffect, PlacementDomainSession,
 };

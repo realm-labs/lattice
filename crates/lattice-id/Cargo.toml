@@ -7,7 +7,7 @@ repository.workspace = true
 
 [dependencies]
 async-trait.workspace = true
-lattice-core.workspace = true
+lattice-model.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 tokio.workspace = true

@@ -407,10 +407,10 @@ fn codec_error(context: &'static str) -> WorkerIdStoreError {
 mod tests {
     use std::time::Duration;
 
-    use lattice_core::actor_address::{ClusterId, NodeIncarnation};
     use lattice_id::worker::{
         WorkerId, WorkerIdLease, WorkerIdLeaseToken, WorkerIdOwner, WorkerIdStoreError,
     };
+    use lattice_model::cluster::{ClusterId, NodeIncarnation};
 
     use super::{granted_validity, keepalive_validity, release_outcome, ttl_seconds};
 

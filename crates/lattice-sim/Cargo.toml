@@ -10,7 +10,8 @@ async-trait.workspace = true
 bytes.workspace = true
 clap.workspace = true
 futures-util.workspace = true
-lattice-core = { workspace = true, features = ["test-failpoints"] }
+lattice-failpoint = { workspace = true, features = ["enabled"] }
+lattice-model.workspace = true
 lattice-actor.workspace = true
 lattice-actor-distributed.workspace = true
 lattice-config.workspace = true

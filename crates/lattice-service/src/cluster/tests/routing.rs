@@ -6,11 +6,12 @@ use std::{
     time::Duration,
 };
 
+use lattice_actor_distributed::actor_kind;
 use lattice_actor_distributed::registry::{ActorAddressConfig, ActorRegistryConfig};
-use lattice_core::{
-    actor_address::{ClusterId, EntityId, EntityType, NodeAddress, NodeIncarnation, ProtocolId},
-    actor_kind,
-    coordinator::CoordinatorScope,
+use lattice_model::{
+    actor::ProtocolId,
+    cluster::CoordinatorScope,
+    cluster::{ClusterId, EntityId, EntityType, NodeEndpoint, NodeIncarnation},
 };
 use lattice_placement::{
     control::{
@@ -330,8 +331,8 @@ async fn stale_generation_never_reaches_entity_loader() {
     let cluster_id = ClusterId::new("router-test").unwrap();
     let local_incarnation = NodeIncarnation::new(1).unwrap();
     let coordinator_incarnation = NodeIncarnation::new(2).unwrap();
-    let local_address = NodeAddress::new("127.0.0.1", 25570).unwrap();
-    let coordinator_address = NodeAddress::new("127.0.0.1", 25571).unwrap();
+    let local_address = NodeEndpoint::new("127.0.0.1", 25570).unwrap();
+    let coordinator_address = NodeEndpoint::new("127.0.0.1", 25571).unwrap();
     let local_node = NodeKey {
         node_id: "logic".to_owned(),
         address: local_address.clone(),

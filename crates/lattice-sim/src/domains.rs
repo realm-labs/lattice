@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
 use bytes::Bytes;
-use lattice_core::actor_address::PlacementDomainId;
+use lattice_model::cluster::PlacementDomainId;
 use lattice_placement::coordinator::{
     CoordinatorDelta, PlacementDomainState, PlacementDomainStateError, SnapshotInstall,
     SnapshotRecord, SnapshotVersion,

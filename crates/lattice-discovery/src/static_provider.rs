@@ -2,8 +2,8 @@ use std::pin::Pin;
 
 use futures_util::Stream;
 use futures_util::stream;
-use lattice_core::actor_address::NodeAddress;
-use lattice_core::coordinator::CoordinatorScope;
+use lattice_model::cluster::CoordinatorScope;
+use lattice_model::cluster::NodeEndpoint;
 
 use crate::provider::{
     CoordinatorDirectorySnapshot, CoordinatorDiscovery, DiscoveryError, DiscoveryOrigin,
@@ -12,7 +12,7 @@ use crate::provider::{
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StaticEndpoint {
-    pub address: NodeAddress,
+    pub address: NodeEndpoint,
     pub expected_node_id: Option<String>,
     pub priority: u16,
 }

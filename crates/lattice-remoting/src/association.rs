@@ -7,7 +7,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use lattice_core::actor_address::{ClusterId, NodeAddress, NodeIncarnation};
+use lattice_model::cluster::{ClusterId, NodeEndpoint, NodeIncarnation};
 use thiserror::Error;
 use tokio::sync::{Notify, mpsc};
 
@@ -51,7 +51,7 @@ impl AssociationId {
 pub struct AssociationKey {
     pub cluster_id: ClusterId,
     pub local_incarnation: NodeIncarnation,
-    pub remote_address: NodeAddress,
+    pub remote_address: NodeEndpoint,
     pub remote_incarnation: NodeIncarnation,
 }
 
@@ -439,11 +439,11 @@ struct AssociationReceiverSlots {
 
 #[derive(Debug)]
 pub struct AssociationManager {
-    local_address: NodeAddress,
+    local_address: NodeEndpoint,
     local_incarnation: NodeIncarnation,
     config: RemotingConfig,
     associations: Mutex<HashMap<AssociationKey, Arc<Association>>>,
-    remote_incarnations: Mutex<HashMap<NodeAddress, NodeIncarnation>>,
+    remote_incarnations: Mutex<HashMap<NodeEndpoint, NodeIncarnation>>,
     queued_bytes: Arc<OutboundByteBudget>,
 }
 

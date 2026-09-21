@@ -2,9 +2,9 @@ use std::marker::PhantomData;
 
 use serde::{Deserialize, Serialize, de::Error as SerdeDeError};
 
-use crate::actor_address::identity::{
-    ActivationId, ActorPath, AddressError, ClusterId, ConfigFingerprint, EntityId, EntityType,
-    ErasedProtocol, NodeAddress, NodeIncarnation, PlacementDomainId, ProtocolId, ProtocolTag,
+use crate::primitives::{
+    ActivationId, ActorPath, ClusterId, ConfigFingerprint, EntityId, EntityType, ErasedProtocol,
+    ModelError, NodeEndpoint, NodeIncarnation, PlacementDomainId, ProtocolId, ProtocolTag,
     SingletonKind,
 };
 
@@ -12,7 +12,7 @@ use crate::actor_address::identity::{
 #[serde(bound = "")]
 pub struct ActorAddress<P: ProtocolTag = ErasedProtocol> {
     cluster_id: ClusterId,
-    node_address: NodeAddress,
+    node_address: NodeEndpoint,
     actor_path: ActorPath,
     activation_id: ActivationId,
     protocol_id: ProtocolId,
@@ -23,11 +23,11 @@ pub struct ActorAddress<P: ProtocolTag = ErasedProtocol> {
 impl<P: ProtocolTag> ActorAddress<P> {
     fn from_parts(
         cluster_id: ClusterId,
-        node_address: NodeAddress,
+        node_address: NodeEndpoint,
         actor_path: ActorPath,
         activation_id: ActivationId,
         protocol_id: ProtocolId,
-    ) -> Result<Self, AddressError> {
+    ) -> Result<Self, ModelError> {
         validate_protocol::<P>(protocol_id)?;
         Ok(Self {
             cluster_id,
@@ -43,7 +43,7 @@ impl<P: ProtocolTag> ActorAddress<P> {
         &self.cluster_id
     }
 
-    pub fn node_address(&self) -> &NodeAddress {
+    pub fn node_address(&self) -> &NodeEndpoint {
         &self.node_address
     }
 
@@ -63,7 +63,7 @@ impl<P: ProtocolTag> ActorAddress<P> {
         self.protocol_id
     }
 
-    pub fn try_typed<Q: ProtocolTag>(&self) -> Result<ActorAddress<Q>, AddressError> {
+    pub fn try_typed<Q: ProtocolTag>(&self) -> Result<ActorAddress<Q>, ModelError> {
         ActorAddress::from_parts(
             self.cluster_id.clone(),
             self.node_address.clone(),
@@ -96,11 +96,11 @@ impl<P: ProtocolTag> ActorAddress<P> {
 impl ActorAddress<ErasedProtocol> {
     pub fn new(
         cluster_id: ClusterId,
-        node_address: NodeAddress,
+        node_address: NodeEndpoint,
         actor_path: ActorPath,
         activation_id: ActivationId,
         protocol_id: ProtocolId,
-    ) -> Result<Self, AddressError> {
+    ) -> Result<Self, ModelError> {
         Self::from_parts(
             cluster_id,
             node_address,
@@ -114,7 +114,7 @@ impl ActorAddress<ErasedProtocol> {
 #[derive(Deserialize)]
 struct ActorAddressData {
     cluster_id: ClusterId,
-    node_address: NodeAddress,
+    node_address: NodeEndpoint,
     actor_path: ActorPath,
     activation_id: ActivationId,
     protocol_id: ProtocolId,
@@ -158,7 +158,7 @@ impl<P: ProtocolTag> EntityAddress<P> {
         entity_id: EntityId,
         protocol_id: ProtocolId,
         entity_config_fingerprint: ConfigFingerprint,
-    ) -> Result<Self, AddressError> {
+    ) -> Result<Self, ModelError> {
         validate_protocol::<P>(protocol_id)?;
         Ok(Self {
             cluster_id,
@@ -195,7 +195,7 @@ impl<P: ProtocolTag> EntityAddress<P> {
         self.entity_config_fingerprint
     }
 
-    pub fn try_typed<Q: ProtocolTag>(&self) -> Result<EntityAddress<Q>, AddressError> {
+    pub fn try_typed<Q: ProtocolTag>(&self) -> Result<EntityAddress<Q>, ModelError> {
         EntityAddress::from_parts(
             self.cluster_id.clone(),
             self.domain.clone(),
@@ -227,7 +227,7 @@ impl EntityAddress<ErasedProtocol> {
         entity_id: EntityId,
         protocol_id: ProtocolId,
         entity_config_fingerprint: ConfigFingerprint,
-    ) -> Result<Self, AddressError> {
+    ) -> Result<Self, ModelError> {
         Self::from_parts(
             cluster_id,
             domain,
@@ -286,7 +286,7 @@ impl<P: ProtocolTag> SingletonAddress<P> {
         singleton_kind: SingletonKind,
         protocol_id: ProtocolId,
         singleton_config_fingerprint: ConfigFingerprint,
-    ) -> Result<Self, AddressError> {
+    ) -> Result<Self, ModelError> {
         validate_protocol::<P>(protocol_id)?;
         Ok(Self {
             cluster_id,
@@ -318,7 +318,7 @@ impl<P: ProtocolTag> SingletonAddress<P> {
         self.singleton_config_fingerprint
     }
 
-    pub fn try_typed<Q: ProtocolTag>(&self) -> Result<SingletonAddress<Q>, AddressError> {
+    pub fn try_typed<Q: ProtocolTag>(&self) -> Result<SingletonAddress<Q>, ModelError> {
         SingletonAddress::from_parts(
             self.cluster_id.clone(),
             self.domain.clone(),
@@ -347,7 +347,7 @@ impl SingletonAddress<ErasedProtocol> {
         singleton_kind: SingletonKind,
         protocol_id: ProtocolId,
         singleton_config_fingerprint: ConfigFingerprint,
-    ) -> Result<Self, AddressError> {
+    ) -> Result<Self, ModelError> {
         Self::from_parts(
             cluster_id,
             domain,
@@ -439,11 +439,11 @@ impl<P: ProtocolTag> From<&SingletonAddress<P>> for RecipientAddress<P> {
     }
 }
 
-fn validate_protocol<P: ProtocolTag>(protocol_id: ProtocolId) -> Result<(), AddressError> {
+fn validate_protocol<P: ProtocolTag>(protocol_id: ProtocolId) -> Result<(), ModelError> {
     if let Some(expected) = P::PROTOCOL_ID
         && expected != protocol_id.get()
     {
-        return Err(AddressError::ProtocolMismatch {
+        return Err(ModelError::ProtocolMismatch {
             expected,
             actual: protocol_id.get(),
         });
@@ -474,7 +474,7 @@ mod tests {
         let incarnation = NodeIncarnation::new(3).unwrap();
         let erased = ActorAddress::new(
             ClusterId::new("test").unwrap(),
-            NodeAddress::new("127.0.0.1", 25520).unwrap(),
+            NodeEndpoint::new("127.0.0.1", 25520).unwrap(),
             ActorPath::user(["user", "actor"]).unwrap(),
             ActivationId::new(incarnation, 1).unwrap(),
             ProtocolId::new(7).unwrap(),
@@ -486,7 +486,7 @@ mod tests {
         assert!(typed.same_activation(&erased));
         assert!(matches!(
             erased.try_typed::<OtherProtocol>(),
-            Err(AddressError::ProtocolMismatch {
+            Err(ModelError::ProtocolMismatch {
                 expected: 8,
                 actual: 7
             })

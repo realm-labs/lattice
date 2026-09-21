@@ -10,8 +10,8 @@ use std::{
 
 use bytes::{Bytes, BytesMut};
 #[doc(hidden)]
-pub use lattice_core::actor_address::ProtocolTag as __ProtocolTag;
-use lattice_core::actor_address::{ProtocolId, ProtocolTag};
+pub use lattice_model::actor::ProtocolTag as __ProtocolTag;
+use lattice_model::actor::{ProtocolId, ProtocolTag};
 use lattice_remoting::protocol::{ProtocolDescriptor, ProtocolFingerprint};
 use thiserror::Error;
 

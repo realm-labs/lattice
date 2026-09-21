@@ -1,8 +1,8 @@
 use std::time::Duration;
 
-use lattice_core::actor_address::PlacementDomainId;
-use lattice_core::actor_address::{ClusterId, NodeAddress, NodeIncarnation};
-use lattice_core::coordinator::CoordinatorScope;
+use lattice_model::cluster::CoordinatorScope;
+use lattice_model::cluster::PlacementDomainId;
+use lattice_model::cluster::{ClusterId, NodeEndpoint, NodeIncarnation};
 use prost::{Enumeration, Message};
 
 use crate::handshake::{FeatureBits, NodeIdentity};
@@ -14,7 +14,7 @@ pub const MAX_BOOTSTRAP_RETRY_AFTER: Duration = Duration::from_secs(30);
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BootstrapProbeTarget {
     pub scope: CoordinatorScope,
-    pub address: NodeAddress,
+    pub address: NodeEndpoint,
     pub expected_node_id: Option<String>,
     pub tls_server_name: Option<String>,
 }
@@ -540,7 +540,7 @@ impl TryFrom<NodeIdentityWire> for NodeIdentity {
             cluster_id: ClusterId::new(value.cluster_id)
                 .map_err(|_| BootstrapError::InvalidIdentity)?,
             node_id: value.node_id,
-            address: NodeAddress::new(
+            address: NodeEndpoint::new(
                 value.host,
                 u16::try_from(value.port).map_err(|_| BootstrapError::InvalidIdentity)?,
             )
@@ -666,7 +666,7 @@ mod tests {
         NodeIdentity {
             cluster_id: ClusterId::new("test").unwrap(),
             node_id: name.to_string(),
-            address: NodeAddress::new("127.0.0.1", port).unwrap(),
+            address: NodeEndpoint::new("127.0.0.1", port).unwrap(),
             incarnation: NodeIncarnation::new(incarnation).unwrap(),
         }
     }

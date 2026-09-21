@@ -1,11 +1,11 @@
 use std::sync::Arc;
 
-use lattice_core::instance::InstanceId;
-use lattice_core::service_kind;
-use lattice_core::trace::TraceContext;
 use lattice_eventbus::local::EventBus;
 use lattice_eventbus::nats::{InMemoryNatsClient, InMemoryNatsEventBus};
 use lattice_eventbus::types::{EventEnvelope, EventId, EventSubscription, Subject, SubjectFilter};
+use lattice_model::service::ServiceInstanceId;
+use lattice_model::service_name;
+use lattice_model::trace::TraceContext;
 use tokio::sync::Mutex;
 
 #[tokio::test]
@@ -65,8 +65,8 @@ fn test_event(event_id: &str) -> EventEnvelope {
         event_id: EventId::new(event_id),
         subject: Subject::new("game.world.entered"),
         event_type: "WorldEntered".to_string(),
-        source_service: service_kind!("World"),
-        source_instance: InstanceId::new("world-a"),
+        source_service: service_name!("World"),
+        source_instance: ServiceInstanceId::new("world-a"),
         recipient: None,
         correlation_id: None,
         trace: TraceContext::default(),

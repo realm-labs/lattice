@@ -18,11 +18,12 @@ use lattice_actor_distributed::{
     },
     registry::{ActorAddressConfig, ActorLoader, ActorRegistry, ActorRegistryConfig},
 };
-use lattice_core::{
-    actor_address::{PlacementDomainId, ProtocolId, RecipientAddress},
-    coordinator::CoordinatorScope,
-};
 use lattice_discovery::provider::CoordinatorDiscovery;
+use lattice_model::{
+    actor::{ProtocolId, RecipientAddress},
+    cluster::CoordinatorScope,
+    cluster::PlacementDomainId,
+};
 use lattice_placement::{
     control::{PlacementControlDirectory, PlacementControlEvent, PlacementControlRouter},
     coordinator::{LeaderRecord, MemberEvent, MemberHello, PlacementDomainHello, SingletonConfig},

@@ -1,8 +1,8 @@
 use base64::engine::general_purpose::STANDARD as BASE64;
-use lattice_core::actor_address::RecipientAddress;
-use lattice_core::instance::InstanceId;
-use lattice_core::kind::ServiceKind;
-use lattice_core::trace::TraceContext;
+use lattice_model::actor::RecipientAddress;
+use lattice_model::service::ServiceInstanceId;
+use lattice_model::service::ServiceName;
+use lattice_model::trace::TraceContext;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -38,8 +38,8 @@ pub struct EventEnvelope {
     pub event_id: EventId,
     pub subject: Subject,
     pub event_type: String,
-    pub source_service: ServiceKind,
-    pub source_instance: InstanceId,
+    pub source_service: ServiceName,
+    pub source_instance: ServiceInstanceId,
     pub recipient: Option<RecipientAddress>,
     pub correlation_id: Option<String>,
     pub trace: TraceContext,
@@ -194,8 +194,8 @@ mod tests {
             event_id: EventId::new("event-1"),
             subject: Subject::new("game.world.entered"),
             event_type: "WorldEntered".to_string(),
-            source_service: lattice_core::service_kind!("World"),
-            source_instance: InstanceId::new("world-a"),
+            source_service: lattice_model::service_name!("World"),
+            source_instance: ServiceInstanceId::new("world-a"),
             recipient: None,
             correlation_id: None,
             trace: TraceContext::default(),

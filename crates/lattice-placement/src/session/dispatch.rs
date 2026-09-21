@@ -1,7 +1,5 @@
 use std::collections::BTreeMap;
 
-use lattice_core::failpoint::Failpoint;
-
 use super::{
     LocalAuthorityEvent, LogicPlacementEffect, LogicSessionError, PlacementDomainSession,
     snapshot::decode_slots,
@@ -10,6 +8,7 @@ use crate::{
     authority::{AuthorityEffect, AuthorityEvent, PlacementAuthority},
     control::{PlacementControlCommand, PlacementControlEventKind},
     coordinator::{CoordinatorDelta, MemberRecord, MemberStatus, SnapshotStager, SnapshotVersion},
+    failpoints,
     types::{PlacementSlot, PlacementSlotKey},
 };
 
@@ -89,7 +88,7 @@ impl PlacementDomainSession {
                             .ok_or(LogicSessionError::SnapshotRequired)?
                             .finish(end, self.now())
                             .map_err(LogicSessionError::Coordinator)?;
-                        lattice_core::failpoint::hit(Failpoint::SnapshotAfterStageBeforeInstall);
+                        lattice_failpoint::hit(failpoints::SNAPSHOT_AFTER_STAGE_BEFORE_INSTALL);
                         let version = install.version.clone();
                         match version {
                             SnapshotVersion::Membership(version) => {

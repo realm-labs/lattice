@@ -1,6 +1,5 @@
 use std::{collections::BTreeSet, sync::Arc, time::Duration};
 
-use lattice_core::actor_address::{ClusterId, NodeIncarnation};
 use lattice_id::{
     service::{DistributedIdConfig, DistributedIdService, DistributedIdState},
     worker::{
@@ -8,6 +7,7 @@ use lattice_id::{
     },
 };
 use lattice_id_etcd::{config::EtcdWorkerIdStoreConfig, store::EtcdWorkerIdLeaseStore};
+use lattice_model::cluster::{ClusterId, NodeIncarnation};
 use tokio::task::JoinSet;
 
 fn endpoints() -> Option<Vec<String>> {

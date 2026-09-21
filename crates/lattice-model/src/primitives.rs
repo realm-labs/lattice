@@ -18,7 +18,7 @@ pub const MAX_LOGICAL_KIND_BYTES: usize = 128;
 pub const MAX_PLACEMENT_DOMAIN_ID_BYTES: usize = 128;
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
-pub enum AddressError {
+pub enum ModelError {
     #[error("{field} must not be empty")]
     Empty { field: &'static str },
     #[error("{field} exceeds its {limit}-byte limit")]
@@ -42,7 +42,7 @@ pub enum AddressError {
 pub struct ClusterId(Arc<str>);
 
 impl ClusterId {
-    pub fn new(value: impl Into<String>) -> Result<Self, AddressError> {
+    pub fn new(value: impl Into<String>) -> Result<Self, ModelError> {
         Ok(Self(
             validate_token(value.into(), "cluster ID", MAX_CLUSTER_ID_BYTES)?.into(),
         ))
@@ -60,13 +60,13 @@ impl fmt::Display for ClusterId {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-pub struct NodeAddress {
+pub struct NodeEndpoint {
     host: Arc<str>,
     port: u16,
 }
 
-impl NodeAddress {
-    pub fn new(host: impl Into<String>, port: u16) -> Result<Self, AddressError> {
+impl NodeEndpoint {
+    pub fn new(host: impl Into<String>, port: u16) -> Result<Self, ModelError> {
         let host = validate_token(host.into(), "node host", MAX_NODE_HOST_BYTES)?;
         let is_ip = host.parse::<IpAddr>().is_ok();
         if port == 0
@@ -76,7 +76,7 @@ impl NodeAddress {
             || host.ends_with(']')
             || host.chars().any(char::is_whitespace)
         {
-            return Err(AddressError::NonCanonical {
+            return Err(ModelError::NonCanonical {
                 field: "node address",
             });
         }
@@ -95,7 +95,7 @@ impl NodeAddress {
     }
 }
 
-impl fmt::Display for NodeAddress {
+impl fmt::Display for NodeEndpoint {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         if self.host.parse::<Ipv6Addr>().is_ok() {
             write!(formatter, "[{}]:{}", self.host, self.port)
@@ -110,9 +110,9 @@ impl fmt::Display for NodeAddress {
 pub struct NodeIncarnation(u128);
 
 impl NodeIncarnation {
-    pub fn new(value: u128) -> Result<Self, AddressError> {
+    pub fn new(value: u128) -> Result<Self, ModelError> {
         if value == 0 {
-            return Err(AddressError::NonCanonical {
+            return Err(ModelError::NonCanonical {
                 field: "node incarnation",
             });
         }
@@ -135,12 +135,9 @@ pub struct ActivationId {
 }
 
 impl ActivationId {
-    pub fn new(
-        node_incarnation: NodeIncarnation,
-        local_sequence: u64,
-    ) -> Result<Self, AddressError> {
+    pub fn new(node_incarnation: NodeIncarnation, local_sequence: u64) -> Result<Self, ModelError> {
         if local_sequence == 0 {
-            return Err(AddressError::ReservedActivationSequence);
+            return Err(ModelError::ReservedActivationSequence);
         }
         Ok(Self {
             node_incarnation,
@@ -163,7 +160,7 @@ pub struct ActorPath {
 }
 
 impl ActorPath {
-    pub fn user<I, S>(segments: I) -> Result<Self, AddressError>
+    pub fn user<I, S>(segments: I) -> Result<Self, ModelError>
     where
         I: IntoIterator<Item = S>,
         S: Into<String>,
@@ -171,7 +168,7 @@ impl ActorPath {
         Self::from_segments(segments, false)
     }
 
-    pub fn child(&self, segment: impl Into<String>) -> Result<Self, AddressError> {
+    pub fn child(&self, segment: impl Into<String>) -> Result<Self, ModelError> {
         Self::from_segments(
             self.segments
                 .iter()
@@ -191,19 +188,19 @@ impl ActorPath {
             .is_some_and(|segment| segment == "system")
     }
 
-    fn from_segments<I, S>(segments: I, allow_system: bool) -> Result<Self, AddressError>
+    fn from_segments<I, S>(segments: I, allow_system: bool) -> Result<Self, ModelError>
     where
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
         let segments = segments.into_iter().map(Into::into).collect::<Vec<_>>();
         if segments.is_empty() {
-            return Err(AddressError::Empty {
+            return Err(ModelError::Empty {
                 field: "actor path",
             });
         }
         if segments.len() > MAX_ACTOR_PATH_DEPTH {
-            return Err(AddressError::PathTooDeep {
+            return Err(ModelError::PathTooDeep {
                 limit: MAX_ACTOR_PATH_DEPTH,
             });
         }
@@ -211,7 +208,7 @@ impl ActorPath {
             validate_path_segment(segment)?;
         }
         if !allow_system && segments[0] == "system" {
-            return Err(AddressError::ReservedSystemPath);
+            return Err(ModelError::ReservedSystemPath);
         }
         let encoded_len = 1 + segments
             .iter()
@@ -219,7 +216,7 @@ impl ActorPath {
             .sum::<usize>()
             - 1;
         if encoded_len > MAX_ACTOR_PATH_BYTES {
-            return Err(AddressError::TooLong {
+            return Err(ModelError::TooLong {
                 field: "actor path",
                 limit: MAX_ACTOR_PATH_BYTES,
             });
@@ -240,11 +237,11 @@ impl fmt::Display for ActorPath {
 }
 
 impl TryFrom<String> for ActorPath {
-    type Error = AddressError;
+    type Error = ModelError;
 
     fn try_from(value: String) -> Result<Self, Self::Error> {
         if !value.starts_with('/') || value.ends_with('/') || value.contains("//") {
-            return Err(AddressError::NonCanonical {
+            return Err(ModelError::NonCanonical {
                 field: "actor path",
             });
         }
@@ -283,9 +280,9 @@ impl<'de> Deserialize<'de> for ActorPath {
 pub struct ProtocolId(u64);
 
 impl ProtocolId {
-    pub fn new(value: u64) -> Result<Self, AddressError> {
+    pub fn new(value: u64) -> Result<Self, ModelError> {
         if value == 0 {
-            return Err(AddressError::ReservedProtocolId);
+            return Err(ModelError::ReservedProtocolId);
         }
         Ok(Self(value))
     }
@@ -316,13 +313,13 @@ impl ProtocolTag for ErasedProtocol {
 pub struct EntityId(Vec<u8>);
 
 impl EntityId {
-    pub fn new(value: impl Into<Vec<u8>>) -> Result<Self, AddressError> {
+    pub fn new(value: impl Into<Vec<u8>>) -> Result<Self, ModelError> {
         let value = value.into();
         if value.is_empty() {
-            return Err(AddressError::Empty { field: "entity ID" });
+            return Err(ModelError::Empty { field: "entity ID" });
         }
         if value.len() > MAX_ENTITY_ID_BYTES {
-            return Err(AddressError::TooLong {
+            return Err(ModelError::TooLong {
                 field: "entity ID",
                 limit: MAX_ENTITY_ID_BYTES,
             });
@@ -336,7 +333,7 @@ impl EntityId {
 }
 
 impl TryFrom<Vec<u8>> for EntityId {
-    type Error = AddressError;
+    type Error = ModelError;
 
     fn try_from(value: Vec<u8>) -> Result<Self, Self::Error> {
         Self::new(value)
@@ -356,7 +353,7 @@ macro_rules! bounded_kind {
         pub struct $name(String);
 
         impl $name {
-            pub fn new(value: impl Into<String>) -> Result<Self, AddressError> {
+            pub fn new(value: impl Into<String>) -> Result<Self, ModelError> {
                 Ok(Self(validate_token(
                     value.into(),
                     $field,
@@ -379,7 +376,7 @@ bounded_kind!(SingletonKind, "singleton kind");
 pub struct PlacementDomainId(String);
 
 impl PlacementDomainId {
-    pub fn new(value: impl Into<String>) -> Result<Self, AddressError> {
+    pub fn new(value: impl Into<String>) -> Result<Self, ModelError> {
         Ok(Self(validate_token(
             value.into(),
             "placement domain ID",
@@ -426,35 +423,31 @@ impl ConfigFingerprint {
     }
 }
 
-fn validate_token(
-    value: String,
-    field: &'static str,
-    limit: usize,
-) -> Result<String, AddressError> {
+fn validate_token(value: String, field: &'static str, limit: usize) -> Result<String, ModelError> {
     if value.is_empty() {
-        return Err(AddressError::Empty { field });
+        return Err(ModelError::Empty { field });
     }
     if value.len() > limit {
-        return Err(AddressError::TooLong { field, limit });
+        return Err(ModelError::TooLong { field, limit });
     }
     if value == "."
         || value == ".."
         || value.contains(['/', '\\', '\0'])
         || value.chars().any(char::is_control)
     {
-        return Err(AddressError::NonCanonical { field });
+        return Err(ModelError::NonCanonical { field });
     }
     Ok(value)
 }
 
-fn validate_path_segment(segment: &str) -> Result<(), AddressError> {
+fn validate_path_segment(segment: &str) -> Result<(), ModelError> {
     validate_token(
         segment.to_owned(),
         "actor path segment",
         MAX_ACTOR_PATH_SEGMENT_BYTES,
     )?;
     if segment.contains('%') {
-        return Err(AddressError::NonCanonical {
+        return Err(ModelError::NonCanonical {
             field: "actor path segment",
         });
     }
@@ -469,7 +462,7 @@ mod tests {
     fn path_rejects_reserved_and_noncanonical_segments() {
         assert_eq!(
             ActorPath::user(["system", "coordinator"]),
-            Err(AddressError::ReservedSystemPath)
+            Err(ModelError::ReservedSystemPath)
         );
         assert!(ActorPath::user(["user", ".."]).is_err());
         assert!(ActorPath::user(["user", "child/name"]).is_err());
@@ -481,7 +474,7 @@ mod tests {
         let cluster_clone = cluster.clone();
         assert!(Arc::ptr_eq(&cluster.0, &cluster_clone.0));
 
-        let address = NodeAddress::new("127.0.0.1", 25520).unwrap();
+        let address = NodeEndpoint::new("127.0.0.1", 25520).unwrap();
         let address_clone = address.clone();
         assert!(Arc::ptr_eq(&address.host, &address_clone.host));
 

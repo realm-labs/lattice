@@ -19,6 +19,7 @@ pub mod bootstrap;
 pub mod config;
 pub mod control;
 pub mod endpoint;
+pub mod failpoints;
 pub mod handshake;
 pub mod lane;
 pub mod messaging;

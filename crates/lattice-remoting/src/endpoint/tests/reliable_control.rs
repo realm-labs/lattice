@@ -10,13 +10,13 @@ async fn invalid_reliable_control_is_acknowledged_without_poisoning_later_comman
     let client_identity = NodeIdentity {
         cluster_id: cluster_id.clone(),
         node_id: "client".to_owned(),
-        address: NodeAddress::new("127.0.0.1", client_port).unwrap(),
+        address: NodeEndpoint::new("127.0.0.1", client_port).unwrap(),
         incarnation: NodeIncarnation::new(11).unwrap(),
     };
     let server_identity = NodeIdentity {
         cluster_id,
         node_id: "server".to_owned(),
-        address: NodeAddress::new("127.0.0.1", server_port).unwrap(),
+        address: NodeEndpoint::new("127.0.0.1", server_port).unwrap(),
         incarnation: NodeIncarnation::new(12).unwrap(),
     };
     let descriptor = ProtocolDescriptor {
@@ -70,13 +70,13 @@ async fn blocked_control_apply_does_not_starve_remoting_heartbeats() {
     let client_identity = NodeIdentity {
         cluster_id: cluster_id.clone(),
         node_id: "client".to_owned(),
-        address: NodeAddress::new("127.0.0.1", client_port).unwrap(),
+        address: NodeEndpoint::new("127.0.0.1", client_port).unwrap(),
         incarnation: NodeIncarnation::new(21).unwrap(),
     };
     let server_identity = NodeIdentity {
         cluster_id,
         node_id: "server".to_owned(),
-        address: NodeAddress::new("127.0.0.1", server_port).unwrap(),
+        address: NodeEndpoint::new("127.0.0.1", server_port).unwrap(),
         incarnation: NodeIncarnation::new(22).unwrap(),
     };
     let descriptor = ProtocolDescriptor {
@@ -121,13 +121,13 @@ async fn unavailable_control_is_retried_without_disconnecting_before_new_session
     let client_identity = NodeIdentity {
         cluster_id: cluster_id.clone(),
         node_id: "client".to_owned(),
-        address: NodeAddress::new("127.0.0.1", client_port).unwrap(),
+        address: NodeEndpoint::new("127.0.0.1", client_port).unwrap(),
         incarnation: NodeIncarnation::new(31).unwrap(),
     };
     let server_identity = NodeIdentity {
         cluster_id,
         node_id: "server".to_owned(),
-        address: NodeAddress::new("127.0.0.1", server_port).unwrap(),
+        address: NodeEndpoint::new("127.0.0.1", server_port).unwrap(),
         incarnation: NodeIncarnation::new(32).unwrap(),
     };
     let descriptor = ProtocolDescriptor {
@@ -197,13 +197,13 @@ async fn retry_backoff_yields_to_ephemeral_control_messages() {
     let client_identity = NodeIdentity {
         cluster_id: cluster_id.clone(),
         node_id: "client".to_owned(),
-        address: NodeAddress::new("127.0.0.1", client_port).unwrap(),
+        address: NodeEndpoint::new("127.0.0.1", client_port).unwrap(),
         incarnation: NodeIncarnation::new(41).unwrap(),
     };
     let server_identity = NodeIdentity {
         cluster_id,
         node_id: "server".to_owned(),
-        address: NodeAddress::new("127.0.0.1", server_port).unwrap(),
+        address: NodeEndpoint::new("127.0.0.1", server_port).unwrap(),
         incarnation: NodeIncarnation::new(42).unwrap(),
     };
     let descriptor = ProtocolDescriptor {
@@ -248,13 +248,13 @@ async fn retrying_stream_does_not_block_an_independent_reliable_stream() {
     let client_identity = NodeIdentity {
         cluster_id: cluster_id.clone(),
         node_id: "client".to_owned(),
-        address: NodeAddress::new("127.0.0.1", client_port).unwrap(),
+        address: NodeEndpoint::new("127.0.0.1", client_port).unwrap(),
         incarnation: NodeIncarnation::new(51).unwrap(),
     };
     let server_identity = NodeIdentity {
         cluster_id,
         node_id: "server".to_owned(),
-        address: NodeAddress::new("127.0.0.1", server_port).unwrap(),
+        address: NodeEndpoint::new("127.0.0.1", server_port).unwrap(),
         incarnation: NodeIncarnation::new(52).unwrap(),
     };
     let descriptor = ProtocolDescriptor {

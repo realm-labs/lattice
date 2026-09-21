@@ -4,7 +4,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use lattice_core::actor_address::{ClusterId, NodeAddress, NodeIncarnation};
+use lattice_model::cluster::{ClusterId, NodeEndpoint, NodeIncarnation};
 use thiserror::Error;
 use tokio::{
     net::{TcpListener, TcpStream},
@@ -74,7 +74,7 @@ pub struct RemotingEndpoint {
     bootstrap_handler: RwLock<Arc<dyn BootstrapHandler>>,
 }
 
-type PeerConnectKey = (ClusterId, NodeAddress, NodeIncarnation);
+type PeerConnectKey = (ClusterId, NodeEndpoint, NodeIncarnation);
 
 /// Serializes concurrent dials of one exact peer without serializing unrelated peers.
 struct PeerConnectLease {

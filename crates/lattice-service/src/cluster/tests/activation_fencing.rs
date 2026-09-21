@@ -1,15 +1,14 @@
 use std::{collections::BTreeSet, sync::atomic::AtomicUsize, time::Duration};
 
 use async_trait::async_trait;
+use lattice_actor_distributed::actor_kind;
 use lattice_actor_distributed::{
     error::ActorFailure,
     registry::{ActorCreateContext, ActorRegistryConfig},
 };
-use lattice_core::{
-    actor_address::{
-        ClusterId, EntityId, EntityType, NodeAddress, NodeIncarnation, ProtocolId, SingletonKind,
-    },
-    actor_kind,
+use lattice_model::{
+    actor::ProtocolId,
+    cluster::{ClusterId, EntityId, EntityType, NodeEndpoint, NodeIncarnation, SingletonKind},
 };
 use lattice_placement::types::{AssignmentGeneration, CoordinatorTerm, PlacementVersion, Revision};
 use lattice_remoting::config::RemotingConfig;
@@ -47,7 +46,7 @@ async fn entity_and_singleton_loading_obey_drain_and_fence() {
 async fn loading_obeys_retirement(singleton: bool, fence: bool) {
     let cluster_id = ClusterId::new("activation-fencing").unwrap();
     let incarnation = NodeIncarnation::new(1).unwrap();
-    let address = NodeAddress::new("127.0.0.1", 25570).unwrap();
+    let address = NodeEndpoint::new("127.0.0.1", 25570).unwrap();
     let node = NodeKey {
         node_id: "local".into(),
         address: address.clone(),
@@ -60,7 +59,7 @@ async fn loading_obeys_retirement(singleton: bool, fence: bool) {
         &associations,
         &cluster_id,
         incarnation,
-        NodeAddress::new("127.0.0.1", 25571).unwrap(),
+        NodeEndpoint::new("127.0.0.1", 25571).unwrap(),
         NodeIncarnation::new(2).unwrap(),
     );
     let entity = EntityConfig::new(

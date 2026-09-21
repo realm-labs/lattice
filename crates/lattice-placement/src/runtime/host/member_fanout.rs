@@ -1,5 +1,5 @@
 use bytes::Bytes;
-use lattice_core::coordinator::CoordinatorScope;
+use lattice_model::cluster::CoordinatorScope;
 use lattice_remoting::{
     association::{AssociationKey, AssociationManager},
     control::ControlDispatchError,
@@ -305,7 +305,7 @@ fn try_remove_global_member_from_domain(
 mod snapshot_backpressure_tests {
     use std::sync::Arc;
 
-    use lattice_core::actor_address::{ClusterId, NodeAddress, NodeIncarnation};
+    use lattice_model::cluster::{ClusterId, NodeEndpoint, NodeIncarnation};
     use lattice_remoting::{
         association::{Association, LaneAttachment, LaneKind},
         config::RemotingConfig,
@@ -324,7 +324,7 @@ mod snapshot_backpressure_tests {
         let key = AssociationKey {
             cluster_id: ClusterId::new("snapshot-backpressure").unwrap(),
             local_incarnation: NodeIncarnation::new(1).unwrap(),
-            remote_address: NodeAddress::new("127.0.0.1", 25520).unwrap(),
+            remote_address: NodeEndpoint::new("127.0.0.1", 25520).unwrap(),
             remote_incarnation: NodeIncarnation::new(2).unwrap(),
         };
         let config = RemotingConfig {

@@ -25,7 +25,7 @@ fn repository_is_dedicated_framework_workspace() {
     );
 
     let metadata = String::from_utf8(output.stdout).expect("metadata should be utf8");
-    for crate_name in ["lattice-core", "lattice-config", "lattice-actor"] {
+    for crate_name in ["lattice-model", "lattice-config", "lattice-actor"] {
         assert!(
             metadata.contains(&format!(r#""name":"{crate_name}""#)),
             "workspace metadata should include {crate_name}"

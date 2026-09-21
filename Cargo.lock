@@ -1053,7 +1053,7 @@ dependencies = [
  "lattice-actor",
  "lattice-actor-distributed",
  "lattice-codegen",
- "lattice-core",
+ "lattice-model",
  "lattice-placement",
  "lattice-remoting",
  "lattice-service",
@@ -2129,7 +2129,7 @@ dependencies = [
  "event-listener",
  "futures-util",
  "lattice-actor-macros",
- "lattice-core",
+ "lattice-model",
  "thiserror",
  "tokio",
  "tracing",
@@ -2145,7 +2145,7 @@ dependencies = [
  "dashmap",
  "futures-util",
  "lattice-actor",
- "lattice-core",
+ "lattice-model",
  "lattice-remoting",
  "prost",
  "serde",
@@ -2208,19 +2208,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "lattice-core"
-version = "0.1.0"
-dependencies = [
- "blake3",
- "serde",
- "serde_json",
- "thiserror",
- "tokio",
- "tracing",
- "uuid",
-]
-
-[[package]]
 name = "lattice-discovery"
 version = "0.1.0"
 dependencies = [
@@ -2229,7 +2216,7 @@ dependencies = [
  "futures-util",
  "hickory-resolver",
  "lattice-config",
- "lattice-core",
+ "lattice-model",
  "serde",
  "serde_json",
  "thiserror",
@@ -2245,8 +2232,8 @@ dependencies = [
  "futures-util",
  "k8s-openapi",
  "kube",
- "lattice-core",
  "lattice-discovery",
+ "lattice-model",
  "thiserror",
  "tokio",
  "tracing",
@@ -2262,7 +2249,7 @@ dependencies = [
  "futures-util",
  "lattice-actor",
  "lattice-actor-distributed",
- "lattice-core",
+ "lattice-model",
  "prost",
  "serde",
  "serde_json",
@@ -2273,11 +2260,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "lattice-failpoint"
+version = "0.1.0"
+
+[[package]]
 name = "lattice-id"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "lattice-core",
+ "lattice-model",
  "serde",
  "thiserror",
  "tokio",
@@ -2291,8 +2282,8 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "etcd-client",
- "lattice-core",
  "lattice-id",
+ "lattice-model",
  "serde",
  "serde_json",
  "thiserror",
@@ -2302,12 +2293,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "lattice-model"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "lattice-ops"
 version = "0.1.0"
 dependencies = [
  "async-trait",
  "axum",
- "lattice-core",
+ "lattice-model",
  "lattice-placement",
  "lattice-service",
  "serde",
@@ -2331,7 +2334,8 @@ dependencies = [
  "etcd-client",
  "http",
  "lattice-config",
- "lattice-core",
+ "lattice-failpoint",
+ "lattice-model",
  "lattice-remoting",
  "prost",
  "rcgen",
@@ -2356,7 +2360,8 @@ dependencies = [
  "blake3",
  "bytes",
  "futures-util",
- "lattice-core",
+ "lattice-failpoint",
+ "lattice-model",
  "prost",
  "rcgen",
  "serde",
@@ -2380,8 +2385,9 @@ dependencies = [
  "futures-util",
  "lattice-actor",
  "lattice-actor-distributed",
- "lattice-core",
  "lattice-discovery",
+ "lattice-failpoint",
+ "lattice-model",
  "lattice-placement",
  "lattice-remoting",
  "prost",
@@ -2406,9 +2412,10 @@ dependencies = [
  "lattice-actor-distributed",
  "lattice-config",
  "lattice-config-etcd",
- "lattice-core",
  "lattice-discovery",
  "lattice-discovery-k8s",
+ "lattice-failpoint",
+ "lattice-model",
  "lattice-placement",
  "lattice-remoting",
  "lattice-service",
@@ -2454,7 +2461,7 @@ dependencies = [
 name = "lattice-telemetry-otlp"
 version = "0.1.0"
 dependencies = [
- "lattice-core",
+ "lattice-model",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
@@ -2604,9 +2611,9 @@ dependencies = [
  "lattice-actor-distributed",
  "lattice-codegen",
  "lattice-config",
- "lattice-core",
  "lattice-discovery",
  "lattice-eventbus",
+ "lattice-model",
  "lattice-ops",
  "lattice-placement",
  "lattice-remoting",
@@ -3483,7 +3490,7 @@ dependencies = [
  "lattice-actor",
  "lattice-actor-distributed",
  "lattice-codegen",
- "lattice-core",
+ "lattice-model",
  "lattice-placement",
  "lattice-remoting",
  "lattice-service",

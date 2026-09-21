@@ -4,7 +4,7 @@
 //! dedicated random stream, so a seed alone reproduces both the event interleaving and the fault
 //! set it runs against.
 
-use lattice_core::failpoint::Failpoint;
+use crate::failpoints::Failpoint;
 
 use super::{HandoffStep, MAXIMUM_ATTEMPTS, Scenario, ScenarioError, ScenarioEvent, incarnation};
 use crate::{clock::SimRandom, fault::FailAction};

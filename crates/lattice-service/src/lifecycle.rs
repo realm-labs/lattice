@@ -7,7 +7,7 @@ use std::{
     time::Instant,
 };
 
-use lattice_core::{actor_address::PlacementDomainId, coordinator::CoordinatorScope};
+use lattice_model::{cluster::CoordinatorScope, cluster::PlacementDomainId};
 use lattice_placement::types::PlacementSlotKey;
 use thiserror::Error;
 use tokio::sync::watch::Sender;

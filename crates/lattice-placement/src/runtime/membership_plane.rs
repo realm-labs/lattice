@@ -1,14 +1,16 @@
+use crate::failpoints;
+
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
-use lattice_core::{
-    coordinator::CoordinatorScope, failpoint::Failpoint, release::ClusterReleaseState,
-};
+use lattice_model::{cluster::ClusterReleaseState, cluster::CoordinatorScope};
+
 use tokio::{
     sync::{broadcast, watch},
     time::MissedTickBehavior,
 };
 
 use super::CoordinatorRuntimeError;
+
 use crate::{
     coordinator::{
         COORDINATOR_PROTOCOL_GENERATION, LeaderRecord, MemberChange, MemberEvent, MemberHello,
@@ -188,7 +190,7 @@ where
                 }
                 let mut member = current.clone();
                 member.version = self.next_version()?;
-                super::guarded_commit_failpoint(Failpoint::MemberBeforeGuardedCommit)?;
+                super::guarded_commit_failpoint(failpoints::MEMBER_BEFORE_GUARDED_COMMIT)?;
                 let committed = self
                     .store
                     .update_member(
@@ -236,7 +238,7 @@ where
             version: self.next_version()?,
             lease_id,
         };
-        super::guarded_commit_failpoint(Failpoint::MemberBeforeGuardedCommit)?;
+        super::guarded_commit_failpoint(failpoints::MEMBER_BEFORE_GUARDED_COMMIT)?;
         let committed = match self
             .store
             .create_member(
@@ -300,7 +302,7 @@ where
             .await?
             .filter(|member| &member.node == node)
             .ok_or(CoordinatorRuntimeError::StaleMember)?;
-        super::guarded_commit_failpoint(Failpoint::MemberBeforeGuardedCommit)?;
+        super::guarded_commit_failpoint(failpoints::MEMBER_BEFORE_GUARDED_COMMIT)?;
         let committed = self
             .store
             .remove_member(
@@ -394,7 +396,7 @@ where
         let mut member = expected.clone();
         member.status = status;
         member.version = self.next_version()?;
-        super::guarded_commit_failpoint(Failpoint::MemberBeforeGuardedCommit)?;
+        super::guarded_commit_failpoint(failpoints::MEMBER_BEFORE_GUARDED_COMMIT)?;
         let committed = self
             .store
             .update_member(&self.guard, UpdateMember { expected, member })
@@ -429,9 +431,9 @@ mod tests {
         sync::Arc,
     };
 
-    use lattice_core::{
-        actor_address::{NodeAddress, NodeIncarnation},
-        release::{ReleaseError, ReleaseManifest},
+    use lattice_model::{
+        cluster::{NodeEndpoint, NodeIncarnation},
+        cluster::{ReleaseError, ReleaseManifest},
     };
 
     use super::{CoordinatorRuntimeError, MembershipLeader, MembershipLeaderConfig};
@@ -444,14 +446,14 @@ mod tests {
     fn node(incarnation: u128) -> NodeKey {
         NodeKey {
             node_id: "logic-a".to_owned(),
-            address: NodeAddress::new("127.0.0.1", 29001).unwrap(),
+            address: NodeEndpoint::new("127.0.0.1", 29001).unwrap(),
             incarnation: NodeIncarnation::new(incarnation).unwrap(),
         }
     }
 
     fn hello(node: NodeKey) -> MemberHello {
         MemberHello {
-            release: lattice_core::release::ReleaseManifest::development(1),
+            release: lattice_model::cluster::ReleaseManifest::development(1),
             rollout_participant: true,
             node,
             roles: BTreeSet::new(),
@@ -464,7 +466,7 @@ mod tests {
     fn versioned_hello(node_id: &str, incarnation: u128, release: u64) -> MemberHello {
         let mut value = hello(NodeKey {
             node_id: node_id.to_owned(),
-            address: NodeAddress::new("127.0.0.1", 29_000 + incarnation as u16).unwrap(),
+            address: NodeEndpoint::new("127.0.0.1", 29_000 + incarnation as u16).unwrap(),
             incarnation: NodeIncarnation::new(incarnation).unwrap(),
         });
         value.release = ReleaseManifest::development(release);
@@ -478,7 +480,7 @@ mod tests {
             store.clone(),
             NodeKey {
                 node_id: "coordinator".to_owned(),
-                address: NodeAddress::new("127.0.0.1", 29000).unwrap(),
+                address: NodeEndpoint::new("127.0.0.1", 29000).unwrap(),
                 incarnation: NodeIncarnation::new(1).unwrap(),
             },
             CoordinatorTerm::new(1).unwrap(),
@@ -522,7 +524,7 @@ mod tests {
             store.clone(),
             NodeKey {
                 node_id: "coordinator".to_owned(),
-                address: NodeAddress::new("127.0.0.1", 29000).unwrap(),
+                address: NodeEndpoint::new("127.0.0.1", 29000).unwrap(),
                 incarnation: NodeIncarnation::new(1).unwrap(),
             },
             CoordinatorTerm::new(1).unwrap(),
@@ -567,7 +569,7 @@ mod tests {
             store,
             NodeKey {
                 node_id: "coordinator".to_owned(),
-                address: NodeAddress::new("127.0.0.1", 29000).unwrap(),
+                address: NodeEndpoint::new("127.0.0.1", 29000).unwrap(),
                 incarnation: NodeIncarnation::new(1).unwrap(),
             },
             CoordinatorTerm::new(1).unwrap(),
@@ -602,7 +604,7 @@ mod tests {
             store,
             NodeKey {
                 node_id: "coordinator".to_owned(),
-                address: NodeAddress::new("127.0.0.1", 29000).unwrap(),
+                address: NodeEndpoint::new("127.0.0.1", 29000).unwrap(),
                 incarnation: NodeIncarnation::new(1).unwrap(),
             },
             CoordinatorTerm::new(1).unwrap(),

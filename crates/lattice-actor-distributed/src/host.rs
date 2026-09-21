@@ -2,7 +2,7 @@ use std::{collections::BTreeMap, sync::Arc, time::Instant};
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use lattice_core::actor_address::ProtocolId;
+use lattice_model::actor::ProtocolId;
 use lattice_remoting::messaging::{
     error::RemoteMessageError,
     inbound::{ImmediateTellDispatch, InboundDispatch},

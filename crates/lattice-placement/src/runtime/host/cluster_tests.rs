@@ -1,8 +1,8 @@
 use std::{collections::BTreeSet, sync::Arc, time::Duration};
 
-use lattice_core::{
-    actor_address::{NodeAddress, NodeIncarnation, PlacementDomainId},
-    coordinator::CoordinatorScope,
+use lattice_model::{
+    cluster::CoordinatorScope,
+    cluster::{NodeEndpoint, NodeIncarnation, PlacementDomainId},
 };
 use lattice_remoting::{association::AssociationManager, config::RemotingConfig};
 use tokio::sync::{mpsc, watch};
@@ -20,7 +20,7 @@ use crate::{
 fn node(id: &str, incarnation: u128, port: u16) -> NodeKey {
     NodeKey {
         node_id: id.to_owned(),
-        address: NodeAddress::new("127.0.0.1", port).unwrap(),
+        address: NodeEndpoint::new("127.0.0.1", port).unwrap(),
         incarnation: NodeIncarnation::new(incarnation).unwrap(),
     }
 }

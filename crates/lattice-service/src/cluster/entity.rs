@@ -1,10 +1,10 @@
 use lattice_actor_distributed::registry::ActorQuarantineError;
-use lattice_core::{actor_address::EntityId, coordinator::CoordinatorScope};
+use lattice_model::{cluster::CoordinatorScope, cluster::EntityId};
 use lattice_placement::{control::PlacementControlCommand, types::ShardId};
 use lattice_remoting::messaging::error::RemoteFailureCode;
 
 use super::{
-    Actor, ActorAddress, ActorHandle, ActorId, ActorLoader, ActorProtocolBinding, ActorRegistry,
+    Actor, ActorAddress, ActorHandle, ActorKey, ActorLoader, ActorProtocolBinding, ActorRegistry,
     Arc, AskError, AssociationKey, AssociationManager, AssociationState, Bytes, DispatchMode,
     DispatchReply, EntityAddress, EntityConfig, Instant, LOGICAL_RESOLVE_MESSAGE_ID,
     LogicPlacementState, LogicalEntityTarget, Mutex, NodeKey, OutboundMessage, OutboundMessaging,
@@ -290,7 +290,7 @@ impl<A: Actor, L: ActorLoader<A>, P: Protocol> EntityRouteHost<A, L, P> {
         let authority = self
             .registry
             .validate_actor_authority(
-                ActorId::Bytes(target.reference.entity_id().as_bytes().to_vec()),
+                ActorKey::Bytes(target.reference.entity_id().as_bytes().to_vec()),
                 target.assignment_generation,
             )
             .map_err(|_| RemoteMessageError::StaleAuthority)?;
@@ -556,7 +556,7 @@ where
         }
         Ok(self
             .registry
-            .exact_address(&ActorId::Bytes(target.entity_id().as_bytes().to_vec())))
+            .exact_address(&ActorKey::Bytes(target.entity_id().as_bytes().to_vec())))
     }
 
     async fn receive_resolve(
@@ -566,7 +566,7 @@ where
         self.validate_local(&target)?;
         let actor = self
             .registry
-            .exact_address(&ActorId::Bytes(
+            .exact_address(&ActorKey::Bytes(
                 target.reference.entity_id().as_bytes().to_vec(),
             ))
             .ok_or(RemoteMessageError::StaleActivation)?;
@@ -581,12 +581,12 @@ where
             .active_actor_ids()
             .into_iter()
             .filter(|actor_id| match actor_id {
-                ActorId::Bytes(bytes) => EntityId::new(bytes.clone()).is_ok_and(|entity_id| {
+                ActorKey::Bytes(bytes) => EntityId::new(bytes.clone()).is_ok_and(|entity_id| {
                     self.mapper
                         .shard_for(&entity_id)
                         .is_ok_and(|mapped| mapped == shard_id)
                 }),
-                ActorId::Str(_) | ActorId::U64(_) | ActorId::I64(_) => false,
+                ActorKey::Str(_) | ActorKey::U64(_) | ActorKey::I64(_) => false,
             })
             .collect::<Vec<_>>();
         drain_actor_ids(
@@ -603,12 +603,12 @@ where
             .active_actor_ids()
             .into_iter()
             .filter(|actor_id| match actor_id {
-                ActorId::Bytes(bytes) => EntityId::new(bytes.clone()).is_ok_and(|entity_id| {
+                ActorKey::Bytes(bytes) => EntityId::new(bytes.clone()).is_ok_and(|entity_id| {
                     self.mapper
                         .shard_for(&entity_id)
                         .is_ok_and(|mapped| mapped == shard_id)
                 }),
-                ActorId::Str(_) | ActorId::U64(_) | ActorId::I64(_) => false,
+                ActorKey::Str(_) | ActorKey::U64(_) | ActorKey::I64(_) => false,
             })
             .collect::<Vec<_>>();
         self.registry.wait_actor_ids_terminal(actor_ids).await;
@@ -642,12 +642,12 @@ where
             .active_actor_ids()
             .into_iter()
             .filter(|actor_id| match actor_id {
-                ActorId::Bytes(bytes) => EntityId::new(bytes.clone()).is_ok_and(|entity_id| {
+                ActorKey::Bytes(bytes) => EntityId::new(bytes.clone()).is_ok_and(|entity_id| {
                     self.mapper
                         .shard_for(&entity_id)
                         .is_ok_and(|mapped| mapped == shard_id)
                 }),
-                ActorId::Str(_) | ActorId::U64(_) | ActorId::I64(_) => false,
+                ActorKey::Str(_) | ActorKey::U64(_) | ActorKey::I64(_) => false,
             })
             .collect::<Vec<_>>();
         for actor_id in actor_ids {

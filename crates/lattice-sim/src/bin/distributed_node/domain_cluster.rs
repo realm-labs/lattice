@@ -44,7 +44,7 @@ async fn domain_host(
     );
     let cluster = ClusterId::new("docker-domain-e2e")?;
     let incarnation = NodeIncarnation::generate();
-    let address = NodeAddress::new(node_id.clone(), port)?;
+    let address = NodeEndpoint::new(node_id.clone(), port)?;
     let builder =
         LatticeService::builder(node_config(cluster, &node_id, address.clone(), incarnation))?;
     let host = CoordinatorHost::elect(
@@ -157,7 +157,7 @@ async fn domain_logic(
     }
     let cluster = ClusterId::new("docker-domain-e2e")?;
     let incarnation = NodeIncarnation::generate();
-    let address = NodeAddress::new(address_host, port)?;
+    let address = NodeEndpoint::new(address_host, port)?;
     let mut config = node_config(
         cluster.clone(),
         &node_id,
@@ -255,7 +255,7 @@ async fn domain_logic(
             },
             protocol.as_ref(),
         ));
-        let actor_id = ActorId::U64(1);
+        let actor_id = ActorKey::U64(1);
         registry.start(actor_id.clone(), PingActor).await?;
         let reference: ActorAddress<FixtureProtocol> = registry
             .address(&actor_id)?
@@ -530,7 +530,7 @@ fn domain_static_discovery(
         .enumerate()
         .map(|(index, (node_id, port))| {
             Ok(StaticEndpoint {
-                address: NodeAddress::new(*node_id, *port)?,
+                address: NodeEndpoint::new(*node_id, *port)?,
                 expected_node_id: Some((*node_id).to_owned()),
                 priority: u16::try_from(index + 1)?,
             })

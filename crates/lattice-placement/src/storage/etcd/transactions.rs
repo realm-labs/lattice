@@ -1,5 +1,5 @@
 use etcd_client::{Compare, CompareOp, PutOptions, Txn, TxnOp};
-use lattice_core::coordinator::CoordinatorScope;
+use lattice_model::cluster::CoordinatorScope;
 use serde::de::DeserializeOwned;
 
 use super::{EtcdPlacementStore, decode, encode, parse_revision_value};

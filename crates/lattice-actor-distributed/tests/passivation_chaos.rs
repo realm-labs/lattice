@@ -7,10 +7,10 @@ use lattice_actor::context::ActorContext;
 use lattice_actor::error::{ActorCallError, ActorFailure, ActorStopError};
 use lattice_actor::reply::ReplyTo;
 use lattice_actor::traits::{Actor, ActorLifecycleState, PassivationReason, Responder, StopReason};
+use lattice_actor_distributed::ActorKey;
+use lattice_actor_distributed::actor_kind;
 use lattice_actor_distributed::registry::ActorRegistry;
 use lattice_actor_distributed::registry::ActorRegistryConfig;
-use lattice_core::actor_kind;
-use lattice_core::id::ActorId;
 use tokio::sync::Semaphore;
 
 const ASK_TIMEOUT: Duration = Duration::from_secs(5);
@@ -81,7 +81,7 @@ async fn request_arriving_while_actor_is_passivating_is_not_processed_by_old_inc
     let handled_pings = Arc::new(AtomicUsize::new(0));
     let handle = registry
         .start(
-            ActorId::U64(7),
+            ActorKey::U64(7),
             PassivatingActor {
                 stop_entered: stop_entered.clone(),
                 release_stop: release_stop.clone(),

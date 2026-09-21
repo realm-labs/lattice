@@ -1,7 +1,6 @@
 use async_trait::async_trait;
-use lattice_core::actor_address::{
-    ActivationId, ActorAddress, ActorPath, ClusterId, NodeAddress, NodeIncarnation, ProtocolId,
-};
+use lattice_model::actor::{ActivationId, ActorAddress, ActorPath, ProtocolId};
+use lattice_model::cluster::{ClusterId, NodeEndpoint, NodeIncarnation};
 use tokio::net::{TcpListener, TcpStream};
 
 use super::*;
@@ -83,7 +82,7 @@ impl InboundDispatch for EchoDispatch {
 fn active_association(
     local: NodeIncarnation,
     remote: NodeIncarnation,
-    remote_address: NodeAddress,
+    remote_address: NodeEndpoint,
     protocol_id: ProtocolId,
     fingerprint: ProtocolFingerprint,
 ) -> Arc<Association> {
@@ -125,8 +124,8 @@ async fn interactive_lane_stays_awake_while_ask_is_in_flight() {
     let server_incarnation = NodeIncarnation::new(2).unwrap();
     let protocol_id = ProtocolId::new(7).unwrap();
     let fingerprint = ProtocolFingerprint::digest(b"lane-test/v1");
-    let server_address = NodeAddress::new("127.0.0.1", socket.port()).unwrap();
-    let client_address = NodeAddress::new("127.0.0.1", 25549).unwrap();
+    let server_address = NodeEndpoint::new("127.0.0.1", socket.port()).unwrap();
+    let client_address = NodeEndpoint::new("127.0.0.1", 25549).unwrap();
     let client_association = active_association(
         client_incarnation,
         server_incarnation,
@@ -287,7 +286,7 @@ async fn cancelling_a_blocked_write_releases_the_entire_dequeued_batch() {
             AssociationKey {
                 cluster_id: ClusterId::new("cancel-write").unwrap(),
                 local_incarnation: NodeIncarnation::new(1).unwrap(),
-                remote_address: NodeAddress::new("remote", 25520).unwrap(),
+                remote_address: NodeEndpoint::new("remote", 25520).unwrap(),
                 remote_incarnation: NodeIncarnation::new(2).unwrap(),
             },
             RemotingConfig {
@@ -353,7 +352,7 @@ async fn cancelling_a_blocked_write_releases_the_entire_dequeued_batch() {
 }
 
 fn lane_target(
-    address: &NodeAddress,
+    address: &NodeEndpoint,
     incarnation: NodeIncarnation,
     protocol_id: ProtocolId,
 ) -> ActorAddress {
@@ -383,7 +382,7 @@ async fn a_bulk_stripe_failure_keeps_interactive_asks_pending() {
     let server_incarnation = NodeIncarnation::new(2).unwrap();
     let protocol_id = ProtocolId::new(7).unwrap();
     let fingerprint = ProtocolFingerprint::digest(b"lane-test/v1");
-    let server_address = NodeAddress::new("127.0.0.1", 25551).unwrap();
+    let server_address = NodeEndpoint::new("127.0.0.1", 25551).unwrap();
     let association = active_association(
         client_incarnation,
         server_incarnation,
@@ -455,7 +454,7 @@ async fn a_blocked_control_write_fails_within_the_heartbeat_window() {
     let association = active_association(
         NodeIncarnation::new(1).unwrap(),
         NodeIncarnation::new(2).unwrap(),
-        NodeAddress::new("127.0.0.1", 25554).unwrap(),
+        NodeEndpoint::new("127.0.0.1", 25554).unwrap(),
         ProtocolId::new(7).unwrap(),
         ProtocolFingerprint::digest(b"lane-test/v1"),
     );
@@ -489,8 +488,8 @@ async fn a_queued_compact_tell_is_expanded_after_the_stripe_reconnects() {
     let server_incarnation = NodeIncarnation::new(2).unwrap();
     let protocol_id = ProtocolId::new(7).unwrap();
     let fingerprint = ProtocolFingerprint::digest(b"lane-test/v1");
-    let server_address = NodeAddress::new("127.0.0.1", 25555).unwrap();
-    let client_address = NodeAddress::new("127.0.0.1", 25556).unwrap();
+    let server_address = NodeEndpoint::new("127.0.0.1", 25555).unwrap();
+    let client_address = NodeEndpoint::new("127.0.0.1", 25556).unwrap();
     let client_association = active_association(
         client_incarnation,
         server_incarnation,
@@ -592,8 +591,8 @@ async fn an_unregistered_dictionary_id_drops_one_frame_and_keeps_the_lane() {
     let server_incarnation = NodeIncarnation::new(2).unwrap();
     let protocol_id = ProtocolId::new(7).unwrap();
     let fingerprint = ProtocolFingerprint::digest(b"lane-test/v1");
-    let server_address = NodeAddress::new("127.0.0.1", 25557).unwrap();
-    let client_address = NodeAddress::new("127.0.0.1", 25558).unwrap();
+    let server_address = NodeEndpoint::new("127.0.0.1", 25557).unwrap();
+    let client_address = NodeEndpoint::new("127.0.0.1", 25558).unwrap();
     let client_association = active_association(
         client_incarnation,
         server_incarnation,
@@ -668,7 +667,7 @@ async fn a_reply_without_a_pending_ask_is_discarded_and_counted() {
     let association = active_association(
         NodeIncarnation::new(1).unwrap(),
         NodeIncarnation::new(2).unwrap(),
-        NodeAddress::new("127.0.0.1", 25559).unwrap(),
+        NodeEndpoint::new("127.0.0.1", 25559).unwrap(),
         ProtocolId::new(7).unwrap(),
         ProtocolFingerprint::digest(b"lane-test/v1"),
     );
@@ -713,7 +712,7 @@ async fn the_control_lane_announces_close_before_shutdown() {
     let association = active_association(
         NodeIncarnation::new(1).unwrap(),
         NodeIncarnation::new(2).unwrap(),
-        NodeAddress::new("127.0.0.1", 25560).unwrap(),
+        NodeEndpoint::new("127.0.0.1", 25560).unwrap(),
         ProtocolId::new(7).unwrap(),
         ProtocolFingerprint::digest(b"lane-test/v1"),
     );
@@ -761,7 +760,7 @@ async fn a_remote_close_completes_pending_asks_by_dispatch_knowledge() {
     let server_incarnation = NodeIncarnation::new(2).unwrap();
     let protocol_id = ProtocolId::new(7).unwrap();
     let fingerprint = ProtocolFingerprint::digest(b"lane-test/v1");
-    let server_address = NodeAddress::new("127.0.0.1", 25561).unwrap();
+    let server_address = NodeEndpoint::new("127.0.0.1", 25561).unwrap();
     let association = active_association(
         client_incarnation,
         server_incarnation,
