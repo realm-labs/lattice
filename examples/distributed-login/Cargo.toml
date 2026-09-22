@@ -15,7 +15,7 @@ lattice-placement.workspace = true
 lattice-remoting.workspace = true
 lattice-service.workspace = true
 prost.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tokio-stream.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

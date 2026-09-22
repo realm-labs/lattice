@@ -20,7 +20,7 @@ lattice-service.workspace = true
 prost.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
 
 [build-dependencies]
 lattice-codegen.workspace = true

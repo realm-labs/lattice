@@ -18,11 +18,12 @@ mongodb.workspace = true
 serde.workspace = true
 uuid.workspace = true
 thiserror.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
 tracing.workspace = true
 xxhash-rust.workspace = true
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 criterion.workspace = true
 trybuild.workspace = true
 

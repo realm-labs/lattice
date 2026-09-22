@@ -25,11 +25,12 @@ lattice-placement.workspace = true
 lattice-remoting.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
 tracing.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "test-util"] }
 lattice-failpoint = { workspace = true, features = ["enabled"] }
 prost.workspace = true
 serde.workspace = true
