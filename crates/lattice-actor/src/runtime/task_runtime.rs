@@ -2,7 +2,7 @@ use std::{
     fmt,
     future::Future,
     sync::{Mutex, mpsc as std_mpsc},
-    thread::{Builder as ThreadBuilder, JoinHandle},
+    thread::{Builder as ThreadBuilder, JoinHandle, current as current_thread},
 };
 
 use tokio::{
@@ -137,7 +137,7 @@ impl Drop for RunningTaskRuntime {
             let _ = shutdown_tx.send(());
         }
         if let Some(owner_thread) = self.owner_thread.take()
-            && owner_thread.thread().id() != std::thread::current().id()
+            && owner_thread.thread().id() != current_thread().id()
         {
             let _ = owner_thread.join();
         }

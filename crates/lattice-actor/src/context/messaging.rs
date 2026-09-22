@@ -4,12 +4,16 @@
 //! not need to know whether an integration implements a target with a mailbox,
 //! a network route, or another transport.
 
-use std::{future::Future, time::Duration};
+use std::{
+    future::Future,
+    time::{Duration, Instant},
+};
 
 use super::ActorContext;
 use crate::{
     error::{ActorCallError, ActorTellError},
     handle::ActorHandle,
+    state_machine::Accepts,
     traits::{Actor, Handler, Message, Request, Responder},
 };
 
@@ -29,14 +33,14 @@ pub trait AskTarget<R: Request>: Sync {
     fn ask_until(
         &self,
         request: R,
-        deadline: std::time::Instant,
+        deadline: Instant,
     ) -> impl Future<Output = Result<R::Response, Self::Error>> + Send;
 }
 
 impl<B, M> TellTarget<M> for ActorHandle<B>
 where
     B: Actor + Handler<M>,
-    B::Behavior: crate::state_machine::Accepts<M>,
+    B::Behavior: Accepts<M>,
     M: Message,
 {
     type Error = ActorTellError<M>;
@@ -49,7 +53,7 @@ where
 impl<B, R> AskTarget<R> for ActorHandle<B>
 where
     B: Actor + Responder<R>,
-    B::Behavior: crate::state_machine::Accepts<R>,
+    B::Behavior: Accepts<R>,
     R: Request,
 {
     type Error = ActorCallError;
@@ -61,7 +65,7 @@ where
     fn ask_until(
         &self,
         request: R,
-        deadline: std::time::Instant,
+        deadline: Instant,
     ) -> impl Future<Output = Result<R::Response, Self::Error>> + Send {
         ActorHandle::ask_until(self, request, deadline)
     }
@@ -91,7 +95,7 @@ impl<A: Actor> ActorContext<A> {
         T: AskTarget<R>,
         R: Request,
     {
-        let requested_deadline = std::time::Instant::now()
+        let requested_deadline = Instant::now()
             .checked_add(timeout)
             .ok_or_else(T::invalid_timeout_error)?;
         let deadline = self

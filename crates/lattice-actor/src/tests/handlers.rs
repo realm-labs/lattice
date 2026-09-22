@@ -11,13 +11,14 @@ use super::{
 use crate::{
     error::ActorCallError,
     mailbox::MailboxConfig,
+    state_machine::Accepts,
     traits::{Handler, Message, Request, Responder},
 };
 
 fn assert_handler_bound<A, M>()
 where
     A: Handler<M>,
-    <A as crate::traits::Actor>::Behavior: crate::state_machine::Accepts<M>,
+    A::Behavior: Accepts<M>,
     M: Message,
 {
 }
@@ -28,7 +29,7 @@ fn handler_compile_time_bounds_are_typed() {
     fn assert_responder_bound<A, R>()
     where
         A: Responder<R>,
-        <A as crate::traits::Actor>::Behavior: crate::state_machine::Accepts<R>,
+        A::Behavior: Accepts<R>,
         R: Request,
     {
     }

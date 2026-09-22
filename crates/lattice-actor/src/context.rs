@@ -9,6 +9,7 @@
 use std::{
     collections::HashMap,
     fmt,
+    ops::{Deref, DerefMut},
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -17,7 +18,7 @@ use std::{
 };
 
 use crate::environment::ActorEnvironment;
-use tokio::task::{JoinHandle, JoinSet};
+use tokio::task::{AbortHandle, JoinHandle, JoinSet};
 
 use crate::{
     attachments::ActorRuntimeAttachments,
@@ -45,7 +46,7 @@ use children::ChildStop;
 /// Actor shutdown still cancels every outstanding pipe task automatically.
 #[derive(Debug, Clone)]
 pub struct PipeTaskHandle {
-    abort: tokio::task::AbortHandle,
+    abort: AbortHandle,
 }
 
 pub struct ActorContext<A: Actor> {
@@ -190,7 +191,7 @@ impl<'a, A: Actor> HandlerContext<'a, A> {
     }
 }
 
-impl<A: Actor> std::ops::Deref for HandlerContext<'_, A> {
+impl<A: Actor> Deref for HandlerContext<'_, A> {
     type Target = ActorContext<A>;
 
     fn deref(&self) -> &Self::Target {
@@ -198,7 +199,7 @@ impl<A: Actor> std::ops::Deref for HandlerContext<'_, A> {
     }
 }
 
-impl<A: Actor> std::ops::DerefMut for HandlerContext<'_, A> {
+impl<A: Actor> DerefMut for HandlerContext<'_, A> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.actor
     }

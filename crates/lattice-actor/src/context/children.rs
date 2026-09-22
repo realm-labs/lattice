@@ -9,7 +9,7 @@ use std::{
     any::type_name,
     sync::{Arc, Mutex},
 };
-use tokio::task::AbortHandle;
+use tokio::{spawn, task::AbortHandle};
 
 use super::ActorContext;
 use crate::{
@@ -258,7 +258,7 @@ where
     };
     // The parent has already released this child, so a full system lane would otherwise leave it
     // running with no owner able to retry.
-    tokio::spawn(async move {
+    spawn(async move {
         let _ = handle.send_stop_internal(reason).await;
     });
 }

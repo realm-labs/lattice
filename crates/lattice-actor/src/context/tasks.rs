@@ -5,12 +5,17 @@
 
 use std::{any::type_name, future::Future, time::Duration};
 
-use tokio::task::{AbortHandle, JoinSet};
+use tokio::{
+    spawn,
+    task::{AbortHandle, JoinSet},
+    time::{interval as time_interval, sleep},
+};
 use tracing::Instrument;
 
 use super::ActorContext;
 use crate::{
     error::{ActorCallError, ActorContextError, ActorTellError},
+    state_machine::Accepts,
     traits::{Actor, Handler, Message},
     watch::{ActorTerminated, TerminationSubscription, WatchId, WatchTarget},
 };
@@ -25,7 +30,7 @@ impl<A: Actor> ActorContext<A> {
     pub fn notify_after<M>(&mut self, delay: Duration, msg: M)
     where
         A: Handler<M>,
-        <A as crate::traits::Actor>::Behavior: crate::state_machine::Accepts<M>,
+        A::Behavior: Accepts<M>,
         M: Message,
     {
         let handle = self.handle.clone();
@@ -38,7 +43,7 @@ impl<A: Actor> ActorContext<A> {
         );
         self.spawn_scoped(
             async move {
-                tokio::time::sleep(delay).await;
+                sleep(delay).await;
                 let _ = handle.try_tell_internal(msg);
             }
             .instrument(span),
@@ -48,7 +53,7 @@ impl<A: Actor> ActorContext<A> {
     pub fn notify_interval<M, F>(&mut self, interval: Duration, mut make_msg: F)
     where
         A: Handler<M>,
-        <A as crate::traits::Actor>::Behavior: crate::state_machine::Accepts<M>,
+        A::Behavior: Accepts<M>,
         M: Message,
         F: FnMut() -> M + Send + 'static,
     {
@@ -62,7 +67,7 @@ impl<A: Actor> ActorContext<A> {
         );
         self.spawn_scoped(
             async move {
-                let mut ticker = tokio::time::interval(interval);
+                let mut ticker = time_interval(interval);
                 loop {
                     ticker.tick().await;
                     // A momentarily full mailbox drops one tick; only a mailbox that can never
@@ -98,7 +103,7 @@ impl<A: Actor> ActorContext<A> {
     pub async fn watch<T>(&mut self, target: &T) -> Result<WatchId, ActorContextError>
     where
         A: Handler<ActorTerminated>,
-        <A as crate::traits::Actor>::Behavior: crate::state_machine::Accepts<ActorTerminated>,
+        A::Behavior: Accepts<ActorTerminated>,
         T: WatchTarget + ?Sized,
     {
         self.watches.retain(|_watch_id, task| !task.is_finished());
@@ -122,7 +127,7 @@ impl<A: Actor> ActorContext<A> {
             watcher.type = type_name::<A>(),
             watch.id = ?watch_id
         );
-        let task = tokio::spawn(
+        let task = spawn(
             async move {
                 if let Some(reason) = terminations.recv().await {
                     let notification = ActorTerminated { watch_id, reason };

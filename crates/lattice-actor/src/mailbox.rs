@@ -333,7 +333,7 @@ where
 impl<A, R> ActorEnvelope<A> for RequestEnvelope<R>
 where
     A: Responder<R>,
-    <A as crate::traits::Actor>::Behavior: crate::state_machine::Accepts<R>,
+    A::Behavior: Accepts<R>,
     R: Request,
 {
     fn metadata(&self, lane: MailboxLane) -> MessageMetadata {
@@ -387,9 +387,7 @@ where
                 ctx.set_current_deadline(None);
                 return outcome;
             }
-            if !<A::Behavior as crate::state_machine::Accepts<R>>::ALWAYS
-                && !crate::state_machine::Accepts::<R>::accepts(behavior)
-            {
+            if !<A::Behavior as Accepts<R>>::ALWAYS && !Accepts::<R>::accepts(behavior) {
                 if let Some(reply_tx) = self.reply_tx.take() {
                     let _ = reply_tx.send(Err(ActorCallError::UnhandledInCurrentState));
                 }

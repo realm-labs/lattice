@@ -54,6 +54,7 @@
 use std::{
     error::Error,
     fmt,
+    mem::replace,
     sync::{Arc, Mutex, MutexGuard},
     time::Instant,
 };
@@ -350,7 +351,7 @@ impl<T: Send + 'static> ReplySlot<T> {
 
     fn transition<R>(&self, transition: impl FnOnce(ReplyState<T>) -> (ReplyState<T>, R)) -> R {
         let mut state = self.lock();
-        let current = std::mem::replace(&mut *state, ReplyState::Completed);
+        let current = replace(&mut *state, ReplyState::Completed);
         let (next, result) = transition(current);
         *state = next;
         result

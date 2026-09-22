@@ -1,4 +1,4 @@
-use std::{convert::Infallible, future::Future};
+use std::{convert::Infallible, fmt::Display, future::Future};
 
 use crate::{
     handle::{ActorHandle, ActorTerminationSubscription},
@@ -36,7 +36,7 @@ pub struct ActorTerminated {
 
 /// A target whose lifetime can be observed without exposing how it is reached.
 pub trait WatchTarget: Send + Sync {
-    type Error: std::fmt::Display;
+    type Error: Display;
     type Subscription: TerminationSubscription;
 
     fn watch(&self) -> impl Future<Output = Result<Self::Subscription, Self::Error>> + Send;

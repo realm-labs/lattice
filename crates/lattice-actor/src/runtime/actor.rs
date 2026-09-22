@@ -1,4 +1,9 @@
-use std::{any::type_name, panic::AssertUnwindSafe, time::SystemTime};
+use std::{
+    any::type_name,
+    future::pending,
+    panic::{AssertUnwindSafe, catch_unwind},
+    time::SystemTime,
+};
 
 use futures_util::FutureExt;
 use tokio::sync::oneshot;
@@ -148,7 +153,7 @@ async fn start_actor<A>(
 where
     A: Actor,
 {
-    let behavior = std::panic::catch_unwind(AssertUnwindSafe(|| actor.initial_behavior()))
+    let behavior = catch_unwind(AssertUnwindSafe(|| actor.initial_behavior()))
         .map_err(|payload| ActorPanic::new("initial_behavior", payload))?;
     if handle.business_admission_fenced() {
         return Ok((behavior, Some(StopReason::Requested)));
@@ -416,7 +421,7 @@ fn finish_actor<A>(
         handle,
         QueuedRejection::MailboxClosed,
     );
-    if let Err(payload) = std::panic::catch_unwind(AssertUnwindSafe(|| drop(actor))) {
+    if let Err(payload) = catch_unwind(AssertUnwindSafe(|| drop(actor))) {
         finalize_panicked_actor(handle, ActorPanic::new("drop", payload));
         return;
     }
@@ -587,7 +592,7 @@ where
                 None => {
                     // ActorContext retains a self handle, so this is reachable only during runtime
                     // teardown. Keep the actor alive until that teardown drops the task.
-                    std::future::pending::<()>().await;
+                    pending::<()>().await;
                 }
             }
         }

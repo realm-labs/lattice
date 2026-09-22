@@ -1,6 +1,6 @@
 use std::{
     any::{Any, type_name},
-    panic::AssertUnwindSafe,
+    panic::{AssertUnwindSafe, catch_unwind},
 };
 
 use tracing::error;
@@ -11,7 +11,7 @@ use crate::{
     error::ActorCallError,
     handle::ActorHandle,
     mailbox::{ActorCommand, MailboxLane, QueuedRejection, channel::Receiver},
-    observation::ActorLifecycleEvent,
+    observation::{ActorLifecycleEvent, record_abandoned_stop_failure},
     traits::{Actor, ActorLifecycleState, StopReason},
     watch::{ActorTermination, TerminatedReason},
 };
@@ -64,7 +64,7 @@ pub(super) fn terminate_panicked_actor<A>(
         QueuedRejection::ActorPanicked,
     );
 
-    if let Err(payload) = std::panic::catch_unwind(AssertUnwindSafe(|| drop(actor))) {
+    if let Err(payload) = catch_unwind(AssertUnwindSafe(|| drop(actor))) {
         let secondary = ActorPanic::new("drop", payload);
         error!(
             actor.type = type_name::<A>(),
@@ -92,7 +92,7 @@ where
     handle.mark_terminal_cleanup_started();
     handle.run_terminal_hook();
     if handle.clear_stop_failure() {
-        crate::observation::record_abandoned_stop_failure();
+        record_abandoned_stop_failure();
     }
     handle.set_lifecycle_state(ActorLifecycleState::Stopped);
     handle

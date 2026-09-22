@@ -1,5 +1,7 @@
 use std::future::pending;
 
+use tokio::time::sleep;
+
 use super::PassivationPolicy;
 
 /// Waits for the configured idle period while the Actor runtime is ready to
@@ -11,6 +13,6 @@ use super::PassivationPolicy;
 pub(super) async fn wait_for_idle_timeout(passivation: PassivationPolicy) {
     match passivation {
         PassivationPolicy::Disabled => pending().await,
-        PassivationPolicy::IdleTimeout(timeout) => tokio::time::sleep(timeout).await,
+        PassivationPolicy::IdleTimeout(timeout) => sleep(timeout).await,
     }
 }

@@ -1,4 +1,4 @@
-use std::{any::type_name, panic::AssertUnwindSafe, time::Instant};
+use std::{any::type_name, iter::once, panic::AssertUnwindSafe, time::Instant};
 
 use futures_util::FutureExt;
 use tracing::{Instrument, debug};
@@ -33,7 +33,7 @@ where
         ActorCommand::Envelope(mut envelope) => {
             if handle.business_admission_fenced() {
                 reject_prefetched_commands(
-                    std::iter::once(ActorCommand::Envelope(envelope)),
+                    once(ActorCommand::Envelope(envelope)),
                     lane,
                     handle,
                     QueuedRejection::MailboxClosed,

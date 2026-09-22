@@ -7,6 +7,7 @@ use std::{
         Arc, Mutex, Weak,
         atomic::{AtomicU64, Ordering},
     },
+    thread::available_parallelism,
     time::Duration,
 };
 
@@ -173,7 +174,7 @@ impl Default for ActorRuntimeConfig {
     fn default() -> Self {
         Self {
             default_execution: ActorExecutionPolicy::TaskPerActor,
-            task_worker_count: std::thread::available_parallelism().map_or(1, NonZeroUsize::get),
+            task_worker_count: available_parallelism().map_or(1, NonZeroUsize::get),
             observer: ActorObserverHandle::default(),
             environment: ActorEnvironment::empty(),
         }

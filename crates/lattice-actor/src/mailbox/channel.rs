@@ -1,7 +1,7 @@
 use std::future::poll_fn;
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering, fence},
 };
 use std::task::{Context, Poll};
 
@@ -115,7 +115,7 @@ impl<T> Inner<T> {
         // The remaining race is a wake-up that lands before `register` installs a waker.
         // `AtomicWaker` resolves it internally: `register` observes the in-flight `WAKING` state
         // and wakes its own task instead of parking.
-        std::sync::atomic::fence(Ordering::SeqCst);
+        fence(Ordering::SeqCst);
         // The guard load only avoids a contended RMW while the receiver is draining; the fence
         // above, not this load, carries the ordering.
         if self.receiver_waiting.load(Ordering::Relaxed)
@@ -294,7 +294,7 @@ impl<T> Receiver<T> {
         // Pairs with the fence in `wake_receiver`: publishing the intent before the recheck below
         // is what makes a concurrent sender either observe this flag or be observed by the
         // recheck. See that function for the full argument.
-        std::sync::atomic::fence(Ordering::SeqCst);
+        fence(Ordering::SeqCst);
         self.inner.receiver_waker.register(context.waker());
 
         if let Ok(value) = self.inner.queue.pop() {

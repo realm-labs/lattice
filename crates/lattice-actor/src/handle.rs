@@ -1,6 +1,8 @@
 use std::{
     any::type_name,
+    convert::Infallible,
     fmt,
+    future::ready,
     marker::PhantomData,
     sync::{
         Arc, Mutex,
@@ -10,7 +12,11 @@ use std::{
 };
 
 use broadcast::error::{RecvError, TryRecvError};
-use tokio::sync::{Notify, broadcast, oneshot, watch};
+use tokio::{
+    sync::{Notify, broadcast, oneshot, watch},
+    task::yield_now,
+    time::timeout_at,
+};
 
 use crate::{
     error::{ActorAdminError, ActorCallError, ActorTellError},
@@ -186,10 +192,8 @@ impl<A: Actor> ActorHandle<A> {
 
     /// Observes this local activation through the same DeathWatch shape used by
     /// bound distributed references.
-    pub fn watch(
-        &self,
-    ) -> impl Future<Output = Result<LocalWatchSubscription, std::convert::Infallible>> + Send {
-        std::future::ready(Ok(LocalWatchSubscription::new(self.subscribe_terminated())))
+    pub fn watch(&self) -> impl Future<Output = Result<LocalWatchSubscription, Infallible>> + Send {
+        ready(Ok(LocalWatchSubscription::new(self.subscribe_terminated())))
     }
 
     pub(crate) fn observer(&self) -> &ActorObserverHandle {
@@ -240,7 +244,7 @@ impl<A: Actor> ActorHandle<A> {
         let (reply_tx, reply_rx) = oneshot::channel();
         let command = ActorCommand::envelope(RequestEnvelope::new(request, reply_tx, deadline));
         self.send_command(command, MailboxLane::Normal)?;
-        match tokio::time::timeout_at(deadline.into(), reply_rx).await {
+        match timeout_at(deadline.into(), reply_rx).await {
             Ok(result) => result.map_err(|_| ActorCallError::ResponseDropped)?,
             Err(_) => Err(ActorCallError::DeadlineExceeded),
         }
@@ -580,7 +584,7 @@ impl<A: Actor> ActorHandle<A> {
                     channel.capacity_waiters(),
                     1..=COOPERATIVE_CAPACITY_WAITER_LIMIT
                 ) {
-                    tokio::task::yield_now().await;
+                    yield_now().await;
                 }
                 match channel.reserve_after_full().await {
                     Ok(permit) => permit,

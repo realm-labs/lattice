@@ -13,6 +13,8 @@ use std::{
     },
 };
 
+use tokio::time::timeout_at;
+
 use super::{ActorContext, HandlerContext, PipeTaskHandle};
 use crate::{
     error::{ActorCallError, PipeToSelfError},
@@ -190,7 +192,7 @@ impl<A: Actor> ActorContext<A> {
         let deadline = control.deadline();
         self.deferred_tasks.spawn(async move {
             let output = if let Some(deadline) = deadline {
-                match tokio::time::timeout_at(deadline.into(), future).await {
+                match timeout_at(deadline.into(), future).await {
                     Ok(output) => output,
                     Err(_) => {
                         control.cancel(ActorCallError::DeadlineExceeded);
@@ -207,9 +209,7 @@ impl<A: Actor> ActorContext<A> {
             let message = map(output, reply_to);
             permit.release();
             if let Some(deadline) = deadline {
-                match tokio::time::timeout_at(deadline.into(), handle.send_tell_internal(message))
-                    .await
-                {
+                match timeout_at(deadline.into(), handle.send_tell_internal(message)).await {
                     Ok(Ok(())) => {}
                     Ok(Err(_)) => control.cancel(ActorCallError::MailboxClosed),
                     Err(_) => control.cancel(ActorCallError::DeadlineExceeded),

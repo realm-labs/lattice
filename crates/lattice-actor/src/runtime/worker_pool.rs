@@ -4,7 +4,7 @@ use std::{
         atomic::{AtomicU64, Ordering},
         mpsc as std_mpsc,
     },
-    thread::{Builder as ThreadBuilder, JoinHandle},
+    thread::{Builder as ThreadBuilder, JoinHandle, current as current_thread},
 };
 
 use tokio::{
@@ -52,7 +52,7 @@ impl Drop for ActorWorkerPool {
         }
         for worker in &mut self.workers {
             if let Some(join_handle) = worker.join_handle.take()
-                && join_handle.thread().id() != std::thread::current().id()
+                && join_handle.thread().id() != current_thread().id()
             {
                 let _ = join_handle.join();
             }
