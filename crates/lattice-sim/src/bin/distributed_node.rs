@@ -1,5 +1,6 @@
 #![cfg_attr(not(test), deny(clippy::wildcard_imports))]
 use lattice_actor::context::HandlerContext;
+use lattice_actor_distributed::registry::ActorDefinition;
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -14,7 +15,7 @@ use async_trait::async_trait;
 use bytes::BytesMut;
 use clap::{Parser, ValueEnum};
 use lattice_actor::environment::ActorEnvironment;
-use lattice_actor_distributed::{ActorKey, actor_kind};
+use lattice_actor_distributed::ActorKey;
 use lattice_actor_distributed::{
     actor_protocol,
     context::ActorContext,
@@ -615,8 +616,7 @@ async fn server(reference: PathBuf) -> Result<(), Box<dyn Error>> {
     let protocol = Arc::new(FixtureProtocol::bind::<PingActor>()?);
     let mut environment = ActorEnvironment::builder();
     environment.insert(ActivationDirectory::new(64)?)?;
-    let registry = Arc::new(ActorRegistry::new_bound(
-        actor_kind!("DistributedFixture"),
+    let registry = Arc::new(ActorRegistry::<DistributedFixtureDefinition, _>::new_bound(
         ActorRegistryConfig {
             address: Some(ActorAddressConfig {
                 cluster_id: cluster.clone(),
@@ -940,19 +940,20 @@ fn entity_service(
     let mut environment = ActorEnvironment::builder();
     environment.insert(ActivationDirectory::new(64)?)?;
     let protocol = Arc::new(FixtureProtocol::bind::<PingActor>()?);
-    let registry = Arc::new(ActorRegistry::new_bound(
-        actor_kind!("DistributedEntityFixture"),
-        ActorRegistryConfig {
-            address: Some(ActorAddressConfig {
-                cluster_id: cluster.clone(),
-                node_address: node.address.clone(),
-                node_incarnation: node.incarnation,
-            }),
-            environment: environment.build(),
-            ..ActorRegistryConfig::default()
-        },
-        protocol.as_ref(),
-    ));
+    let registry = Arc::new(
+        ActorRegistry::<DistributedEntityFixtureDefinition, _>::new_bound(
+            ActorRegistryConfig {
+                address: Some(ActorAddressConfig {
+                    cluster_id: cluster.clone(),
+                    node_address: node.address.clone(),
+                    node_incarnation: node.incarnation,
+                }),
+                environment: environment.build(),
+                ..ActorRegistryConfig::default()
+            },
+            protocol.as_ref(),
+        ),
+    );
     let mut builder = LatticeServiceBuilder::new(node_config(
         cluster.clone(),
         &node.node_id,
@@ -1143,3 +1144,19 @@ include!("distributed_node/helpers.rs");
 include!("distributed_node/domain_cluster.rs");
 include!("distributed_node/split_entity.rs");
 include!("distributed_node/ha_coordinator.rs");
+
+#[derive(Debug)]
+struct DistributedFixtureDefinition;
+
+impl ActorDefinition for DistributedFixtureDefinition {
+    const NAME: &'static str = "DistributedFixture";
+    type Protocol = FixtureProtocol;
+}
+
+#[derive(Debug)]
+struct DistributedEntityFixtureDefinition;
+
+impl ActorDefinition for DistributedEntityFixtureDefinition {
+    const NAME: &'static str = "DistributedEntityFixture";
+    type Protocol = FixtureProtocol;
+}

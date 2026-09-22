@@ -1,8 +1,9 @@
 //! Remote message routing against an exact actor reference over TCP.
 
+use lattice_actor_distributed::registry::ActorDefinition;
 use std::{sync::Arc, time::Duration};
 
-use lattice_actor_distributed::{ActorKey, actor_kind};
+use lattice_actor_distributed::ActorKey;
 use lattice_actor_distributed::{
     activation::DistributedActorContextExt,
     context::{ActorContext, HandlerContext},
@@ -86,8 +87,7 @@ async fn bound_actor_ref_asks_exact_remote_activation_over_tcp() {
     let client_incarnation = NodeIncarnation::new(1).unwrap();
     let server_incarnation = NodeIncarnation::new(2).unwrap();
     let binding = Arc::new(PingProtocol::bind::<PingActor>().unwrap());
-    let registry = Arc::new(ActorRegistry::new_bound(
-        actor_kind!("Ping"),
+    let registry = Arc::new(ActorRegistry::<PingDefinition, _>::new_bound(
         ActorRegistryConfig {
             address: Some(ActorAddressConfig {
                 cluster_id: cluster_id.clone(),
@@ -175,8 +175,7 @@ async fn local_exact_watch_uses_the_same_subscription_and_drop_cancels_it() {
     let address = unused_address().await;
     let incarnation = NodeIncarnation::new(11).unwrap();
     let binding = Arc::new(PingProtocol::bind::<PingActor>().unwrap());
-    let registry = Arc::new(ActorRegistry::new_bound(
-        actor_kind!("Ping"),
+    let registry = Arc::new(ActorRegistry::<PingDefinition, _>::new_bound(
         ActorRegistryConfig {
             address: Some(ActorAddressConfig {
                 cluster_id: cluster_id.clone(),
@@ -242,8 +241,7 @@ async fn actor_context_watch_delivers_a_remote_termination_to_the_system_mailbox
     let server_incarnation = NodeIncarnation::new(22).unwrap();
 
     let target_binding = Arc::new(PingProtocol::bind::<PingActor>().unwrap());
-    let target_registry = Arc::new(ActorRegistry::new_bound(
-        actor_kind!("RemoteWatchTarget"),
+    let target_registry = Arc::new(ActorRegistry::<RemoteWatchTargetDefinition, _>::new_bound(
         ActorRegistryConfig {
             address: Some(ActorAddressConfig {
                 cluster_id: cluster_id.clone(),
@@ -273,8 +271,7 @@ async fn actor_context_watch_delivers_a_remote_termination_to_the_system_mailbox
     .unwrap();
 
     let watcher_binding = Arc::new(PingProtocol::bind::<RemoteWatcherActor>().unwrap());
-    let watcher_registry = Arc::new(ActorRegistry::new_bound(
-        actor_kind!("RemoteWatcher"),
+    let watcher_registry = Arc::new(ActorRegistry::<RemoteWatcherDefinition, _>::new_bound(
         ActorRegistryConfig {
             address: Some(ActorAddressConfig {
                 cluster_id: cluster_id.clone(),
@@ -356,4 +353,28 @@ async fn actor_context_watch_delivers_a_remote_termination_to_the_system_mailbox
 
     client.shutdown().await.unwrap();
     server.shutdown().await.unwrap();
+}
+
+#[derive(Debug)]
+struct PingDefinition;
+
+impl ActorDefinition for PingDefinition {
+    const NAME: &'static str = "Ping";
+    type Protocol = PingProtocol;
+}
+
+#[derive(Debug)]
+struct RemoteWatchTargetDefinition;
+
+impl ActorDefinition for RemoteWatchTargetDefinition {
+    const NAME: &'static str = "RemoteWatchTarget";
+    type Protocol = PingProtocol;
+}
+
+#[derive(Debug)]
+struct RemoteWatcherDefinition;
+
+impl ActorDefinition for RemoteWatcherDefinition {
+    const NAME: &'static str = "RemoteWatcher";
+    type Protocol = PingProtocol;
 }

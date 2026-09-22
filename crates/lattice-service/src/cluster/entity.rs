@@ -1,4 +1,4 @@
-use lattice_actor_distributed::registry::ActorQuarantineError;
+use lattice_actor_distributed::registry::{ActorDefinition, ActorQuarantineError};
 use lattice_model::{cluster::CoordinatorScope, cluster::EntityId};
 use lattice_placement::{control::PlacementControlCommand, types::ShardId};
 use lattice_remoting::messaging::error::RemoteFailureCode;
@@ -95,7 +95,12 @@ impl RouteFailureLog {
     }
 }
 
-pub(super) struct EntityRouteHost<A: Actor, L: ActorLoader<A>, P: Protocol> {
+pub(super) struct EntityRouteHost<
+    D: ActorDefinition<Protocol = P>,
+    A: Actor,
+    L: ActorLoader<A>,
+    P: Protocol,
+> {
     pub(super) local_node: NodeKey,
     pub(super) state: Arc<Mutex<LogicPlacementState>>,
     pub(super) associations: Arc<AssociationManager>,
@@ -104,13 +109,15 @@ pub(super) struct EntityRouteHost<A: Actor, L: ActorLoader<A>, P: Protocol> {
     pub(super) buffer: RouteBuffer,
     pub(super) config: EntityConfig,
     pub(super) mapper: ShardMapperBinding,
-    pub(super) registry: Arc<ActorRegistry<A>>,
+    pub(super) registry: Arc<ActorRegistry<D, A>>,
     pub(super) protocol: Arc<ActorProtocolBinding<A, P>>,
     pub(super) loader: L,
     pub(super) route_failures: RouteFailureLog,
 }
 
-impl<A: Actor, L: ActorLoader<A>, P: Protocol> EntityRouteHost<A, L, P> {
+impl<D: ActorDefinition<Protocol = P>, A: Actor, L: ActorLoader<A>, P: Protocol>
+    EntityRouteHost<D, A, L, P>
+{
     fn slot_key(&self, target: &EntityAddress) -> Result<PlacementSlotKey, RemoteMessageError> {
         if target.protocol_id() != self.config.protocol_id
             || target.domain() != &self.config.domain
@@ -305,7 +312,7 @@ impl<A: Actor, L: ActorLoader<A>, P: Protocol> EntityRouteHost<A, L, P> {
 }
 
 #[async_trait]
-impl<A, L, P> EntityRoute for EntityRouteHost<A, L, P>
+impl<D: ActorDefinition<Protocol = P>, A, L, P> EntityRoute for EntityRouteHost<D, A, L, P>
 where
     A: Actor,
     L: ActorLoader<A>,

@@ -6,9 +6,10 @@
 //! place. These tests hold the line in both directions: the cluster-internal scopes survive a
 //! membership session loss, and no termination path is allowed to inherit that leniency.
 
+use lattice_actor_distributed::registry::ActorDefinition;
 use std::{collections::BTreeSet, sync::Arc, time::Duration};
 
-use lattice_actor_distributed::{ActorKey, actor_kind};
+use lattice_actor_distributed::ActorKey;
 use lattice_actor_distributed::{
     registry::{ActorAddressConfig, ActorRegistry, ActorRegistryConfig},
     traits::StopReason,
@@ -48,12 +49,11 @@ fn hosted_ping(
     address: &NodeEndpoint,
     incarnation: NodeIncarnation,
 ) -> (
-    Arc<ActorRegistry<PingActor>>,
+    Arc<ActorRegistry<AdmissionPingDefinition, PingActor>>,
     Arc<lattice_actor_distributed::protocol::ActorProtocolBinding<PingActor, PingProtocol>>,
 ) {
     let binding = Arc::new(PingProtocol::bind::<PingActor>().unwrap());
-    let registry = Arc::new(ActorRegistry::new_bound(
-        actor_kind!("AdmissionPing"),
+    let registry = Arc::new(ActorRegistry::<AdmissionPingDefinition, _>::new_bound(
         ActorRegistryConfig {
             address: Some(ActorAddressConfig {
                 cluster_id: cluster_id.clone(),
@@ -491,4 +491,12 @@ async fn force_stop_closes_every_admission_scope() {
             .await
             .is_err()
     );
+}
+
+#[derive(Debug)]
+struct AdmissionPingDefinition;
+
+impl ActorDefinition for AdmissionPingDefinition {
+    const NAME: &'static str = "AdmissionPing";
+    type Protocol = PingProtocol;
 }

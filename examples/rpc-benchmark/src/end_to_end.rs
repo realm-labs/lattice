@@ -1,4 +1,6 @@
 use lattice_actor::context::HandlerContext;
+use lattice_actor_distributed::registry::ActorDefinition;
+use lattice_model::actor::ErasedProtocol;
 use std::{
     error::Error,
     sync::{
@@ -11,7 +13,7 @@ use std::{
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::{StreamExt as _, stream::FuturesUnordered};
-use lattice_actor_distributed::{ActorKey, actor_kind};
+use lattice_actor_distributed::ActorKey;
 use lattice_actor_distributed::{
     error::{ActorCallError, ActorFailure},
     handle::ActorHandle,
@@ -205,7 +207,7 @@ fn map_actor_error(error: ActorCallError) -> RemoteMessageError {
 }
 
 pub struct RemoteActorTopology {
-    actor_registry: Arc<ActorRegistry<EchoActor>>,
+    actor_registry: Arc<ActorRegistry<BenchmarkRemoteEchoDefinition, EchoActor>>,
     client: Arc<RemotingEndpoint>,
     server: Arc<RemotingEndpoint>,
     messaging: Arc<OutboundMessaging>,
@@ -232,8 +234,7 @@ impl RemoteActorTopology {
     }
 
     pub async fn start(bulk_stripes: usize) -> Result<Self, Box<dyn Error>> {
-        let actor_registry = Arc::new(ActorRegistry::new(
-            actor_kind!("BenchmarkRemoteEcho"),
+        let actor_registry = Arc::new(ActorRegistry::<BenchmarkRemoteEchoDefinition, _>::new(
             ActorRegistryConfig::default(),
         ));
         let tell_completion = Arc::new(TellCompletion::default());
@@ -504,4 +505,12 @@ mod tests {
         assert!(report.latencies.iter().all(|latency| !latency.is_zero()));
         topology.shutdown().await.unwrap();
     }
+}
+
+#[derive(Debug)]
+struct BenchmarkRemoteEchoDefinition;
+
+impl ActorDefinition for BenchmarkRemoteEchoDefinition {
+    const NAME: &'static str = "BenchmarkRemoteEcho";
+    type Protocol = ErasedProtocol;
 }

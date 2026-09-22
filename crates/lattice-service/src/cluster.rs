@@ -13,7 +13,7 @@ use lattice_actor_distributed::ActorKey;
 use lattice_actor_distributed::{error::ActorCallError, handle::ActorHandle, traits::Actor};
 use lattice_actor_distributed::{
     protocol::{ActorProtocolBinding, DispatchError, DispatchMode, DispatchReply, Protocol},
-    registry::{ActorLoader, ActorRegistry},
+    registry::{ActorDefinition, ActorLoader, ActorRegistry},
 };
 use lattice_model::{
     actor::{ActorAddress, EntityAddress, ProtocolId, SingletonAddress},
@@ -116,8 +116,8 @@ pub struct DomainLogicalRouter {
     maximum_registrations: usize,
 }
 
-async fn drain_actor_ids<A, I>(
-    registry: &ActorRegistry<A>,
+async fn drain_actor_ids<D: ActorDefinition, A, I>(
+    registry: &ActorRegistry<D, A>,
     actor_ids: I,
     timeout: Duration,
 ) -> Result<bool, RemoteMessageError>

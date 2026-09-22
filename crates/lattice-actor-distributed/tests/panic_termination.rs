@@ -1,4 +1,6 @@
 use lattice_actor::context::HandlerContext;
+use lattice_actor_distributed::registry::ActorDefinition;
+use lattice_model::actor::ErasedProtocol;
 use std::{
     any::type_name,
     sync::{
@@ -8,7 +10,7 @@ use std::{
     time::Duration,
 };
 
-use lattice_actor_distributed::{ActorKey, actor_kind};
+use lattice_actor_distributed::ActorKey;
 use lattice_actor_distributed::{
     context::ActorContext,
     error::{ActorCallError, ActorFailure, ActorStopError},
@@ -599,7 +601,7 @@ impl Actor for StartActor {
 #[tokio::test]
 async fn start_panic_releases_registry_activation_for_replacement() {
     let registry =
-        ActorRegistry::<StartActor>::new(actor_kind!("PanicStart"), ActorRegistryConfig::default());
+        ActorRegistry::<PanicStartDefinition, StartActor>::new(ActorRegistryConfig::default());
     let actor_id = ActorKey::U64(99);
     let first = registry
         .start(
@@ -908,4 +910,12 @@ async fn prefetched_ask_is_rejected_with_actor_panicked() {
             .count(),
         1
     );
+}
+
+#[derive(Debug)]
+struct PanicStartDefinition;
+
+impl ActorDefinition for PanicStartDefinition {
+    const NAME: &'static str = "PanicStart";
+    type Protocol = ErasedProtocol;
 }

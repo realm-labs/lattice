@@ -1,7 +1,6 @@
 use std::{fmt, sync::Arc};
 
 use lattice_actor::mailbox::MailboxConfig;
-use lattice_actor_distributed::ActorKind;
 use lattice_actor_distributed::registry::ActorRegistryConfig;
 use lattice_model::actor::ProtocolId;
 use lattice_model::cluster::{EntityType, PlacementDomainId, SingletonKind};
@@ -22,13 +21,11 @@ pub struct EntityOptions {
     pub allocation_policy_version: u32,
     pub hard_constraints: Vec<String>,
     pub shard_mapper: Arc<dyn ShardMapper>,
-    pub actor_kind: ActorKind,
     pub registry: ActorRegistryConfig,
 }
 
 impl EntityOptions {
     pub fn new(domain: PlacementDomainId, entity_type: EntityType, shard_count: u32) -> Self {
-        let actor_kind = ActorKind::new(entity_type.as_str());
         Self {
             domain,
             entity_type,
@@ -37,14 +34,8 @@ impl EntityOptions {
             allocation_policy_version: 1,
             hard_constraints: Vec::new(),
             shard_mapper: Arc::new(Xxh3V1ShardMapper),
-            actor_kind,
             registry: ActorRegistryConfig::default(),
         }
-    }
-
-    pub fn actor_kind(mut self, actor_kind: ActorKind) -> Self {
-        self.actor_kind = actor_kind;
-        self
     }
 
     pub fn mailbox(mut self, mailbox: MailboxConfig) -> Self {
@@ -109,7 +100,6 @@ impl fmt::Debug for EntityOptions {
             .field("hard_constraints", &self.hard_constraints)
             .field("shard_mapper_id", &self.shard_mapper.mapper_id())
             .field("shard_mapper_version", &self.shard_mapper.mapper_version())
-            .field("actor_kind", &self.actor_kind)
             .field("registry", &self.registry)
             .finish()
     }
@@ -120,24 +110,16 @@ impl fmt::Debug for EntityOptions {
 pub struct SingletonOptions {
     pub domain: PlacementDomainId,
     pub kind: SingletonKind,
-    pub actor_kind: ActorKind,
     pub registry: ActorRegistryConfig,
 }
 
 impl SingletonOptions {
     pub fn new(domain: PlacementDomainId, kind: SingletonKind) -> Self {
-        let actor_kind = ActorKind::new(kind.as_str());
         Self {
             domain,
             kind,
-            actor_kind,
             registry: ActorRegistryConfig::default(),
         }
-    }
-
-    pub fn actor_kind(mut self, actor_kind: ActorKind) -> Self {
-        self.actor_kind = actor_kind;
-        self
     }
 
     pub fn mailbox(mut self, mailbox: MailboxConfig) -> Self {

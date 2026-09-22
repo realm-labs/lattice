@@ -580,9 +580,7 @@ impl SplitHost {
         let protocol = Arc::new(SplitProtocol::bind::<SplitEntityActor>()?);
         let mut environment = ActorEnvironment::builder();
         environment.insert(ActivationDirectory::new(8)?)?;
-        let registry = Arc::new(ActorRegistry::new_bound(
-            actor_kind!("DistributedSplitFixture"),
-            ActorRegistryConfig {
+        let registry = Arc::new(ActorRegistry::<DistributedSplitFixtureDefinition, _>::new_bound(ActorRegistryConfig {
                 address: Some(ActorAddressConfig {
                     cluster_id: cluster.clone(),
                     node_address: config.address.clone(),
@@ -773,4 +771,12 @@ impl SplitProbeCounters {
         append_line(journal, &serde_json::to_vec(&event)?)?;
         Ok(())
     }
+}
+
+#[derive(Debug)]
+struct DistributedSplitFixtureDefinition;
+
+impl ActorDefinition for DistributedSplitFixtureDefinition {
+    const NAME: &'static str = "DistributedSplitFixture";
+    type Protocol = SplitProtocol;
 }

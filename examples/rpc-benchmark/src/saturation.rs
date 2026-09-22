@@ -1,3 +1,5 @@
+use lattice_actor_distributed::registry::ActorDefinition;
+use lattice_model::actor::ErasedProtocol;
 use std::{
     error::Error,
     io::Error as IoError,
@@ -6,7 +8,7 @@ use std::{
 };
 
 use bytes::Bytes;
-use lattice_actor_distributed::{ActorKey, actor_kind};
+use lattice_actor_distributed::ActorKey;
 use lattice_actor_distributed::{
     context::HandlerContext,
     error::{ActorFailure, ActorTellError},
@@ -141,7 +143,7 @@ impl SaturationReport {
 }
 
 pub struct SaturationTopology {
-    registry: Arc<ActorRegistry<SaturationActor>>,
+    registry: Arc<ActorRegistry<BenchmarkSaturationDefinition, SaturationActor>>,
     handle: ActorHandle<SaturationActor>,
     state: Arc<SaturationState>,
     mailbox_capacity: usize,
@@ -150,8 +152,7 @@ pub struct SaturationTopology {
 impl SaturationTopology {
     pub async fn start(mailbox_capacity: usize) -> Result<Self, Box<dyn Error>> {
         let mailbox_capacity = mailbox_capacity.max(1);
-        let registry = Arc::new(ActorRegistry::new(
-            actor_kind!("BenchmarkSaturation"),
+        let registry = Arc::new(ActorRegistry::<BenchmarkSaturationDefinition, _>::new(
             ActorRegistryConfig {
                 mailbox: MailboxConfig::bounded(mailbox_capacity),
                 ..ActorRegistryConfig::default()
@@ -509,4 +510,12 @@ mod tests {
         assert!(!report.sampled_latencies.is_empty());
         topology.shutdown().await.unwrap();
     }
+}
+
+#[derive(Debug)]
+struct BenchmarkSaturationDefinition;
+
+impl ActorDefinition for BenchmarkSaturationDefinition {
+    const NAME: &'static str = "BenchmarkSaturation";
+    type Protocol = ErasedProtocol;
 }

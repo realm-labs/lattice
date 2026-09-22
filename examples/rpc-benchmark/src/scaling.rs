@@ -1,3 +1,5 @@
+use lattice_actor_distributed::registry::ActorDefinition;
+use lattice_model::actor::ErasedProtocol;
 use std::{
     error::Error,
     io::Error as IoError,
@@ -5,7 +7,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use lattice_actor_distributed::{ActorKey, actor_kind};
+use lattice_actor_distributed::ActorKey;
 use lattice_actor_distributed::{
     context::HandlerContext,
     error::{ActorFailure, ActorTellError},
@@ -89,7 +91,7 @@ impl MailboxContentionReport {
 }
 
 pub struct ActorScaleTopology {
-    registry: Arc<ActorRegistry<ScaleActor>>,
+    registry: Arc<ActorRegistry<BenchmarkScaleDefinition, ScaleActor>>,
     handles: Arc<Vec<ActorHandle<ScaleActor>>>,
 }
 
@@ -114,8 +116,7 @@ impl ActorScaleTopology {
         mailbox: MailboxConfig,
     ) -> Result<Self, Box<dyn Error>> {
         let actor_count = actor_count.max(1);
-        let registry = Arc::new(ActorRegistry::new(
-            actor_kind!("BenchmarkScale"),
+        let registry = Arc::new(ActorRegistry::<BenchmarkScaleDefinition, _>::new(
             ActorRegistryConfig {
                 mailbox,
                 ..ActorRegistryConfig::default()
@@ -281,4 +282,12 @@ mod tests {
         assert!(report.throughput_per_second().is_finite());
         topology.shutdown().await.unwrap();
     }
+}
+
+#[derive(Debug)]
+struct BenchmarkScaleDefinition;
+
+impl ActorDefinition for BenchmarkScaleDefinition {
+    const NAME: &'static str = "BenchmarkScale";
+    type Protocol = ErasedProtocol;
 }

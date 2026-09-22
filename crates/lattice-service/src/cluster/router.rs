@@ -12,6 +12,7 @@ use super::{
     singleton::SingletonRouteHost,
     singleton_proxy::SingletonProxyRoute,
 };
+use lattice_actor_distributed::registry::ActorDefinition;
 
 impl DomainLogicalRouter {
     pub fn new(
@@ -54,10 +55,10 @@ impl DomainLogicalRouter {
         self
     }
 
-    pub fn register_entity<A, L, P>(
+    pub fn register_entity<D: ActorDefinition<Protocol = P>, A, L, P>(
         &mut self,
         config: EntityConfig,
-        registry: Arc<ActorRegistry<A>>,
+        registry: Arc<ActorRegistry<D, A>>,
         protocol: Arc<ActorProtocolBinding<A, P>>,
         loader: L,
     ) -> Result<(), ClusterRouterError>
@@ -75,11 +76,11 @@ impl DomainLogicalRouter {
         )
     }
 
-    pub fn register_entity_with_mapper<A, L, P>(
+    pub fn register_entity_with_mapper<D: ActorDefinition<Protocol = P>, A, L, P>(
         &mut self,
         config: EntityConfig,
         mapper: Arc<dyn ShardMapper>,
-        registry: Arc<ActorRegistry<A>>,
+        registry: Arc<ActorRegistry<D, A>>,
         protocol: Arc<ActorProtocolBinding<A, P>>,
         loader: L,
     ) -> Result<(), ClusterRouterError>
@@ -207,10 +208,10 @@ impl DomainLogicalRouter {
         Ok(())
     }
 
-    pub fn register_singleton<A, L, P>(
+    pub fn register_singleton<D: ActorDefinition<Protocol = P>, A, L, P>(
         &mut self,
         config: SingletonConfig,
-        registry: Arc<ActorRegistry<A>>,
+        registry: Arc<ActorRegistry<D, A>>,
         protocol: Arc<ActorProtocolBinding<A, P>>,
         loader: L,
     ) -> Result<(), ClusterRouterError>

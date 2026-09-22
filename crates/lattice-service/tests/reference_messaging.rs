@@ -7,11 +7,10 @@ use bytes::BytesMut;
 use lattice_actor::error::ActorFailure;
 use lattice_actor::traits::{Actor, Handler, StopReason};
 use lattice_actor_distributed::ActorKey;
-use lattice_actor_distributed::ActorKind;
-use lattice_actor_distributed::actor_kind;
 use lattice_actor_distributed::protocol::{
     ActorProtocolBinding, CodecDescriptor, DecodeError, EncodeError, Protocol, WireCodec,
 };
+use lattice_actor_distributed::registry::ActorDefinition;
 use lattice_actor_distributed::registry::{ActorAddressConfig, ActorRegistry, ActorRegistryConfig};
 use lattice_actor_distributed::{activation::DistributedActorContextExt, actor_protocol};
 use lattice_model::actor::ActorAddress;
@@ -140,15 +139,13 @@ actor_protocol! {
     }
 }
 
-fn registry<A: Actor, P: Protocol>(
-    kind: ActorKind,
+fn registry<D: ActorDefinition<Protocol = P>, A: Actor, P: Protocol>(
     cluster_id: &ClusterId,
     address: &NodeEndpoint,
     incarnation: NodeIncarnation,
     protocol: &ActorProtocolBinding<A, P>,
-) -> Arc<ActorRegistry<A>> {
+) -> Arc<ActorRegistry<D, A>> {
     Arc::new(ActorRegistry::new_bound(
-        kind,
         ActorRegistryConfig {
             address: Some(ActorAddressConfig {
                 cluster_id: cluster_id.clone(),
@@ -168,15 +165,13 @@ async fn deserialized_actor_address_is_bound_at_the_actor_boundary() {
     let incarnation = NodeIncarnation::new(1).unwrap();
     let source_protocol = Arc::new(SourceProtocol::bind::<SourceActor>().unwrap());
     let sink_protocol = Arc::new(SinkProtocol::bind::<SinkActor>().unwrap());
-    let source_registry = registry(
-        actor_kind!("ReferenceSource"),
+    let source_registry = registry::<SourceDefinition, _, _>(
         &cluster_id,
         &address,
         incarnation,
         source_protocol.as_ref(),
     );
-    let sink_registry = registry(
-        actor_kind!("ReferenceSink"),
+    let sink_registry = registry::<SinkDefinition, _, _>(
         &cluster_id,
         &address,
         incarnation,
@@ -240,4 +235,15 @@ async fn deserialized_actor_address_is_bound_at_the_actor_boundary() {
     source_handle.stop(StopReason::Requested).unwrap();
     sink_handle.stop(StopReason::Requested).unwrap();
     service.shutdown().await.unwrap();
+}
+
+struct SourceDefinition;
+impl ActorDefinition for SourceDefinition {
+    const NAME: &'static str = "ReferenceSource";
+    type Protocol = SourceProtocol;
+}
+struct SinkDefinition;
+impl ActorDefinition for SinkDefinition {
+    const NAME: &'static str = "ReferenceSink";
+    type Protocol = SinkProtocol;
 }

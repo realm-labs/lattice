@@ -1,4 +1,6 @@
 use lattice_actor::context::HandlerContext;
+use lattice_actor_distributed::registry::ActorDefinition;
+use lattice_model::actor::ErasedProtocol;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -8,7 +10,6 @@ use lattice_actor::error::{ActorCallError, ActorFailure, ActorStopError};
 use lattice_actor::reply::ReplyTo;
 use lattice_actor::traits::{Actor, ActorLifecycleState, PassivationReason, Responder, StopReason};
 use lattice_actor_distributed::ActorKey;
-use lattice_actor_distributed::actor_kind;
 use lattice_actor_distributed::registry::ActorRegistry;
 use lattice_actor_distributed::registry::ActorRegistryConfig;
 use tokio::sync::Semaphore;
@@ -72,8 +73,7 @@ impl Responder<Ping> for PassivatingActor {
 
 #[tokio::test]
 async fn request_arriving_while_actor_is_passivating_is_not_processed_by_old_incarnation() {
-    let registry = ActorRegistry::<PassivatingActor>::new(
-        actor_kind!("Passivating"),
+    let registry = ActorRegistry::<PassivatingDefinition, PassivatingActor>::new(
         ActorRegistryConfig::default(),
     );
     let stop_entered = Arc::new(Semaphore::new(0));
@@ -111,4 +111,12 @@ async fn request_arriving_while_actor_is_passivating_is_not_processed_by_old_inc
         lifecycle.changed().await.unwrap();
     }
     assert_eq!(handled_pings.load(Ordering::SeqCst), 0);
+}
+
+#[derive(Debug)]
+struct PassivatingDefinition;
+
+impl ActorDefinition for PassivatingDefinition {
+    const NAME: &'static str = "Passivating";
+    type Protocol = ErasedProtocol;
 }

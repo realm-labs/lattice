@@ -4,8 +4,8 @@ crates/lattice-actor/src/lib.rs	pub use lattice_actor_macros::{Message, Request,
 crates/lattice-actor-distributed/src/lib.rs	pub use lattice_actor::{	The distributed facade exposes the complete local Actor API plus distributed addressing and protocols from one dependency.
 crates/lattice-actor-distributed/src/lib.rs	pub use reference::{ActorRef, EntityRef, Recipient, SingletonRef};	Bound distributed references are the primary location-transparent messaging API.
 crates/lattice-actor-distributed/src/lib.rs	pub use entity::{EntityActivationState, EntityKey, EntityKeyDecodeError, ShardedActor};	Distributed entity identity and activation traits are exposed from the distributed facade.
-crates/lattice-actor-distributed/src/lib.rs	pub use registry::{ActorKey, ActorKind};	Registry keys and kinds are distributed-runtime concepts exposed by the distributed facade.
-crates/lattice-actor-distributed/src/registry.rs	pub use key::{ActorKey, ActorKind};	The registry module owns and exposes its application-facing key and kind types.
+crates/lattice-actor-distributed/src/lib.rs	pub use registry::{ActorDefinition, ActorKey};	Registry keys and kinds are distributed-runtime concepts exposed by the distributed facade.
+crates/lattice-actor-distributed/src/registry.rs	pub use key::{ActorDefinition, ActorKey};	The registry module owns and exposes its application-facing key and kind types.
 crates/lattice-actor/src/context.rs	pub use messaging::{AskTarget, TellTarget};	The context facade exposes transport-independent typed messaging capabilities while implementations remain grouped with messaging behavior.
 crates/lattice-actor/src/watch.rs	pub use lattice_model::actor::{TerminatedReason, WatchId, WatchStatus};	Actor-facing DeathWatch uses the shared wire model without defining a second public identity.
 crates/lattice-actor-distributed/src/protocol.rs	pub use lattice_model::actor::ProtocolTag as __ProtocolTag;	The public protocol macro expansion requires a stable hidden facade path.

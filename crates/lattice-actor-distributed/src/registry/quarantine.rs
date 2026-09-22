@@ -1,3 +1,4 @@
+use super::ActorDefinition;
 use crate::ActorKey;
 use dashmap::mapref::entry::{Entry, OccupiedEntry};
 
@@ -14,7 +15,7 @@ use super::{
     QuarantineDiagnostics, QuarantinedEntry, RegistryEntry, RetainedActorFailure, is_terminal,
 };
 
-impl<A: Actor> ActorRegistry<A> {
+impl<D: ActorDefinition, A: Actor> ActorRegistry<D, A> {
     pub fn retained_stop_failures(&self) -> Vec<RetainedActorFailure> {
         let mut failures = self
             .entries

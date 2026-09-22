@@ -1,5 +1,6 @@
 //! Cluster membership: discovery-driven join, leave, per-domain health and Coordinator rollover.
 
+use lattice_actor_distributed::registry::ActorDefinition;
 use std::{
     collections::BTreeSet,
     pin::Pin,
@@ -12,7 +13,6 @@ use std::{
 };
 
 use futures_util::Stream;
-use lattice_actor_distributed::actor_kind;
 use lattice_actor_distributed::registry::{ActorAddressConfig, ActorRegistry, ActorRegistryConfig};
 use lattice_discovery::{
     provider::{
@@ -505,8 +505,7 @@ async fn coordinator_rollover_recovers_after_blocked_session_registration() {
         tokio::sync::watch::channel(discovery_snapshot(1, "coordinator-a", address_a));
     let member_incarnation = NodeIncarnation::new(303).unwrap();
     let binding = Arc::new(PingProtocol::bind::<PingActor>().unwrap());
-    let registry = Arc::new(ActorRegistry::new_bound(
-        actor_kind!("RolloverPing"),
+    let registry = Arc::new(ActorRegistry::<RolloverPingDefinition, _>::new_bound(
         ActorRegistryConfig {
             address: Some(ActorAddressConfig {
                 cluster_id: cluster_id.clone(),
@@ -723,31 +722,33 @@ async fn an_active_shard_recovers_after_a_transient_association_loss() {
     )
     .unwrap();
     let primary_binding = Arc::new(PingProtocol::bind::<PingActor>().unwrap());
-    let primary_registry = Arc::new(ActorRegistry::new_bound(
-        actor_kind!("AssociationRecoveryPrimary"),
-        ActorRegistryConfig {
-            address: Some(ActorAddressConfig {
-                cluster_id: cluster_id.clone(),
-                node_address: member_address.clone(),
-                node_incarnation: member_incarnation,
-            }),
-            ..ActorRegistryConfig::default()
-        },
-        primary_binding.as_ref(),
-    ));
+    let primary_registry = Arc::new(
+        ActorRegistry::<AssociationRecoveryPrimaryDefinition, _>::new_bound(
+            ActorRegistryConfig {
+                address: Some(ActorAddressConfig {
+                    cluster_id: cluster_id.clone(),
+                    node_address: member_address.clone(),
+                    node_incarnation: member_incarnation,
+                }),
+                ..ActorRegistryConfig::default()
+            },
+            primary_binding.as_ref(),
+        ),
+    );
     let secondary_binding = Arc::new(OtherPingProtocol::bind::<PingActor>().unwrap());
-    let secondary_registry = Arc::new(ActorRegistry::new_bound(
-        actor_kind!("AssociationRecoverySecondary"),
-        ActorRegistryConfig {
-            address: Some(ActorAddressConfig {
-                cluster_id: cluster_id.clone(),
-                node_address: member_address.clone(),
-                node_incarnation: member_incarnation,
-            }),
-            ..ActorRegistryConfig::default()
-        },
-        secondary_binding.as_ref(),
-    ));
+    let secondary_registry = Arc::new(
+        ActorRegistry::<AssociationRecoverySecondaryDefinition, _>::new_bound(
+            ActorRegistryConfig {
+                address: Some(ActorAddressConfig {
+                    cluster_id: cluster_id.clone(),
+                    node_address: member_address.clone(),
+                    node_incarnation: member_incarnation,
+                }),
+                ..ActorRegistryConfig::default()
+            },
+            secondary_binding.as_ref(),
+        ),
+    );
     let member = LatticeService::builder(node_config(
         cluster_id.clone(),
         "member",
@@ -943,8 +944,7 @@ async fn a_member_hosting_a_shard_leaves_by_handing_it_over_rather_than_timing_o
     let host = |node_id: &str, address: NodeEndpoint, incarnation: u128| {
         let incarnation = NodeIncarnation::new(incarnation).unwrap();
         let binding = Arc::new(PingProtocol::bind::<PingActor>().unwrap());
-        let registry = Arc::new(ActorRegistry::new_bound(
-            actor_kind!("DrainedPing"),
+        let registry = Arc::new(ActorRegistry::<DrainedPingDefinition, _>::new_bound(
             ActorRegistryConfig {
                 address: Some(ActorAddressConfig {
                     cluster_id: cluster_id.clone(),
@@ -1042,4 +1042,36 @@ async fn a_member_hosting_a_shard_leaves_by_handing_it_over_rather_than_timing_o
 
     observer.force_shutdown().await.unwrap();
     coordinator.shutdown().await.unwrap();
+}
+
+#[derive(Debug)]
+struct RolloverPingDefinition;
+
+impl ActorDefinition for RolloverPingDefinition {
+    const NAME: &'static str = "RolloverPing";
+    type Protocol = PingProtocol;
+}
+
+#[derive(Debug)]
+struct AssociationRecoveryPrimaryDefinition;
+
+impl ActorDefinition for AssociationRecoveryPrimaryDefinition {
+    const NAME: &'static str = "AssociationRecoveryPrimary";
+    type Protocol = PingProtocol;
+}
+
+#[derive(Debug)]
+struct AssociationRecoverySecondaryDefinition;
+
+impl ActorDefinition for AssociationRecoverySecondaryDefinition {
+    const NAME: &'static str = "AssociationRecoverySecondary";
+    type Protocol = OtherPingProtocol;
+}
+
+#[derive(Debug)]
+struct DrainedPingDefinition;
+
+impl ActorDefinition for DrainedPingDefinition {
+    const NAME: &'static str = "DrainedPing";
+    type Protocol = PingProtocol;
 }

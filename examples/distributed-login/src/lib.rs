@@ -1,12 +1,13 @@
 #![cfg_attr(not(test), deny(clippy::wildcard_imports))]
 use lattice_actor::context::HandlerContext;
+use lattice_actor_distributed::registry::ActorDefinition;
 
 use std::{
     collections::BTreeSet, error::Error as StdError, io::Error as IoError, sync::Arc,
     time::Duration,
 };
 
-use lattice_actor_distributed::{ActorKey, actor_kind};
+use lattice_actor_distributed::ActorKey;
 use lattice_actor_distributed::{
     actor_protocol,
     error::ActorFailure,
@@ -129,8 +130,7 @@ pub async fn run_demo() -> Result<LoginAcceptedReply, Box<dyn StdError>> {
     let address = NodeEndpoint::new("127.0.0.1", 25530)?;
     let incarnation = NodeIncarnation::generate();
     let protocol = Arc::new(WorldProtocol::bind::<WorldActor>()?);
-    let registry = Arc::new(ActorRegistry::new_bound(
-        actor_kind!("World"),
+    let registry = Arc::new(ActorRegistry::<WorldDefinition, _>::new_bound(
         ActorRegistryConfig {
             address: Some(ActorAddressConfig {
                 cluster_id: cluster_id.clone(),
@@ -184,4 +184,12 @@ pub async fn run_demo() -> Result<LoginAcceptedReply, Box<dyn StdError>> {
         .await?;
     service.shutdown().await?;
     Ok(reply)
+}
+
+#[derive(Debug)]
+struct WorldDefinition;
+
+impl ActorDefinition for WorldDefinition {
+    const NAME: &'static str = "World";
+    type Protocol = WorldProtocol;
 }

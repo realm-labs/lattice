@@ -22,4 +22,4 @@ pub mod registry;
 
 pub use entity::{EntityActivationState, EntityKey, EntityKeyDecodeError, ShardedActor};
 pub use reference::{ActorRef, EntityRef, Recipient, SingletonRef};
-pub use registry::{ActorKey, ActorKind};
+pub use registry::{ActorDefinition, ActorKey};

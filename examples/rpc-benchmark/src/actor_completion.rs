@@ -1,4 +1,6 @@
 use lattice_actor::context::HandlerContext;
+use lattice_actor_distributed::registry::ActorDefinition;
+use lattice_model::actor::ErasedProtocol;
 use std::{
     error::Error,
     sync::atomic::{AtomicUsize, Ordering},
@@ -8,7 +10,7 @@ use std::{
 
 use bytes::Bytes;
 use futures_util::{StreamExt as _, stream::FuturesUnordered};
-use lattice_actor_distributed::{ActorKey, actor_kind};
+use lattice_actor_distributed::ActorKey;
 use lattice_actor_distributed::{
     error::{ActorFailure, ActorTellError},
     mailbox::MailboxConfig,
@@ -183,7 +185,7 @@ impl Handler<CompletionBarrier> for CompletionActor {
 }
 
 pub struct ActorCompletionTopology {
-    registry: Arc<ActorRegistry<CompletionActor>>,
+    registry: Arc<ActorRegistry<BenchmarkCompletionDefinition, CompletionActor>>,
     handle: lattice_actor::handle::ActorHandle<CompletionActor>,
     observer: Option<Arc<CompletionObserver>>,
 }
@@ -202,13 +204,11 @@ impl ActorCompletionTopology {
         observe: bool,
     ) -> Result<Self, Box<dyn Error>> {
         let observer = observe.then(|| Arc::new(CompletionObserver::default()));
-        let registry = ActorRegistry::new(
-            actor_kind!("BenchmarkCompletion"),
-            ActorRegistryConfig {
+        let registry =
+            ActorRegistry::<BenchmarkCompletionDefinition, _>::new(ActorRegistryConfig {
                 mailbox: MailboxConfig::bounded(mailbox_capacity),
                 ..ActorRegistryConfig::default()
-            },
-        );
+            });
         let registry = match &observer {
             Some(observer) => {
                 registry.with_observer(ActorObserverHandle::from_arc(observer.clone()))
@@ -459,4 +459,12 @@ mod tests {
         assert_eq!(report.latency_sample_count(), 32);
         topology.shutdown().await.unwrap();
     }
+}
+
+#[derive(Debug)]
+struct BenchmarkCompletionDefinition;
+
+impl ActorDefinition for BenchmarkCompletionDefinition {
+    const NAME: &'static str = "BenchmarkCompletion";
+    type Protocol = ErasedProtocol;
 }

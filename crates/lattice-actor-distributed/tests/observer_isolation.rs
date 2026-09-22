@@ -1,3 +1,5 @@
+use lattice_actor_distributed::registry::ActorDefinition;
+use lattice_model::actor::ErasedProtocol;
 use std::{
     sync::{
         Arc,
@@ -6,7 +8,7 @@ use std::{
     time::Duration,
 };
 
-use lattice_actor_distributed::{ActorKey, actor_kind};
+use lattice_actor_distributed::ActorKey;
 use lattice_actor_distributed::{
     context::HandlerContext,
     error::ActorFailure,
@@ -110,8 +112,7 @@ async fn observer_panics_preserve_messaging_registry_cleanup_and_deathwatch() {
         PanicPhase::Stopped,
     ] {
         let panics = Arc::new(AtomicUsize::new(0));
-        let registry = ActorRegistry::<HealthyActor>::new(
-            actor_kind!("ObserverIsolation"),
+        let registry = ActorRegistry::<ObserverIsolationDefinition, HealthyActor>::new(
             ActorRegistryConfig::default(),
         )
         .with_observer(ActorObserverHandle::new(PanickingObserver {
@@ -145,4 +146,12 @@ async fn observer_panics_preserve_messaging_registry_cleanup_and_deathwatch() {
             "observer must be disabled after its first panic: {phase:?}"
         );
     }
+}
+
+#[derive(Debug)]
+struct ObserverIsolationDefinition;
+
+impl ActorDefinition for ObserverIsolationDefinition {
+    const NAME: &'static str = "ObserverIsolation";
+    type Protocol = ErasedProtocol;
 }

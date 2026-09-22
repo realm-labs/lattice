@@ -1,6 +1,7 @@
 use lattice_actor_distributed::actor_protocol;
 use lattice_actor_distributed::protocol::ProstCodec;
 use lattice_actor::traits::Message;
+use lattice_actor_distributed::registry::ActorDefinition;
 
 #[derive(Clone, PartialEq, prost::Message)]
 struct Ping {}
@@ -21,4 +22,10 @@ actor_protocol! {
 fn main() {
     let protocol = ClientProtocol::build().unwrap();
     assert_eq!(protocol.protocol_id().get(), 101);
+}
+
+struct ClientDefinition;
+impl ActorDefinition for ClientDefinition {
+    const NAME: &'static str = "Client";
+    type Protocol = ClientProtocol;
 }

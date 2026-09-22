@@ -1,4 +1,8 @@
-use std::{collections::BTreeMap, sync::Arc, time::Instant};
+use std::{
+    collections::{BTreeMap, btree_map::Entry},
+    sync::Arc,
+    time::Instant,
+};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -19,7 +23,7 @@ use lattice_actor::{
 
 use crate::{
     protocol::{ActorProtocolBinding, DispatchError, DispatchMode, DispatchReply, Protocol},
-    registry::{ActorCellDiagnostics, ActorQuarantineError, ActorRegistry},
+    registry::{ActorCellDiagnostics, ActorDefinition, ActorQuarantineError, ActorRegistry},
 };
 
 #[async_trait]
@@ -62,13 +66,16 @@ trait ErasedActorHost: Send + Sync {
     ) -> Result<Bytes, RemoteMessageError>;
 }
 
-pub struct ActorHost<A: Actor, P: Protocol> {
-    registry: Arc<ActorRegistry<A>>,
+pub struct ActorHost<D: ActorDefinition<Protocol = P>, A: Actor, P: Protocol> {
+    registry: Arc<ActorRegistry<D, A>>,
     protocol: Arc<ActorProtocolBinding<A, P>>,
 }
 
-impl<A: Actor, P: Protocol> ActorHost<A, P> {
-    pub fn new(registry: Arc<ActorRegistry<A>>, protocol: Arc<ActorProtocolBinding<A, P>>) -> Self {
+impl<D: ActorDefinition<Protocol = P>, A: Actor, P: Protocol> ActorHost<D, A, P> {
+    pub fn new(
+        registry: Arc<ActorRegistry<D, A>>,
+        protocol: Arc<ActorProtocolBinding<A, P>>,
+    ) -> Self {
         Self { registry, protocol }
     }
 
@@ -83,7 +90,9 @@ impl<A: Actor, P: Protocol> ActorHost<A, P> {
 }
 
 #[async_trait]
-impl<A: Actor, P: Protocol> ErasedActorHost for ActorHost<A, P> {
+impl<D: ActorDefinition<Protocol = P>, A: Actor, P: Protocol> ErasedActorHost
+    for ActorHost<D, A, P>
+{
     fn protocol_id(&self) -> ProtocolId {
         self.protocol.protocol_id()
     }
@@ -224,7 +233,7 @@ impl<A: Actor, P: Protocol> ErasedActorHost for ActorHost<A, P> {
 
 pub struct ProtocolHostRegistry {
     maximum: usize,
-    hosts: BTreeMap<u64, Arc<dyn ErasedActorHost>>,
+    hosts: BTreeMap<(u64, String), Arc<dyn ErasedActorHost>>,
 }
 
 impl ProtocolHostRegistry {
@@ -238,29 +247,38 @@ impl ProtocolHostRegistry {
         })
     }
 
-    pub fn register<A: Actor, P: Protocol>(
+    pub fn register<D: ActorDefinition<Protocol = P>, A: Actor, P: Protocol>(
         &mut self,
-        host: ActorHost<A, P>,
+        host: ActorHost<D, A, P>,
     ) -> Result<(), HostRegistryError> {
         let protocol_id = host.protocol_id().get();
+        let namespace = host.registry.address_namespace();
+        let actor_name = host.registry.name();
         let at_capacity = self.hosts.len() >= self.maximum;
-        match self.hosts.entry(protocol_id) {
-            std::collections::btree_map::Entry::Occupied(_) => {
-                Err(HostRegistryError::DuplicateProtocol(protocol_id))
-            }
-            std::collections::btree_map::Entry::Vacant(_) if at_capacity => {
-                Err(HostRegistryError::Capacity)
-            }
-            std::collections::btree_map::Entry::Vacant(entry) => {
+        match self.hosts.entry((protocol_id, namespace)) {
+            Entry::Occupied(_) => Err(HostRegistryError::DuplicateDefinition {
+                protocol_id,
+                actor_name,
+            }),
+            Entry::Vacant(_) if at_capacity => Err(HostRegistryError::Capacity),
+            Entry::Vacant(entry) => {
                 entry.insert(Arc::new(host));
                 Ok(())
             }
         }
     }
 
-    pub fn is_current(&self, target: &ExactActorTarget) -> bool {
+    fn host_for(&self, target: &ExactActorTarget) -> Option<&Arc<dyn ErasedActorHost>> {
+        let mut segments = target.actor_path.segments();
+        if segments.next()? != "user" {
+            return None;
+        }
+        let namespace = segments.next()?;
         self.hosts
-            .get(&target.protocol_id.get())
+            .get(&(target.protocol_id.get(), namespace.to_owned()))
+    }
+    pub fn is_current(&self, target: &ExactActorTarget) -> bool {
+        self.host_for(target)
             .is_some_and(|host| host.is_current(target))
     }
 
@@ -268,8 +286,7 @@ impl ProtocolHostRegistry {
         &self,
         target: &ExactActorTarget,
     ) -> Option<ActorTerminationSubscription> {
-        self.hosts
-            .get(&target.protocol_id.get())
+        self.host_for(target)
             .and_then(|host| host.subscribe_terminated(target))
     }
 
@@ -317,7 +334,7 @@ impl ProtocolHostRegistry {
     }
 
     pub fn try_tell_immediate(&self, tell: InboundTell) -> ImmediateTellDispatch {
-        let Some(host) = self.hosts.get(&tell.target.protocol_id.get()) else {
+        let Some(host) = self.host_for(&tell.target) else {
             return ImmediateTellDispatch::Complete(Err(RemoteMessageError::UnsupportedProtocol));
         };
         host.try_tell(tell)
@@ -329,8 +346,7 @@ impl ProtocolHostRegistry {
         message_id: u64,
         payload: Bytes,
     ) -> Result<(), RemoteMessageError> {
-        self.hosts
-            .get(&target.protocol_id.get())
+        self.host_for(&target)
             .ok_or(RemoteMessageError::UnsupportedProtocol)?
             .tell(target, message_id, payload)
             .await
@@ -382,8 +398,7 @@ impl InboundDispatch for ProtocolHostRegistry {
         payload: Bytes,
         deadline: Instant,
     ) -> Result<Bytes, RemoteMessageError> {
-        self.hosts
-            .get(&target.protocol_id.get())
+        self.host_for(&target)
             .ok_or(RemoteMessageError::UnsupportedProtocol)?
             .ask(target, message_id, payload, deadline)
             .await
@@ -417,8 +432,13 @@ pub enum HostRegistryError {
     ZeroLimit,
     #[error("actor host registry is full")]
     Capacity,
-    #[error("actor host registry contains duplicate ProtocolId {0}")]
-    DuplicateProtocol(u64),
+    #[error(
+        "actor host registry contains duplicate definition {actor_name} for protocol {protocol_id}"
+    )]
+    DuplicateDefinition {
+        protocol_id: u64,
+        actor_name: &'static str,
+    },
 }
 
 #[derive(Debug, Error)]

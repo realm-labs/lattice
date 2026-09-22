@@ -11,7 +11,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use lattice_actor_distributed::actor_kind;
+use lattice_actor_distributed::registry::ActorDefinition;
 use lattice_actor_distributed::{
     actor_protocol,
     error::ActorFailure,
@@ -270,11 +270,9 @@ async fn main() -> Result<(), Box<dyn StdError>> {
         EntityType::new("world")?,
         config.shard_count,
     )
-    .actor_kind(actor_kind!("World"))
     .mailbox(MailboxConfig::bounded(config.mailbox_capacity));
     let singleton_options =
         SingletonOptions::new(domain.clone(), SingletonKind::new("world-clock")?)
-            .actor_kind(actor_kind!("WorldClock"))
             .mailbox(MailboxConfig::bounded(config.mailbox_capacity));
     let entity_config = entity_options.build(ProtocolId::new(WORLD_PROTOCOL_ID)?)?;
     let singleton_config = singleton_options.build(ProtocolId::new(CLOCK_PROTOCOL_ID)?);
@@ -295,8 +293,8 @@ async fn main() -> Result<(), Box<dyn StdError>> {
         logic_address,
         logic_incarnation,
     ))?
-    .host_entity::<WorldActor, WorldProtocol, _>(entity_options, WorldLoader)?
-    .host_singleton::<ClockActor, ClockProtocol, _>(singleton_options, ClockLoader)?
+    .host_entity::<WorldDefinition, WorldActor, _>(entity_options, WorldLoader)?
+    .host_singleton::<ClockDefinition, ClockActor, _>(singleton_options, ClockLoader)?
     .domain_capacity(domain.clone(), config.capacity_units)?
     .join_config(ClusterJoinConfig {
         retry_initial: Duration::from_millis(10),
@@ -423,4 +421,15 @@ async fn main() -> Result<(), Box<dyn StdError>> {
         domain, direct_reply.player_count, clock_reply.tick, event_type, scheduled, metric_count,
     );
     Ok(())
+}
+
+struct WorldDefinition;
+impl ActorDefinition for WorldDefinition {
+    const NAME: &'static str = "World";
+    type Protocol = WorldProtocol;
+}
+struct ClockDefinition;
+impl ActorDefinition for ClockDefinition {
+    const NAME: &'static str = "WorldClock";
+    type Protocol = ClockProtocol;
 }

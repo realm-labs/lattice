@@ -1,4 +1,6 @@
 use lattice_actor::context::HandlerContext;
+use lattice_actor_distributed::registry::ActorDefinition;
+use lattice_model::actor::ErasedProtocol;
 use std::{
     sync::{
         Arc,
@@ -8,7 +10,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use lattice_actor_distributed::{ActorKey, actor_kind};
+use lattice_actor_distributed::ActorKey;
 use lattice_actor_distributed::{
     error::ActorFailure,
     mailbox::MailboxConfig,
@@ -55,7 +57,7 @@ struct CountingLoader {
 #[async_trait]
 impl ActorLoader<LazyActor> for CountingLoader {
     async fn load(&self, ctx: ActorCreateContext) -> Result<LazyActor, ActorFailure> {
-        assert_eq!(ctx.actor_kind, actor_kind!("Lazy"));
+        assert_eq!(ctx.actor_name, LazyDefinition::NAME);
         assert_eq!(ctx.actor_id, ActorKey::U64(7));
         self.loads.fetch_add(1, Ordering::SeqCst);
         if let Some(release) = &self.release {
@@ -71,8 +73,7 @@ impl ActorLoader<LazyActor> for CountingLoader {
 
 #[tokio::test]
 async fn concurrent_lazy_activation_starts_one_local_actor() {
-    let registry = Arc::new(ActorRegistry::<LazyActor>::new(
-        actor_kind!("Lazy"),
+    let registry = Arc::new(ActorRegistry::<LazyDefinition, LazyActor>::new(
         ActorRegistryConfig {
             mailbox: MailboxConfig::bounded(8),
             ..ActorRegistryConfig::default()
@@ -109,8 +110,7 @@ async fn concurrent_lazy_activation_starts_one_local_actor() {
 
 #[tokio::test]
 async fn loader_failure_is_explicit_and_allows_retry() {
-    let registry =
-        ActorRegistry::<LazyActor>::new(actor_kind!("Lazy"), ActorRegistryConfig::default());
+    let registry = ActorRegistry::<LazyDefinition, LazyActor>::new(ActorRegistryConfig::default());
     let loads = Arc::new(AtomicUsize::new(0));
     let loader = CountingLoader {
         loads: loads.clone(),
@@ -130,4 +130,12 @@ async fn loader_failure_is_explicit_and_allows_retry() {
     ));
     assert_eq!(second.ask(Ping, ASK_TIMEOUT).await.unwrap(), "pong");
     assert_eq!(loads.load(Ordering::SeqCst), 2);
+}
+
+#[derive(Debug)]
+struct LazyDefinition;
+
+impl ActorDefinition for LazyDefinition {
+    const NAME: &'static str = "Lazy";
+    type Protocol = ErasedProtocol;
 }

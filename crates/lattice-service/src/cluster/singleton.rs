@@ -1,4 +1,4 @@
-use lattice_actor_distributed::registry::ActorQuarantineError;
+use lattice_actor_distributed::registry::{ActorDefinition, ActorQuarantineError};
 use lattice_model::cluster::CoordinatorScope;
 use lattice_placement::{
     control::PlacementControlCommand, types::PlacementSlot as PlacementSlotRecord,
@@ -63,7 +63,12 @@ pub(super) trait SingletonRoute: Send + Sync {
     }
 }
 
-pub(super) struct SingletonRouteHost<A: Actor, L: ActorLoader<A>, P: Protocol> {
+pub(super) struct SingletonRouteHost<
+    D: ActorDefinition<Protocol = P>,
+    A: Actor,
+    L: ActorLoader<A>,
+    P: Protocol,
+> {
     pub(super) local_node: NodeKey,
     pub(super) state: Arc<Mutex<LogicPlacementState>>,
     pub(super) associations: Arc<AssociationManager>,
@@ -74,12 +79,14 @@ pub(super) struct SingletonRouteHost<A: Actor, L: ActorLoader<A>, P: Protocol> {
     pub(super) kind: SingletonKind,
     pub(super) config_fingerprint: ConfigFingerprint,
     pub(super) protocol_id: ProtocolId,
-    pub(super) registry: Arc<ActorRegistry<A>>,
+    pub(super) registry: Arc<ActorRegistry<D, A>>,
     pub(super) protocol: Arc<ActorProtocolBinding<A, P>>,
     pub(super) loader: L,
 }
 
-impl<A: Actor, L: ActorLoader<A>, P: Protocol> SingletonRouteHost<A, L, P> {
+impl<D: ActorDefinition<Protocol = P>, A: Actor, L: ActorLoader<A>, P: Protocol>
+    SingletonRouteHost<D, A, L, P>
+{
     fn slot(&self, target: &SingletonAddress) -> Result<PlacementSlotRecord, RemoteMessageError> {
         if target.protocol_id() != self.protocol_id
             || target.domain() != &self.domain
@@ -256,7 +263,9 @@ impl<A: Actor, L: ActorLoader<A>, P: Protocol> SingletonRouteHost<A, L, P> {
 }
 
 #[async_trait]
-impl<A: Actor, L: ActorLoader<A>, P: Protocol> SingletonRoute for SingletonRouteHost<A, L, P> {
+impl<D: ActorDefinition<Protocol = P>, A: Actor, L: ActorLoader<A>, P: Protocol> SingletonRoute
+    for SingletonRouteHost<D, A, L, P>
+{
     async fn tell(
         &self,
         target: SingletonAddress,

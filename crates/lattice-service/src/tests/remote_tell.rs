@@ -1,3 +1,4 @@
+use lattice_actor_distributed::registry::ActorDefinition;
 use std::{
     sync::{
         Arc,
@@ -7,7 +8,7 @@ use std::{
 };
 
 use bytes::BytesMut;
-use lattice_actor_distributed::{ActorKey, actor_kind};
+use lattice_actor_distributed::ActorKey;
 use lattice_actor_distributed::{
     actor_protocol,
     context::HandlerContext,
@@ -98,8 +99,7 @@ async fn remote_tell_waits_for_mailbox_capacity_without_losing_messages() {
     let client_incarnation = NodeIncarnation::new(11).unwrap();
     let server_incarnation = NodeIncarnation::new(12).unwrap();
     let binding = Arc::new(FloodProtocol::bind::<FloodActor>().unwrap());
-    let registry = Arc::new(ActorRegistry::new_bound(
-        actor_kind!("Flood"),
+    let registry = Arc::new(ActorRegistry::<FloodDefinition, _>::new_bound(
         ActorRegistryConfig {
             mailbox: MailboxConfig::bounded(1),
             address: Some(ActorAddressConfig {
@@ -178,4 +178,12 @@ async fn remote_tell_waits_for_mailbox_capacity_without_losing_messages() {
 
     client.shutdown().await.unwrap();
     server.shutdown().await.unwrap();
+}
+
+#[derive(Debug)]
+struct FloodDefinition;
+
+impl ActorDefinition for FloodDefinition {
+    const NAME: &'static str = "Flood";
+    type Protocol = FloodProtocol;
 }

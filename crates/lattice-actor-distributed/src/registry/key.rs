@@ -1,7 +1,6 @@
 //! Application-defined keys used by the distributed activation registry.
 
-use std::{borrow::Cow, fmt};
-
+use lattice_model::actor::ProtocolTag;
 use serde::{Deserialize, Serialize};
 
 /// Application-shaped key for one registry activation.
@@ -17,46 +16,17 @@ pub enum ActorKey {
     Bytes(Vec<u8>),
 }
 
-/// Stable application name for one registered Actor implementation.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct ActorKind(Cow<'static, str>);
-
-impl ActorKind {
-    pub const fn from_static(value: &'static str) -> Self {
-        Self(Cow::Borrowed(value))
-    }
-
-    pub fn new(value: impl Into<String>) -> Self {
-        Self(Cow::Owned(value.into()))
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Display for ActorKind {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.as_str())
-    }
-}
-
-#[macro_export]
-macro_rules! actor_kind {
-    ($name:literal) => {
-        $crate::registry::ActorKind::from_static($name)
-    };
-}
-
-#[cfg(test)]
-mod tests {
-    use super::ActorKind;
-
-    const WORLD: ActorKind = crate::actor_kind!("World");
-
-    #[test]
-    fn actor_kind_macro_is_const() {
-        assert_eq!(WORLD.as_str(), "World");
-    }
+/// Public contract for an Actor category, independent of its server implementation.
+///
+/// Define a marker in the shared protocol crate and implement this trait there. Multiple
+/// definitions may share a protocol, but each hosted category must have a distinct stable name.
+/// The name becomes part of published Actor paths; changing it changes those paths.
+/// `ActorRegistry<D, A>` binds this definition to a concrete Actor implementation. Its protocol
+/// binding must use `D::Protocol`, so callers cannot substitute an unrelated protocol.
+///
+/// Use `ErasedProtocol` for a definition used only by a node-local registry. Such a definition
+/// cannot be passed to `new_bound`, which requires an actual wire protocol.
+pub trait ActorDefinition: Send + Sync + 'static {
+    const NAME: &'static str;
+    type Protocol: ProtocolTag;
 }

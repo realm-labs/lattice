@@ -1,4 +1,6 @@
 use lattice_actor::context::HandlerContext;
+use lattice_actor_distributed::registry::ActorDefinition;
+use lattice_model::actor::ErasedProtocol;
 use std::{
     collections::{BTreeMap, BTreeSet},
     error::Error,
@@ -7,7 +9,7 @@ use std::{
 };
 
 use bytes::Bytes;
-use lattice_actor_distributed::{ActorKey, actor_kind};
+use lattice_actor_distributed::ActorKey;
 use lattice_actor_distributed::{
     error::{ActorFailure, ActorTellError},
     mailbox::MailboxConfig,
@@ -68,8 +70,7 @@ impl Handler<BenchTell> for BenchActor {
 }
 
 pub async fn local_actor_admission(operations: usize) -> Result<MatrixMeasurement, Box<dyn Error>> {
-    let registry = Arc::new(ActorRegistry::new(
-        actor_kind!("BenchmarkLocal"),
+    let registry = Arc::new(ActorRegistry::<BenchmarkLocalDefinition, _>::new(
         ActorRegistryConfig {
             mailbox: MailboxConfig::bounded(1024),
             ..ActorRegistryConfig::default()
@@ -379,4 +380,12 @@ mod tests {
         assert_eq!(placement_matrix(2, 16).unwrap().len(), 6);
         assert_eq!(local_actor_admission(2).await.unwrap().operations, 2);
     }
+}
+
+#[derive(Debug)]
+struct BenchmarkLocalDefinition;
+
+impl ActorDefinition for BenchmarkLocalDefinition {
+    const NAME: &'static str = "BenchmarkLocal";
+    type Protocol = ErasedProtocol;
 }

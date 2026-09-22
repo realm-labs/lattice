@@ -242,9 +242,7 @@ async fn domain_logic(
         let protocol = Arc::new(FixtureProtocol::bind::<PingActor>()?);
         let mut environment = ActorEnvironment::builder();
         environment.insert(ActivationDirectory::new(8)?)?;
-        let registry = Arc::new(ActorRegistry::new_bound(
-            actor_kind!("DistributedScaleFixture"),
-            ActorRegistryConfig {
+        let registry = Arc::new(ActorRegistry::<DistributedScaleFixtureDefinition, _>::new_bound(ActorRegistryConfig {
                 address: Some(ActorAddressConfig {
                     cluster_id: cluster.clone(),
                     node_address: address,
@@ -584,4 +582,12 @@ fn write_domain_logic_artifact(
         })?,
     )?;
     Ok(())
+}
+
+#[derive(Debug)]
+struct DistributedScaleFixtureDefinition;
+
+impl ActorDefinition for DistributedScaleFixtureDefinition {
+    const NAME: &'static str = "DistributedScaleFixture";
+    type Protocol = FixtureProtocol;
 }

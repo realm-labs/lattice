@@ -16,9 +16,6 @@ All framework identifiers are explicit newtypes. Business identifiers such as `W
 pub struct ServiceName(std::borrow::Cow<'static, str>);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct ActorKind(std::borrow::Cow<'static, str>);
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ServiceInstanceId(String);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -34,12 +31,36 @@ pub struct ActorPath(String);
 pub struct EntityId(Bytes);
 ```
 
-`ActorKind` and `ServiceName` are opaque framework identifiers. They can be constructed from constants through macros:
+`ServiceName` is a deployment name and can be constructed from a constant:
 
 ```rust
 pub const WORLD_SERVICE: ServiceName = service_name!("World");
-pub const WORLD_ACTOR: ActorKind = actor_kind!("World");
 ```
+
+Actor categories use independent marker types in the shared contract crate:
+
+```rust
+pub struct WorldDefinition;
+
+impl ActorDefinition for WorldDefinition {
+    const NAME: &'static str = "World";
+    type Protocol = WorldProtocol;
+}
+
+let binding = WorldProtocol::bind::<WorldActor>()?;
+let registry = ActorRegistry::<WorldDefinition, WorldActor>::new_bound(config, &binding);
+```
+
+`ActorRegistry<D, A>` binds the category to its server implementation. The definition fixes the
+stable address name and associated protocol; the protocol binding checks the Actor's handlers.
+Several definitions may share the same protocol. Hosts route by protocol ID and the encoded
+definition name in the Actor path, and reject duplicate registrations of that pair. Shared
+contract crates do not need to depend on server Actor implementations.
+
+Local-only registry definitions may use `ErasedProtocol` and `ActorRegistry::new(config)`.
+`ActorKey` remains the per-registry instance key. Entity placement types and singleton kinds are
+configured separately; `host_entity::<D, A, L>` and `host_singleton::<D, A, L>` derive the registry
+name and protocol from `D`, with no separate category string in their options.
 
 The names `World`, `Player`, or `Guild` may appear in examples and business crates, but not as built-in framework variants.
 

@@ -1,3 +1,4 @@
+use super::ActorDefinition;
 use std::sync::{
     Arc,
     atomic::{AtomicU8, Ordering},
@@ -88,7 +89,7 @@ impl<A: Actor> ActivationState<A> {
     }
 }
 
-impl<A: Actor> ActorRegistry<A> {
+impl<D: ActorDefinition, A: Actor> ActorRegistry<D, A> {
     // Called under the resolver's authority lock. A current grant can supersede an old
     // activation even if disconnect/snapshot recovery lost the old session's stop effect.
     // Fence it before admitting the replacement; retain any failed persistence in quarantine.

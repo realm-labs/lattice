@@ -1,18 +1,22 @@
+use bytes::Bytes;
 use std::{
     sync::{Arc, Barrier},
     time::Duration,
 };
+use tokio::{sync::Semaphore, time::timeout};
 
-use lattice_actor_distributed::{ActorKey, actor_kind};
+use lattice_actor_distributed::ActorKey;
 use lattice_actor_distributed::{
     actor_protocol,
     context::HandlerContext,
     directory::{ActivationDirectory, ActivationDirectoryError},
+    environment::ActorEnvironment,
     error::ActorFailure,
     host::{ActorHost, HostRegistryError, ProtocolHostRegistry},
     protocol::ProstCodec,
-    registry::{ActorAddressConfig, ActorRegistry, ActorRegistryConfig},
+    registry::{ActorAddressConfig, ActorDefinition, ActorRegistry, ActorRegistryConfig},
     runtime::{ActorRuntime, ActorSpawnOptions},
+    state_machine::Stateless,
     traits::{Actor, Handler, Message, StopReason},
 };
 use lattice_model::{
@@ -24,7 +28,7 @@ struct TestActor;
 
 impl Actor for TestActor {
     type Error = ActorFailure;
-    type Behavior = lattice_actor_distributed::state_machine::Stateless;
+    type Behavior = Stateless;
 }
 
 #[derive(Clone, PartialEq, prost::Message)]
@@ -106,7 +110,7 @@ async fn concurrent_directory_registration_never_exceeds_capacity() {
     }
     let mut terminated = handle.subscribe_terminated();
     handle.stop(StopReason::Requested).unwrap();
-    tokio::time::timeout(Duration::from_secs(2), terminated.recv())
+    timeout(Duration::from_secs(2), terminated.recv())
         .await
         .unwrap()
         .unwrap();
@@ -123,15 +127,12 @@ async fn duplicate_host_registration_preserves_original_routing_and_drain() {
         }),
         ..Default::default()
     };
-    let original = Arc::new(ActorRegistry::new_bound(
-        actor_kind!("Original"),
+    let original = Arc::new(ActorRegistry::<OriginalDefinition, _>::new_bound(
         config.clone(),
         &protocol,
     ));
-    let replacement = Arc::new(ActorRegistry::new_bound(
-        actor_kind!("Replacement"),
-        config,
-        &protocol,
+    let replacement = Arc::new(ActorRegistry::<OriginalDefinition, _>::new_bound(
+        config, &protocol,
     ));
     let actor_id = ActorKey::U64(1);
     let handle = original.start(actor_id.clone(), TestActor).await.unwrap();
@@ -142,14 +143,138 @@ async fn duplicate_host_registration_preserves_original_routing_and_drain() {
         .unwrap();
     assert_eq!(
         hosts.register(ActorHost::new(replacement, protocol)),
-        Err(HostRegistryError::DuplicateProtocol(301))
+        Err(HostRegistryError::DuplicateDefinition {
+            protocol_id: 301,
+            actor_name: "Original"
+        })
     );
     assert!(hosts.is_current(&(&reference).into()));
     let mut terminated = handle.subscribe_terminated();
     assert!(hosts.drain_all().await.is_empty());
-    tokio::time::timeout(Duration::from_secs(2), terminated.recv())
+    timeout(Duration::from_secs(2), terminated.recv())
         .await
         .unwrap()
         .unwrap();
     assert!(original.get_running(&actor_id).is_none());
+}
+
+#[derive(Debug)]
+struct OriginalDefinition;
+
+impl ActorDefinition for OriginalDefinition {
+    const NAME: &'static str = "Original";
+    type Protocol = TestProtocol;
+}
+
+#[derive(Debug)]
+struct ReplacementDefinition;
+
+impl ActorDefinition for ReplacementDefinition {
+    const NAME: &'static str = "Replacement";
+    type Protocol = TestProtocol;
+}
+
+struct RoutedActor(Arc<Semaphore>);
+
+impl Actor for RoutedActor {
+    type Error = ActorFailure;
+    type Behavior = Stateless;
+}
+
+impl Handler<Probe> for RoutedActor {
+    async fn handle(
+        &mut self,
+        _: &mut HandlerContext<'_, Self>,
+        _: Probe,
+    ) -> Result<(), ActorFailure> {
+        self.0.add_permits(1);
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn different_definitions_share_one_protocol_without_cross_routing() {
+    let mut environment = ActorEnvironment::builder();
+    environment
+        .insert(ActivationDirectory::new(8).unwrap())
+        .unwrap();
+    let config = ActorRegistryConfig {
+        environment: environment.build(),
+        address: Some(ActorAddressConfig {
+            cluster_id: ClusterId::new("shared-protocol").unwrap(),
+            node_address: NodeEndpoint::new("127.0.0.1", 19301).unwrap(),
+            node_incarnation: NodeIncarnation::new(302).unwrap(),
+        }),
+        ..Default::default()
+    };
+    let protocol = Arc::new(TestProtocol::bind::<RoutedActor>().unwrap());
+    let first = Arc::new(ActorRegistry::<OriginalDefinition, _>::new_bound(
+        config.clone(),
+        &protocol,
+    ));
+    let second = Arc::new(ActorRegistry::<ReplacementDefinition, _>::new_bound(
+        config, &protocol,
+    ));
+    let first_deliveries = Arc::new(Semaphore::new(0));
+    let second_deliveries = Arc::new(Semaphore::new(0));
+    let key = ActorKey::U64(42);
+    first
+        .start(key.clone(), RoutedActor(first_deliveries.clone()))
+        .await
+        .unwrap();
+    second
+        .start(key.clone(), RoutedActor(second_deliveries.clone()))
+        .await
+        .unwrap();
+    let first_address = first.exact_address(&key).unwrap();
+    let second_address = second.exact_address(&key).unwrap();
+    assert_ne!(first_address.actor_path(), second_address.actor_path());
+    assert!(first.get_exact(&second_address).is_none());
+    assert!(second.get_exact(&first_address).is_none());
+    let mut hosts = ProtocolHostRegistry::new(2).unwrap();
+    hosts
+        .register(ActorHost::new(first.clone(), protocol.clone()))
+        .unwrap();
+    hosts
+        .register(ActorHost::new(second.clone(), protocol))
+        .unwrap();
+    assert!(hosts.is_current(&(&first_address).into()));
+    assert!(hosts.is_current(&(&second_address).into()));
+    let mut first_terminated = hosts
+        .subscribe_terminated(&(&first_address).into())
+        .unwrap();
+    let mut second_terminated = hosts
+        .subscribe_terminated(&(&second_address).into())
+        .unwrap();
+    hosts
+        .tell_wait((&first_address).into(), 1, Bytes::new())
+        .await
+        .unwrap();
+    timeout(Duration::from_secs(2), first_deliveries.acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    assert_eq!(second_deliveries.available_permits(), 0);
+    hosts
+        .tell_wait((&second_address).into(), 1, Bytes::new())
+        .await
+        .unwrap();
+    timeout(Duration::from_secs(2), second_deliveries.acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    assert_eq!(first_deliveries.available_permits(), 0);
+    assert!(hosts.drain_all().await.is_empty());
+    timeout(Duration::from_secs(2), first_terminated.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    timeout(Duration::from_secs(2), second_terminated.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(first.get_running(&key).is_none());
+    assert!(second.get_running(&key).is_none());
 }

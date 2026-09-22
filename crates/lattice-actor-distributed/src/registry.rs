@@ -2,6 +2,7 @@ use std::{
     collections::BTreeMap,
     fmt,
     future::Future,
+    marker::PhantomData,
     num::NonZeroU64,
     sync::{
         Arc, OnceLock, RwLock,
@@ -43,7 +44,7 @@ mod activation;
 pub mod key;
 mod quarantine;
 
-pub use key::{ActorKey, ActorKind};
+pub use key::{ActorDefinition, ActorKey};
 
 use activation::{ActivationCleanup, ActivationState};
 
@@ -106,8 +107,8 @@ impl Default for ActorRegistryConfig {
     }
 }
 
-pub struct ActorRegistry<A: Actor> {
-    kind: ActorKind,
+pub struct ActorRegistry<D: ActorDefinition, A: Actor> {
+    definition: PhantomData<fn() -> D>,
     config: ActorRegistryConfig,
     protocol_id: Option<ProtocolId>,
     entries: Arc<DashMap<ActorKey, RegistryEntry<A>>>,
@@ -156,11 +157,11 @@ struct ExactRegistryEntry<A: Actor> {
     local_ref: LocalActorRef,
 }
 
-impl<A: Actor> fmt::Debug for ActorRegistry<A> {
+impl<D: ActorDefinition, A: Actor> fmt::Debug for ActorRegistry<D, A> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("ActorRegistry")
-            .field("kind", &self.kind)
+            .field("definition", &D::NAME)
             .field("config", &self.config)
             .field("entry_count", &self.entries.len())
             .finish()
@@ -169,7 +170,7 @@ impl<A: Actor> fmt::Debug for ActorRegistry<A> {
 
 #[derive(Debug, Clone)]
 pub struct ActorCreateContext {
-    pub actor_kind: ActorKind,
+    pub actor_name: &'static str,
     pub actor_id: ActorKey,
     pub environment: ActorEnvironment,
     fencing_token: Option<ActorFencingToken>,
@@ -259,8 +260,8 @@ where
     async fn load(&self, ctx: ActorCreateContext) -> Result<A, A::Error>;
 }
 
-impl<A: Actor> ActorRegistry<A> {
-    pub fn new(kind: ActorKind, mut config: ActorRegistryConfig) -> Self {
+impl<D: ActorDefinition, A: Actor> ActorRegistry<D, A> {
+    pub fn new(mut config: ActorRegistryConfig) -> Self {
         assert!(
             config.address.is_none(),
             "registries with exact ActorAddresses must be constructed with ActorRegistry::new_bound"
@@ -279,7 +280,7 @@ impl<A: Actor> ActorRegistry<A> {
             ..ActorRuntimeConfig::default()
         });
         Self {
-            kind,
+            definition: PhantomData,
             config,
             protocol_id: None,
             entries: Arc::new(DashMap::new()),
@@ -296,10 +297,12 @@ impl<A: Actor> ActorRegistry<A> {
     /// the supplied server protocol. The address protocol ID is derived from
     /// the binding and cannot drift from the registered dispatcher.
     pub fn new_bound<P: Protocol>(
-        kind: ActorKind,
         mut config: ActorRegistryConfig,
         protocol: &ActorProtocolBinding<A, P>,
-    ) -> Self {
+    ) -> Self
+    where
+        D: ActorDefinition<Protocol = P>,
+    {
         assert!(
             config.quarantine_capacity > 0,
             "quarantine capacity must be nonzero"
@@ -314,7 +317,7 @@ impl<A: Actor> ActorRegistry<A> {
             ..ActorRuntimeConfig::default()
         });
         Self {
-            kind,
+            definition: PhantomData,
             config,
             protocol_id: Some(protocol.protocol_id()),
             entries: Arc::new(DashMap::new()),
@@ -342,8 +345,12 @@ impl<A: Actor> ActorRegistry<A> {
         self.actor_system.set(actor_system)
     }
 
-    pub fn kind(&self) -> &ActorKind {
-        &self.kind
+    pub fn name(&self) -> &'static str {
+        D::NAME
+    }
+
+    pub(crate) fn address_namespace(&self) -> String {
+        encode_segment(D::NAME.as_bytes())
     }
 
     /// Installs an authority resolver used by direct registry activations.
@@ -444,6 +451,9 @@ impl<A: Actor> ActorRegistry<A> {
     }
 
     pub fn get_exact(&self, address: &ActorAddress) -> Option<ActorHandle<A>> {
+        if address.actor_path().segments().nth(1) != Some(self.address_namespace().as_str()) {
+            return None;
+        }
         if self.config.address.as_ref().is_none_or(|config| {
             config.cluster_id != *address.cluster_id()
                 || config.node_address != *address.node_address()
@@ -877,7 +887,7 @@ impl<A: Actor> ActorRegistry<A> {
         fencing_token: Option<ActorFencingToken>,
     ) -> ActorCreateContext {
         ActorCreateContext {
-            actor_kind: self.kind.clone(),
+            actor_name: D::NAME,
             actor_id: actor_id.clone(),
             environment: self.config.environment.clone(),
             fencing_token,
@@ -1100,12 +1110,12 @@ impl<A: Actor> ActorRegistry<A> {
         let protocol_id = self.protocol_id?;
         let path = ActorPath::user([
             "user".to_owned(),
-            encode_segment(self.kind.as_str().as_bytes()),
+            encode_segment(D::NAME.as_bytes()),
             encode_actor_id(&actor_id),
         ])
         .inspect_err(|error| {
             tracing::warn!(
-                actor_kind = self.kind.as_str(),
+                actor_kind = D::NAME,
                 %error,
                 "actor identity does not fit an addressable actor path; the activation stays node-local"
             );

@@ -1,11 +1,11 @@
 //! Cross-node dispatch: asks must reach the claimed owner and nothing else.
 
+use lattice_actor_distributed::registry::ActorDefinition;
 use std::{
     sync::atomic::{AtomicUsize, Ordering},
     time::Duration,
 };
 
-use lattice_actor_distributed::actor_kind;
 use lattice_actor_distributed::{
     host::ProtocolHostRegistry,
     registry::{ActorAddressConfig, ActorRegistryConfig},
@@ -161,8 +161,7 @@ async fn remote_entity_ask_reaches_only_claimed_owner() {
     let source_loads = Arc::new(AtomicUsize::new(0));
     let owner_loads = Arc::new(AtomicUsize::new(0));
     let registry = |address: NodeEndpoint, incarnation: NodeIncarnation| {
-        Arc::new(ActorRegistry::new_bound(
-            actor_kind!("RemoteEntity"),
+        Arc::new(ActorRegistry::<RemoteEntityDefinition, _>::new_bound(
             ActorRegistryConfig {
                 address: Some(ActorAddressConfig {
                     cluster_id: cluster_id.clone(),
@@ -374,4 +373,12 @@ async fn remote_entity_ask_reaches_only_claimed_owner() {
     owner_shutdown.send(true).unwrap();
     source_logic.await.unwrap().unwrap();
     owner_logic.await.unwrap().unwrap();
+}
+
+#[derive(Debug)]
+struct RemoteEntityDefinition;
+
+impl ActorDefinition for RemoteEntityDefinition {
+    const NAME: &'static str = "RemoteEntity";
+    type Protocol = EntityProtocol;
 }

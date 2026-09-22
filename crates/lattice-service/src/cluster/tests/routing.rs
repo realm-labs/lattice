@@ -1,12 +1,12 @@
 //! Local slot resolution: single-flight failure propagation and authority fencing.
 
+use lattice_actor_distributed::registry::ActorDefinition;
 use std::{
     collections::BTreeSet,
     sync::atomic::{AtomicU64, AtomicUsize, Ordering},
     time::Duration,
 };
 
-use lattice_actor_distributed::actor_kind;
 use lattice_actor_distributed::registry::{ActorAddressConfig, ActorRegistryConfig};
 use lattice_model::{
     actor::ProtocolId,
@@ -483,8 +483,7 @@ async fn stale_generation_never_reaches_entity_loader() {
     }
     let protocol = Arc::new(EntityProtocol::build().unwrap());
     let binding = Arc::new(EntityProtocol::bind::<EntityActor>().unwrap());
-    let registry = Arc::new(ActorRegistry::new_bound(
-        actor_kind!("Entity"),
+    let registry = Arc::new(ActorRegistry::<EntityDefinition, _>::new_bound(
         ActorRegistryConfig {
             address: Some(ActorAddressConfig {
                 cluster_id: cluster_id.clone(),
@@ -559,4 +558,12 @@ async fn stale_generation_never_reaches_entity_loader() {
     assert_eq!(observed_token.load(Ordering::SeqCst), 2);
     shutdown_tx.send(true).unwrap();
     logic_task.await.unwrap().unwrap();
+}
+
+#[derive(Debug)]
+struct EntityDefinition;
+
+impl ActorDefinition for EntityDefinition {
+    const NAME: &'static str = "Entity";
+    type Protocol = EntityProtocol;
 }

@@ -27,7 +27,7 @@ at the crate root:
 - `lattice-model::trace` owns propagation and telemetry resource values.
 
 Runtime containers such as `ActorEnvironment` remain in `lattice-actor`.
-Registry-local `ActorKey` and `ActorKind` remain in
+Registry-local `ActorKey` and the shared-contract trait `ActorDefinition` remain in
 `lattice-actor-distributed`; they are not wire address primitives.
 
 `lattice-actor-distributed` owns protocols, activation registries, hosting,

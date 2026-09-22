@@ -1,5 +1,6 @@
 //! Node lifecycle: registration validation, start rollback, shutdown and forced drain.
 
+use lattice_actor_distributed::registry::ActorDefinition;
 use std::{
     collections::BTreeSet,
     sync::{
@@ -9,7 +10,7 @@ use std::{
     time::Duration,
 };
 
-use lattice_actor_distributed::{ActorKey, actor_kind};
+use lattice_actor_distributed::ActorKey;
 use lattice_actor_distributed::{
     context::{ActorContext, HandlerContext},
     error::{ActorFailure, ActorStopError},
@@ -35,13 +36,10 @@ use crate::{
 };
 
 #[test]
-fn actor_registration_rejects_a_registry_bound_to_another_protocol() {
+fn actor_registration_rejects_an_unbound_registry() {
     let ping = Arc::new(PingProtocol::bind::<PingActor>().unwrap());
-    let other = OtherPingProtocol::bind::<PingActor>().unwrap();
-    let registry = Arc::new(ActorRegistry::new_bound(
-        actor_kind!("Ping"),
+    let registry = Arc::new(ActorRegistry::<PingDefinition, PingActor>::new(
         ActorRegistryConfig::default(),
-        &other,
     ));
     let config = node_config(
         ClusterId::new("service-test").unwrap(),
@@ -101,8 +99,7 @@ async fn force_shutdown_forces_retained_actor_before_publishing_terminated() {
     }
 
     let binding = Arc::new(PingProtocol::bind::<ForceShutdownActor>().unwrap());
-    let registry = Arc::new(ActorRegistry::new_bound(
-        actor_kind!("ForceShutdownActor"),
+    let registry = Arc::new(ActorRegistry::<ForceShutdownActorDefinition, _>::new_bound(
         ActorRegistryConfig::default(),
         binding.as_ref(),
     ));
@@ -162,11 +159,12 @@ async fn force_shutdown_forces_retained_actor_before_publishing_terminated() {
 async fn terminal_shutdown_drains_local_actors_without_a_migration_target() {
     let _network = network_test_guard().await;
     let binding = Arc::new(PingProtocol::bind::<PingActor>().unwrap());
-    let registry = Arc::new(ActorRegistry::new_bound(
-        actor_kind!("TerminalShutdownActor"),
-        ActorRegistryConfig::default(),
-        binding.as_ref(),
-    ));
+    let registry = Arc::new(
+        ActorRegistry::<TerminalShutdownActorDefinition, _>::new_bound(
+            ActorRegistryConfig::default(),
+            binding.as_ref(),
+        ),
+    );
     let handle = registry.start(ActorKey::U64(1), PingActor).await.unwrap();
     let config = node_config(
         ClusterId::new("terminal-shutdown-test").unwrap(),
@@ -228,8 +226,7 @@ async fn service_retry_api_resolves_retained_actor_cell() {
     }
 
     let binding = Arc::new(PingProtocol::bind::<RetryShutdownActor>().unwrap());
-    let registry = Arc::new(ActorRegistry::new_bound(
-        actor_kind!("RetryShutdownActor"),
+    let registry = Arc::new(ActorRegistry::<RetryShutdownActorDefinition, _>::new_bound(
         ActorRegistryConfig::default(),
         binding.as_ref(),
     ));
@@ -300,8 +297,7 @@ async fn leave_deadline_retains_an_actor_waiting_for_its_stop_hook() {
     }
     let finish = Arc::new(tokio::sync::Notify::new());
     let binding = Arc::new(PingProtocol::bind::<SlowStopActor>().unwrap());
-    let registry = Arc::new(ActorRegistry::new_bound(
-        actor_kind!("SlowStopActor"),
+    let registry = Arc::new(ActorRegistry::<SlowStopActorDefinition, _>::new_bound(
         ActorRegistryConfig::default(),
         binding.as_ref(),
     ));
@@ -349,8 +345,7 @@ async fn leave_deadline_retains_an_actor_waiting_for_its_stop_hook() {
 async fn repeated_start_is_rejected_without_stopping_a_ready_node() {
     let _network = network_test_guard().await;
     let binding = Arc::new(PingProtocol::bind::<PingActor>().unwrap());
-    let registry = Arc::new(ActorRegistry::new_bound(
-        actor_kind!("RepeatedStartActor"),
+    let registry = Arc::new(ActorRegistry::<RepeatedStartActorDefinition, _>::new_bound(
         ActorRegistryConfig::default(),
         binding.as_ref(),
     ));
@@ -432,4 +427,52 @@ async fn startup_failure_rolls_back_partially_started_components() {
     tokio::net::TcpListener::bind(socket)
         .await
         .expect("a failed start must release the remoting endpoint");
+}
+
+#[derive(Debug)]
+struct PingDefinition;
+
+impl ActorDefinition for PingDefinition {
+    const NAME: &'static str = "Ping";
+    type Protocol = PingProtocol;
+}
+
+#[derive(Debug)]
+struct ForceShutdownActorDefinition;
+
+impl ActorDefinition for ForceShutdownActorDefinition {
+    const NAME: &'static str = "ForceShutdownActor";
+    type Protocol = PingProtocol;
+}
+
+#[derive(Debug)]
+struct TerminalShutdownActorDefinition;
+
+impl ActorDefinition for TerminalShutdownActorDefinition {
+    const NAME: &'static str = "TerminalShutdownActor";
+    type Protocol = PingProtocol;
+}
+
+#[derive(Debug)]
+struct RetryShutdownActorDefinition;
+
+impl ActorDefinition for RetryShutdownActorDefinition {
+    const NAME: &'static str = "RetryShutdownActor";
+    type Protocol = PingProtocol;
+}
+
+#[derive(Debug)]
+struct SlowStopActorDefinition;
+
+impl ActorDefinition for SlowStopActorDefinition {
+    const NAME: &'static str = "SlowStopActor";
+    type Protocol = PingProtocol;
+}
+
+#[derive(Debug)]
+struct RepeatedStartActorDefinition;
+
+impl ActorDefinition for RepeatedStartActorDefinition {
+    const NAME: &'static str = "RepeatedStartActor";
+    type Protocol = PingProtocol;
 }

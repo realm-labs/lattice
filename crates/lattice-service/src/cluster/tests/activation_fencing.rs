@@ -1,7 +1,7 @@
+use lattice_actor_distributed::registry::ActorDefinition;
 use std::{collections::BTreeSet, sync::atomic::AtomicUsize, time::Duration};
 
 use async_trait::async_trait;
-use lattice_actor_distributed::actor_kind;
 use lattice_actor_distributed::{
     error::ActorFailure,
     registry::{ActorCreateContext, ActorRegistryConfig},
@@ -118,8 +118,7 @@ async fn loading_obeys_retirement(singleton: bool, fence: bool) {
     let (state, _control, shutdown, runtime) =
         stage_logic_runtime(hello, coordinator.clone(), associations.clone(), vec![slot]).await;
     let binding = Arc::new(EntityProtocol::bind::<EntityActor>().unwrap());
-    let registry = Arc::new(ActorRegistry::new(
-        actor_kind!("FencedLoading"),
+    let registry = Arc::new(ActorRegistry::<FencedLoadingDefinition, _>::new(
         ActorRegistryConfig::default(),
     ));
     let loader = PausedLoader {
@@ -251,4 +250,12 @@ async fn loading_obeys_retirement(singleton: bool, fence: bool) {
     assert!(registry.active_actor_ids().is_empty());
     shutdown.send(true).unwrap();
     runtime.await.unwrap().unwrap();
+}
+
+#[derive(Debug)]
+struct FencedLoadingDefinition;
+
+impl ActorDefinition for FencedLoadingDefinition {
+    const NAME: &'static str = "FencedLoading";
+    type Protocol = EntityProtocol;
 }
