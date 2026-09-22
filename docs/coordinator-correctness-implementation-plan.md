@@ -293,7 +293,7 @@ session. Member registration resends pending effects but is not the only repair 
 | Simulation | `crates/lattice-sim/src/{store,scenario,explorer}.rs` | atomic transaction model, invariants, liveness, replay |
 | Real acceptance | `crates/lattice-placement/tests/etcd_acceptance.rs`, `tests/distributed/`, `lattice-sim testctl` | real etcd, process failover, chaos, artifacts |
 
-Split `storage/etcd.rs` before it exceeds the repository file limit. Prefer a small `etcd/mod.rs` plus
+Split `storage/etcd.rs` before it exceeds the repository file limit. Prefer a small `etcd.rs` plus
 focused transaction, pagination/codec, and migration modules. Do not create a generic abstraction
 layer that obscures the exact predicates being tested.
 

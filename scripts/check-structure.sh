@@ -49,6 +49,15 @@ trap 'rm -f "$failure_marker"' EXIT HUP INT TERM
 
 find "$root" \
   \( -path "$root/target" -o -path "$root/.git" \) -prune -o \
+  -type f -name 'mod.rs' -print |
+while IFS= read -r file; do
+  relative=${file#"$root"/}
+  echo "$relative: mod.rs is forbidden; use a same-named module file and directory" >&2
+  echo failed >"$failure_marker"
+done
+
+find "$root" \
+  \( -path "$root/target" -o -path "$root/.git" \) -prune -o \
   -type f -name '*.rs' -print |
 while IFS= read -r file; do
   check_file "$file"

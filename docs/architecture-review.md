@@ -216,7 +216,7 @@ slot and plan movement in one commit.
 ### 3.4 F4 — admin retry and pause semantics do not survive leader failover — MEDIUM
 
 `automatic_globally_paused`, `paused_entity_types`, and `applied_admin_operations` are initialized
-empty for every elected leader (`runtime/mod.rs:365-367, 431-456`). Therefore:
+empty for every elected leader (`runtime.rs:365-367, 431-456`). Therefore:
 
 - an automatic-balancing pause silently disappears on failover;
 - an operation ID can be reused after failover without detecting a different fingerprint;
