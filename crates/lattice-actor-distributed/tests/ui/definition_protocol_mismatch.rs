@@ -1,3 +1,4 @@
+use lattice_actor::runtime::ActorRuntime;
 use lattice_actor::error::ActorFailure;
 use lattice_actor::state_machine::Stateless;
 use lattice_actor::traits::Actor;
@@ -25,5 +26,6 @@ impl Actor for Server {
 
 fn main() {
     let binding = WrongProtocol::bind::<Server>().unwrap();
-    let _ = ActorRegistry::<Definition, Server>::new_bound(ActorRegistryConfig::default(), &binding);
+    let actor_runtime = ActorRuntime::default();
+    let _ = ActorRegistry::<Definition, Server>::new_bound(actor_runtime.spawner(), ActorRegistryConfig::default(), &binding);
 }

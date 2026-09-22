@@ -15,7 +15,7 @@ use lattice_actor_distributed::{
     host::{ActorHost, HostRegistryError, ProtocolHostRegistry},
     protocol::ProstCodec,
     registry::{ActorAddressConfig, ActorDefinition, ActorRegistry, ActorRegistryConfig},
-    runtime::{ActorRuntime, ActorSpawnOptions},
+    runtime::{ActorRuntime, ActorRuntimeConfig, ActorSpawnOptions},
     state_machine::Stateless,
     traits::{Actor, Handler, Message, StopReason},
 };
@@ -127,12 +127,17 @@ async fn duplicate_host_registration_preserves_original_routing_and_drain() {
         }),
         ..Default::default()
     };
+    let actor_runtime = ActorRuntime::default();
     let original = Arc::new(ActorRegistry::<OriginalDefinition, _>::new_bound(
+        actor_runtime.spawner(),
         config.clone(),
         &protocol,
     ));
+    let actor_runtime = ActorRuntime::default();
     let replacement = Arc::new(ActorRegistry::<OriginalDefinition, _>::new_bound(
-        config, &protocol,
+        actor_runtime.spawner(),
+        config,
+        &protocol,
     ));
     let actor_id = ActorKey::U64(1);
     let handle = original.start(actor_id.clone(), TestActor).await.unwrap();
@@ -198,8 +203,11 @@ async fn different_definitions_share_one_protocol_without_cross_routing() {
     environment
         .insert(ActivationDirectory::new(8).unwrap())
         .unwrap();
-    let config = ActorRegistryConfig {
+    let actor_runtime = ActorRuntime::new(ActorRuntimeConfig {
         environment: environment.build(),
+        ..Default::default()
+    });
+    let config = ActorRegistryConfig {
         address: Some(ActorAddressConfig {
             cluster_id: ClusterId::new("shared-protocol").unwrap(),
             node_address: NodeEndpoint::new("127.0.0.1", 19301).unwrap(),
@@ -209,11 +217,14 @@ async fn different_definitions_share_one_protocol_without_cross_routing() {
     };
     let protocol = Arc::new(TestProtocol::bind::<RoutedActor>().unwrap());
     let first = Arc::new(ActorRegistry::<OriginalDefinition, _>::new_bound(
+        actor_runtime.spawner(),
         config.clone(),
         &protocol,
     ));
     let second = Arc::new(ActorRegistry::<ReplacementDefinition, _>::new_bound(
-        config, &protocol,
+        actor_runtime.spawner(),
+        config,
+        &protocol,
     ));
     let first_deliveries = Arc::new(Semaphore::new(0));
     let second_deliveries = Arc::new(Semaphore::new(0));

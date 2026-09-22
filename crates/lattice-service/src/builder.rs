@@ -6,7 +6,10 @@ use std::{
     sync::{Arc, Mutex, atomic::AtomicBool},
 };
 
-use lattice_actor::traits::{Actor, Message, Request};
+use lattice_actor::{
+    runtime::{ActorRuntime, spawner::ActorSpawner},
+    traits::{Actor, Message, Request},
+};
 use lattice_actor_distributed::{
     host::{ActorHost, ProtocolHostRegistry},
     protocol::{
@@ -91,6 +94,7 @@ pub(crate) struct LogicalEntityInstaller {
 }
 
 pub struct LatticeServiceBuilder {
+    actor_runtime: ActorRuntime,
     config: NodeConfig,
     associations: Arc<AssociationManager>,
     messaging: Arc<OutboundMessaging>,
@@ -136,6 +140,15 @@ struct CoordinatorRuntimeAssembly {
 
 impl LatticeServiceBuilder {
     pub fn new(config: NodeConfig) -> Result<Self, ServiceError> {
+        Self::with_actor_runtime(config, ActorRuntime::default())
+    }
+
+    /// Transfers ownership of the Actor executors to the service.
+    /// All convenience-hosted registries share these executors and their environment.
+    pub fn with_actor_runtime(
+        config: NodeConfig,
+        actor_runtime: ActorRuntime,
+    ) -> Result<Self, ServiceError> {
         config.validate().map_err(ServiceError::Config)?;
         let associations = Arc::new(
             AssociationManager::new(
@@ -150,6 +163,7 @@ impl LatticeServiceBuilder {
                 .map_err(ServiceError::Messaging)?,
         );
         Ok(Self {
+            actor_runtime,
             hosts: ProtocolHostRegistry::new(config.maximum_actor_protocols)
                 .map_err(ServiceError::Host)?,
             config,
@@ -179,6 +193,11 @@ impl LatticeServiceBuilder {
 
     pub fn association_manager(&self) -> Arc<AssociationManager> {
         self.associations.clone()
+    }
+
+    /// Execution entry point for registries created before building this service.
+    pub fn actor_spawner(&self) -> ActorSpawner {
+        self.actor_runtime.spawner()
     }
 
     pub fn outbound_messaging(&self) -> Arc<OutboundMessaging> {
@@ -266,6 +285,7 @@ impl LatticeServiceBuilder {
             node_incarnation: self.config.incarnation,
         });
         let registry = Arc::new(ActorRegistry::<D, A>::new_bound(
+            self.actor_spawner(),
             registry_config,
             protocol.as_ref(),
         ));
@@ -441,6 +461,7 @@ impl LatticeServiceBuilder {
             node_incarnation: self.config.incarnation,
         });
         let registry = Arc::new(ActorRegistry::<D, A>::new_bound(
+            self.actor_spawner(),
             registry_config,
             protocol.as_ref(),
         ));
@@ -1083,6 +1104,7 @@ impl LatticeServiceBuilder {
             })
             .transpose()?;
         Ok(LatticeService {
+            actor_runtime: Mutex::new(Some(self.actor_runtime)),
             cluster_id: self.config.cluster_id.clone(),
             release: self.config.release.clone(),
             actor_system,

@@ -1,4 +1,5 @@
 use lattice_actor::context::HandlerContext;
+use lattice_actor::runtime::ActorRuntime;
 use lattice_actor_distributed::registry::ActorDefinition;
 use lattice_model::actor::ErasedProtocol;
 use std::{
@@ -185,6 +186,7 @@ impl Handler<CompletionBarrier> for CompletionActor {
 }
 
 pub struct ActorCompletionTopology {
+    _actor_runtime: ActorRuntime,
     registry: Arc<ActorRegistry<BenchmarkCompletionDefinition, CompletionActor>>,
     handle: lattice_actor::handle::ActorHandle<CompletionActor>,
     observer: Option<Arc<CompletionObserver>>,
@@ -204,11 +206,14 @@ impl ActorCompletionTopology {
         observe: bool,
     ) -> Result<Self, Box<dyn Error>> {
         let observer = observe.then(|| Arc::new(CompletionObserver::default()));
-        let registry =
-            ActorRegistry::<BenchmarkCompletionDefinition, _>::new(ActorRegistryConfig {
+        let actor_runtime = ActorRuntime::default();
+        let registry = ActorRegistry::<BenchmarkCompletionDefinition, _>::new(
+            actor_runtime.spawner(),
+            ActorRegistryConfig {
                 mailbox: MailboxConfig::bounded(mailbox_capacity),
                 ..ActorRegistryConfig::default()
-            });
+            },
+        );
         let registry = match &observer {
             Some(observer) => {
                 registry.with_observer(ActorObserverHandle::from_arc(observer.clone()))
@@ -220,6 +225,7 @@ impl ActorCompletionTopology {
             .start(ActorKey::U64(1), CompletionActor::default())
             .await?;
         Ok(Self {
+            _actor_runtime: actor_runtime,
             registry,
             handle,
             observer,

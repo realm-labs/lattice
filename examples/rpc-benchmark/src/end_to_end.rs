@@ -1,4 +1,5 @@
 use lattice_actor::context::HandlerContext;
+use lattice_actor::runtime::ActorRuntime;
 use lattice_actor_distributed::registry::ActorDefinition;
 use lattice_model::actor::ErasedProtocol;
 use std::{
@@ -207,6 +208,7 @@ fn map_actor_error(error: ActorCallError) -> RemoteMessageError {
 }
 
 pub struct RemoteActorTopology {
+    _actor_runtime: ActorRuntime,
     actor_registry: Arc<ActorRegistry<BenchmarkRemoteEchoDefinition, EchoActor>>,
     client: Arc<RemotingEndpoint>,
     server: Arc<RemotingEndpoint>,
@@ -234,7 +236,9 @@ impl RemoteActorTopology {
     }
 
     pub async fn start(bulk_stripes: usize) -> Result<Self, Box<dyn Error>> {
+        let actor_runtime = ActorRuntime::default();
         let actor_registry = Arc::new(ActorRegistry::<BenchmarkRemoteEchoDefinition, _>::new(
+            actor_runtime.spawner(),
             ActorRegistryConfig::default(),
         ));
         let tell_completion = Arc::new(TellCompletion::default());
@@ -299,6 +303,7 @@ impl RemoteActorTopology {
         let prepared_tell =
             client_messaging.prepare_exact_tell_route(association.clone(), &target, fingerprint)?;
         let topology = Self {
+            _actor_runtime: actor_runtime,
             actor_registry,
             client,
             server,

@@ -1,5 +1,7 @@
 //! Node lifecycle: registration validation, start rollback, shutdown and forced drain.
 
+use lattice_actor::runtime::ActorRuntime;
+
 use lattice_actor_distributed::registry::ActorDefinition;
 use std::{
     collections::BTreeSet,
@@ -29,7 +31,7 @@ use lattice_placement::{
 
 use super::support::*;
 use crate::{
-    builder::LatticeService,
+    builder::{LatticeService, LatticeServiceBuilder},
     error::ServiceError,
     lifecycle::NodeLifecycleState,
     test_support::{network_test_guard, unused_address},
@@ -38,7 +40,9 @@ use crate::{
 #[test]
 fn actor_registration_rejects_an_unbound_registry() {
     let ping = Arc::new(PingProtocol::bind::<PingActor>().unwrap());
+    let actor_runtime = ActorRuntime::default();
     let registry = Arc::new(ActorRegistry::<PingDefinition, PingActor>::new(
+        actor_runtime.spawner(),
         ActorRegistryConfig::default(),
     ));
     let config = node_config(
@@ -99,7 +103,9 @@ async fn force_shutdown_forces_retained_actor_before_publishing_terminated() {
     }
 
     let binding = Arc::new(PingProtocol::bind::<ForceShutdownActor>().unwrap());
+    let actor_runtime = ActorRuntime::default();
     let registry = Arc::new(ActorRegistry::<ForceShutdownActorDefinition, _>::new_bound(
+        actor_runtime.spawner(),
         ActorRegistryConfig::default(),
         binding.as_ref(),
     ));
@@ -159,8 +165,10 @@ async fn force_shutdown_forces_retained_actor_before_publishing_terminated() {
 async fn terminal_shutdown_drains_local_actors_without_a_migration_target() {
     let _network = network_test_guard().await;
     let binding = Arc::new(PingProtocol::bind::<PingActor>().unwrap());
+    let actor_runtime = ActorRuntime::default();
     let registry = Arc::new(
         ActorRegistry::<TerminalShutdownActorDefinition, _>::new_bound(
+            actor_runtime.spawner(),
             ActorRegistryConfig::default(),
             binding.as_ref(),
         ),
@@ -226,7 +234,9 @@ async fn service_retry_api_resolves_retained_actor_cell() {
     }
 
     let binding = Arc::new(PingProtocol::bind::<RetryShutdownActor>().unwrap());
+    let actor_runtime = ActorRuntime::default();
     let registry = Arc::new(ActorRegistry::<RetryShutdownActorDefinition, _>::new_bound(
+        actor_runtime.spawner(),
         ActorRegistryConfig::default(),
         binding.as_ref(),
     ));
@@ -297,7 +307,9 @@ async fn leave_deadline_retains_an_actor_waiting_for_its_stop_hook() {
     }
     let finish = Arc::new(tokio::sync::Notify::new());
     let binding = Arc::new(PingProtocol::bind::<SlowStopActor>().unwrap());
+    let actor_runtime = ActorRuntime::default();
     let registry = Arc::new(ActorRegistry::<SlowStopActorDefinition, _>::new_bound(
+        actor_runtime.spawner(),
         ActorRegistryConfig::default(),
         binding.as_ref(),
     ));
@@ -305,12 +317,16 @@ async fn leave_deadline_retains_an_actor_waiting_for_its_stop_hook() {
         .start(ActorKey::U64(1), SlowStopActor(finish.clone()))
         .await
         .unwrap();
-    let service = LatticeService::builder(node_config(
-        ClusterId::new("leave-slow-stop-test").unwrap(),
-        "slow-stop",
-        unused_address().await,
-        NodeIncarnation::new(1).unwrap(),
-    ))
+    let spawner = actor_runtime.spawner();
+    let service = LatticeServiceBuilder::with_actor_runtime(
+        node_config(
+            ClusterId::new("leave-slow-stop-test").unwrap(),
+            "slow-stop",
+            unused_address().await,
+            NodeIncarnation::new(1).unwrap(),
+        ),
+        actor_runtime,
+    )
     .unwrap()
     .register_actor(registry.clone(), binding)
     .unwrap()
@@ -335,6 +351,7 @@ async fn leave_deadline_retains_an_actor_waiting_for_its_stop_hook() {
         .unwrap();
     assert_eq!(handle.lifecycle_state(), ActorLifecycleState::Stopped);
     assert!(registry.live_cells().is_empty());
+    assert!(spawner.spawn_actor(PingActor, Default::default()).is_err());
     assert_eq!(
         service.node_lifecycle_state(),
         NodeLifecycleState::Terminated
@@ -345,7 +362,9 @@ async fn leave_deadline_retains_an_actor_waiting_for_its_stop_hook() {
 async fn repeated_start_is_rejected_without_stopping_a_ready_node() {
     let _network = network_test_guard().await;
     let binding = Arc::new(PingProtocol::bind::<PingActor>().unwrap());
+    let actor_runtime = ActorRuntime::default();
     let registry = Arc::new(ActorRegistry::<RepeatedStartActorDefinition, _>::new_bound(
+        actor_runtime.spawner(),
         ActorRegistryConfig::default(),
         binding.as_ref(),
     ));

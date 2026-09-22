@@ -1,3 +1,4 @@
+use lattice_actor::runtime::ActorRuntime;
 use lattice_actor_distributed::registry::ActorDefinition;
 use lattice_model::actor::ErasedProtocol;
 use std::{
@@ -112,7 +113,9 @@ async fn observer_panics_preserve_messaging_registry_cleanup_and_deathwatch() {
         PanicPhase::Stopped,
     ] {
         let panics = Arc::new(AtomicUsize::new(0));
+        let actor_runtime = ActorRuntime::default();
         let registry = ActorRegistry::<ObserverIsolationDefinition, HealthyActor>::new(
+            actor_runtime.spawner(),
             ActorRegistryConfig::default(),
         )
         .with_observer(ActorObserverHandle::new(PanickingObserver {

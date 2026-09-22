@@ -1,5 +1,7 @@
 //! Cluster membership: discovery-driven join, leave, per-domain health and Coordinator rollover.
 
+use lattice_actor::runtime::ActorRuntime;
+
 use lattice_actor_distributed::registry::ActorDefinition;
 use std::{
     collections::BTreeSet,
@@ -42,7 +44,7 @@ use tokio::{sync::watch::Receiver, time::Instant};
 
 use super::support::*;
 use crate::{
-    builder::LatticeService,
+    builder::{LatticeService, LatticeServiceBuilder},
     cluster::api::ClusterEvent,
     config::ClusterJoinConfig,
     lifecycle::{NodeLifecycleState, PlacementDomainState},
@@ -505,7 +507,9 @@ async fn coordinator_rollover_recovers_after_blocked_session_registration() {
         tokio::sync::watch::channel(discovery_snapshot(1, "coordinator-a", address_a));
     let member_incarnation = NodeIncarnation::new(303).unwrap();
     let binding = Arc::new(PingProtocol::bind::<PingActor>().unwrap());
+    let actor_runtime = ActorRuntime::default();
     let registry = Arc::new(ActorRegistry::<RolloverPingDefinition, _>::new_bound(
+        actor_runtime.spawner(),
         ActorRegistryConfig {
             address: Some(ActorAddressConfig {
                 cluster_id: cluster_id.clone(),
@@ -722,8 +726,10 @@ async fn an_active_shard_recovers_after_a_transient_association_loss() {
     )
     .unwrap();
     let primary_binding = Arc::new(PingProtocol::bind::<PingActor>().unwrap());
+    let actor_runtime = ActorRuntime::default();
     let primary_registry = Arc::new(
         ActorRegistry::<AssociationRecoveryPrimaryDefinition, _>::new_bound(
+            actor_runtime.spawner(),
             ActorRegistryConfig {
                 address: Some(ActorAddressConfig {
                     cluster_id: cluster_id.clone(),
@@ -736,8 +742,10 @@ async fn an_active_shard_recovers_after_a_transient_association_loss() {
         ),
     );
     let secondary_binding = Arc::new(OtherPingProtocol::bind::<PingActor>().unwrap());
+    let actor_runtime = ActorRuntime::default();
     let secondary_registry = Arc::new(
         ActorRegistry::<AssociationRecoverySecondaryDefinition, _>::new_bound(
+            actor_runtime.spawner(),
             ActorRegistryConfig {
                 address: Some(ActorAddressConfig {
                     cluster_id: cluster_id.clone(),
@@ -944,7 +952,9 @@ async fn a_member_hosting_a_shard_leaves_by_handing_it_over_rather_than_timing_o
     let host = |node_id: &str, address: NodeEndpoint, incarnation: u128| {
         let incarnation = NodeIncarnation::new(incarnation).unwrap();
         let binding = Arc::new(PingProtocol::bind::<PingActor>().unwrap());
+        let actor_runtime = ActorRuntime::default();
         let registry = Arc::new(ActorRegistry::<DrainedPingDefinition, _>::new_bound(
+            actor_runtime.spawner(),
             ActorRegistryConfig {
                 address: Some(ActorAddressConfig {
                     cluster_id: cluster_id.clone(),
@@ -955,12 +965,10 @@ async fn a_member_hosting_a_shard_leaves_by_handing_it_over_rather_than_timing_o
             },
             binding.as_ref(),
         ));
-        LatticeService::builder(node_config(
-            cluster_id.clone(),
-            node_id,
-            address,
-            incarnation,
-        ))
+        LatticeServiceBuilder::with_actor_runtime(
+            node_config(cluster_id.clone(), node_id, address, incarnation),
+            actor_runtime,
+        )
         .unwrap()
         .host_entity_with_registry(entity_config.clone(), registry, binding, PingLoader)
         .unwrap()

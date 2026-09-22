@@ -1,4 +1,5 @@
 use lattice_actor::context::HandlerContext;
+use lattice_actor::runtime::ActorRuntime;
 use lattice_actor_distributed::registry::ActorDefinition;
 use lattice_model::actor::ErasedProtocol;
 use std::{
@@ -70,7 +71,9 @@ impl Handler<BenchTell> for BenchActor {
 }
 
 pub async fn local_actor_admission(operations: usize) -> Result<MatrixMeasurement, Box<dyn Error>> {
+    let actor_runtime = ActorRuntime::default();
     let registry = Arc::new(ActorRegistry::<BenchmarkLocalDefinition, _>::new(
+        actor_runtime.spawner(),
         ActorRegistryConfig {
             mailbox: MailboxConfig::bounded(1024),
             ..ActorRegistryConfig::default()

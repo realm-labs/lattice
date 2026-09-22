@@ -1,4 +1,5 @@
 use lattice_actor::context::HandlerContext;
+use lattice_actor::runtime::ActorRuntime;
 use lattice_actor_distributed::registry::ActorDefinition;
 use lattice_model::actor::ErasedProtocol;
 use std::{
@@ -73,7 +74,9 @@ impl ActorLoader<LazyActor> for CountingLoader {
 
 #[tokio::test]
 async fn concurrent_lazy_activation_starts_one_local_actor() {
+    let actor_runtime = ActorRuntime::default();
     let registry = Arc::new(ActorRegistry::<LazyDefinition, LazyActor>::new(
+        actor_runtime.spawner(),
         ActorRegistryConfig {
             mailbox: MailboxConfig::bounded(8),
             ..ActorRegistryConfig::default()
@@ -110,7 +113,11 @@ async fn concurrent_lazy_activation_starts_one_local_actor() {
 
 #[tokio::test]
 async fn loader_failure_is_explicit_and_allows_retry() {
-    let registry = ActorRegistry::<LazyDefinition, LazyActor>::new(ActorRegistryConfig::default());
+    let actor_runtime = ActorRuntime::default();
+    let registry = ActorRegistry::<LazyDefinition, LazyActor>::new(
+        actor_runtime.spawner(),
+        ActorRegistryConfig::default(),
+    );
     let loads = Arc::new(AtomicUsize::new(0));
     let loader = CountingLoader {
         loads: loads.clone(),

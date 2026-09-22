@@ -6,6 +6,8 @@
 //! place. These tests hold the line in both directions: the cluster-internal scopes survive a
 //! membership session loss, and no termination path is allowed to inherit that leniency.
 
+use lattice_actor::runtime::{ActorRuntime, spawner::ActorSpawner};
+
 use lattice_actor_distributed::registry::ActorDefinition;
 use std::{collections::BTreeSet, sync::Arc, time::Duration};
 
@@ -45,6 +47,7 @@ fn join_config() -> ClusterJoinConfig {
 /// A node hosting one exact activation, wired so that its `ActorAddress` can be addressed from
 /// another process.
 fn hosted_ping(
+    spawner: ActorSpawner,
     cluster_id: &ClusterId,
     address: &NodeEndpoint,
     incarnation: NodeIncarnation,
@@ -54,6 +57,7 @@ fn hosted_ping(
 ) {
     let binding = Arc::new(PingProtocol::bind::<PingActor>().unwrap());
     let registry = Arc::new(ActorRegistry::<AdmissionPingDefinition, _>::new_bound(
+        spawner,
         ActorRegistryConfig {
             address: Some(ActorAddressConfig {
                 cluster_id: cluster_id.clone(),
@@ -136,7 +140,14 @@ async fn membership_loss_sheds_the_edge_while_local_and_exact_traffic_keep_servi
         .unwrap(),
     );
 
-    let (registry, binding) = hosted_ping(&cluster_id, &member_address, member_incarnation);
+    let actor_runtime = ActorRuntime::default();
+
+    let (registry, binding) = hosted_ping(
+        actor_runtime.spawner(),
+        &cluster_id,
+        &member_address,
+        member_incarnation,
+    );
     let handle = registry.start(ActorKey::U64(1), PingActor).await.unwrap();
     let target: ActorAddress<PingProtocol> = registry.address(&ActorKey::U64(1)).unwrap().unwrap();
     let member = LatticeService::builder(node_config(
@@ -329,7 +340,13 @@ async fn membership_loss_leaves_placement_governed_entity_traffic_serving() {
         Vec::new(),
     )
     .unwrap();
-    let (registry, binding) = hosted_ping(&cluster_id, &member_address, member_incarnation);
+    let actor_runtime = ActorRuntime::default();
+    let (registry, binding) = hosted_ping(
+        actor_runtime.spawner(),
+        &cluster_id,
+        &member_address,
+        member_incarnation,
+    );
     let member = LatticeService::builder(node_config(
         cluster_id.clone(),
         "member",
@@ -408,7 +425,9 @@ async fn cordon_closes_every_admission_scope_including_local_dispatch() {
     let cluster_id = ClusterId::new("service-admission-drain").unwrap();
     let address = unused_address().await;
     let incarnation = NodeIncarnation::new(903).unwrap();
-    let (registry, binding) = hosted_ping(&cluster_id, &address, incarnation);
+    let actor_runtime = ActorRuntime::default();
+    let (registry, binding) =
+        hosted_ping(actor_runtime.spawner(), &cluster_id, &address, incarnation);
     registry.start(ActorKey::U64(1), PingActor).await.unwrap();
     let target: ActorAddress<PingProtocol> = registry.address(&ActorKey::U64(1)).unwrap().unwrap();
     let service = LatticeService::builder(node_config(cluster_id, "drained", address, incarnation))
@@ -467,7 +486,9 @@ async fn force_stop_closes_every_admission_scope() {
     let cluster_id = ClusterId::new("service-admission-force").unwrap();
     let address = unused_address().await;
     let incarnation = NodeIncarnation::new(904).unwrap();
-    let (registry, binding) = hosted_ping(&cluster_id, &address, incarnation);
+    let actor_runtime = ActorRuntime::default();
+    let (registry, binding) =
+        hosted_ping(actor_runtime.spawner(), &cluster_id, &address, incarnation);
     registry.start(ActorKey::U64(1), PingActor).await.unwrap();
     let target: ActorAddress<PingProtocol> = registry.address(&ActorKey::U64(1)).unwrap().unwrap();
     let service = LatticeService::builder(node_config(cluster_id, "forced", address, incarnation))

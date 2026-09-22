@@ -1,5 +1,6 @@
 #![cfg_attr(not(test), deny(clippy::wildcard_imports))]
 use lattice_actor::context::HandlerContext;
+use lattice_actor::runtime::ActorRuntime;
 use lattice_actor_distributed::registry::ActorDefinition;
 
 use std::{
@@ -21,7 +22,7 @@ use lattice_model::{
     cluster::{ClusterId, NodeEndpoint, NodeIncarnation},
 };
 use lattice_remoting::config::RemotingConfig;
-use lattice_service::{builder::LatticeService, config::NodeConfig};
+use lattice_service::{builder::LatticeServiceBuilder, config::NodeConfig};
 
 pub mod lattice {
     pub mod actor {
@@ -130,7 +131,9 @@ pub async fn run_demo() -> Result<LoginAcceptedReply, Box<dyn StdError>> {
     let address = NodeEndpoint::new("127.0.0.1", 25530)?;
     let incarnation = NodeIncarnation::generate();
     let protocol = Arc::new(WorldProtocol::bind::<WorldActor>()?);
+    let actor_runtime = ActorRuntime::default();
     let registry = Arc::new(ActorRegistry::<WorldDefinition, _>::new_bound(
+        actor_runtime.spawner(),
         ActorRegistryConfig {
             address: Some(ActorAddressConfig {
                 cluster_id: cluster_id.clone(),
@@ -154,19 +157,22 @@ pub async fn run_demo() -> Result<LoginAcceptedReply, Box<dyn StdError>> {
     let actor_address: ActorAddress<WorldProtocol> = registry
         .address(&actor_id)?
         .ok_or_else(|| IoError::other("missing exact World ActorAddress"))?;
-    let service = LatticeService::builder(NodeConfig {
-        release: lattice_model::cluster::ReleaseManifest::development(1),
-        cluster_id,
-        node_id: "world-a".to_owned(),
-        address,
-        incarnation,
-        roles: BTreeSet::from(["world".to_owned()]),
-        remoting: RemotingConfig::default(),
-        maximum_actor_protocols: 32,
-        maximum_watches: 1024,
-        maximum_supervised_tasks: 1024,
-        shutdown_timeout: Duration::from_secs(5),
-    })?
+    let service = LatticeServiceBuilder::with_actor_runtime(
+        NodeConfig {
+            release: lattice_model::cluster::ReleaseManifest::development(1),
+            cluster_id,
+            node_id: "world-a".to_owned(),
+            address,
+            incarnation,
+            roles: BTreeSet::from(["world".to_owned()]),
+            remoting: RemotingConfig::default(),
+            maximum_actor_protocols: 32,
+            maximum_watches: 1024,
+            maximum_supervised_tasks: 1024,
+            shutdown_timeout: Duration::from_secs(5),
+        },
+        actor_runtime,
+    )?
     .register_actor(registry, protocol)?
     .build()?;
     service.start().await?;

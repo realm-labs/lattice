@@ -580,18 +580,18 @@ impl SplitHost {
         let protocol = Arc::new(SplitProtocol::bind::<SplitEntityActor>()?);
         let mut environment = ActorEnvironment::builder();
         environment.insert(ActivationDirectory::new(8)?)?;
-        let registry = Arc::new(ActorRegistry::<DistributedSplitFixtureDefinition, _>::new_bound(ActorRegistryConfig {
+        let actor_runtime = ActorRuntime::new(ActorRuntimeConfig { environment: environment.build(), ..Default::default() });
+        let registry = Arc::new(ActorRegistry::<DistributedSplitFixtureDefinition, _>::new_bound(actor_runtime.spawner(), ActorRegistryConfig {
                 address: Some(ActorAddressConfig {
                     cluster_id: cluster.clone(),
                     node_address: config.address.clone(),
                     node_incarnation: incarnation,
                 }),
-                environment: environment.build(),
                 ..ActorRegistryConfig::default()
             },
             protocol.as_ref(),
         ));
-        let service = LatticeService::builder(config)?
+        let service = LatticeServiceBuilder::with_actor_runtime(config, actor_runtime)?
             .host_entity_with_registry(
                 entity.clone(),
                 registry,

@@ -1,4 +1,5 @@
 use lattice_actor::context::HandlerContext;
+use lattice_actor::runtime::ActorRuntime;
 use lattice_actor_distributed::registry::ActorDefinition;
 use lattice_model::actor::ErasedProtocol;
 use std::sync::Arc;
@@ -73,7 +74,9 @@ impl Responder<Ping> for PassivatingActor {
 
 #[tokio::test]
 async fn request_arriving_while_actor_is_passivating_is_not_processed_by_old_incarnation() {
+    let actor_runtime = ActorRuntime::default();
     let registry = ActorRegistry::<PassivatingDefinition, PassivatingActor>::new(
+        actor_runtime.spawner(),
         ActorRegistryConfig::default(),
     );
     let stop_entered = Arc::new(Semaphore::new(0));

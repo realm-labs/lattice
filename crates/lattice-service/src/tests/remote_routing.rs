@@ -1,5 +1,7 @@
 //! Remote message routing against an exact actor reference over TCP.
 
+use lattice_actor::runtime::ActorRuntime;
+
 use lattice_actor_distributed::registry::ActorDefinition;
 use std::{sync::Arc, time::Duration};
 
@@ -87,7 +89,9 @@ async fn bound_actor_ref_asks_exact_remote_activation_over_tcp() {
     let client_incarnation = NodeIncarnation::new(1).unwrap();
     let server_incarnation = NodeIncarnation::new(2).unwrap();
     let binding = Arc::new(PingProtocol::bind::<PingActor>().unwrap());
+    let actor_runtime = ActorRuntime::default();
     let registry = Arc::new(ActorRegistry::<PingDefinition, _>::new_bound(
+        actor_runtime.spawner(),
         ActorRegistryConfig {
             address: Some(ActorAddressConfig {
                 cluster_id: cluster_id.clone(),
@@ -175,7 +179,9 @@ async fn local_exact_watch_uses_the_same_subscription_and_drop_cancels_it() {
     let address = unused_address().await;
     let incarnation = NodeIncarnation::new(11).unwrap();
     let binding = Arc::new(PingProtocol::bind::<PingActor>().unwrap());
+    let actor_runtime = ActorRuntime::default();
     let registry = Arc::new(ActorRegistry::<PingDefinition, _>::new_bound(
+        actor_runtime.spawner(),
         ActorRegistryConfig {
             address: Some(ActorAddressConfig {
                 cluster_id: cluster_id.clone(),
@@ -241,7 +247,9 @@ async fn actor_context_watch_delivers_a_remote_termination_to_the_system_mailbox
     let server_incarnation = NodeIncarnation::new(22).unwrap();
 
     let target_binding = Arc::new(PingProtocol::bind::<PingActor>().unwrap());
+    let actor_runtime = ActorRuntime::default();
     let target_registry = Arc::new(ActorRegistry::<RemoteWatchTargetDefinition, _>::new_bound(
+        actor_runtime.spawner(),
         ActorRegistryConfig {
             address: Some(ActorAddressConfig {
                 cluster_id: cluster_id.clone(),
@@ -271,7 +279,9 @@ async fn actor_context_watch_delivers_a_remote_termination_to_the_system_mailbox
     .unwrap();
 
     let watcher_binding = Arc::new(PingProtocol::bind::<RemoteWatcherActor>().unwrap());
+    let actor_runtime = ActorRuntime::default();
     let watcher_registry = Arc::new(ActorRegistry::<RemoteWatcherDefinition, _>::new_bound(
+        actor_runtime.spawner(),
         ActorRegistryConfig {
             address: Some(ActorAddressConfig {
                 cluster_id: cluster_id.clone(),

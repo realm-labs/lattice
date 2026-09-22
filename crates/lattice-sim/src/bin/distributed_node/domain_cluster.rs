@@ -168,7 +168,10 @@ async fn domain_logic(
         config.remoting.heartbeat_interval = Duration::from_secs(2);
         config.remoting.idle_data_connection_timeout = Duration::from_secs(2);
     }
-    let mut builder = LatticeService::builder(config)?;
+    let mut environment = ActorEnvironment::builder();
+    environment.insert(ActivationDirectory::new(8)?)?;
+    let actor_runtime = ActorRuntime::new(ActorRuntimeConfig { environment: environment.build(), ..Default::default() });
+    let mut builder = LatticeServiceBuilder::with_actor_runtime(config, actor_runtime)?;
     if !membership_only {
         for (name, entity) in [
             ("alpha", "distributed-alpha"),
@@ -240,15 +243,12 @@ async fn domain_logic(
     let mut scale_actor = None;
     if membership_only {
         let protocol = Arc::new(FixtureProtocol::bind::<PingActor>()?);
-        let mut environment = ActorEnvironment::builder();
-        environment.insert(ActivationDirectory::new(8)?)?;
-        let registry = Arc::new(ActorRegistry::<DistributedScaleFixtureDefinition, _>::new_bound(ActorRegistryConfig {
+        let registry = Arc::new(ActorRegistry::<DistributedScaleFixtureDefinition, _>::new_bound(builder.actor_spawner(), ActorRegistryConfig {
                 address: Some(ActorAddressConfig {
                     cluster_id: cluster.clone(),
                     node_address: address,
                     node_incarnation: incarnation,
                 }),
-                environment: environment.build(),
                 ..ActorRegistryConfig::default()
             },
             protocol.as_ref(),

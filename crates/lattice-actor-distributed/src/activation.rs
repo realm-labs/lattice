@@ -11,7 +11,7 @@ use crate::{
     reference::{ActorRef, EntityRef, Recipient, SingletonRef},
 };
 
-/// Service-scoped access to the distributed Actor system.
+/// Registry-scoped capability attached to each distributed activation.
 #[derive(Clone)]
 pub(crate) struct DistributedActorRuntime {
     actor_system: Arc<OnceLock<ActorSystem>>,
@@ -121,7 +121,7 @@ pub trait DistributedActorContextExt<A: Actor> {
 
 impl<A: Actor> DistributedActorContextExt<A> for ActorContext<A> {
     fn distributed(&self) -> Option<Arc<DistributedActorContext>> {
-        let runtime = self.environment().get::<DistributedActorRuntime>()?;
+        let runtime = self.runtime_attachment::<DistributedActorRuntime>()?;
         let self_address = self
             .runtime_attachment::<DistributedActorIdentity>()
             .and_then(|identity| identity.self_address.clone());

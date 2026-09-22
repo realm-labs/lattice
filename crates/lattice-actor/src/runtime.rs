@@ -34,7 +34,7 @@ mod dispatch;
 mod panic;
 mod passivation;
 mod rejection;
-pub(crate) mod spawner;
+pub mod spawner;
 mod task_runtime;
 mod worker_pool;
 
@@ -238,6 +238,17 @@ impl ActorRuntime {
         &self.scheduler
     }
 
+    /// Returns a lightweight entry point sharing this runtime's executors and environment.
+    /// The returned spawner does not keep the runtime alive.
+    pub fn spawner(&self) -> ActorSpawner {
+        ActorSpawner::new(
+            self.scheduler.clone(),
+            self.config.default_execution.clone(),
+            self.config.environment.clone(),
+            self.config.observer.clone(),
+        )
+    }
+
     /// Shuts down every executor owned by this runtime.
     ///
     /// This is an execution-level shutdown: active Actor tasks are cancelled and their graceful
@@ -275,21 +286,8 @@ impl ActorRuntime {
     where
         A: Actor,
     {
-        let spawner = ActorSpawner::new(
-            self.scheduler.clone(),
-            self.config.default_execution.clone(),
-        );
-        spawner.spawn(
-            actor,
-            ActorSpawnContext {
-                options,
-                environment: self.config.environment.clone(),
-                observer: self.config.observer.clone(),
-                terminal_hook,
-                runtime_attachments,
-                spawner: spawner.clone(),
-            },
-        )
+        self.spawner()
+            .spawn_managed_actor(actor, options, runtime_attachments, terminal_hook)
     }
 }
 

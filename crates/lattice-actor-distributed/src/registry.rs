@@ -27,7 +27,7 @@ use lattice_actor::{
     handle::{ActorHandle, StopFailureRecord},
     mailbox::MailboxConfig,
     observation::ActorObserverHandle,
-    runtime::{ActorRuntime, ActorRuntimeConfig, ActorSpawnOptions, PassivationPolicy},
+    runtime::{ActorSpawnOptions, PassivationPolicy, spawner::ActorSpawner},
     traits::{Actor, ActorLifecycleState, PassivationReason, StopReason},
     watch::LocalActorRef,
 };
@@ -82,7 +82,6 @@ pub struct ActorRegistryConfig {
     pub waiter_timeout: Duration,
     pub quarantine_capacity: usize,
     pub address: Option<ActorAddressConfig>,
-    pub environment: ActorEnvironment,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -102,11 +101,16 @@ impl Default for ActorRegistryConfig {
             waiter_timeout: Duration::from_secs(5),
             quarantine_capacity: 1024,
             address: None,
-            environment: ActorEnvironment::empty(),
         }
     }
 }
 
+/// Activation registry using an externally owned Actor runtime.
+///
+/// Retain the runtime that supplied the spawner for the lifetime of these Actors.
+/// Multiple registries may share one spawner and its execution resources. The
+/// registry never creates executors or shuts them down; drain it before shutting
+/// down the owner. Loader and Actor environments come from that same spawner.
 pub struct ActorRegistry<D: ActorDefinition, A: Actor> {
     definition: PhantomData<fn() -> D>,
     config: ActorRegistryConfig,
@@ -116,8 +120,7 @@ pub struct ActorRegistry<D: ActorDefinition, A: Actor> {
     quarantined: Arc<DashMap<LocalActorRef, QuarantinedEntry<A>>>,
     actor_system: Arc<OnceLock<ActorSystem>>,
     fencing_token_resolvers: Arc<RwLock<BTreeMap<String, ActorFencingTokenResolver>>>,
-    observer: ActorObserverHandle,
-    runtime: ActorRuntime,
+    spawner: ActorSpawner,
 }
 
 type ActorFencingTokenResolver =
@@ -261,7 +264,8 @@ where
 }
 
 impl<D: ActorDefinition, A: Actor> ActorRegistry<D, A> {
-    pub fn new(mut config: ActorRegistryConfig) -> Self {
+    /// Creates a node-local registry using the supplied execution entry point.
+    pub fn new(spawner: ActorSpawner, config: ActorRegistryConfig) -> Self {
         assert!(
             config.address.is_none(),
             "registries with exact ActorAddresses must be constructed with ActorRegistry::new_bound"
@@ -271,14 +275,6 @@ impl<D: ActorDefinition, A: Actor> ActorRegistry<D, A> {
             "quarantine capacity must be nonzero"
         );
         let actor_system = Arc::new(OnceLock::new());
-        config.environment = config
-            .environment
-            .with(DistributedActorRuntime::new(actor_system.clone()))
-            .expect("distributed Actor runtime value is private to ActorRegistry");
-        let runtime = ActorRuntime::new(ActorRuntimeConfig {
-            environment: config.environment.clone(),
-            ..ActorRuntimeConfig::default()
-        });
         Self {
             definition: PhantomData,
             config,
@@ -288,8 +284,7 @@ impl<D: ActorDefinition, A: Actor> ActorRegistry<D, A> {
             quarantined: Arc::new(DashMap::new()),
             actor_system,
             fencing_token_resolvers: Arc::new(RwLock::new(BTreeMap::new())),
-            observer: ActorObserverHandle::default(),
-            runtime,
+            spawner,
         }
     }
 
@@ -297,7 +292,8 @@ impl<D: ActorDefinition, A: Actor> ActorRegistry<D, A> {
     /// the supplied server protocol. The address protocol ID is derived from
     /// the binding and cannot drift from the registered dispatcher.
     pub fn new_bound<P: Protocol>(
-        mut config: ActorRegistryConfig,
+        spawner: ActorSpawner,
+        config: ActorRegistryConfig,
         protocol: &ActorProtocolBinding<A, P>,
     ) -> Self
     where
@@ -308,14 +304,6 @@ impl<D: ActorDefinition, A: Actor> ActorRegistry<D, A> {
             "quarantine capacity must be nonzero"
         );
         let actor_system = Arc::new(OnceLock::new());
-        config.environment = config
-            .environment
-            .with(DistributedActorRuntime::new(actor_system.clone()))
-            .expect("distributed Actor runtime value is private to ActorRegistry");
-        let runtime = ActorRuntime::new(ActorRuntimeConfig {
-            environment: config.environment.clone(),
-            ..ActorRuntimeConfig::default()
-        });
         Self {
             definition: PhantomData,
             config,
@@ -325,18 +313,12 @@ impl<D: ActorDefinition, A: Actor> ActorRegistry<D, A> {
             quarantined: Arc::new(DashMap::new()),
             actor_system,
             fencing_token_resolvers: Arc::new(RwLock::new(BTreeMap::new())),
-            observer: ActorObserverHandle::default(),
-            runtime,
+            spawner,
         }
     }
 
     pub fn with_observer(mut self, observer: ActorObserverHandle) -> Self {
-        self.observer = observer.clone();
-        self.runtime = ActorRuntime::new(ActorRuntimeConfig {
-            observer,
-            environment: self.config.environment.clone(),
-            ..ActorRuntimeConfig::default()
-        });
+        self.spawner = self.spawner.with_observer(observer);
         self
     }
 
@@ -462,7 +444,7 @@ impl<D: ActorDefinition, A: Actor> ActorRegistry<D, A> {
         }) {
             return None;
         }
-        if let Some(directory) = self.config.environment.get::<ActivationDirectory>()
+        if let Some(directory) = self.spawner.environment().get::<ActivationDirectory>()
             && let Some(handle) = directory.resolve(address)
         {
             return Some(handle);
@@ -889,7 +871,7 @@ impl<D: ActorDefinition, A: Actor> ActorRegistry<D, A> {
         ActorCreateContext {
             actor_name: D::NAME,
             actor_id: actor_id.clone(),
-            environment: self.config.environment.clone(),
+            environment: self.spawner.environment().clone(),
             fencing_token,
         }
     }
@@ -986,7 +968,7 @@ impl<D: ActorDefinition, A: Actor> ActorRegistry<D, A> {
         });
         if let Some((_, RegistryEntry::Running(handle, _))) = removed
             && let Some(reference) = self.remove_exact(&handle)
-            && let Some(directory) = self.config.environment.get::<ActivationDirectory>()
+            && let Some(directory) = self.spawner.environment().get::<ActivationDirectory>()
         {
             directory.remove(&reference);
         }
@@ -1041,7 +1023,7 @@ impl<D: ActorDefinition, A: Actor> ActorRegistry<D, A> {
         let exact_entries = self.exact_entries.clone();
         let quarantined = self.quarantined.clone();
         let terminal_actor_id = actor_id.clone();
-        let directory = self.config.environment.get::<ActivationDirectory>();
+        let directory = self.spawner.environment().get::<ActivationDirectory>();
         let terminal_reference = self_address.clone();
         let terminal_activation = self_address.as_ref().map(ActorAddress::activation_id);
         let terminal_hook = Box::new(move |local_ref| {
@@ -1060,10 +1042,13 @@ impl<D: ActorDefinition, A: Actor> ActorRegistry<D, A> {
         });
         let mut runtime_attachments = ActorRuntimeAttachments::builder();
         runtime_attachments
+            .insert(DistributedActorRuntime::new(self.actor_system.clone()))
+            .map_err(|error| ActorFailure::new(error.to_string()))?;
+        runtime_attachments
             .insert(DistributedActorIdentity::new(self_address.clone()))
             .map_err(|error| ActorFailure::new(error.to_string()))?;
         let handle = self
-            .runtime
+            .spawner
             .spawn_managed_actor(
                 actor,
                 ActorSpawnOptions {
@@ -1077,7 +1062,7 @@ impl<D: ActorDefinition, A: Actor> ActorRegistry<D, A> {
             )
             .map_err(|error| ActorFailure::new(error.to_string()))?;
         if let (Some(directory), Some(reference)) = (
-            self.config.environment.get::<ActivationDirectory>(),
+            self.spawner.environment().get::<ActivationDirectory>(),
             self_address.as_ref(),
         ) && let Err(error) = directory.register(reference, &handle)
         {
@@ -1085,7 +1070,7 @@ impl<D: ActorDefinition, A: Actor> ActorRegistry<D, A> {
             return Err(ActorFailure::new(error.to_string()));
         }
         if is_terminal(handle.lifecycle_state())
-            && let Some(directory) = self.config.environment.get::<ActivationDirectory>()
+            && let Some(directory) = self.spawner.environment().get::<ActivationDirectory>()
             && let Some(reference) = self_address.as_ref()
         {
             directory.remove(reference);

@@ -1,5 +1,6 @@
 #![cfg_attr(not(test), deny(clippy::wildcard_imports))]
 use lattice_actor::context::HandlerContext;
+use lattice_actor::runtime::{ActorRuntime, ActorRuntimeConfig};
 use lattice_actor_distributed::registry::ActorDefinition;
 
 use std::{
@@ -616,14 +617,18 @@ async fn server(reference: PathBuf) -> Result<(), Box<dyn Error>> {
     let protocol = Arc::new(FixtureProtocol::bind::<PingActor>()?);
     let mut environment = ActorEnvironment::builder();
     environment.insert(ActivationDirectory::new(64)?)?;
+    let actor_runtime = ActorRuntime::new(ActorRuntimeConfig {
+        environment: environment.build(),
+        ..Default::default()
+    });
     let registry = Arc::new(ActorRegistry::<DistributedFixtureDefinition, _>::new_bound(
+        actor_runtime.spawner(),
         ActorRegistryConfig {
             address: Some(ActorAddressConfig {
                 cluster_id: cluster.clone(),
                 node_address: address.clone(),
                 node_incarnation: incarnation,
             }),
-            environment: environment.build(),
             ..ActorRegistryConfig::default()
         },
         protocol.as_ref(),
@@ -642,10 +647,12 @@ async fn server(reference: PathBuf) -> Result<(), Box<dyn Error>> {
         reference.with_file_name("child-ref.json"),
         serde_json::to_vec(&child)?,
     )?;
-    let service =
-        LatticeService::builder(node_config(cluster, "fixture-server", address, incarnation))?
-            .register_actor(registry, protocol)?
-            .build()?;
+    let service = LatticeServiceBuilder::with_actor_runtime(
+        node_config(cluster, "fixture-server", address, incarnation),
+        actor_runtime,
+    )?
+    .register_actor(registry, protocol)?
+    .build()?;
     service.start().await?;
     std::fs::write(reference, serde_json::to_vec(&target)?)?;
     tokio::signal::ctrl_c().await?;
@@ -940,26 +947,33 @@ fn entity_service(
     let mut environment = ActorEnvironment::builder();
     environment.insert(ActivationDirectory::new(64)?)?;
     let protocol = Arc::new(FixtureProtocol::bind::<PingActor>()?);
+    let actor_runtime = ActorRuntime::new(ActorRuntimeConfig {
+        environment: environment.build(),
+        ..Default::default()
+    });
     let registry = Arc::new(
         ActorRegistry::<DistributedEntityFixtureDefinition, _>::new_bound(
+            actor_runtime.spawner(),
             ActorRegistryConfig {
                 address: Some(ActorAddressConfig {
                     cluster_id: cluster.clone(),
                     node_address: node.address.clone(),
                     node_incarnation: node.incarnation,
                 }),
-                environment: environment.build(),
                 ..ActorRegistryConfig::default()
             },
             protocol.as_ref(),
         ),
     );
-    let mut builder = LatticeServiceBuilder::new(node_config(
-        cluster.clone(),
-        &node.node_id,
-        node.address.clone(),
-        node.incarnation,
-    ))?;
+    let mut builder = LatticeServiceBuilder::with_actor_runtime(
+        node_config(
+            cluster.clone(),
+            &node.node_id,
+            node.address.clone(),
+            node.incarnation,
+        ),
+        actor_runtime,
+    )?;
     let associations = builder.association_manager();
     let messaging = builder.outbound_messaging();
     let coordinator_incarnation = NodeIncarnation::new(999)?;

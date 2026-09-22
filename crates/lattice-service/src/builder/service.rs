@@ -1,3 +1,4 @@
+use lattice_actor::runtime::ActorRuntime;
 use std::{sync::atomic::Ordering, time::Duration};
 
 use lattice_actor_distributed::{
@@ -42,6 +43,7 @@ use super::{
 };
 
 pub struct LatticeService {
+    pub(super) actor_runtime: Mutex<Option<ActorRuntime>>,
     pub(super) cluster_id: ClusterId,
     pub(super) release: ReleaseManifest,
     pub(super) actor_system: ActorSystem,
@@ -817,6 +819,14 @@ impl LatticeService {
         self.supervisor
             .shutdown(self.join_config.shutdown_timeout)
             .await?;
+        let actor_runtime = self
+            .actor_runtime
+            .lock()
+            .expect("service Actor runtime poisoned")
+            .take();
+        if let Some(runtime) = actor_runtime {
+            runtime.shutdown();
+        }
         if self.node_lifecycle_state() == NodeLifecycleState::Stopping {
             for domain in &self.configured_domains {
                 self.lifecycle_driver

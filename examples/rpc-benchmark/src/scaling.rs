@@ -1,3 +1,4 @@
+use lattice_actor::runtime::ActorRuntime;
 use lattice_actor_distributed::registry::ActorDefinition;
 use lattice_model::actor::ErasedProtocol;
 use std::{
@@ -91,6 +92,7 @@ impl MailboxContentionReport {
 }
 
 pub struct ActorScaleTopology {
+    _actor_runtime: ActorRuntime,
     registry: Arc<ActorRegistry<BenchmarkScaleDefinition, ScaleActor>>,
     handles: Arc<Vec<ActorHandle<ScaleActor>>>,
 }
@@ -116,7 +118,9 @@ impl ActorScaleTopology {
         mailbox: MailboxConfig,
     ) -> Result<Self, Box<dyn Error>> {
         let actor_count = actor_count.max(1);
+        let actor_runtime = ActorRuntime::default();
         let registry = Arc::new(ActorRegistry::<BenchmarkScaleDefinition, _>::new(
+            actor_runtime.spawner(),
             ActorRegistryConfig {
                 mailbox,
                 ..ActorRegistryConfig::default()
@@ -131,6 +135,7 @@ impl ActorScaleTopology {
             );
         }
         Ok(Self {
+            _actor_runtime: actor_runtime,
             registry,
             handles: Arc::new(handles),
         })

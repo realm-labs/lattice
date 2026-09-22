@@ -1,3 +1,4 @@
+use lattice_actor::runtime::ActorRuntime;
 use lattice_actor_distributed::registry::ActorDefinition;
 use lattice_model::actor::ErasedProtocol;
 use std::{
@@ -143,6 +144,7 @@ impl SaturationReport {
 }
 
 pub struct SaturationTopology {
+    _actor_runtime: ActorRuntime,
     registry: Arc<ActorRegistry<BenchmarkSaturationDefinition, SaturationActor>>,
     handle: ActorHandle<SaturationActor>,
     state: Arc<SaturationState>,
@@ -152,7 +154,9 @@ pub struct SaturationTopology {
 impl SaturationTopology {
     pub async fn start(mailbox_capacity: usize) -> Result<Self, Box<dyn Error>> {
         let mailbox_capacity = mailbox_capacity.max(1);
+        let actor_runtime = ActorRuntime::default();
         let registry = Arc::new(ActorRegistry::<BenchmarkSaturationDefinition, _>::new(
+            actor_runtime.spawner(),
             ActorRegistryConfig {
                 mailbox: MailboxConfig::bounded(mailbox_capacity),
                 ..ActorRegistryConfig::default()
@@ -169,6 +173,7 @@ impl SaturationTopology {
             )
             .await?;
         Ok(Self {
+            _actor_runtime: actor_runtime,
             registry,
             handle,
             state,

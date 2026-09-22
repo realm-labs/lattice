@@ -1,3 +1,4 @@
+use lattice_actor::runtime::ActorRuntime;
 use lattice_actor_distributed::registry::ActorDefinition;
 use std::{
     sync::{
@@ -99,7 +100,9 @@ async fn remote_tell_waits_for_mailbox_capacity_without_losing_messages() {
     let client_incarnation = NodeIncarnation::new(11).unwrap();
     let server_incarnation = NodeIncarnation::new(12).unwrap();
     let binding = Arc::new(FloodProtocol::bind::<FloodActor>().unwrap());
+    let actor_runtime = ActorRuntime::default();
     let registry = Arc::new(ActorRegistry::<FloodDefinition, _>::new_bound(
+        actor_runtime.spawner(),
         ActorRegistryConfig {
             mailbox: MailboxConfig::bounded(1),
             address: Some(ActorAddressConfig {

@@ -1,4 +1,5 @@
 use lattice_actor::context::HandlerContext;
+use lattice_actor::runtime::{ActorRuntime, ActorRuntimeConfig};
 use lattice_actor_distributed::registry::ActorDefinition;
 use lattice_model::actor::ErasedProtocol;
 use std::{
@@ -36,7 +37,9 @@ struct SlowActor;
 
 #[tokio::test]
 async fn cancelled_activation_releases_placeholder_and_notifies_existing_waiters() {
+    let actor_runtime = ActorRuntime::default();
     let registry = Arc::new(ActorRegistry::<CancelledDefinition, SlowActor>::new(
+        actor_runtime.spawner(),
         ActorRegistryConfig::default(),
     ));
     let actor_id = ActorKey::U64(71);
@@ -65,7 +68,9 @@ async fn cancelled_activation_releases_placeholder_and_notifies_existing_waiters
 
 #[tokio::test]
 async fn panicking_loader_releases_its_activation_placeholder() {
+    let actor_runtime = ActorRuntime::default();
     let registry = Arc::new(ActorRegistry::<PanickingLoaderDefinition, SlowActor>::new(
+        actor_runtime.spawner(),
         ActorRegistryConfig::default(),
     ));
     let task_registry = registry.clone();
@@ -92,8 +97,11 @@ async fn panicking_loader_releases_its_activation_placeholder() {
 
 #[tokio::test]
 async fn draining_loading_activation_prevents_late_publication() {
-    let registry =
-        ActorRegistry::<DrainLoadingDefinition, SlowActor>::new(ActorRegistryConfig::default());
+    let actor_runtime = ActorRuntime::default();
+    let registry = ActorRegistry::<DrainLoadingDefinition, SlowActor>::new(
+        actor_runtime.spawner(),
+        ActorRegistryConfig::default(),
+    );
     let actor_id = ActorKey::U64(73);
     let (release, ready) = oneshot::channel();
     let mut producer = Box::pin(registry.get_or_activate(actor_id.clone(), || async {
@@ -114,8 +122,11 @@ async fn draining_loading_activation_prevents_late_publication() {
 
 #[tokio::test]
 async fn fencing_loading_activation_does_not_remove_a_replacement() {
-    let registry =
-        ActorRegistry::<FenceLoadingDefinition, SlowActor>::new(ActorRegistryConfig::default());
+    let actor_runtime = ActorRuntime::default();
+    let registry = ActorRegistry::<FenceLoadingDefinition, SlowActor>::new(
+        actor_runtime.spawner(),
+        ActorRegistryConfig::default(),
+    );
     let actor_id = ActorKey::U64(74);
     let mut old = Box::pin(registry.get_or_activate(actor_id.clone(), || async {
         std::future::pending::<Result<SlowActor, ActorFailure>>().await
@@ -139,7 +150,9 @@ async fn fencing_loading_activation_does_not_remove_a_replacement() {
 
 #[tokio::test]
 async fn authority_change_during_loading_rejects_publication_and_allows_retry() {
+    let actor_runtime = ActorRuntime::default();
     let registry = ActorRegistry::<GenerationLoadingDefinition, SlowActor>::new(
+        actor_runtime.spawner(),
         ActorRegistryConfig::default(),
     );
     let generation = Arc::new(Mutex::new(Some(1)));
@@ -186,8 +199,11 @@ async fn authority_change_during_loading_rejects_publication_and_allows_retry() 
 
 #[tokio::test]
 async fn current_generation_cancels_a_loading_predecessor_and_its_waiters() {
-    let registry =
-        ActorRegistry::<ReplaceLoadingDefinition, SlowActor>::new(ActorRegistryConfig::default());
+    let actor_runtime = ActorRuntime::default();
+    let registry = ActorRegistry::<ReplaceLoadingDefinition, SlowActor>::new(
+        actor_runtime.spawner(),
+        ActorRegistryConfig::default(),
+    );
     let generation = Arc::new(Mutex::new(Some(1)));
     registry.install_fencing_token_resolver("test", {
         let generation = generation.clone();
@@ -218,8 +234,11 @@ async fn current_generation_cancels_a_loading_predecessor_and_its_waiters() {
 
 #[tokio::test]
 async fn new_generation_preserves_an_old_stop_failure_in_quarantine() {
-    let registry =
-        ActorRegistry::<ReplaceStopFailureDefinition, _>::new(ActorRegistryConfig::default());
+    let actor_runtime = ActorRuntime::default();
+    let registry = ActorRegistry::<ReplaceStopFailureDefinition, _>::new(
+        actor_runtime.spawner(),
+        ActorRegistryConfig::default(),
+    );
     let generation = Arc::new(Mutex::new(Some(1)));
     registry.install_fencing_token_resolver("test", {
         let generation = generation.clone();
@@ -283,8 +302,11 @@ async fn new_generation_preserves_an_old_stop_failure_in_quarantine() {
 
 #[tokio::test]
 async fn wait_terminal_tracks_loading_until_invalidation() {
-    let registry =
-        ActorRegistry::<WaitLoadingDefinition, SlowActor>::new(ActorRegistryConfig::default());
+    let actor_runtime = ActorRuntime::default();
+    let registry = ActorRegistry::<WaitLoadingDefinition, SlowActor>::new(
+        actor_runtime.spawner(),
+        ActorRegistryConfig::default(),
+    );
     let actor_id = ActorKey::U64(76);
     let mut producer = Box::pin(registry.get_or_activate(actor_id.clone(), || async {
         std::future::pending::<Result<SlowActor, ActorFailure>>().await
@@ -301,8 +323,11 @@ async fn wait_terminal_tracks_loading_until_invalidation() {
 
 #[tokio::test]
 async fn activation_waiter_revalidates_authority_after_publication() {
-    let registry =
-        ActorRegistry::<WaiterGenerationDefinition, SlowActor>::new(ActorRegistryConfig::default());
+    let actor_runtime = ActorRuntime::default();
+    let registry = ActorRegistry::<WaiterGenerationDefinition, SlowActor>::new(
+        actor_runtime.spawner(),
+        ActorRegistryConfig::default(),
+    );
     let generation = Arc::new(Mutex::new(Some(1)));
     registry.install_fencing_token_resolver("test", {
         let generation = generation.clone();
@@ -331,7 +356,9 @@ async fn activation_waiter_revalidates_authority_after_publication() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn fast_fence_cleanup_cannot_leave_a_stopped_cell_in_quarantine() {
+    let actor_runtime = ActorRuntime::default();
     let registry = Arc::new(ActorRegistry::<FenceCleanupDefinition, SlowActor>::new(
+        actor_runtime.spawner(),
         ActorRegistryConfig::default(),
     ));
     let mut tasks = tokio::task::JoinSet::new();
@@ -369,7 +396,9 @@ impl Actor for SlowActor {
 
 #[tokio::test]
 async fn activation_waiter_times_out_while_activation_is_loading() {
+    let actor_runtime = ActorRuntime::default();
     let registry = Arc::new(ActorRegistry::<SlowDefinition, SlowActor>::new(
+        actor_runtime.spawner(),
         ActorRegistryConfig {
             mailbox: MailboxConfig::bounded(8),
             passivation: Default::default(),
@@ -378,7 +407,6 @@ async fn activation_waiter_times_out_while_activation_is_loading() {
             waiter_timeout: Duration::from_millis(10),
             quarantine_capacity: 8,
             address: None,
-            environment: ActorEnvironment::empty(),
         },
     ));
     let actor_id = ActorKey::U64(7);
@@ -420,7 +448,11 @@ async fn activation_waiter_times_out_while_activation_is_loading() {
 
 #[tokio::test]
 async fn remove_running_actor_allows_restart_with_same_id() {
-    let registry = ActorRegistry::<SlowDefinition, SlowActor>::new(ActorRegistryConfig::default());
+    let actor_runtime = ActorRuntime::default();
+    let registry = ActorRegistry::<SlowDefinition, SlowActor>::new(
+        actor_runtime.spawner(),
+        ActorRegistryConfig::default(),
+    );
     let actor_id = ActorKey::U64(9);
 
     let first = registry.start(actor_id.clone(), SlowActor).await.unwrap();
@@ -485,7 +517,9 @@ impl Actor for SelfRefActor {
 async fn registry_injects_exact_actor_address_into_context() {
     let node_incarnation = NodeIncarnation::new(7).unwrap();
     let protocol = SelfRefProtocol::bind::<SelfRefActor>().unwrap();
+    let actor_runtime = ActorRuntime::default();
     let registry = ActorRegistry::<GatewaySessionDefinition, SelfRefActor>::new_bound(
+        actor_runtime.spawner(),
         ActorRegistryConfig {
             address: Some(ActorAddressConfig {
                 cluster_id: ClusterId::new("test").unwrap(),
@@ -538,7 +572,9 @@ async fn registry_injects_exact_actor_address_into_context() {
 #[tokio::test]
 async fn registry_keeps_unaddressable_identities_node_local() {
     let protocol = SelfRefProtocol::bind::<SelfRefActor>().unwrap();
+    let actor_runtime = ActorRuntime::default();
     let registry = ActorRegistry::<GatewaySessionDefinition, SelfRefActor>::new_bound(
+        actor_runtime.spawner(),
         ActorRegistryConfig {
             address: Some(ActorAddressConfig {
                 cluster_id: ClusterId::new("test").unwrap(),
@@ -589,8 +625,11 @@ impl Actor for RetainedRegistryActor {
 
 #[tokio::test]
 async fn voluntary_stop_failed_blocks_replacement_until_same_actor_retries() {
-    let registry =
-        ActorRegistry::<RetainedRegistryActorDefinition, _>::new(ActorRegistryConfig::default());
+    let actor_runtime = ActorRuntime::default();
+    let registry = ActorRegistry::<RetainedRegistryActorDefinition, _>::new(
+        actor_runtime.spawner(),
+        ActorRegistryConfig::default(),
+    );
     let actor_id = ActorKey::U64(44);
     let persistence_available = Arc::new(AtomicBool::new(false));
     let dropped = Arc::new(AtomicUsize::new(0));
@@ -636,10 +675,14 @@ async fn voluntary_stop_failed_blocks_replacement_until_same_actor_retries() {
 
 #[tokio::test]
 async fn external_authority_loss_quarantines_old_actor_and_allows_replacement() {
-    let registry = ActorRegistry::<RetainedRegistryActorDefinition, _>::new(ActorRegistryConfig {
-        quarantine_capacity: 1,
-        ..ActorRegistryConfig::default()
-    });
+    let actor_runtime = ActorRuntime::default();
+    let registry = ActorRegistry::<RetainedRegistryActorDefinition, _>::new(
+        actor_runtime.spawner(),
+        ActorRegistryConfig {
+            quarantine_capacity: 1,
+            ..ActorRegistryConfig::default()
+        },
+    );
     let actor_id = ActorKey::U64(45);
     let persistence_available = Arc::new(AtomicBool::new(false));
     let dropped = Arc::new(AtomicUsize::new(0));
@@ -702,10 +745,14 @@ async fn external_authority_loss_quarantines_old_actor_and_allows_replacement() 
 
 #[tokio::test]
 async fn quarantine_capacity_exhaustion_is_explicit_and_never_drops_retained_state() {
-    let registry = ActorRegistry::<RetainedRegistryActorDefinition, _>::new(ActorRegistryConfig {
-        quarantine_capacity: 1,
-        ..ActorRegistryConfig::default()
-    });
+    let actor_runtime = ActorRuntime::default();
+    let registry = ActorRegistry::<RetainedRegistryActorDefinition, _>::new(
+        actor_runtime.spawner(),
+        ActorRegistryConfig {
+            quarantine_capacity: 1,
+            ..ActorRegistryConfig::default()
+        },
+    );
     let first_id = ActorKey::U64(46);
     let second_id = ActorKey::U64(47);
     let first_dropped = Arc::new(AtomicUsize::new(0));
@@ -776,10 +823,14 @@ async fn quarantine_capacity_exhaustion_is_explicit_and_never_drops_retained_sta
 
 #[tokio::test]
 async fn repeated_authority_loss_retains_every_exact_activation() {
-    let registry = ActorRegistry::<RetainedRegistryActorDefinition, _>::new(ActorRegistryConfig {
-        quarantine_capacity: 2,
-        ..ActorRegistryConfig::default()
-    });
+    let actor_runtime = ActorRuntime::default();
+    let registry = ActorRegistry::<RetainedRegistryActorDefinition, _>::new(
+        actor_runtime.spawner(),
+        ActorRegistryConfig {
+            quarantine_capacity: 2,
+            ..ActorRegistryConfig::default()
+        },
+    );
     let actor_id = ActorKey::U64(48);
     let persistence_available = Arc::new(AtomicBool::new(false));
     let first = registry
@@ -864,9 +915,12 @@ async fn authority_loss_during_stopping_finishes_in_non_authoritative_quarantine
             Err(ActorStopError::new("store unavailable"))
         }
     }
+    let actor_runtime = ActorRuntime::default();
 
-    let registry =
-        ActorRegistry::<ConcurrentFenceActorDefinition, _>::new(ActorRegistryConfig::default());
+    let registry = ActorRegistry::<ConcurrentFenceActorDefinition, _>::new(
+        actor_runtime.spawner(),
+        ActorRegistryConfig::default(),
+    );
     let actor_id = ActorKey::U64(49);
     let stopping_entered = Arc::new(Semaphore::new(0));
     let release_stopping = Arc::new(Semaphore::new(0));
@@ -915,7 +969,12 @@ async fn idle_passivation_eagerly_releases_registry_and_directory_capacity() {
     let environment = environment.build();
     let directory = environment.get::<ActivationDirectory>().unwrap();
     let protocol = SelfRefProtocol::bind::<SelfRefActor>().unwrap();
+    let actor_runtime = ActorRuntime::new(ActorRuntimeConfig {
+        environment,
+        ..Default::default()
+    });
     let registry = ActorRegistry::<GatewaySessionDefinition, SelfRefActor>::new_bound(
+        actor_runtime.spawner(),
         ActorRegistryConfig {
             passivation: PassivationPolicy::IdleTimeout(Duration::from_millis(10)),
             address: Some(ActorAddressConfig {
@@ -923,7 +982,6 @@ async fn idle_passivation_eagerly_releases_registry_and_directory_capacity() {
                 node_address: NodeEndpoint::new("127.0.0.1", 19091).unwrap(),
                 node_incarnation: NodeIncarnation::new(8).unwrap(),
             }),
-            environment,
             ..ActorRegistryConfig::default()
         },
         &protocol,
@@ -958,8 +1016,10 @@ async fn concurrent_activation_never_produces_a_second_cell() {
         type Error = ActorFailure;
         type Behavior = ::lattice_actor::state_machine::Stateless;
     }
+    let actor_runtime = ActorRuntime::default();
 
     let registry = Arc::new(ActorRegistry::<CountedDefinition, CountedActor>::new(
+        actor_runtime.spawner(),
         ActorRegistryConfig::default(),
     ));
 

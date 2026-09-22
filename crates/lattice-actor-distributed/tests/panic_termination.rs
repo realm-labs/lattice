@@ -600,8 +600,11 @@ impl Actor for StartActor {
 
 #[tokio::test]
 async fn start_panic_releases_registry_activation_for_replacement() {
-    let registry =
-        ActorRegistry::<PanicStartDefinition, StartActor>::new(ActorRegistryConfig::default());
+    let actor_runtime = ActorRuntime::default();
+    let registry = ActorRegistry::<PanicStartDefinition, StartActor>::new(
+        actor_runtime.spawner(),
+        ActorRegistryConfig::default(),
+    );
     let actor_id = ActorKey::U64(99);
     let first = registry
         .start(

@@ -48,7 +48,10 @@ impl ActorDefinition for WorldDefinition {
 }
 
 let binding = WorldProtocol::bind::<WorldActor>()?;
-let registry = ActorRegistry::<WorldDefinition, WorldActor>::new_bound(config, &binding);
+let runtime = ActorRuntime::new(runtime_config);
+let registry = ActorRegistry::<WorldDefinition, WorldActor>::new_bound(
+    runtime.spawner(), config, &binding,
+);
 ```
 
 `ActorRegistry<D, A>` binds the category to its server implementation. The definition fixes the
@@ -220,6 +223,23 @@ Rules:
 Actor tasks are spawned by lattice ActorRuntime, not directly by business code.
 ActorRuntime owns task naming, lifecycle, cancellation, metrics, tracing, and drain integration.
 ActorRuntime must be retained for the lifetime of its Actors; dropping it shuts down its execution resources.
+
+Registries do not create or own executors. `ActorRuntime::spawner()` returns a cloneable
+`ActorSpawner` carrying the runtime's environment, default execution policy and observer, with
+only a weak reference to execution resources. Multiple registries share it; dropping a registry
+does not shut down other registries' executors. Spawning after the owner has shut down returns
+an executor error. `ActorRegistry::with_observer` overrides observation without replacing executors.
+
+`LatticeServiceBuilder` owns a runtime and exposes `actor_spawner()` for manually constructed
+registries. Convenience entity/singleton hosting uses that same runtime. Use
+`LatticeServiceBuilder::with_actor_runtime(config, runtime)` to transfer an explicitly configured
+runtime to the service. Successful service shutdown drains actors before shutting down its runtime;
+an intervention-required result retains the runtime so stopping can be retried. Registries registered
+with a separately owned runtime still require the caller to retain that owner.
+
+Distributed Actor-system access and the activation's exact address are injected as runtime
+attachments, not inserted into the shared environment. These attachments belong to the activation;
+ordinary local child Actors do not automatically inherit distributed identity or capabilities.
 ActorContext creates scoped tasks through the actor runtime so they can be cancelled or isolated.
 Application-scoped task ownership belongs to its owning runtime, not to `ActorEnvironment`.
 CPU-heavy or blocking work must not run directly on Tokio worker threads; use a named worker pool, blocking pool, or external compute service.
@@ -678,7 +698,7 @@ Entity activation is serialized per `(EntityType, EntityId)` at the owning shard
 
 The local registry prevents duplicate local activation and maps actor references to mailboxes. It is not a distributed placement store.
 
-Every registry environment may share a bounded `ActivationDirectory` through `ActorEnvironment`.
+Registries sharing a runtime environment may share a bounded `ActivationDirectory` through `ActorEnvironment`.
 Registry-hosted activations register the exact `(ActorPath, ActivationId, protocol)` and typed local
 handle; remote protocol dispatch resolves through this directory. Core supervision children remain
 local and do not automatically register distributed addresses. Successful stop, passivation,

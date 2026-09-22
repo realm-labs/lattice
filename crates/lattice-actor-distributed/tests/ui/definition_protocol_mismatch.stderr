@@ -1,10 +1,8 @@
 error[E0308]: mismatched types
-  --> tests/ui/definition_protocol_mismatch.rs:28:92
+  --> tests/ui/definition_protocol_mismatch.rs:30:117
    |
-28 |     let _ = ActorRegistry::<Definition, Server>::new_bound(ActorRegistryConfig::default(), &binding);
-   |             ----------------------------------------------                                 ^^^^^^^^ expected `ExpectedProtocol`, found `WrongProtocol`
-   |             |
-   |             arguments to this function are incorrect
+30 |     let _ = ActorRegistry::<Definition, Server>::new_bound(actor_runtime.spawner(), ActorRegistryConfig::default(), &binding);
+   |             ---------------------------------------------- arguments to this function are incorrect                 ^^^^^^^^ expected `ExpectedProtocol`, found `WrongProtocol`
    |
    = note: expected reference `&ActorProtocolBinding<Server, ExpectedProtocol>`
               found reference `&ActorProtocolBinding<Server, WrongProtocol>`

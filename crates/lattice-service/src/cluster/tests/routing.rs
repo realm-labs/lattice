@@ -1,5 +1,7 @@
 //! Local slot resolution: single-flight failure propagation and authority fencing.
 
+use lattice_actor::runtime::ActorRuntime;
+
 use lattice_actor_distributed::registry::ActorDefinition;
 use std::{
     collections::BTreeSet,
@@ -483,7 +485,9 @@ async fn stale_generation_never_reaches_entity_loader() {
     }
     let protocol = Arc::new(EntityProtocol::build().unwrap());
     let binding = Arc::new(EntityProtocol::bind::<EntityActor>().unwrap());
+    let actor_runtime = ActorRuntime::default();
     let registry = Arc::new(ActorRegistry::<EntityDefinition, _>::new_bound(
+        actor_runtime.spawner(),
         ActorRegistryConfig {
             address: Some(ActorAddressConfig {
                 cluster_id: cluster_id.clone(),

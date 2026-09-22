@@ -1,3 +1,4 @@
+use lattice_actor::runtime::ActorRuntime;
 use lattice_actor_distributed::registry::ActorDefinition;
 use std::{collections::BTreeSet, sync::atomic::AtomicUsize, time::Duration};
 
@@ -118,7 +119,9 @@ async fn loading_obeys_retirement(singleton: bool, fence: bool) {
     let (state, _control, shutdown, runtime) =
         stage_logic_runtime(hello, coordinator.clone(), associations.clone(), vec![slot]).await;
     let binding = Arc::new(EntityProtocol::bind::<EntityActor>().unwrap());
+    let actor_runtime = ActorRuntime::default();
     let registry = Arc::new(ActorRegistry::<FencedLoadingDefinition, _>::new(
+        actor_runtime.spawner(),
         ActorRegistryConfig::default(),
     ));
     let loader = PausedLoader {
