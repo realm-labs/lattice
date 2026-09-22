@@ -3,14 +3,19 @@ set -eu
 
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 allowlist="$root/scripts/pub-use-allowlist.txt"
+loc_counter="$root/scripts/rust-effective-loc.awk"
 status=0
 
 check_file() {
   file=$1
   relative=${file#"$root"/}
-  lines=$(awk 'END { print NR }' "$file")
+  if ! lines=$(awk -f "$loc_counter" "$file"); then
+    echo "$relative: effective LOC counting failed" >&2
+    echo failed >"$failure_marker"
+    return
+  fi
   if [ "$lines" -gt 1200 ]; then
-    echo "$relative: $lines lines exceeds the 1200 line limit" >&2
+    echo "$relative: $lines effective code lines exceeds the 1200 line limit" >&2
     status=1
   fi
 
