@@ -11,7 +11,7 @@ use lattice_actor::runtime::{ActorRuntime, spawner::ActorSpawner};
 use lattice_actor_distributed::registry::ActorDefinition;
 use std::{collections::BTreeSet, sync::Arc, time::Duration};
 
-use lattice_actor_distributed::ActorKey;
+use lattice_actor_distributed::ActorId;
 use lattice_actor_distributed::{
     registry::{ActorAddressConfig, ActorRegistry, ActorRegistryConfig},
     traits::StopReason,
@@ -20,7 +20,7 @@ use lattice_discovery::static_provider::{StaticDiscovery, StaticEndpoint};
 use lattice_model::{
     actor::{ActorAddress, ProtocolId},
     cluster::CoordinatorScope,
-    cluster::{ClusterId, EntityId, EntityType, NodeEndpoint, NodeIncarnation},
+    cluster::{ClusterId, EntityType, NodeEndpoint, NodeIncarnation},
 };
 use lattice_placement::{region::EntityConfig, storage::InMemoryPlacementStore};
 use lattice_remoting::handshake::NodeIdentity;
@@ -148,8 +148,17 @@ async fn membership_loss_sheds_the_edge_while_local_and_exact_traffic_keep_servi
         &member_address,
         member_incarnation,
     );
-    let handle = registry.start(ActorKey::U64(1), PingActor).await.unwrap();
-    let target: ActorAddress<PingProtocol> = registry.address(&ActorKey::U64(1)).unwrap().unwrap();
+    let handle = registry
+        .start(
+            ActorId::new(1_u64.to_be_bytes().to_vec()).expect("valid actor ID"),
+            PingActor,
+        )
+        .await
+        .unwrap();
+    let target: ActorAddress<PingProtocol> = registry
+        .address(&ActorId::new(1_u64.to_be_bytes().to_vec()).expect("valid actor ID"))
+        .unwrap()
+        .unwrap();
     let member = LatticeService::builder(node_config(
         cluster_id.clone(),
         "member",
@@ -384,7 +393,7 @@ async fn membership_loss_leaves_placement_governed_entity_traffic_serving() {
         .unwrap();
 
     let target = entity_config
-        .entity_ref::<PingProtocol>(cluster_id, EntityId::new(b"admitted".to_vec()).unwrap())
+        .entity_ref::<PingProtocol>(cluster_id, ActorId::new(b"admitted".to_vec()).unwrap())
         .unwrap();
     assert_eq!(
         member
@@ -428,8 +437,17 @@ async fn cordon_closes_every_admission_scope_including_local_dispatch() {
     let actor_runtime = ActorRuntime::default();
     let (registry, binding) =
         hosted_ping(actor_runtime.spawner(), &cluster_id, &address, incarnation);
-    registry.start(ActorKey::U64(1), PingActor).await.unwrap();
-    let target: ActorAddress<PingProtocol> = registry.address(&ActorKey::U64(1)).unwrap().unwrap();
+    registry
+        .start(
+            ActorId::new(1_u64.to_be_bytes().to_vec()).expect("valid actor ID"),
+            PingActor,
+        )
+        .await
+        .unwrap();
+    let target: ActorAddress<PingProtocol> = registry
+        .address(&ActorId::new(1_u64.to_be_bytes().to_vec()).expect("valid actor ID"))
+        .unwrap()
+        .unwrap();
     let service = LatticeService::builder(node_config(cluster_id, "drained", address, incarnation))
         .unwrap()
         .register_actor(registry, binding)
@@ -489,8 +507,17 @@ async fn force_stop_closes_every_admission_scope() {
     let actor_runtime = ActorRuntime::default();
     let (registry, binding) =
         hosted_ping(actor_runtime.spawner(), &cluster_id, &address, incarnation);
-    registry.start(ActorKey::U64(1), PingActor).await.unwrap();
-    let target: ActorAddress<PingProtocol> = registry.address(&ActorKey::U64(1)).unwrap().unwrap();
+    registry
+        .start(
+            ActorId::new(1_u64.to_be_bytes().to_vec()).expect("valid actor ID"),
+            PingActor,
+        )
+        .await
+        .unwrap();
+    let target: ActorAddress<PingProtocol> = registry
+        .address(&ActorId::new(1_u64.to_be_bytes().to_vec()).expect("valid actor ID"))
+        .unwrap()
+        .unwrap();
     let service = LatticeService::builder(node_config(cluster_id, "forced", address, incarnation))
         .unwrap()
         .register_actor(registry, binding)

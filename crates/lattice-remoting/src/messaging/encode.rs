@@ -1,4 +1,6 @@
 use bytes::{BufMut, Bytes, BytesMut};
+#[cfg(test)]
+use lattice_model::actor::ActorId;
 use lattice_model::actor::{ActorAddress, ActorPath, ProtocolTag};
 use std::sync::Arc;
 
@@ -463,16 +465,32 @@ const fn encoded_varint_len(value: u64) -> usize {
 mod tests {
     use lattice_model::actor::{ActivationId, EntityAddress, ProtocolId, SingletonAddress};
     use lattice_model::cluster::{
-        ClusterId, ConfigFingerprint, EntityId, EntityType, NodeEndpoint, NodeIncarnation,
-        PlacementDomainId, SingletonKind,
+        ClusterId, ConfigFingerprint, EntityType, NodeEndpoint, NodeIncarnation, PlacementDomainId,
+        SingletonKind,
     };
 
     use super::*;
     use crate::messaging::codec::{
         AskWire, EntityAskWire, EntityTellWire, FailureWire, ReplyWire, SingletonAskWire,
-        SingletonTellWire, TellWire, entity_target_to_wire, singleton_target_to_wire,
-        target_to_wire,
+        SingletonTellWire, TellWire, entity_target_from_wire, entity_target_to_wire,
+        singleton_target_to_wire, target_to_wire,
     };
+
+    #[test]
+    fn entity_wire_conversion_reuses_id_storage() {
+        let target = entity_target();
+        let cloned_address = target.reference.clone();
+        assert_eq!(
+            target.reference.entity_id().as_bytes().as_ptr(),
+            cloned_address.entity_id().as_bytes().as_ptr()
+        );
+        let wire = entity_target_to_wire(&target);
+        let pointer = wire.entity_id.as_ptr();
+        assert_eq!(pointer, target.reference.entity_id().as_bytes().as_ptr());
+        let decoded = entity_target_from_wire(wire).unwrap();
+        assert_eq!(decoded.reference.entity_id().as_bytes().as_ptr(), pointer);
+        assert_eq!(decoded.reference, target.reference);
+    }
 
     fn actor(host: &str, incarnation: u128, sequence: u64) -> ActorAddress {
         let incarnation = NodeIncarnation::new(incarnation).unwrap();
@@ -492,7 +510,7 @@ mod tests {
                 ClusterId::new("test-cluster").unwrap(),
                 PlacementDomainId::new("world").unwrap(),
                 EntityType::new("player").unwrap(),
-                EntityId::new(b"player-1".to_vec()).unwrap(),
+                ActorId::new(b"player-1".to_vec()).unwrap(),
                 ProtocolId::new(7).unwrap(),
                 ConfigFingerprint::new([3; 32]),
             )

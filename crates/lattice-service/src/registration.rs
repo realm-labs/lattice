@@ -139,8 +139,8 @@ impl SingletonOptions {
 
 #[cfg(test)]
 mod tests {
+    use lattice_model::actor::ActorId;
     use lattice_model::actor::ProtocolId;
-    use lattice_model::cluster::EntityId;
     use lattice_placement::{
         allocation::{
             AllocationDecision, AllocationError, AllocationRequest, PlacementView, RebalanceLimits,
@@ -196,7 +196,7 @@ mod tests {
 
         fn shard_for(
             &self,
-            entity_id: &EntityId,
+            entity_id: &ActorId,
             shard_count: u32,
         ) -> Result<ShardId, ShardMappingError> {
             let world = entity_id
@@ -226,7 +226,7 @@ mod tests {
         assert_eq!(config.allocation_policy_version, 3);
         assert_eq!(
             config
-                .shard_for_with(&WorldMapper, &EntityId::new(vec![42, 1, 2]).unwrap())
+                .shard_for_with(&WorldMapper, &ActorId::new(vec![42, 1, 2]).unwrap())
                 .unwrap(),
             ShardId::new(42)
         );

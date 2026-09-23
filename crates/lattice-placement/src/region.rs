@@ -1,3 +1,4 @@
+use lattice_model::actor::ActorId;
 use std::{
     collections::{BTreeMap, BTreeSet, HashSet, VecDeque},
     sync::Arc,
@@ -8,7 +9,7 @@ use bytes::Bytes;
 use lattice_model::ModelError;
 use lattice_model::actor::{EntityAddress, ProtocolId, ProtocolTag};
 use lattice_model::cluster::{
-    ClusterId, ConfigFingerprint, EntityId, EntityType, NodeIncarnation, PlacementDomainId,
+    ClusterId, ConfigFingerprint, EntityType, NodeIncarnation, PlacementDomainId,
 };
 use thiserror::Error;
 
@@ -177,14 +178,14 @@ impl EntityConfig {
         Ok(())
     }
 
-    pub fn shard_for(&self, entity_id: &EntityId) -> Result<ShardId, ShardMappingError> {
+    pub fn shard_for(&self, entity_id: &ActorId) -> Result<ShardId, ShardMappingError> {
         self.shard_for_with(&Xxh3V1ShardMapper, entity_id)
     }
 
     pub fn shard_for_with(
         &self,
         mapper: &dyn ShardMapper,
-        entity_id: &EntityId,
+        entity_id: &ActorId,
     ) -> Result<ShardId, ShardMappingError> {
         self.validate_mapper(mapper)?;
         let shard_id = mapper.shard_for(entity_id, self.shard_count)?;
@@ -218,7 +219,7 @@ impl EntityConfig {
     pub fn entity_ref<P: ProtocolTag>(
         &self,
         cluster_id: ClusterId,
-        entity_id: EntityId,
+        entity_id: ActorId,
     ) -> Result<EntityAddress<P>, ModelError> {
         EntityAddress::new(
             cluster_id,
@@ -254,7 +255,7 @@ pub struct ShardHome {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BufferedMessage {
-    pub entity_id: EntityId,
+    pub entity_id: ActorId,
     pub message_id: u64,
     pub mode: BufferedMessageMode,
     pub payload: Bytes,
@@ -435,7 +436,7 @@ impl ShardRegion {
 
     pub fn route(
         &mut self,
-        entity_id: EntityId,
+        entity_id: ActorId,
         message_id: u64,
         mode: BufferedMessageMode,
         payload: Bytes,
@@ -623,7 +624,7 @@ mod tests {
 
         fn shard_for(
             &self,
-            entity_id: &EntityId,
+            entity_id: &ActorId,
             shard_count: u32,
         ) -> Result<ShardId, ShardMappingError> {
             let world = entity_id
@@ -636,12 +637,12 @@ mod tests {
         }
     }
 
-    fn region_id(world: u64, x: i32, z: i32) -> EntityId {
+    fn region_id(world: u64, x: i32, z: i32) -> ActorId {
         let mut bytes = Vec::with_capacity(16);
         bytes.extend_from_slice(&world.to_be_bytes());
         bytes.extend_from_slice(&x.to_be_bytes());
         bytes.extend_from_slice(&z.to_be_bytes());
-        EntityId::new(bytes).unwrap()
+        ActorId::new(bytes).unwrap()
     }
 
     fn entity() -> EntityConfig {
@@ -802,7 +803,7 @@ mod tests {
         let local = NodeIncarnation::new(1).unwrap();
         let remote = NodeIncarnation::new(2).unwrap();
         let mut region = ShardRegion::new(local, entity(), RegionConfig::default()).unwrap();
-        let entity_id = EntityId::new(b"entity".to_vec()).unwrap();
+        let entity_id = ActorId::new(b"entity".to_vec()).unwrap();
         let deadline = MonotonicTime::from_millis(900);
         assert_eq!(
             region
@@ -893,7 +894,7 @@ mod tests {
         region.apply_home(ShardId::new(2), home(2)).unwrap();
         region
             .route(
-                EntityId::new(1_u64.to_be_bytes().to_vec()).unwrap(),
+                ActorId::new(1_u64.to_be_bytes().to_vec()).unwrap(),
                 1,
                 BufferedMessageMode::Tell,
                 Bytes::new(),
@@ -933,7 +934,7 @@ mod tests {
         assert_eq!(
             region
                 .route(
-                    EntityId::new(b"expired".to_vec()).unwrap(),
+                    ActorId::new(b"expired".to_vec()).unwrap(),
                     1,
                     BufferedMessageMode::Ask {
                         deadline: MonotonicTime::from_millis(10),

@@ -9,7 +9,7 @@ use std::{
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use lattice_actor_distributed::ActorKey;
+use lattice_actor_distributed::ActorId;
 use lattice_actor_distributed::{error::ActorCallError, handle::ActorHandle, traits::Actor};
 use lattice_actor_distributed::{
     protocol::{ActorProtocolBinding, DispatchError, DispatchMode, DispatchReply, Protocol},
@@ -123,7 +123,7 @@ async fn drain_actor_ids<D: ActorDefinition, A, I>(
 ) -> Result<bool, RemoteMessageError>
 where
     A: Actor,
-    I: IntoIterator<Item = ActorKey>,
+    I: IntoIterator<Item = ActorId>,
 {
     let _ = timeout;
     Ok(registry.drain_actor_ids(actor_ids).await.completed())

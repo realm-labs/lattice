@@ -86,7 +86,7 @@ No separate high-throughput Direct Link or stream transport for actor messages.
 | `NodeIncarnation` | Identity of one process lifetime at a node address |
 | `ProtocolId` | Explicit stable `u64` identifying one actor protocol independently of Rust type names |
 | `ProtocolFingerprint` | BLAKE3 digest of the canonical protocol/message/codec/schema descriptor negotiated per ProtocolId after Association establishment |
-| `EntityId` | Maximum 256-byte canonical business-key encoding used by EntityRef and shard hashing |
+| `ActorId` | Maximum 256-byte canonical business-key encoding used by EntityRef and shard hashing |
 | Association | One logical peer relationship between two exact node incarnations, owning a fixed bounded group of TCP/TLS lane connections |
 | ShardRegion | Per-node routing and buffering component for one sharded entity type |
 | Shard | Placement unit containing many logical entities |

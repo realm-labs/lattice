@@ -16,7 +16,7 @@ use async_trait::async_trait;
 use bytes::BytesMut;
 use clap::{Parser, ValueEnum};
 use lattice_actor::environment::ActorEnvironment;
-use lattice_actor_distributed::ActorKey;
+use lattice_actor_distributed::ActorId;
 use lattice_actor_distributed::{
     actor_protocol,
     context::ActorContext,
@@ -39,7 +39,7 @@ use lattice_discovery::{
 use lattice_model::{
     actor::{ActorAddress, EntityAddress, ProtocolId},
     cluster::CoordinatorScope,
-    cluster::{ClusterId, EntityId, EntityType, NodeEndpoint, NodeIncarnation, PlacementDomainId},
+    cluster::{ClusterId, EntityType, NodeEndpoint, NodeIncarnation, PlacementDomainId},
 };
 use lattice_placement::{
     control::{
@@ -633,12 +633,12 @@ async fn server(reference: PathBuf) -> Result<(), Box<dyn Error>> {
         },
         protocol.as_ref(),
     ));
-    let actor_id = ActorKey::U64(1);
+    let actor_id = ActorId::new(1_u64.to_be_bytes().to_vec()).expect("valid actor ID");
     registry.start(actor_id.clone(), PingActor).await?;
     let target: ActorAddress<FixtureProtocol> = registry
         .address(&actor_id)?
         .ok_or("missing actor address")?;
-    let child_id = ActorKey::U64(2);
+    let child_id = ActorId::new(2_u64.to_be_bytes().to_vec()).expect("valid actor ID");
     registry.start(child_id.clone(), PingActor).await?;
     let child: ActorAddress<FixtureProtocol> = registry
         .address(&child_id)?
@@ -823,7 +823,7 @@ async fn entity_owner(reference: PathBuf) -> Result<(), Box<dyn Error>> {
         incarnation,
     };
     let entity_config = fixture_entity_config()?;
-    let entity_id = EntityId::new(b"gateway-account-42".to_vec())?;
+    let entity_id = ActorId::new(b"gateway-account-42".to_vec())?;
     let slot = fixture_entity_slot(&entity_config, &entity_id, owner.clone())?;
     let EntityServiceFixture {
         service,

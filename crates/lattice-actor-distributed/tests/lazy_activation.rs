@@ -11,7 +11,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use lattice_actor_distributed::ActorKey;
+use lattice_actor_distributed::ActorId;
 use lattice_actor_distributed::{
     error::ActorFailure,
     mailbox::MailboxConfig,
@@ -59,7 +59,10 @@ struct CountingLoader {
 impl ActorLoader<LazyActor> for CountingLoader {
     async fn load(&self, ctx: ActorCreateContext) -> Result<LazyActor, ActorFailure> {
         assert_eq!(ctx.actor_name, LazyDefinition::NAME);
-        assert_eq!(ctx.actor_id, ActorKey::U64(7));
+        assert_eq!(
+            ctx.actor_id,
+            ActorId::new(7_u64.to_be_bytes().to_vec()).expect("valid actor ID")
+        );
         self.loads.fetch_add(1, Ordering::SeqCst);
         if let Some(release) = &self.release {
             release.acquire().await.unwrap().forget();
@@ -95,7 +98,12 @@ async fn concurrent_lazy_activation_starts_one_local_actor() {
         let registry = registry.clone();
         let loader = loader.clone();
         tasks.push(tokio::spawn(async move {
-            registry.get_or_load(ActorKey::U64(7), loader).await
+            registry
+                .get_or_load(
+                    ActorId::new(7_u64.to_be_bytes().to_vec()).expect("valid actor ID"),
+                    loader,
+                )
+                .await
         }));
     }
 
@@ -125,9 +133,17 @@ async fn loader_failure_is_explicit_and_allows_retry() {
         failures_remaining: Arc::new(AtomicUsize::new(1)),
     };
 
-    let first = registry.get_or_load(ActorKey::U64(7), loader.clone()).await;
+    let first = registry
+        .get_or_load(
+            ActorId::new(7_u64.to_be_bytes().to_vec()).expect("valid actor ID"),
+            loader.clone(),
+        )
+        .await;
     let second = registry
-        .get_or_load(ActorKey::U64(7), loader)
+        .get_or_load(
+            ActorId::new(7_u64.to_be_bytes().to_vec()).expect("valid actor ID"),
+            loader,
+        )
         .await
         .unwrap();
 

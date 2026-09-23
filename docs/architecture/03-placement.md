@@ -168,21 +168,22 @@ impl ShardedActor for PlayerActor {
 }
 
 impl EntityKey for PlayerId {
-    fn to_entity_id(&self) -> EntityId {
-        EntityId::from_bounded_bytes(self.0.to_be_bytes())
+    fn to_entity_id(&self) -> Result<ActorId, EntityKeyDecodeError> {
+        ActorId::new(self.0.to_be_bytes().to_vec())
+            .map_err(|error| EntityKeyDecodeError { reason: error.to_string() })
     }
 
-    fn try_from_entity_id(entity_id: &EntityId) -> Result<Self, EntityKeyDecodeError> {
+    fn try_from_entity_id(entity_id: &ActorId) -> Result<Self, EntityKeyDecodeError> {
         let bytes: [u8; 8] = entity_id
             .as_bytes()
             .try_into()
-            .map_err(|_| EntityKeyDecodeError::invalid_length(8, entity_id.len()))?;
+            .map_err(|_| EntityKeyDecodeError { reason: "expected an 8-byte player ID".into() })?;
         Ok(PlayerId::new(u64::from_be_bytes(bytes)))
     }
 }
 ```
 
-`EntityId` is at most 256 canonical bytes. The default `Xxh3V1ShardMapper` is exactly
+`ActorId` is at most 256 canonical bytes. The default `Xxh3V1ShardMapper` is exactly
 `xxh3_64_with_seed(entity_id_bytes, 0x4c41_5454_4943_4531)`, followed by modulo configured shard
 count. Rust `Hash`, `DefaultHasher`, platform endianness, type names, and declaration order are
 forbidden inputs.
@@ -197,7 +198,7 @@ impl ShardMapper for WorldRegionMapper {
 
     fn shard_for(
         &self,
-        entity_id: &EntityId,
+        entity_id: &ActorId,
         shard_count: u32,
     ) -> Result<ShardId, ShardMappingError> {
         let region = RegionKey::decode(entity_id)?;

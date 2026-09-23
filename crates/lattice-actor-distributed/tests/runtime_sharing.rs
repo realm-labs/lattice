@@ -17,7 +17,7 @@ use lattice_actor::{
     traits::{Actor, Responder},
 };
 use lattice_actor_distributed::registry::{
-    ActorDefinition, ActorKey, ActorRegistry, ActorRegistryConfig,
+    ActorDefinition, ActorId, ActorRegistry, ActorRegistryConfig,
 };
 use lattice_model::actor::ErasedProtocol;
 
@@ -76,8 +76,20 @@ async fn verify_sharing(execution: ActorExecutionPolicy) {
         ActorRegistry::<First, ProbeActor>::new(runtime.spawner(), ActorRegistryConfig::default());
     let second =
         ActorRegistry::<Second, ProbeActor>::new(runtime.spawner(), ActorRegistryConfig::default());
-    let a = first.start(ActorKey::U64(1), ProbeActor).await.unwrap();
-    let b = second.start(ActorKey::U64(1), ProbeActor).await.unwrap();
+    let a = first
+        .start(
+            ActorId::new(1_u64.to_be_bytes().to_vec()).expect("valid actor ID"),
+            ProbeActor,
+        )
+        .await
+        .unwrap();
+    let b = second
+        .start(
+            ActorId::new(1_u64.to_be_bytes().to_vec()).expect("valid actor ID"),
+            ProbeActor,
+        )
+        .await
+        .unwrap();
     let (first_thread, first_dependency) = a.ask(Probe, Duration::from_secs(3)).await.unwrap();
     let (second_thread, second_dependency) = b.ask(Probe, Duration::from_secs(3)).await.unwrap();
     assert_eq!(first_thread, second_thread);
@@ -92,7 +104,15 @@ async fn verify_sharing(execution: ActorExecutionPolicy) {
     );
     second.drain().await;
     runtime.shutdown();
-    assert!(second.start(ActorKey::U64(2), ProbeActor).await.is_err());
+    assert!(
+        second
+            .start(
+                ActorId::new(2_u64.to_be_bytes().to_vec()).expect("valid actor ID"),
+                ProbeActor
+            )
+            .await
+            .is_err()
+    );
 }
 
 #[tokio::test]

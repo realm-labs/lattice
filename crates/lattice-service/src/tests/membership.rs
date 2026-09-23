@@ -1,6 +1,7 @@
 //! Cluster membership: discovery-driven join, leave, per-domain health and Coordinator rollover.
 
 use lattice_actor::runtime::ActorRuntime;
+use lattice_model::actor::ActorId;
 
 use lattice_actor_distributed::registry::ActorDefinition;
 use std::{
@@ -26,7 +27,7 @@ use lattice_discovery::{
 use lattice_model::{
     actor::{EntityAddress, ProtocolId},
     cluster::CoordinatorScope,
-    cluster::{ClusterId, EntityId, EntityType, NodeEndpoint, NodeIncarnation},
+    cluster::{ClusterId, EntityType, NodeEndpoint, NodeIncarnation},
 };
 use lattice_placement::{
     control::{DEFAULT_MAX_CONTROL_PAYLOAD, PlacementControlRouter},
@@ -533,7 +534,7 @@ async fn coordinator_rollover_recovers_after_blocked_session_registration() {
     let target = entity_config
         .entity_ref::<PingProtocol>(
             cluster_id.clone(),
-            EntityId::new(b"entity-1".to_vec()).unwrap(),
+            ActorId::new(b"entity-1".to_vec()).unwrap(),
         )
         .unwrap();
     let member = LatticeService::builder(node_config(
@@ -806,8 +807,8 @@ async fn an_active_shard_recovers_after_a_transient_association_loss() {
     member.start().await.unwrap();
     let cluster = member.cluster();
     cluster.wait_ready(Duration::from_secs(5)).await.unwrap();
-    let primary_entity_id = EntityId::new(b"association-recovery-primary".to_vec()).unwrap();
-    let secondary_entity_id = EntityId::new(b"association-recovery-secondary".to_vec()).unwrap();
+    let primary_entity_id = ActorId::new(b"association-recovery-primary".to_vec()).unwrap();
+    let secondary_entity_id = ActorId::new(b"association-recovery-secondary".to_vec()).unwrap();
     let primary_target = primary_config
         .entity_ref::<PingProtocol>(cluster_id.clone(), primary_entity_id.clone())
         .unwrap();
@@ -1001,7 +1002,7 @@ async fn a_member_hosting_a_shard_leaves_by_handing_it_over_rather_than_timing_o
             .await
             .unwrap();
     }
-    let entity_id = EntityId::new(b"drained-entity".to_vec()).unwrap();
+    let entity_id = ActorId::new(b"drained-entity".to_vec()).unwrap();
     let target = entity_config
         .entity_ref::<PingProtocol>(cluster_id.clone(), entity_id.clone())
         .unwrap();

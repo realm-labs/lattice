@@ -6,6 +6,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+bytes = { workspace = true, features = ["serde"] }
 blake3.workspace = true
 serde.workspace = true
 thiserror.workspace = true

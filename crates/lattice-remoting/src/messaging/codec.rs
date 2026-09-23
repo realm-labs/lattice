@@ -9,9 +9,9 @@ use super::target::{
 use super::target_cache::ExactTargetCache;
 use super::target_dictionary::ExactTargetDictionary;
 use super::{
-    ActivationId, ActorPath, Bytes, ClusterId, ConfigFingerprint, Duration, EntityAddress,
-    EntityId, EntityType, Frame, FrameKind, Message, NodeEndpoint, NodeIncarnation,
-    PlacementDomainId, ProtocolId, SingletonAddress, SingletonKind,
+    ActivationId, ActorId, ActorPath, Bytes, ClusterId, ConfigFingerprint, Duration, EntityAddress,
+    EntityType, Frame, FrameKind, Message, NodeEndpoint, NodeIncarnation, PlacementDomainId,
+    ProtocolId, SingletonAddress, SingletonKind,
 };
 
 pub fn ask_correlation(frame: &Frame) -> Option<CorrelationId> {
@@ -449,7 +449,7 @@ pub(super) fn entity_target_to_wire(target: &LogicalEntityTarget) -> EntityTarge
         owner_incarnation: Bytes::copy_from_slice(&target.owner_incarnation.get().to_be_bytes()),
         domain: target.reference.domain().as_str().to_owned(),
         entity_type: target.reference.entity_type().as_str().to_owned(),
-        entity_id: Bytes::copy_from_slice(target.reference.entity_id().as_bytes()),
+        entity_id: target.reference.entity_id().clone().into(),
         protocol_id: target.reference.protocol_id().get(),
         config_fingerprint: Bytes::copy_from_slice(
             target.reference.config_fingerprint().as_bytes(),
@@ -477,8 +477,7 @@ pub(super) fn entity_target_from_wire(
             ClusterId::new(wire.cluster_id).map_err(|_| RemoteMessageError::InvalidPayload)?,
             PlacementDomainId::new(wire.domain).map_err(|_| RemoteMessageError::InvalidPayload)?,
             EntityType::new(wire.entity_type).map_err(|_| RemoteMessageError::InvalidPayload)?,
-            EntityId::new(wire.entity_id.to_vec())
-                .map_err(|_| RemoteMessageError::InvalidPayload)?,
+            ActorId::new(wire.entity_id).map_err(|_| RemoteMessageError::InvalidPayload)?,
             ProtocolId::new(wire.protocol_id).map_err(|_| RemoteMessageError::InvalidPayload)?,
             ConfigFingerprint::new(fingerprint),
         )

@@ -1,5 +1,6 @@
 #![cfg_attr(not(test), deny(clippy::wildcard_imports))]
 use lattice_actor::context::HandlerContext;
+use lattice_model::actor::ActorId;
 
 use std::{
     collections::{BTreeSet, HashSet},
@@ -29,8 +30,7 @@ use lattice_eventbus::{
 use lattice_model::{
     actor::{EntityAddress, ProtocolId, RecipientAddress, SingletonAddress},
     cluster::{
-        ClusterId, EntityId, EntityType, NodeEndpoint, NodeIncarnation, PlacementDomainId,
-        SingletonKind,
+        ClusterId, EntityType, NodeEndpoint, NodeIncarnation, PlacementDomainId, SingletonKind,
     },
     service::ServiceInstanceId,
     service_name,
@@ -277,7 +277,7 @@ async fn main() -> Result<(), Box<dyn StdError>> {
     let entity_config = entity_options.build(ProtocolId::new(WORLD_PROTOCOL_ID)?)?;
     let singleton_config = singleton_options.build(ProtocolId::new(CLOCK_PROTOCOL_ID)?);
     let world_ref = entity_config
-        .entity_ref::<WorldProtocol>(cluster_id.clone(), EntityId::new(b"world-1".to_vec())?)?;
+        .entity_ref::<WorldProtocol>(cluster_id.clone(), ActorId::new(b"world-1".to_vec())?)?;
     let clock_ref: SingletonAddress<ClockProtocol> = SingletonAddress::new(
         cluster_id.clone(),
         domain.clone(),

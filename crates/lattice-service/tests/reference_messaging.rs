@@ -7,7 +7,7 @@ use bytes::BytesMut;
 use lattice_actor::error::ActorFailure;
 use lattice_actor::runtime::{ActorRuntime, spawner::ActorSpawner};
 use lattice_actor::traits::{Actor, Handler, StopReason};
-use lattice_actor_distributed::ActorKey;
+use lattice_actor_distributed::ActorId;
 use lattice_actor_distributed::protocol::{
     ActorProtocolBinding, CodecDescriptor, DecodeError, EncodeError, Protocol, WireCodec,
 };
@@ -186,7 +186,7 @@ async fn deserialized_actor_address_is_bound_at_the_actor_boundary() {
     let (observed_tx, observed_rx) = oneshot::channel();
     let sink_handle = sink_registry
         .start(
-            ActorKey::U64(1),
+            ActorId::new(1_u64.to_be_bytes().to_vec()).expect("valid actor ID"),
             SinkActor {
                 observed: Arc::new(Mutex::new(Some(observed_tx))),
             },
@@ -194,13 +194,20 @@ async fn deserialized_actor_address_is_bound_at_the_actor_boundary() {
         .await
         .unwrap();
     let source_handle = source_registry
-        .start(ActorKey::U64(1), SourceActor)
+        .start(
+            ActorId::new(1_u64.to_be_bytes().to_vec()).expect("valid actor ID"),
+            SourceActor,
+        )
         .await
         .unwrap();
-    let sink_ref: ActorAddress<SinkProtocol> =
-        sink_registry.address(&ActorKey::U64(1)).unwrap().unwrap();
-    let source_ref: ActorAddress<SourceProtocol> =
-        source_registry.address(&ActorKey::U64(1)).unwrap().unwrap();
+    let sink_ref: ActorAddress<SinkProtocol> = sink_registry
+        .address(&ActorId::new(1_u64.to_be_bytes().to_vec()).expect("valid actor ID"))
+        .unwrap()
+        .unwrap();
+    let source_ref: ActorAddress<SourceProtocol> = source_registry
+        .address(&ActorId::new(1_u64.to_be_bytes().to_vec()).expect("valid actor ID"))
+        .unwrap()
+        .unwrap();
     let decoded_sink: ActorAddress<SinkProtocol> =
         serde_json::from_slice(&serde_json::to_vec(&sink_ref).unwrap()).unwrap();
 

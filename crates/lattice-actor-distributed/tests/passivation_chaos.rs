@@ -10,7 +10,7 @@ use lattice_actor::context::ActorContext;
 use lattice_actor::error::{ActorCallError, ActorFailure, ActorStopError};
 use lattice_actor::reply::ReplyTo;
 use lattice_actor::traits::{Actor, ActorLifecycleState, PassivationReason, Responder, StopReason};
-use lattice_actor_distributed::ActorKey;
+use lattice_actor_distributed::ActorId;
 use lattice_actor_distributed::registry::ActorRegistry;
 use lattice_actor_distributed::registry::ActorRegistryConfig;
 use tokio::sync::Semaphore;
@@ -84,7 +84,7 @@ async fn request_arriving_while_actor_is_passivating_is_not_processed_by_old_inc
     let handled_pings = Arc::new(AtomicUsize::new(0));
     let handle = registry
         .start(
-            ActorKey::U64(7),
+            ActorId::new(7_u64.to_be_bytes().to_vec()).expect("valid actor ID"),
             PassivatingActor {
                 stop_entered: stop_entered.clone(),
                 release_stop: release_stop.clone(),

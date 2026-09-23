@@ -1,6 +1,6 @@
 use std::{fmt, sync::Arc};
 
-use lattice_model::cluster::EntityId;
+use lattice_model::actor::ActorId;
 use thiserror::Error;
 use xxhash_rust::xxh3::xxh3_64_with_seed;
 
@@ -22,7 +22,7 @@ pub trait ShardMapper: Send + Sync + 'static {
 
     fn shard_for(
         &self,
-        entity_id: &EntityId,
+        entity_id: &ActorId,
         shard_count: u32,
     ) -> Result<ShardId, ShardMappingError>;
 }
@@ -53,7 +53,7 @@ impl ShardMapperBinding {
         })
     }
 
-    pub fn shard_for(&self, entity_id: &EntityId) -> Result<ShardId, ShardMappingError> {
+    pub fn shard_for(&self, entity_id: &ActorId) -> Result<ShardId, ShardMappingError> {
         let shard_id = self.mapper.shard_for(entity_id, self.shard_count)?;
         if shard_id.get() >= self.shard_count {
             return Err(ShardMappingError::ShardOutOfRange);
@@ -88,7 +88,7 @@ impl ShardMapper for Xxh3V1ShardMapper {
 
     fn shard_for(
         &self,
-        entity_id: &EntityId,
+        entity_id: &ActorId,
         shard_count: u32,
     ) -> Result<ShardId, ShardMappingError> {
         if shard_count == 0 {

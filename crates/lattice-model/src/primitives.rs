@@ -5,6 +5,7 @@ use std::{
     sync::Arc,
 };
 
+use bytes::Bytes;
 use serde::{Deserialize, Serialize, de::Error as SerdeDeError};
 use thiserror::Error;
 
@@ -13,7 +14,7 @@ pub const MAX_NODE_HOST_BYTES: usize = 253;
 pub const MAX_ACTOR_PATH_DEPTH: usize = 64;
 pub const MAX_ACTOR_PATH_BYTES: usize = 1024;
 pub const MAX_ACTOR_PATH_SEGMENT_BYTES: usize = 128;
-pub const MAX_ENTITY_ID_BYTES: usize = 256;
+pub const MAX_ACTOR_ID_BYTES: usize = 256;
 pub const MAX_LOGICAL_KIND_BYTES: usize = 128;
 pub const MAX_PLACEMENT_DOMAIN_ID_BYTES: usize = 128;
 
@@ -308,20 +309,35 @@ impl ProtocolTag for ErasedProtocol {
     const PROTOCOL_ID: Option<u64> = None;
 }
 
+/// Immutable, category-local business identity, independent of an activation or owner node.
+///
+/// Business code defines a canonical byte encoding shared by all participating nodes. The
+/// framework compares and hashes the bytes, without string/numeric type tags. Cloning shares
+/// the backing storage. Routing borrows these bytes and registries retain the same identity.
+///
+/// This value is nonempty and at most 256 bytes. It does not by itself identify a category,
+/// cluster or placement domain; use an Actor address to supply that context.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(try_from = "Vec<u8>", into = "Vec<u8>")]
-pub struct EntityId(Vec<u8>);
+#[serde(try_from = "Bytes", into = "Bytes")]
+pub struct ActorId(Bytes);
 
-impl EntityId {
-    pub fn new(value: impl Into<Vec<u8>>) -> Result<Self, ModelError> {
+impl ActorId {
+    /// Validates owned or shared bytes without copying their payload.
+    ///
+    /// A `Vec<u8>` or `String` transfers its allocation, while `Bytes` can reuse shared storage.
+    /// Borrowed static slices also work: `ActorId::new(&b"player-42"[..])`.
+    /// For numeric keys, define a stable encoding in the business crate, for example
+    /// `ActorId::new(42_u64.to_be_bytes().to_vec())`. Cache the ID or its bound reference
+    /// instead of encoding it again for every message.
+    pub fn new(value: impl Into<Bytes>) -> Result<Self, ModelError> {
         let value = value.into();
         if value.is_empty() {
-            return Err(ModelError::Empty { field: "entity ID" });
+            return Err(ModelError::Empty { field: "actor ID" });
         }
-        if value.len() > MAX_ENTITY_ID_BYTES {
+        if value.len() > MAX_ACTOR_ID_BYTES {
             return Err(ModelError::TooLong {
-                field: "entity ID",
-                limit: MAX_ENTITY_ID_BYTES,
+                field: "actor ID",
+                limit: MAX_ACTOR_ID_BYTES,
             });
         }
         Ok(Self(value))
@@ -332,16 +348,16 @@ impl EntityId {
     }
 }
 
-impl TryFrom<Vec<u8>> for EntityId {
+impl TryFrom<Bytes> for ActorId {
     type Error = ModelError;
 
-    fn try_from(value: Vec<u8>) -> Result<Self, Self::Error> {
+    fn try_from(value: Bytes) -> Result<Self, Self::Error> {
         Self::new(value)
     }
 }
 
-impl From<EntityId> for Vec<u8> {
-    fn from(value: EntityId) -> Self {
+impl From<ActorId> for Bytes {
+    fn from(value: ActorId) -> Self {
         value.0
     }
 }

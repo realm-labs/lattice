@@ -28,7 +28,7 @@ pub struct ActivationId(Uuid);
 pub struct ActorPath(String);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct EntityId(Bytes);
+pub struct ActorId(Bytes);
 ```
 
 `ServiceName` is a deployment name and can be constructed from a constant:
@@ -60,8 +60,8 @@ Several definitions may share the same protocol. Hosts route by protocol ID and 
 definition name in the Actor path, and reject duplicate registrations of that pair. Shared
 contract crates do not need to depend on server Actor implementations.
 
-Local-only registry definitions may use `ErasedProtocol` and `ActorRegistry::new(config)`.
-`ActorKey` remains the per-registry instance key. Entity placement types and singleton kinds are
+Local-only registry definitions may use `ErasedProtocol` and `ActorRegistry::new(runtime.spawner(), config)`.
+`ActorId` remains the per-registry instance key. Entity placement types and singleton kinds are
 configured separately; `host_entity::<D, A, L>` and `host_singleton::<D, A, L>` derive the registry
 name and protocol from `D`, with no separate category string in their options.
 
@@ -69,12 +69,27 @@ The names `World`, `Player`, or `Guild` may appear in examples and business crat
 
 ### 6.2 Entity Keys
 
-Business identifiers convert to canonical entity bytes only at the `EntityRef` boundary. They are not framework enums and concrete actors do not need entity IDs.
+Business identifiers convert once to `lattice_model::actor::ActorId`, an immutable, shared
+`Bytes` value with a 1–256 byte length bound. The same ID is used by logical Entity addresses,
+shard mapping, registry lookups and loaders. There is no second registry-key enum or conversion
+between two ID representations. Equality and hashing depend only on byte contents.
+
+Cache the ID or `EntityRef` for repeated sends. Clones share the ID payload; routing borrows it,
+and remote decoding transfers the decoded `Bytes` into the ID without another `to_vec()`.
+Singleton hosting creates its internal ID once from the validated singleton name.
+
+Business code must choose a stable encoding (for example, big-endian `u64` bytes) and share it
+between all participants. Changing the encoding changes identity. Owner migration and activation
+replacement do not change the logical ID. IDs remain category-local, not globally unique.
+
+Registry exact paths now encode every ID as `b-<hex bytes>`. This preserves the former byte-ID
+path format but changes paths formerly using numeric or string key variants. Old exact addresses
+must be discarded; this is a breaking API/address change, not a rolling-compatible migration.
 
 ```rust
 pub trait EntityKey: Clone + Send + Sync + 'static {
-    fn to_entity_id(&self) -> EntityId;
-    fn try_from_entity_id(entity_id: &EntityId) -> Result<Self, EntityKeyDecodeError>;
+    fn to_entity_id(&self) -> Result<ActorId, EntityKeyDecodeError>;
+    fn try_from_entity_id(entity_id: &ActorId) -> Result<Self, EntityKeyDecodeError>;
 }
 
 pub trait ShardedActor: Actor {
@@ -82,7 +97,7 @@ pub trait ShardedActor: Actor {
 }
 ```
 
-`EntityId` is a bounded canonical byte string; every `EntityKey` implementation must produce identical bytes across processes and versions. `ActorPath` is canonical, hierarchical, length-bounded, and validated by the runtime. Child names are one escaped path segment. `ActivationId` is newly generated for every actor lifetime and is never derived from the path.
+`ActorId` is a bounded canonical byte string; every `EntityKey` implementation must produce identical bytes across processes and versions. `ActorPath` is canonical, hierarchical, length-bounded, and validated by the runtime. Child names are one escaped path segment. `ActivationId` is newly generated for every actor lifetime and is never derived from the path.
 
 ---
 
@@ -246,7 +261,7 @@ CPU-heavy or blocking work must not run directly on Tokio worker threads; use a 
 ActorRegistry stores actor ownership independently from the concrete execution policy.
 Mailbox semantics are identical across execution policies.
 Changing execution policy must not change `Handler<M>` business code.
-Sharded entities should pass a stable scheduler_key derived from EntityId when using WorkerPool affinity placement.
+Sharded entities should pass a stable scheduler_key derived from ActorId when using WorkerPool affinity placement.
 ```
 
 Forbidden implementation shortcuts:
@@ -692,7 +707,7 @@ Registry activation is separately observable as
 `EntityActivationState::{Absent, Activating, Loading, Active}`. Loading variants never appear in a
 live Actor cell.
 
-Entity activation is serialized per `(EntityType, EntityId)` at the owning shard. Concrete spawn is serialized by the parent/path registry. Concurrent activation waiters are bounded and deadline-controlled.
+Entity activation is serialized per `(EntityType, ActorId)` at the owning shard. Concrete spawn is serialized by the parent/path registry. Concurrent activation waiters are bounded and deadline-controlled.
 
 ### 8.2 ActorRegistry
 

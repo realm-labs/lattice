@@ -10,7 +10,7 @@ use std::{
     time::Duration,
 };
 
-use lattice_actor_distributed::ActorKey;
+use lattice_actor_distributed::ActorId;
 use lattice_actor_distributed::{
     context::ActorContext,
     error::{ActorCallError, ActorFailure, ActorStopError},
@@ -605,7 +605,7 @@ async fn start_panic_releases_registry_activation_for_replacement() {
         actor_runtime.spawner(),
         ActorRegistryConfig::default(),
     );
-    let actor_id = ActorKey::U64(99);
+    let actor_id = ActorId::new(99_u64.to_be_bytes().to_vec()).expect("valid actor ID");
     let first = registry
         .start(
             actor_id.clone(),

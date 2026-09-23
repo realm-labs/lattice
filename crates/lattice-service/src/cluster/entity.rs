@@ -1,11 +1,11 @@
 use lattice_actor_distributed::registry::{ActorDefinition, ActorQuarantineError};
-use lattice_model::{cluster::CoordinatorScope, cluster::EntityId};
+use lattice_model::cluster::CoordinatorScope;
 use lattice_placement::{control::PlacementControlCommand, types::ShardId};
 use lattice_remoting::messaging::error::RemoteFailureCode;
 
 use super::{
-    Actor, ActorAddress, ActorHandle, ActorKey, ActorLoader, ActorProtocolBinding, ActorRegistry,
-    Arc, AskError, AssociationKey, AssociationManager, AssociationState, Bytes, DispatchMode,
+    Actor, ActorAddress, ActorHandle, ActorLoader, ActorProtocolBinding, ActorRegistry, Arc,
+    AskError, AssociationKey, AssociationManager, AssociationState, Bytes, DispatchMode,
     DispatchReply, EntityAddress, EntityConfig, Instant, LOGICAL_RESOLVE_MESSAGE_ID,
     LogicPlacementState, LogicalEntityTarget, Mutex, NodeKey, OutboundMessage, OutboundMessaging,
     PlacementSlot, PlacementSlotKey, PlacementSlotState, Protocol, ProtocolFingerprint,
@@ -297,7 +297,7 @@ impl<D: ActorDefinition<Protocol = P>, A: Actor, L: ActorLoader<A>, P: Protocol>
         let authority = self
             .registry
             .validate_actor_authority(
-                ActorKey::Bytes(target.reference.entity_id().as_bytes().to_vec()),
+                target.reference.entity_id().clone(),
                 target.assignment_generation,
             )
             .map_err(|_| RemoteMessageError::StaleAuthority)?;
@@ -561,9 +561,7 @@ where
         {
             return Ok(None);
         }
-        Ok(self
-            .registry
-            .exact_address(&ActorKey::Bytes(target.entity_id().as_bytes().to_vec())))
+        Ok(self.registry.exact_address(target.entity_id()))
     }
 
     async fn receive_resolve(
@@ -573,9 +571,7 @@ where
         self.validate_local(&target)?;
         let actor = self
             .registry
-            .exact_address(&ActorKey::Bytes(
-                target.reference.entity_id().as_bytes().to_vec(),
-            ))
+            .exact_address(target.reference.entity_id())
             .ok_or(RemoteMessageError::StaleActivation)?;
         serde_json::to_vec(&actor)
             .map(Bytes::from)
@@ -587,13 +583,10 @@ where
             .registry
             .active_actor_ids()
             .into_iter()
-            .filter(|actor_id| match actor_id {
-                ActorKey::Bytes(bytes) => EntityId::new(bytes.clone()).is_ok_and(|entity_id| {
-                    self.mapper
-                        .shard_for(&entity_id)
-                        .is_ok_and(|mapped| mapped == shard_id)
-                }),
-                ActorKey::Str(_) | ActorKey::U64(_) | ActorKey::I64(_) => false,
+            .filter(|actor_id| {
+                self.mapper
+                    .shard_for(actor_id)
+                    .is_ok_and(|mapped| mapped == shard_id)
             })
             .collect::<Vec<_>>();
         drain_actor_ids(
@@ -609,13 +602,10 @@ where
             .registry
             .active_actor_ids()
             .into_iter()
-            .filter(|actor_id| match actor_id {
-                ActorKey::Bytes(bytes) => EntityId::new(bytes.clone()).is_ok_and(|entity_id| {
-                    self.mapper
-                        .shard_for(&entity_id)
-                        .is_ok_and(|mapped| mapped == shard_id)
-                }),
-                ActorKey::Str(_) | ActorKey::U64(_) | ActorKey::I64(_) => false,
+            .filter(|actor_id| {
+                self.mapper
+                    .shard_for(actor_id)
+                    .is_ok_and(|mapped| mapped == shard_id)
             })
             .collect::<Vec<_>>();
         self.registry.wait_actor_ids_terminal(actor_ids).await;
@@ -648,13 +638,10 @@ where
             .registry
             .active_actor_ids()
             .into_iter()
-            .filter(|actor_id| match actor_id {
-                ActorKey::Bytes(bytes) => EntityId::new(bytes.clone()).is_ok_and(|entity_id| {
-                    self.mapper
-                        .shard_for(&entity_id)
-                        .is_ok_and(|mapped| mapped == shard_id)
-                }),
-                ActorKey::Str(_) | ActorKey::U64(_) | ActorKey::I64(_) => false,
+            .filter(|actor_id| {
+                self.mapper
+                    .shard_for(actor_id)
+                    .is_ok_and(|mapped| mapped == shard_id)
             })
             .collect::<Vec<_>>();
         for actor_id in actor_ids {

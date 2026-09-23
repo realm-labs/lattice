@@ -9,7 +9,7 @@ use std::{
     time::Duration,
 };
 
-use lattice_actor_distributed::ActorKey;
+use lattice_actor_distributed::ActorId;
 use lattice_actor_distributed::{
     context::HandlerContext,
     error::ActorFailure,
@@ -122,7 +122,7 @@ async fn observer_panics_preserve_messaging_registry_cleanup_and_deathwatch() {
             phase,
             panics: panics.clone(),
         }));
-        let actor_id = ActorKey::U64(1);
+        let actor_id = ActorId::new(1_u64.to_be_bytes().to_vec()).expect("valid actor ID");
         let handle = registry
             .start(actor_id.clone(), HealthyActor)
             .await

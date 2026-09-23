@@ -8,7 +8,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use lattice_actor_distributed::ActorKey;
+use lattice_actor_distributed::ActorId;
 use lattice_actor_distributed::{
     context::HandlerContext,
     error::{ActorFailure, ActorTellError},
@@ -130,7 +130,11 @@ impl ActorScaleTopology {
         for index in 0..actor_count {
             handles.push(
                 registry
-                    .start(ActorKey::U64((index + 1) as u64), ScaleActor::default())
+                    .start(
+                        ActorId::new(((index + 1) as u64 as u64).to_be_bytes().to_vec())
+                            .expect("valid actor ID"),
+                        ScaleActor::default(),
+                    )
                     .await?,
             );
         }

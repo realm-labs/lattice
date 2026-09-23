@@ -1,6 +1,7 @@
 //! Cross-node dispatch: asks must reach the claimed owner and nothing else.
 
 use lattice_actor::runtime::ActorRuntime;
+use lattice_model::actor::ActorId;
 
 use lattice_actor_distributed::registry::ActorDefinition;
 use std::{
@@ -14,7 +15,7 @@ use lattice_actor_distributed::{
 };
 use lattice_model::{
     actor::ProtocolId,
-    cluster::{ClusterId, EntityId, EntityType, NodeEndpoint, NodeIncarnation},
+    cluster::{ClusterId, EntityType, NodeEndpoint, NodeIncarnation},
 };
 use lattice_placement::{
     control::PlacementControlRouter,
@@ -91,7 +92,7 @@ async fn remote_entity_ask_reaches_only_claimed_owner() {
         Vec::new(),
     )
     .unwrap();
-    let entity_id = EntityId::new(b"account-42".to_vec()).unwrap();
+    let entity_id = ActorId::new(b"account-42".to_vec()).unwrap();
     let entity_slot = PlacementSlot {
         key: PlacementSlotKey::Shard {
             domain: domain(),

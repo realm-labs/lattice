@@ -3,7 +3,7 @@ use std::marker::PhantomData;
 use serde::{Deserialize, Serialize, de::Error as SerdeDeError};
 
 use crate::primitives::{
-    ActivationId, ActorPath, ClusterId, ConfigFingerprint, EntityId, EntityType, ErasedProtocol,
+    ActivationId, ActorId, ActorPath, ClusterId, ConfigFingerprint, EntityType, ErasedProtocol,
     ModelError, NodeEndpoint, NodeIncarnation, PlacementDomainId, ProtocolId, ProtocolTag,
     SingletonKind,
 };
@@ -143,7 +143,7 @@ pub struct EntityAddress<P: ProtocolTag = ErasedProtocol> {
     cluster_id: ClusterId,
     domain: PlacementDomainId,
     entity_type: EntityType,
-    entity_id: EntityId,
+    entity_id: ActorId,
     protocol_id: ProtocolId,
     entity_config_fingerprint: ConfigFingerprint,
     #[serde(skip)]
@@ -155,7 +155,7 @@ impl<P: ProtocolTag> EntityAddress<P> {
         cluster_id: ClusterId,
         domain: PlacementDomainId,
         entity_type: EntityType,
-        entity_id: EntityId,
+        entity_id: ActorId,
         protocol_id: ProtocolId,
         entity_config_fingerprint: ConfigFingerprint,
     ) -> Result<Self, ModelError> {
@@ -183,7 +183,7 @@ impl<P: ProtocolTag> EntityAddress<P> {
         &self.entity_type
     }
 
-    pub fn entity_id(&self) -> &EntityId {
+    pub fn entity_id(&self) -> &ActorId {
         &self.entity_id
     }
 
@@ -224,7 +224,7 @@ impl EntityAddress<ErasedProtocol> {
         cluster_id: ClusterId,
         domain: PlacementDomainId,
         entity_type: EntityType,
-        entity_id: EntityId,
+        entity_id: ActorId,
         protocol_id: ProtocolId,
         entity_config_fingerprint: ConfigFingerprint,
     ) -> Result<Self, ModelError> {
@@ -244,7 +244,7 @@ struct EntityAddressData {
     cluster_id: ClusterId,
     domain: PlacementDomainId,
     entity_type: EntityType,
-    entity_id: EntityId,
+    entity_id: ActorId,
     protocol_id: ProtocolId,
     entity_config_fingerprint: ConfigFingerprint,
 }
@@ -511,7 +511,7 @@ mod tests {
             ClusterId::new("test").unwrap(),
             PlacementDomainId::new("world").unwrap(),
             EntityType::new("world").unwrap(),
-            EntityId::new(b"entity-1".to_vec()).unwrap(),
+            ActorId::new(b"entity-1".to_vec()).unwrap(),
             ProtocolId::new(7).unwrap(),
             ConfigFingerprint::new([1; 32]),
         )

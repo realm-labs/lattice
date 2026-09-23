@@ -253,7 +253,7 @@ async fn domain_logic(
             },
             protocol.as_ref(),
         ));
-        let actor_id = ActorKey::U64(1);
+        let actor_id = ActorId::new(1_u64.to_be_bytes().to_vec()).expect("valid actor ID");
         registry.start(actor_id.clone(), PingActor).await?;
         let reference: ActorAddress<FixtureProtocol> = registry
             .address(&actor_id)?

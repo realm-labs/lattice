@@ -1,3 +1,4 @@
+use lattice_model::actor::ActorId;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -9,8 +10,8 @@ use lattice_model::actor::{
     ActivationId, ActorAddress, ActorPath, EntityAddress, ProtocolId, ProtocolTag, SingletonAddress,
 };
 use lattice_model::cluster::{
-    ClusterId, ConfigFingerprint, EntityId, EntityType, NodeEndpoint, NodeIncarnation,
-    PlacementDomainId, SingletonKind,
+    ClusterId, ConfigFingerprint, EntityType, NodeEndpoint, NodeIncarnation, PlacementDomainId,
+    SingletonKind,
 };
 use prost::Message;
 use thiserror::Error;

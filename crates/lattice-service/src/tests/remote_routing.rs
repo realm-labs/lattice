@@ -5,7 +5,7 @@ use lattice_actor::runtime::ActorRuntime;
 use lattice_actor_distributed::registry::ActorDefinition;
 use std::{sync::Arc, time::Duration};
 
-use lattice_actor_distributed::ActorKey;
+use lattice_actor_distributed::ActorId;
 use lattice_actor_distributed::{
     activation::DistributedActorContextExt,
     context::{ActorContext, HandlerContext},
@@ -102,8 +102,17 @@ async fn bound_actor_ref_asks_exact_remote_activation_over_tcp() {
         },
         binding.as_ref(),
     ));
-    let handle = registry.start(ActorKey::U64(1), PingActor).await.unwrap();
-    let target: ActorAddress<PingProtocol> = registry.address(&ActorKey::U64(1)).unwrap().unwrap();
+    let handle = registry
+        .start(
+            ActorId::new(1_u64.to_be_bytes().to_vec()).expect("valid actor ID"),
+            PingActor,
+        )
+        .await
+        .unwrap();
+    let target: ActorAddress<PingProtocol> = registry
+        .address(&ActorId::new(1_u64.to_be_bytes().to_vec()).expect("valid actor ID"))
+        .unwrap()
+        .unwrap();
     let server = LatticeService::builder(node_config(
         cluster_id.clone(),
         "server",
@@ -192,8 +201,17 @@ async fn local_exact_watch_uses_the_same_subscription_and_drop_cancels_it() {
         },
         binding.as_ref(),
     ));
-    let handle = registry.start(ActorKey::U64(1), PingActor).await.unwrap();
-    let target: ActorAddress<PingProtocol> = registry.address(&ActorKey::U64(1)).unwrap().unwrap();
+    let handle = registry
+        .start(
+            ActorId::new(1_u64.to_be_bytes().to_vec()).expect("valid actor ID"),
+            PingActor,
+        )
+        .await
+        .unwrap();
+    let target: ActorAddress<PingProtocol> = registry
+        .address(&ActorId::new(1_u64.to_be_bytes().to_vec()).expect("valid actor ID"))
+        .unwrap()
+        .unwrap();
     let mut config = node_config(cluster_id, "local", address, incarnation);
     config.maximum_watches = 1;
     let service = LatticeService::builder(config)
@@ -261,11 +279,16 @@ async fn actor_context_watch_delivers_a_remote_termination_to_the_system_mailbox
         target_binding.as_ref(),
     ));
     let target_handle = target_registry
-        .start(ActorKey::U64(1), PingActor)
+        .start(
+            ActorId::new(1_u64.to_be_bytes().to_vec()).expect("valid actor ID"),
+            PingActor,
+        )
         .await
         .unwrap();
-    let target: ActorAddress<PingProtocol> =
-        target_registry.address(&ActorKey::U64(1)).unwrap().unwrap();
+    let target: ActorAddress<PingProtocol> = target_registry
+        .address(&ActorId::new(1_u64.to_be_bytes().to_vec()).expect("valid actor ID"))
+        .unwrap()
+        .unwrap();
     let server = LatticeService::builder(node_config(
         cluster_id.clone(),
         "server",
@@ -329,7 +352,7 @@ async fn actor_context_watch_delivers_a_remote_termination_to_the_system_mailbox
     let watch_id = Arc::new(Mutex::new(None));
     let _watcher = watcher_registry
         .start(
-            ActorKey::U64(2),
+            ActorId::new(2_u64.to_be_bytes().to_vec()).expect("valid actor ID"),
             RemoteWatcherActor {
                 target: target.clone(),
                 events: events.clone(),

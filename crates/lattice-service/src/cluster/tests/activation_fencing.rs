@@ -1,5 +1,6 @@
 use lattice_actor::runtime::ActorRuntime;
 use lattice_actor_distributed::registry::ActorDefinition;
+use lattice_model::actor::ActorId;
 use std::{collections::BTreeSet, sync::atomic::AtomicUsize, time::Duration};
 
 use async_trait::async_trait;
@@ -9,7 +10,7 @@ use lattice_actor_distributed::{
 };
 use lattice_model::{
     actor::ProtocolId,
-    cluster::{ClusterId, EntityId, EntityType, NodeEndpoint, NodeIncarnation, SingletonKind},
+    cluster::{ClusterId, EntityType, NodeEndpoint, NodeIncarnation, SingletonKind},
 };
 use lattice_placement::types::{AssignmentGeneration, CoordinatorTerm, PlacementVersion, Revision};
 use lattice_remoting::config::RemotingConfig;
@@ -78,7 +79,7 @@ async fn loading_obeys_retirement(singleton: bool, fence: bool) {
         SingletonKind::new("activation-fencing").unwrap(),
         ProtocolId::new(TEST_PROTOCOL_ID).unwrap(),
     );
-    let entity_id = EntityId::new(b"loading".to_vec()).unwrap();
+    let entity_id = ActorId::new(b"loading".to_vec()).unwrap();
     let slot_key = if singleton {
         PlacementSlotKey::Singleton {
             domain: domain(),

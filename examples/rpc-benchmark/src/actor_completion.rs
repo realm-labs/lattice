@@ -11,7 +11,7 @@ use std::{
 
 use bytes::Bytes;
 use futures_util::{StreamExt as _, stream::FuturesUnordered};
-use lattice_actor_distributed::ActorKey;
+use lattice_actor_distributed::ActorId;
 use lattice_actor_distributed::{
     error::{ActorFailure, ActorTellError},
     mailbox::MailboxConfig,
@@ -222,7 +222,10 @@ impl ActorCompletionTopology {
         };
         let registry = Arc::new(registry);
         let handle = registry
-            .start(ActorKey::U64(1), CompletionActor::default())
+            .start(
+                ActorId::new(1_u64.to_be_bytes().to_vec()).expect("valid actor ID"),
+                CompletionActor::default(),
+            )
             .await?;
         Ok(Self {
             _actor_runtime: actor_runtime,

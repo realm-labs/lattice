@@ -9,7 +9,7 @@ use std::{
 };
 
 use bytes::Bytes;
-use lattice_actor_distributed::ActorKey;
+use lattice_actor_distributed::ActorId;
 use lattice_actor_distributed::{
     context::HandlerContext,
     error::{ActorFailure, ActorTellError},
@@ -165,7 +165,7 @@ impl SaturationTopology {
         let state = Arc::new(SaturationState::default());
         let handle = registry
             .start(
-                ActorKey::U64(1),
+                ActorId::new(1_u64.to_be_bytes().to_vec()).expect("valid actor ID"),
                 SaturationActor {
                     state: state.clone(),
                     processed_bytes: 0,

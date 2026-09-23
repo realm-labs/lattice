@@ -19,6 +19,7 @@ pub mod types;
 
 #[cfg(test)]
 mod tests {
+    use lattice_model::actor::ActorId;
     use std::{
         collections::{BTreeMap, BTreeSet},
         time::Duration,
@@ -27,8 +28,7 @@ mod tests {
     use lattice_model::actor::{EntityAddress, ProtocolId};
 
     use lattice_model::cluster::{
-        ClusterId, ConfigFingerprint, EntityId, EntityType, NodeEndpoint, NodeIncarnation,
-        PlacementDomainId,
+        ClusterId, ConfigFingerprint, EntityType, NodeEndpoint, NodeIncarnation, PlacementDomainId,
     };
 
     use crate::{allocation::*, authority::*, region::*, types::*};
@@ -192,7 +192,7 @@ mod tests {
             Vec::new(),
         )
         .unwrap();
-        let entity = EntityId::new(b"player-42".to_vec()).unwrap();
+        let entity = ActorId::new(b"player-42".to_vec()).unwrap();
         assert_eq!(config.shard_for(&entity).unwrap(), ShardId::new(17));
         let reference: EntityAddress = config
             .entity_ref(ClusterId::new("test").unwrap(), entity)

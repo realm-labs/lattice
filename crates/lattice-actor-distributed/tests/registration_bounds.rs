@@ -5,7 +5,7 @@ use std::{
 };
 use tokio::{sync::Semaphore, time::timeout};
 
-use lattice_actor_distributed::ActorKey;
+use lattice_actor_distributed::ActorId;
 use lattice_actor_distributed::{
     actor_protocol,
     context::HandlerContext,
@@ -139,7 +139,7 @@ async fn duplicate_host_registration_preserves_original_routing_and_drain() {
         config,
         &protocol,
     ));
-    let actor_id = ActorKey::U64(1);
+    let actor_id = ActorId::new(1_u64.to_be_bytes().to_vec()).expect("valid actor ID");
     let handle = original.start(actor_id.clone(), TestActor).await.unwrap();
     let reference = original.exact_address(&actor_id).unwrap();
     let mut hosts = ProtocolHostRegistry::new(2).unwrap();
@@ -228,7 +228,7 @@ async fn different_definitions_share_one_protocol_without_cross_routing() {
     ));
     let first_deliveries = Arc::new(Semaphore::new(0));
     let second_deliveries = Arc::new(Semaphore::new(0));
-    let key = ActorKey::U64(42);
+    let key = ActorId::new(42_u64.to_be_bytes().to_vec()).expect("valid actor ID");
     first
         .start(key.clone(), RoutedActor(first_deliveries.clone()))
         .await

@@ -12,7 +12,7 @@ fn fixture_entity_config() -> Result<EntityConfig, Box<dyn Error>> {
 
 fn fixture_entity_slot(
     config: &EntityConfig,
-    entity_id: &EntityId,
+    entity_id: &ActorId,
     owner: NodeKey,
 ) -> Result<PlacementSlot, Box<dyn Error>> {
     Ok(PlacementSlot {

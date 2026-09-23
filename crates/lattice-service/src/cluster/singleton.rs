@@ -6,7 +6,7 @@ use lattice_placement::{
 use lattice_remoting::messaging::error::RemoteFailureCode;
 
 use super::{
-    Actor, ActorAddress, ActorHandle, ActorKey, ActorLoader, ActorProtocolBinding, ActorRegistry,
+    Actor, ActorAddress, ActorHandle, ActorId, ActorLoader, ActorProtocolBinding, ActorRegistry,
     Arc, AskError, AssociationKey, AssociationManager, AssociationState, Bytes, ConfigFingerprint,
     DispatchMode, DispatchReply, Instant, LOGICAL_RESOLVE_MESSAGE_ID, LogicPlacementState,
     LogicalSingletonTarget, Mutex, NodeKey, OutboundMessage, OutboundMessaging, PlacementDomainId,
@@ -77,6 +77,7 @@ pub(super) struct SingletonRouteHost<
     pub(super) buffer: RouteBuffer,
     pub(super) domain: PlacementDomainId,
     pub(super) kind: SingletonKind,
+    pub(super) actor_id: ActorId,
     pub(super) config_fingerprint: ConfigFingerprint,
     pub(super) protocol_id: ProtocolId,
     pub(super) registry: Arc<ActorRegistry<D, A>>,
@@ -247,10 +248,7 @@ impl<D: ActorDefinition<Protocol = P>, A: Actor, L: ActorLoader<A>, P: Protocol>
         self.validate_local(target)?;
         let authority = self
             .registry
-            .validate_actor_authority(
-                ActorKey::Str(self.kind.as_str().to_owned()),
-                target.assignment_generation,
-            )
+            .validate_actor_authority(self.actor_id.clone(), target.assignment_generation)
             .map_err(|_| RemoteMessageError::StaleAuthority)?;
         let handle = self
             .registry
@@ -465,9 +463,7 @@ impl<D: ActorDefinition<Protocol = P>, A: Actor, L: ActorLoader<A>, P: Protocol>
         {
             return Ok(None);
         }
-        Ok(self
-            .registry
-            .exact_address(&ActorKey::Str(self.kind.as_str().to_owned())))
+        Ok(self.registry.exact_address(&self.actor_id))
     }
 
     async fn receive_resolve(
@@ -477,7 +473,7 @@ impl<D: ActorDefinition<Protocol = P>, A: Actor, L: ActorLoader<A>, P: Protocol>
         self.validate_local(&target)?;
         let actor = self
             .registry
-            .exact_address(&ActorKey::Str(self.kind.as_str().to_owned()))
+            .exact_address(&self.actor_id)
             .ok_or(RemoteMessageError::StaleActivation)?;
         serde_json::to_vec(&actor)
             .map(Bytes::from)
@@ -485,7 +481,7 @@ impl<D: ActorDefinition<Protocol = P>, A: Actor, L: ActorLoader<A>, P: Protocol>
     }
 
     async fn drain(&self) -> Result<bool, RemoteMessageError> {
-        let actor_id = ActorKey::Str(self.kind.as_str().to_owned());
+        let actor_id = self.actor_id.clone();
         drain_actor_ids(
             &self.registry,
             [actor_id],
@@ -495,7 +491,7 @@ impl<D: ActorDefinition<Protocol = P>, A: Actor, L: ActorLoader<A>, P: Protocol>
     }
 
     async fn wait_drained(&self) -> Result<(), RemoteMessageError> {
-        let actor_id = ActorKey::Str(self.kind.as_str().to_owned());
+        let actor_id = self.actor_id.clone();
         self.registry.wait_actor_ids_terminal([actor_id]).await;
         let key = PlacementSlotKey::Singleton {
             domain: self.domain.clone(),
@@ -521,7 +517,7 @@ impl<D: ActorDefinition<Protocol = P>, A: Actor, L: ActorLoader<A>, P: Protocol>
     }
 
     async fn fence(&self) -> Result<(), RemoteMessageError> {
-        let actor_id = ActorKey::Str(self.kind.as_str().to_owned());
+        let actor_id = self.actor_id.clone();
         if self.registry.active_actor_ids().contains(&actor_id) {
             match self.registry.fence_after_authority_loss(&actor_id).await {
                 Ok(()) | Err(ActorQuarantineError::NotRetained) => {}

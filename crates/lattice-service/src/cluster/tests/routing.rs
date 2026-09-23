@@ -1,6 +1,7 @@
 //! Local slot resolution: single-flight failure propagation and authority fencing.
 
 use lattice_actor::runtime::ActorRuntime;
+use lattice_model::actor::ActorId;
 
 use lattice_actor_distributed::registry::ActorDefinition;
 use std::{
@@ -13,7 +14,7 @@ use lattice_actor_distributed::registry::{ActorAddressConfig, ActorRegistryConfi
 use lattice_model::{
     actor::ProtocolId,
     cluster::CoordinatorScope,
-    cluster::{ClusterId, EntityId, EntityType, NodeEndpoint, NodeIncarnation},
+    cluster::{ClusterId, EntityType, NodeEndpoint, NodeIncarnation},
 };
 use lattice_placement::{
     control::{
@@ -128,7 +129,7 @@ async fn unavailable_resolution_fails_fast_and_clears_route_single_flight() {
     let reference = entity_config
         .entity_ref(
             cluster_id.clone(),
-            EntityId::new(b"missing-host".to_vec()).unwrap(),
+            ActorId::new(b"missing-host".to_vec()).unwrap(),
         )
         .unwrap();
     let shard_key = PlacementSlotKey::Shard {
@@ -382,7 +383,7 @@ async fn stale_generation_never_reaches_entity_loader() {
         Vec::new(),
     )
     .unwrap();
-    let entity_id = EntityId::new(b"player-42".to_vec()).unwrap();
+    let entity_id = ActorId::new(b"player-42".to_vec()).unwrap();
     let slot_key = PlacementSlotKey::Shard {
         domain: domain(),
         entity_type: entity_config.entity_type.clone(),

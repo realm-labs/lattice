@@ -10,7 +10,7 @@ use std::{
 };
 
 use bytes::Bytes;
-use lattice_actor_distributed::ActorKey;
+use lattice_actor_distributed::ActorId;
 use lattice_actor_distributed::{
     error::{ActorFailure, ActorTellError},
     mailbox::MailboxConfig,
@@ -19,7 +19,7 @@ use lattice_actor_distributed::{
 };
 use lattice_model::{
     actor::ProtocolId,
-    cluster::{EntityId, EntityType, NodeEndpoint, NodeIncarnation, PlacementDomainId},
+    cluster::{EntityType, NodeEndpoint, NodeIncarnation, PlacementDomainId},
 };
 use lattice_placement::{
     allocation::{
@@ -79,7 +79,12 @@ pub async fn local_actor_admission(operations: usize) -> Result<MatrixMeasuremen
             ..ActorRegistryConfig::default()
         },
     ));
-    let handle = registry.start(ActorKey::U64(1), BenchActor).await?;
+    let handle = registry
+        .start(
+            ActorId::new(1_u64.to_be_bytes().to_vec()).expect("valid actor ID"),
+            BenchActor,
+        )
+        .await?;
     let started = Instant::now();
     for _ in 0..operations {
         let mut message = BenchTell;
@@ -122,7 +127,7 @@ pub fn placement_matrix(
     )?;
     let local = node("local", 1, 27101)?;
     let remote = node("remote", 2, 27102)?;
-    let entity_id = EntityId::new(b"benchmark-key".to_vec())?;
+    let entity_id = ActorId::new(b"benchmark-key".to_vec())?;
     let home = |revision| ShardHome {
         owner: remote.clone(),
         generation: AssignmentGeneration::new(1).expect("constant generation"),

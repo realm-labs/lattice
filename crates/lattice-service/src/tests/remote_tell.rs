@@ -9,7 +9,7 @@ use std::{
 };
 
 use bytes::BytesMut;
-use lattice_actor_distributed::ActorKey;
+use lattice_actor_distributed::ActorId;
 use lattice_actor_distributed::{
     actor_protocol,
     context::HandlerContext,
@@ -118,7 +118,7 @@ async fn remote_tell_waits_for_mailbox_capacity_without_losing_messages() {
     let completed = Arc::new(Notify::new());
     registry
         .start(
-            ActorKey::U64(1),
+            ActorId::new(1_u64.to_be_bytes().to_vec()).expect("valid actor ID"),
             FloodActor {
                 processed: processed.clone(),
                 completed: completed.clone(),
@@ -126,7 +126,10 @@ async fn remote_tell_waits_for_mailbox_capacity_without_losing_messages() {
         )
         .await
         .unwrap();
-    let target: ActorAddress<FloodProtocol> = registry.address(&ActorKey::U64(1)).unwrap().unwrap();
+    let target: ActorAddress<FloodProtocol> = registry
+        .address(&ActorId::new(1_u64.to_be_bytes().to_vec()).expect("valid actor ID"))
+        .unwrap()
+        .unwrap();
     let server = LatticeService::builder(node_config(
         cluster_id.clone(),
         "server",

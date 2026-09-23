@@ -33,7 +33,7 @@ lattice does not implement remote deployment, wildcard selection, or path-only r
 pub struct EntityRef<A: Actor> {
     cluster_id: ClusterId,
     entity_type: EntityType,
-    entity_id: EntityId,
+    entity_id: ActorId,
     protocol_id: ProtocolId,
     entity_config_fingerprint: EntityConfigFingerprint,
     _actor: PhantomData<fn() -> A>,

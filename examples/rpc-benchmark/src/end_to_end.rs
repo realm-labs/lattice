@@ -14,7 +14,7 @@ use std::{
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::{StreamExt as _, stream::FuturesUnordered};
-use lattice_actor_distributed::ActorKey;
+use lattice_actor_distributed::ActorId;
 use lattice_actor_distributed::{
     error::{ActorCallError, ActorFailure},
     handle::ActorHandle,
@@ -244,7 +244,7 @@ impl RemoteActorTopology {
         let tell_completion = Arc::new(TellCompletion::default());
         let actor = actor_registry
             .start(
-                ActorKey::U64(1),
+                ActorId::new(1_u64.to_be_bytes().to_vec()).expect("valid actor ID"),
                 EchoActor {
                     tell_completion: tell_completion.clone(),
                     processed_bytes: 0,

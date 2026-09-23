@@ -8,7 +8,7 @@ use std::{
     time::Duration,
 };
 
-use lattice_actor_distributed::ActorKey;
+use lattice_actor_distributed::ActorId;
 use lattice_actor_distributed::{
     actor_protocol,
     error::ActorFailure,
@@ -144,7 +144,7 @@ pub async fn run_demo() -> Result<LoginAcceptedReply, Box<dyn StdError>> {
         },
         protocol.as_ref(),
     ));
-    let actor_id = ActorKey::U64(7);
+    let actor_id = ActorId::new(7_u64.to_be_bytes().to_vec()).expect("valid actor ID");
     registry
         .start(
             actor_id.clone(),

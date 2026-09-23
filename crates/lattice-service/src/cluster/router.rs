@@ -1,5 +1,5 @@
 use super::{
-    Actor, ActorAddress, ActorKey, ActorLoader, ActorProtocolBinding, ActorRegistry, Arc, AskError,
+    Actor, ActorAddress, ActorId, ActorLoader, ActorProtocolBinding, ActorRegistry, Arc, AskError,
     AssociationKey, AssociationManager, BTreeMap, Bytes, ClusterRouterError, DomainLogicalRouter,
     EntityAddress, EntityConfig, Instant, LOGICAL_RESOLVE_MESSAGE_ID, LogicPlacementState,
     LogicalBufferConfig, LogicalEntityTarget, LogicalRouter, LogicalSingletonTarget, Mutex,
@@ -115,13 +115,7 @@ impl DomainLogicalRouter {
         registry.install_fencing_token_resolver(
             authority_resolver_name,
             move |actor_id, publish| {
-                let ActorKey::Bytes(entity_id) = actor_id else {
-                    return publish(None);
-                };
-                let Ok(entity_id) = lattice_model::cluster::EntityId::new(entity_id.clone()) else {
-                    return publish(None);
-                };
-                let Ok(shard_id) = authority_mapper.shard_for(&entity_id) else {
+                let Ok(shard_id) = authority_mapper.shard_for(actor_id) else {
                     return publish(None);
                 };
                 let key = PlacementSlotKey::Shard {
@@ -242,10 +236,7 @@ impl DomainLogicalRouter {
         registry.install_fencing_token_resolver(
             authority_resolver_name,
             move |actor_id, publish| {
-                let ActorKey::Str(actor_kind) = actor_id else {
-                    return publish(None);
-                };
-                if actor_kind != authority_kind.as_str() {
+                if actor_id.as_bytes() != authority_kind.as_str().as_bytes() {
                     return publish(None);
                 }
                 let key = PlacementSlotKey::Singleton {
@@ -278,6 +269,8 @@ impl DomainLogicalRouter {
                 domain: config.domain,
                 kind: kind.clone(),
                 config_fingerprint,
+                actor_id: ActorId::new(kind.as_str().to_owned())
+                    .expect("validated singleton kind fits actor ID"),
                 protocol_id,
                 registry,
                 protocol,

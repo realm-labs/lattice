@@ -631,7 +631,7 @@ impl SplitHost {
             .build()?;
         service.start().await?;
         let reference =
-            entity.entity_ref::<SplitProtocol>(cluster, EntityId::new(SPLIT_ENTITY_ID.to_vec())?)?;
+            entity.entity_ref::<SplitProtocol>(cluster, ActorId::new(SPLIT_ENTITY_ID.to_vec())?)?;
         let health = service.subscribe_health();
         let mut ticker = tokio::time::interval(RELEASE_POLL_INTERVAL);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
