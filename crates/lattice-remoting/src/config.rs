@@ -81,7 +81,7 @@ impl Default for RemotingConfig {
 
 impl RemotingConfig {
     pub fn validate(&self) -> Result<(), RemotingConfigError> {
-        for (name, value) in [
+        let nonzero_limits = [
             ("max_associations", self.max_associations),
             ("max_frame_size", self.max_frame_size),
             ("control_queue_frames", self.control_queue_frames),
@@ -128,7 +128,8 @@ impl RemotingConfig {
                 "max_coalesced_write_batch_bytes",
                 self.max_coalesced_write_batch_bytes,
             ),
-        ] {
+        ];
+        for (name, value) in nonzero_limits {
             if value == 0 {
                 return Err(RemotingConfigError::Zero { name });
             }
@@ -167,7 +168,7 @@ impl RemotingConfig {
         if self.reconnect_backoff_min > self.reconnect_backoff_max {
             return Err(RemotingConfigError::ReconnectBackoffOrder);
         }
-        for (name, value) in [
+        let nonzero_durations = [
             ("connect_timeout", self.connect_timeout),
             ("establishing_timeout", self.establishing_timeout),
             ("reconnect_backoff_min", self.reconnect_backoff_min),
@@ -182,7 +183,8 @@ impl RemotingConfig {
                 self.idle_data_connection_timeout,
             ),
             ("shutdown_timeout", self.shutdown_timeout),
-        ] {
+        ];
+        for (name, value) in nonzero_durations {
             if value.is_zero() {
                 return Err(RemotingConfigError::ZeroDuration { name });
             }
