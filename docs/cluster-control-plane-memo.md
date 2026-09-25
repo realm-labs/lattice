@@ -641,6 +641,8 @@ Shutdown cleanup and reducing persistence during operation are related but separ
 
 ## 9. Pre-implementation decisions and acceptance criteria
 
+The [W2/W3 implementation contracts](cluster-control-plane-contracts.md) propose concrete transaction boundaries, renewal freshness, candidate revocation, sealed transfer sets, and shutdown/reset semantics. They refine the questions below without marking them implemented. Explicit behavior-approval and validation gates remain open; use section 9 here as the sole completion checklist.
+
 This section is the single active list of remaining decisions and validation requirements. The historical analysis in section 10 is not a second backlog. Sections 3.4, 3.5, and 5.1 establish discovery through replaceable providers (including etcd), runtime candidate changes, and recovery/degraded-operation boundaries. Section 4 assigns global shutdown orchestration to the Cluster Coordinator and group execution to Group Coordinators.
 
 Remaining shutdown details include cross-group barriers, authorization and operation deduplication, drain policies, handling of unreachable nodes and in-flight migrations without false success, shutdown-progress recovery, new-run startup and safety generations, per-key cleanup scope and exclusion, and the relationship between existing terminal/force APIs and the public interface boundary.
