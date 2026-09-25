@@ -584,7 +584,7 @@ fn dns_config(mode: DnsMode) -> DnsDiscoveryConfig {
 }
 
 fn scope() -> CoordinatorScope {
-    CoordinatorScope::Membership
+    CoordinatorScope::Cluster
 }
 
 fn document(generation: u64, endpoints: Vec<(&str, u16, &str, u16)>) -> serde_json::Value {

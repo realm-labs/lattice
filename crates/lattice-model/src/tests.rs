@@ -1,7 +1,7 @@
 use crate::actor::ActorId;
 use crate::actor::{ActivationId, ActorAddress, ActorPath, EntityAddress, ProtocolId};
 use crate::cluster::{
-    ClusterId, ConfigFingerprint, EntityType, NodeEndpoint, NodeIncarnation, PlacementDomainId,
+    ActorGroupId, ClusterId, ConfigFingerprint, EntityType, NodeEndpoint, NodeIncarnation,
 };
 use crate::service::ServiceName;
 use crate::service_name;
@@ -69,7 +69,7 @@ fn actor_and_entity_refs_have_distinct_exact_and_logical_identity() {
     .unwrap();
     let entity = EntityAddress::new(
         ClusterId::new("test").unwrap(),
-        PlacementDomainId::new("world").unwrap(),
+        ActorGroupId::new("world").unwrap(),
         EntityType::new("world").unwrap(),
         ActorId::new(42_u64.to_be_bytes().to_vec()).unwrap(),
         protocol,
@@ -80,7 +80,7 @@ fn actor_and_entity_refs_have_distinct_exact_and_logical_identity() {
     assert_eq!(actor.node_incarnation(), node);
     assert_eq!(actor.actor_path().to_string(), "/user/session-1");
     assert_eq!(entity.entity_id().as_bytes(), &42_u64.to_be_bytes());
-    assert_eq!(entity.domain().as_str(), "world");
+    assert_eq!(entity.group().as_str(), "world");
 }
 
 #[test]

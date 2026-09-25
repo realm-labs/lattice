@@ -1,24 +1,22 @@
-use lattice_placement::{
-    coordinator::LeaderRecord, runtime::membership_plane::MembershipLeaderConfig,
-};
-use lattice_service::lifecycle::{PlacementDomainState, ServiceHealthSnapshot};
-fn distributed_domain(name: &str) -> Result<PlacementDomainId, Box<dyn Error>> {
-    Ok(PlacementDomainId::new(format!("domain-{name}"))?)
+use lattice_coordination::{coordinator::LeaderRecord, runtime::cluster::ClusterCoordinatorConfig};
+use lattice_service::lifecycle::{ActorGroupState, ServiceHealthSnapshot};
+fn distributed_group(name: &str) -> Result<ActorGroupId, Box<dyn Error>> {
+    Ok(ActorGroupId::new(format!("group-{name}"))?)
 }
 
-fn parse_distributed_domains(value: &str) -> Result<BTreeSet<PlacementDomainId>, Box<dyn Error>> {
+fn parse_distributed_groups(value: &str) -> Result<BTreeSet<ActorGroupId>, Box<dyn Error>> {
     value
         .split(',')
         .filter(|value| !value.is_empty())
-        .map(distributed_domain)
+        .map(distributed_group)
         .collect()
 }
 
-async fn domain_host(
+async fn group_host(
     artifact: PathBuf,
     node_id: String,
     port: u16,
-    domains: String,
+    groups: String,
 ) -> Result<(), Box<dyn Error>> {
     let endpoints = std::env::var("LATTICE_ETCD_ENDPOINTS")?
         .split(',')
@@ -26,9 +24,9 @@ async fn domain_host(
         .collect::<Vec<_>>();
     let run_id = std::env::var("LATTICE_RUN_ID")?;
     let store = Arc::new(
-        EtcdPlacementStore::connect(EtcdPlacementConfig {
+        EtcdCoordinationStore::connect(EtcdCoordinationConfig {
             endpoints,
-            cluster_prefix: format!("/lattice-domain-e2e/{run_id}"),
+            cluster_prefix: format!("/lattice-group-e2e/{run_id}"),
             list_page_size: 64,
             limits: DurableStorageLimits {
                 maximum_slots: 1_024,
@@ -42,7 +40,7 @@ async fn domain_host(
         })
         .await?,
     );
-    let cluster = ClusterId::new("docker-domain-e2e")?;
+    let cluster = ClusterId::new("docker-group-e2e")?;
     let incarnation = NodeIncarnation::generate();
     let address = NodeEndpoint::new(node_id.clone(), port)?;
     let builder =
@@ -55,17 +53,17 @@ async fn domain_host(
             address,
             incarnation,
         },
-        parse_distributed_domains(&domains)?,
+        parse_distributed_groups(&groups)?,
         CoordinatorHostConfig {
-            membership: MembershipLeaderConfig {
+            cluster: ClusterCoordinatorConfig {
                 leader_lease_ttl: Duration::from_secs(10),
                 renewal_interval: Duration::from_secs(1),
-                ..MembershipLeaderConfig::default()
+                ..ClusterCoordinatorConfig::default()
             },
-            placement: PlacementDomainLeaderConfig {
+            group: GroupCoordinatorConfig {
                 leader_lease_ttl: Duration::from_secs(10),
                 renewal_interval: Duration::from_secs(1),
-                ..PlacementDomainLeaderConfig::default()
+                ..GroupCoordinatorConfig::default()
             },
             renewal_interval: Duration::from_millis(500),
             maximum_candidate_jitter: Duration::from_millis(50),
@@ -79,7 +77,7 @@ async fn domain_host(
         .coordinator_host(Arc::new(control), host, controls)
         .build()?;
     service.start().await?;
-    write_domain_host_artifact(
+    write_group_host_artifact(
         &artifact,
         &node_id,
         incarnation,
@@ -93,7 +91,7 @@ async fn domain_host(
                 break;
             }
             let snapshot = directory.borrow().clone();
-            if write_domain_host_artifact(&writer_artifact, &writer_node, incarnation, &snapshot)
+            if write_group_host_artifact(&writer_artifact, &writer_node, incarnation, &snapshot)
                 .is_err()
             {
                 break;
@@ -106,7 +104,7 @@ async fn domain_host(
     Ok(())
 }
 
-fn write_domain_host_artifact(
+fn write_group_host_artifact(
     artifact: &Path,
     node_id: &str,
     incarnation: NodeIncarnation,
@@ -116,9 +114,9 @@ fn write_domain_host_artifact(
         .iter()
         .map(|(scope, leader)| {
             let name = match scope {
-                CoordinatorScope::Membership => "membership".to_owned(),
-                CoordinatorScope::Placement(domain) => {
-                    format!("placement:{}", domain.as_str())
+                CoordinatorScope::Cluster => "membership".to_owned(),
+                CoordinatorScope::Group(group) => {
+                    format!("placement:{}", group.as_str())
                 }
             };
             (
@@ -133,7 +131,7 @@ fn write_domain_host_artifact(
         .collect();
     write_atomic(
         artifact.to_path_buf(),
-        &serde_json::to_vec_pretty(&MultiDomainHostArtifact {
+        &serde_json::to_vec_pretty(&MultiGroupHostArtifact {
             node_id: node_id.to_owned(),
             incarnation: incarnation.get(),
             scopes,
@@ -142,7 +140,7 @@ fn write_domain_host_artifact(
     Ok(())
 }
 
-async fn domain_logic(
+async fn group_logic(
     artifact: PathBuf,
     node_id: String,
     address_host: String,
@@ -154,22 +152,20 @@ async fn domain_logic(
     if let Some(parent) = artifact.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let cluster = ClusterId::new("docker-domain-e2e")?;
+    let cluster = ClusterId::new("docker-group-e2e")?;
     let incarnation = NodeIncarnation::generate();
     let address = NodeEndpoint::new(address_host, port)?;
-    let mut config = node_config(
-        cluster.clone(),
-        &node_id,
-        address.clone(),
-        incarnation,
-    );
+    let mut config = node_config(cluster.clone(), &node_id, address.clone(), incarnation);
     if membership_only {
         config.remoting.heartbeat_interval = Duration::from_secs(2);
         config.remoting.idle_data_connection_timeout = Duration::from_secs(2);
     }
     let mut environment = ActorEnvironment::builder();
     environment.insert(ActivationDirectory::new(8)?)?;
-    let actor_runtime = ActorRuntime::new(ActorRuntimeConfig { environment: environment.build(), ..Default::default() });
+    let actor_runtime = ActorRuntime::new(ActorRuntimeConfig {
+        environment: environment.build(),
+        ..Default::default()
+    });
     let mut builder = LatticeServiceBuilder::with_actor_runtime(config, actor_runtime)?;
     if !membership_only {
         for (name, entity) in [
@@ -178,10 +174,10 @@ async fn domain_logic(
             ("gamma", "distributed-gamma"),
             ("delta", "distributed-delta"),
         ] {
-            let domain = distributed_domain(name)?;
+            let group = distributed_group(name)?;
             builder = builder
                 .proxy_entity_config::<FixtureProtocol>(EntityConfig::new(
-                    domain.clone(),
+                    group.clone(),
                     EntityType::new(entity)?,
                     ProtocolId::new(PROTOCOL_ID)?,
                     16,
@@ -189,47 +185,47 @@ async fn domain_logic(
                     1,
                     Vec::new(),
                 )?)?
-                .domain_capacity(domain, 1)?;
+                .group_capacity(group, 1)?;
         }
     }
     let membership_candidates = if membership_only {
-        vec![("domain-membership", 29300)]
+        vec![("group-membership", 29300)]
     } else {
         vec![
-            ("domain-membership", 29300),
-            ("domain-alpha", 29301),
-            ("domain-beta", 29302),
-            ("domain-gamma", 29303),
-            ("domain-standby", 29304),
+            ("group-membership", 29300),
+            ("group-alpha", 29301),
+            ("group-beta", 29302),
+            ("group-gamma", 29303),
+            ("group-standby", 29304),
         ]
     };
-    builder = builder.coordinator_discovery(domain_static_discovery(
-        CoordinatorScope::Membership,
+    builder = builder.coordinator_discovery(group_static_discovery(
+        CoordinatorScope::Cluster,
         "membership",
         &membership_candidates,
     )?)?;
     if !membership_only {
         builder = builder
-            .coordinator_discovery(domain_static_discovery(
-            CoordinatorScope::Placement(distributed_domain("alpha")?),
-            "alpha",
-            &[("domain-alpha", 29301), ("domain-standby", 29304)],
-        )?)?
-        .coordinator_discovery(domain_static_discovery(
-            CoordinatorScope::Placement(distributed_domain("beta")?),
-            "beta",
-            &[("domain-beta", 29302), ("domain-standby", 29304)],
-        )?)?
-        .coordinator_discovery(domain_static_discovery(
-            CoordinatorScope::Placement(distributed_domain("gamma")?),
-            "gamma",
-            &[("domain-gamma", 29303), ("domain-standby", 29304)],
-        )?)?
-        .coordinator_discovery(domain_static_discovery(
-            CoordinatorScope::Placement(distributed_domain("delta")?),
-            "delta",
-            &[("domain-alpha", 29301), ("domain-standby", 29304)],
-        )?)?;
+            .coordinator_discovery(group_static_discovery(
+                CoordinatorScope::Group(distributed_group("alpha")?),
+                "alpha",
+                &[("group-alpha", 29301), ("group-standby", 29304)],
+            )?)?
+            .coordinator_discovery(group_static_discovery(
+                CoordinatorScope::Group(distributed_group("beta")?),
+                "beta",
+                &[("group-beta", 29302), ("group-standby", 29304)],
+            )?)?
+            .coordinator_discovery(group_static_discovery(
+                CoordinatorScope::Group(distributed_group("gamma")?),
+                "gamma",
+                &[("group-gamma", 29303), ("group-standby", 29304)],
+            )?)?
+            .coordinator_discovery(group_static_discovery(
+                CoordinatorScope::Group(distributed_group("delta")?),
+                "delta",
+                &[("group-alpha", 29301), ("group-standby", 29304)],
+            )?)?;
     }
     builder = builder.join_config(ClusterJoinConfig {
         retry_initial: Duration::from_millis(25),
@@ -242,16 +238,20 @@ async fn domain_logic(
     let mut scale_actor = None;
     if membership_only {
         let protocol = Arc::new(FixtureProtocol::bind::<PingActor>()?);
-        let registry = Arc::new(ActorRegistry::<DistributedScaleFixtureDefinition, _>::new_bound(builder.actor_spawner(), ActorRegistryConfig {
-                address: Some(ActorAddressConfig {
-                    cluster_id: cluster.clone(),
-                    node_address: address,
-                    node_incarnation: incarnation,
-                }),
-                ..ActorRegistryConfig::default()
-            },
-            protocol.as_ref(),
-        ));
+        let registry = Arc::new(
+            ActorRegistry::<DistributedScaleFixtureDefinition, _>::new_bound(
+                builder.actor_spawner(),
+                ActorRegistryConfig {
+                    address: Some(ActorAddressConfig {
+                        cluster_id: cluster.clone(),
+                        node_address: address,
+                        node_incarnation: incarnation,
+                    }),
+                    ..ActorRegistryConfig::default()
+                },
+                protocol.as_ref(),
+            ),
+        );
         let actor_id = ActorId::new(1_u64.to_be_bytes().to_vec()).expect("valid actor ID");
         registry.start(actor_id.clone(), PingActor).await?;
         let reference: ActorAddress<FixtureProtocol> = registry
@@ -273,7 +273,7 @@ async fn domain_logic(
         loop {
             let snapshot = health.borrow().clone();
             let members = service.member_snapshot();
-            write_domain_logic_artifact(
+            write_group_logic_artifact(
                 &artifact,
                 &node_id,
                 incarnation,
@@ -282,7 +282,7 @@ async fn domain_logic(
                 &evidence,
                 &service,
             )?;
-            if domain_logic_ready(&snapshot, membership_only)
+            if group_logic_ready(&snapshot, membership_only)
                 && expected_members.is_none_or(|expected| {
                     members.members.len() == expected
                         && members
@@ -307,7 +307,7 @@ async fn domain_logic(
         Ok(result) => result?,
         Err(_) => {
             let snapshot = health.borrow().clone();
-            write_domain_logic_artifact(
+            write_group_logic_artifact(
                 &artifact,
                 &node_id,
                 incarnation,
@@ -317,7 +317,7 @@ async fn domain_logic(
                 &service,
             )?;
             return Err(IoError::other(format!(
-                "domain logic {node_id} did not reach Ready with {expected_members:?} expected members within 300s; last health snapshot: {snapshot:?}"
+                "group logic {node_id} did not reach Ready with {expected_members:?} expected members within 300s; last health snapshot: {snapshot:?}"
             ))
             .into());
         }
@@ -325,11 +325,17 @@ async fn domain_logic(
     evidence.join_millis = Some(started.elapsed().as_millis());
     if let (true, Some(reference)) = (membership_only, scale_actor.as_ref()) {
         evidence.ring = Some(
-            run_scale_ring(&artifact, &node_id, reference, &service, &service.member_snapshot())
-                .await?,
+            run_scale_ring(
+                &artifact,
+                &node_id,
+                reference,
+                &service,
+                &service.member_snapshot(),
+            )
+            .await?,
         );
     }
-    write_domain_logic_artifact(
+    write_group_logic_artifact(
         &artifact,
         &node_id,
         incarnation,
@@ -346,7 +352,7 @@ async fn domain_logic(
                 if changed.is_err() {
                     break;
                 }
-                write_domain_logic_artifact(
+                write_group_logic_artifact(
                     &artifact,
                     &node_id,
                     incarnation,
@@ -356,7 +362,7 @@ async fn domain_logic(
                     &service,
                 )?;
             }
-            _ = artifact_tick.tick() => write_domain_logic_artifact(
+            _ = artifact_tick.tick() => write_group_logic_artifact(
                 &artifact,
                 &node_id,
                 incarnation,
@@ -460,7 +466,9 @@ async fn run_scale_ring(
     }
     let request = u64::try_from(index)?;
     let started = Instant::now();
-    let reply = service.ask(&target, Ping(request), Duration::from_secs(10)).await?;
+    let reply = service
+        .ask(&target, Ping(request), Duration::from_secs(10))
+        .await?;
     if reply != Pong(request + 1) {
         return Err(IoError::other("scale ring returned an unexpected reply").into());
     }
@@ -505,19 +513,18 @@ fn process_status_value(status: &Option<String>, key: &str) -> Option<u64> {
     })
 }
 
-fn domain_logic_ready(health: &ServiceHealthSnapshot, membership_only: bool) -> bool {
+fn group_logic_ready(health: &ServiceHealthSnapshot, membership_only: bool) -> bool {
     health.node == NodeLifecycleState::Ready
         && (membership_only
-            || ["alpha", "beta", "gamma", "delta"]
-            .into_iter()
-            .all(|name| {
-                health.domains.get(
-                    &distributed_domain(name).expect("static distributed domain must be valid"),
-                ) == Some(&PlacementDomainState::Ready)
+            || ["alpha", "beta", "gamma", "delta"].into_iter().all(|name| {
+                health
+                    .groups
+                    .get(&distributed_group(name).expect("static distributed group must be valid"))
+                    == Some(&ActorGroupState::Ready)
             }))
 }
 
-fn domain_static_discovery(
+fn group_static_discovery(
     scope: CoordinatorScope,
     name: &'static str,
     candidates: &[(&str, u16)],
@@ -536,7 +543,7 @@ fn domain_static_discovery(
     Ok(Arc::new(StaticDiscovery::new(scope, name, endpoints)?))
 }
 
-fn write_domain_logic_artifact(
+fn write_group_logic_artifact(
     artifact: &Path,
     node_id: &str,
     incarnation: NodeIncarnation,
@@ -559,14 +566,14 @@ fn write_domain_logic_artifact(
     });
     write_atomic(
         artifact.to_path_buf(),
-        &serde_json::to_vec_pretty(&MultiDomainLogicArtifact {
+        &serde_json::to_vec_pretty(&MultiGroupLogicArtifact {
             node_id: node_id.to_owned(),
             incarnation: incarnation.get(),
             lifecycle: format!("{:?}", health.node),
-            domains: health
-                .domains
+            groups: health
+                .groups
                 .iter()
-                .map(|(domain, state)| (domain.as_str().to_owned(), format!("{state:?}")))
+                .map(|(group, state)| (group.as_str().to_owned(), format!("{state:?}")))
                 .collect(),
             membership_version: membership.version.map(|version| MembershipVersionArtifact {
                 term: version.term.get(),

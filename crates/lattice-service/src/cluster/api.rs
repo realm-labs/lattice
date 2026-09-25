@@ -3,17 +3,17 @@ use std::{
     time::Duration,
 };
 
-use lattice_model::cluster::ClusterId;
-use lattice_placement::{
+use lattice_coordination::{
     coordinator::{MemberEvent, MemberRecord},
     types::{MembershipVersion, NodeKey},
 };
+use lattice_model::cluster::ClusterId;
 use thiserror::Error;
 use tokio::sync::{broadcast, watch};
 
 use super::members::{MemberDirectory, MemberSnapshot};
 use crate::lifecycle::{
-    CoordinatorScopeState, NodeLifecycleState, PlacementDomainState, ServiceHealthSnapshot,
+    ActorGroupState, CoordinatorScopeState, NodeLifecycleState, ServiceHealthSnapshot,
 };
 
 /// A user-facing handle to the local node's view of its cluster.
@@ -169,9 +169,9 @@ impl ClusterState {
         self.health.node == NodeLifecycleState::Ready
             && self
                 .health
-                .domains
+                .groups
                 .values()
-                .all(|state| *state == PlacementDomainState::Ready)
+                .all(|state| *state == ActorGroupState::Ready)
             && self
                 .health
                 .coordinator_scopes

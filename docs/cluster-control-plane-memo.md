@@ -1,6 +1,6 @@
 # Cluster Shutdown and etcd State Lifecycle: Design Draft
 
-> Status: the shutdown interface, lifecycle, target logical data model, version policy, discovery boundary, and dynamic Coordinator candidacy are agreed as the design direction; protocol, API, physical schema, and migration details remain open and are not implemented.
+> Status: work package 1 is complete (see section 9.6 for evidence). Cluster shutdown, run-scoped storage, authority consolidation, and dynamic candidacy remain planned work packages 2/3.
 > This document is the shared entry point for ongoing design edits and pre-implementation review, incorporating the earlier memo on minimal etcd state and Coordinator candidacy.
 > Revise and approve this document before implementing it; no protocol or storage migration has been completed by this draft.
 > Current implementation references: [placement architecture](architecture/03-placement.md) and [discovery](cluster-discovery.md).
@@ -23,7 +23,7 @@ An empty membership list must not automatically imply that the entire cluster ha
 - [Service](../crates/lattice-service/src/builder/service.rs) implements `shutdown()` through `leave(deadline)`, waiting for domain drain and membership removal confirmation before stopping components.
 - In the same file, `terminal_shutdown()` supports whole-deployment termination without requiring local placement slots to migrate to another node. It fences local cluster authority before stopping local actors and runtime components.
 - [Deployment](../crates/lattice-service/src/deployment.rs) shutdown coordinates logic and Coordinator components within the current deployment; it is not a global cluster shutdown protocol.
-- [Member removal](../crates/lattice-placement/src/runtime/membership_domain_ops.rs) handles claims according to the removal reason and may initiate shard/singleton recovery for the previous owner.
+- [Member removal](../crates/lattice-coordination/src/runtime/membership_domain_ops.rs) handles claims according to the removal reason and may initiate shard/singleton recovery for the previous owner.
 
 These capabilities do not implement the proposed `cluster.shutdown()`: cross-node and cross-domain coordination, completion evidence, and unified runtime-state cleanup are missing. The existing `terminal_shutdown()` execution order cannot simply become the new protocol; control sessions that must survive until confirmation and cleanup need to be identified.
 
@@ -68,11 +68,11 @@ An actor group contains actor types, not an enumeration of active actor instance
 
 Keep `CoordinatorScope` as an internal election abstraction, with the target conceptual variants `Cluster` and `Group(ActorGroupId)`. Each scope has independent leadership; a dedicated candidate may campaign for multiple groups without being guaranteed to lead all of them. Applications should primarily configure clusters and actor groups rather than manipulate election scopes.
 
-In existing-source descriptions and the earlier analysis, `domain` remains an alias for the current placement-domain concept, mapped to actor group by this table. Existing Rust identifiers and source links are preserved until implementation. General phrases such as authorization scope or shutdown scope mean an operation's range, not a `CoordinatorScope` value. Renaming a Coordinator does not itself add cluster-wide shutdown behavior to the existing membership implementation.
+In existing-source descriptions and the earlier analysis, `domain` remains an alias for the current placement-domain concept, mapped to actor group by this table. Public Rust APIs now use the new names without forwarding aliases; historical descriptions use the mapping above. General phrases such as authorization scope or shutdown scope mean an operation's range, not a `CoordinatorScope` value. Renaming a Coordinator does not itself add cluster-wide shutdown behavior to the existing membership implementation.
 
 ### 3.2 Crate and migration naming
 
-Review package names together with their actual responsibilities during implementation. The recommended candidate for `lattice-placement` is `lattice-coordination`: the crate already contains membership, leadership, ownership, allocation, handoff, and singleton coordination, so `lattice-allocation` or `lattice-sharding` would describe only part of it. This package name is a proposal to confirm with the final boundaries, not an already completed rename.
+Review package names together with their actual responsibilities during implementation. The selected name for `lattice-placement` is `lattice-coordination`: the crate already contains membership, leadership, ownership, allocation, handoff, and singleton coordination, so `lattice-allocation` or `lattice-sharding` would describe only part of it. The crate rename is implemented in the section 9.6 checkpoint; its responsibilities remain together.
 
 Do not split the crate solely to match terminology. Prefer cohesive internal modules such as membership, groups, allocation, ownership, and rebalance. `lattice-service` remains the assembly and application lifecycle layer; `lattice-remoting` remains transport and messaging. Neither needs a rename merely because placement terminology changes. Actor runtime scheduling must remain distinguishable from distributed allocation.
 
@@ -96,7 +96,7 @@ Implement only the framework-version boundary in this work. Framework upgrades a
 
 **One framework gate, not multiple compatibility negotiations.** Check the exact framework identity at connection/bootstrap admission before interpreting version-sensitive payloads, and before a candidate participates in coordination. Keep a minimal framework identity marker in etcd so a new binary cannot silently load old runtime records. The identity envelope and marker must be readable sufficiently early to reject mismatches clearly; this does not require supporting the old protocol after rejection.
 
-Replace independently configured framework transport, control, storage, and watch compatibility generations with this framework gate. Retain independent configuration/protocol checks. The old application release mechanism is explicitly removed, including its self-reported ABI/state fingerprints; no replacement application compatibility guarantee is provided. Internal encoding discriminants may remain where parsing needs them, but must not become another public compatibility policy. A released framework identity must determine its protocol behavior; development/custom builds or protocol-changing feature combinations need an automatically derived build distinction if the release version alone cannot guarantee that. Do not introduce another user-maintained version field for this purpose.
+Replace independently configured framework transport, control, storage, and watch compatibility generations with this framework gate. Retain independent configuration/protocol checks. The old application release mechanism is explicitly removed, including its self-reported ABI/state fingerprints; no replacement application compatibility guarantee is provided. Internal encoding discriminants may remain where parsing needs them, but must not become another public compatibility policy. Both published packages and development/custom builds use the exact Cargo package version, with no source digest or additional user-maintained version field. Developers are responsible for deploying consistent same-version builds and bumping the package version for incompatible protocol or storage changes. Protocol-changing feature combinations must not silently alter the same version's protocol contract. The gate deliberately does not detect different sources sharing a version; ordinary development edits and restarts do not create a new framework identity. Runtime cleanup remains a separate cluster-lifecycle responsibility.
 
 **Framework upgrades require a full stop.** Complete cluster shutdown and approved runtime cleanup under the old deployment, or use the explicit abnormal-stop reset procedure after confirming old processes have stopped. Only then establish the new framework marker and a new run through a guarded administrative/startup transition. An upgrade must refuse leftover runtime state rather than deserialize it optimistically. No mixed-framework rolling upgrade or automatic reinterpretation of old runtime records is promised. A rollback to a different Lattice version follows the same full-stop/reset rule.
 
@@ -326,7 +326,7 @@ The target is to persist minimal authority and recovery facts, not a complete sn
         └── cleanup/<scope>
 ```
 
-Paths are illustrative. `scope` distinguishes the cluster-level Coordinator from each group-level Coordinator; `group` is an `ActorGroupId` (currently `PlacementDomainId`). `slot-key` distinguishes a shard `(entity-type, shard-id)` from a singleton kind; singleton definitions require equivalent protocol/configuration metadata without shard-mapping fields.
+Paths are illustrative. `scope` distinguishes the cluster-level Coordinator from each group-level Coordinator; `group` is an `ActorGroupId`. `slot-key` distinguishes a shard `(entity-type, shard-id)` from a singleton kind; singleton definitions require equivalent protocol/configuration metadata without shard-mapping fields.
 
 Metadata, definitions, and managed candidate eligibility survive runtime cleanup. Records under `runs/<epoch>/` belong to one cluster run; slots and shutdown progress are durable within that run, while the marked records are lease-backed. Lease expiry alone does not remove the entire run.
 
@@ -376,7 +376,7 @@ The routing relationship is:
 Entity ID → deterministic mapper → Shard ID → persisted owner → local ActorRegistry
 ```
 
-The current default mapper uses `xxh3_with_fixed_seed(entity_id) % shard_count`; the current implementation gives custom mappers an explicit identity and version. See [mapping.rs](../crates/lattice-placement/src/mapping.rs). The target model avoids a separate mapper release-version knob: mapping identity and configuration must unambiguously identify the algorithm and its parameters, including custom behavior. A framework version alone cannot establish that agreement. Every host and proxy must agree on the mapping configuration. Changing shard count or mapper behavior requires a mapping migration, not an ordinary configuration refresh.
+The current default mapper uses `xxh3_with_fixed_seed(entity_id) % shard_count`; the current implementation gives custom mappers an explicit identity and version. See [mapping.rs](../crates/lattice-coordination/src/mapping.rs). The target model avoids a separate mapper release-version knob: mapping identity and configuration must unambiguously identify the algorithm and its parameters, including custom behavior. A framework version alone cannot establish that agreement. Every host and proxy must agree on the mapping configuration. Changing shard count or mapper behavior requires a mapping migration, not an ordinary configuration refresh.
 
 Do not add a default per-entity placement table to etcd:
 
@@ -533,7 +533,7 @@ When transfer metadata and its slot reference are separate, their publication an
 
 Applications select a provided rebalance policy or supply their own. Policy controls which shards should move, where they should move, and how quickly to start work; the runtime enforces the selected budget and non-negotiable authority constraints.
 
-Build on the existing [allocation policies and RebalanceLimits](../crates/lattice-placement/src/allocation.rs), rather than introducing an unrelated scheduling mechanism. The following describes the target contract, not a finalized Rust API:
+Build on the existing [allocation policies and RebalanceLimits](../crates/lattice-coordination/src/allocation.rs), rather than introducing an unrelated scheduling mechanism. The following describes the target contract, not a finalized Rust API:
 
 ```text
 RebalanceDecision {
@@ -574,7 +574,7 @@ Simplify fencing by centralizing rules and revocation orchestration, not by indi
 | Membership snapshot application | Prevent delayed snapshots from reintroducing a retired node incarnation |
 | External side-effect boundary | Enforce the external resource's fencing contract; local admission closure alone cannot reject an already-issued write |
 
-Use the existing [PlacementAuthority](../crates/lattice-placement/src/authority.rs) and [Registry authority validation](../crates/lattice-actor-distributed/src/registry.rs) as the starting points. Do not introduce a third independently maintained authority model alongside them. Exact target type names remain subject to the terminology migration.
+Use the existing [PlacementAuthority](../crates/lattice-coordination/src/authority.rs) and [Registry authority validation](../crates/lattice-actor-distributed/src/registry.rs) as the starting points. Do not introduce a third independently maintained authority model alongside them. Exact target type names remain subject to the terminology migration.
 
 **Centralize the ownership decision.** Entity and singleton routes, direct Registry activation paths, and publication must use one authoritative interpretation of owner incarnation, assignment generation, slot state, grant validity, and admission. Callers should not each reconstruct these rules with their own combinations of conditions. Derived admission gates may exist at execution boundaries, but their revocation and generation binding must remain consistent with that authority source.
 
@@ -661,7 +661,7 @@ For bounded storage and rebalance admission, finalize participant-set sealing an
 
 For authority consolidation, specify the shared authority source, publication/admission synchronization with revocation, generation-bound idempotent retirement, and the treatment of queued versus in-flight work. Audit existing checks against these invariants before removing or relocating them.
 
-For the version policy in section 3.3, finalize automatic framework/build identity across crates, the early rejection envelope, and the retained metadata upgrade/reset contract. Inventory existing compatibility generations and fingerprints before removing them; distinguish framework compatibility machinery from runtime safety counters and configuration consistency checks; the old application release mechanism is removed separately. `AppVersion` and rolling-release semantics are deferred and do not block package 1.
+For the version policy in section 3.3, use the exact Cargo package version across crates without a source digest. Finalize the early rejection envelope and retained metadata upgrade/reset contract. Inventory existing compatibility generations and fingerprints before removing them; distinguish framework compatibility machinery from runtime safety counters and configuration consistency checks; the old application release mechanism is removed separately. `AppVersion` and rolling-release semantics are deferred and do not block package 1.
 
 Apply the terminology mapping in section 3.1 throughout the eventual API and documentation migration. Confirm the proposed crate name in section 3.2 and separately decide the persisted/wire compatibility boundary before renaming stored identifiers.
 
@@ -705,11 +705,11 @@ Acceptance coverage must include at least:
 
 ### 9.1 Preparation gate and implementation rules
 
-Status: P0 source inspection is in progress; runtime implementation has not started. The [preparation evidence](cluster-control-plane-preparation.md) records the first key-family audit, protocol findings, and test map. P0.1 still needs finalized field-removal/cleanup contracts; P0.4 has no executed baseline or scale measurements. All work items remain unchecked until their stated deliverables are complete. This plan groups responsibilities, not independent crate rewrites or separate production rollouts. Keep one final target protocol/schema; do not build old/new dual-read, dual-write, or mixed-framework compatibility paths merely to stage development.
+Status: work package 1 is complete; the remaining P0 authority/storage preparation applies to packages 2/3. The [preparation evidence](cluster-control-plane-preparation.md) records the first key-family audit, protocol findings, and test map. P0.1 still needs finalized field-removal/cleanup contracts; P0.4 has no executed baseline or scale measurements. Only work items with completed deliverables and recorded validation are checked. This plan groups responsibilities, not independent crate rewrites or separate production rollouts. Keep one final target protocol/schema; do not build old/new dual-read, dual-write, or mixed-framework compatibility paths merely to stage development.
 
 - [ ] **P0.1 Inventory:** complete section 8 with actual keys, readers, writers, leases, transaction predicates, and retention rules. Include configuration and worker-ID safety history so runtime cleanup cannot erase unrelated persistent state. Record each removed field's replacement or why it is no longer needed.
 - [ ] **P0.2 Contract decisions:** resolve the relevant section 9 questions before implementing each affected boundary. First settle candidate eligibility/revocation guards, grant deadline and renewal assumptions, transfer/barrier completion evidence, and cluster shutdown success/cleanup conditions. Confirm the proposed no-revival lifecycle rule rather than implementing it as an unstated assumption.
-- [ ] **P0.3 Public contract:** confirm the crate rename, framework/build identity source, and public administration/lifecycle entry points. API examples must distinguish configuration, candidate eligibility, discovery hints, and serving authority. Application rolling-release design is deferred, not a prerequisite for this work.
+- [ ] **P0.3 Public contract:** the crate rename and Cargo package version as the sole framework identity are confirmed; finalize public administration/lifecycle entry points. API examples must distinguish configuration, candidate eligibility, discovery hints, and serving authority. Application rolling-release design is deferred, not a prerequisite for this work.
 - [ ] **P0.4 Evidence baseline:** map existing focused tests and failpoints to the acceptance requirements above. Record known failures and representative workload sizes; preserve unrelated worktree changes. Do not run the full suite solely to begin the inventory.
 
 Preparation delivers the storage/invariant inventory, the necessary state-transition and transaction contracts, and a test map. Complete the rename/version-specific decisions before package 1; authority and storage decisions may be refined alongside that work, but must be settled before the corresponding package 2/3 slice starts. If a decision changes agreed product behavior or safety guarantees, bring it back for review.
@@ -718,19 +718,19 @@ Preparation delivers the storage/invariant inventory, the necessary state-transi
 
 **Preparatory cleanup:** the old application release model, N/N+1 admission,
 release-biased placement, release diagnostics, and release-upgrade simulation
-fixtures have been removed. Existing transport/control/schema and independent
-configuration/protocol checks remain. This cleanup does not complete W1.1-W1.3,
-add `AppVersion`, or establish the proposed exact framework-version gate.
+fixtures have been removed. The subsequent W1 implementation replaces framework
+compatibility generations with exact package-version admission. Independent
+configuration/protocol checks remain; no `AppVersion` or rolling-release policy is added.
 
 **Outcome:** application-facing terminology is consistent, and one automatic framework identity replaces the public framework compatibility matrix with the old application release mechanism removed and no replacement rolling-release policy. `AppVersion` and rolling updates are outside this package and the current implementation effort.
 
-Primary areas: `lattice-model`, `lattice-placement` (proposed `lattice-coordination`), `lattice-remoting`, `lattice-service`, distributed Actor integration, and workspace consumers. These are inspection targets, not permission to reorganize unrelated crates.
+Primary areas: `lattice-model`, `lattice-coordination` (renamed from `lattice-placement`), `lattice-remoting`, `lattice-service`, distributed Actor integration, and workspace consumers. These are inspection targets, not permission to reorganize unrelated crates.
 
-- [ ] **W1.1 Terminology:** apply the approved Actor group / Cluster Coordinator / Group Coordinator naming to public types, configuration, diagnostics, examples, and tests. Rename the coordination crate if confirmed, including workspace dependencies, lockfile, imports, scripts, and documentation links. Keep module boundaries cohesive and distinguish Actor scheduling from distributed allocation.
-- [ ] **W1.2 Version inventory and identity:** classify existing generation/version/fingerprint fields as release compatibility, configuration/protocol consistency, or runtime safety. Define and automatically supply the exact Lattice identity across participating crates; retain necessary terms, epochs, generations, and incarnations.
-- [ ] **W1.3 Framework admission gate:** apply the exact identity check to bootstrap/connection setup, candidate startup, and the minimal etcd framework marker before version-sensitive payload/state consumption. Specify the small retained marker format jointly with W3.1. Mismatches fail clearly; they do not select an older codec or bypass storage guards.
+- [x] **W1.1 Terminology:** apply the approved Actor group / Cluster Coordinator / Group Coordinator naming to public types, configuration, diagnostics, examples, and tests. Rename the coordination crate if confirmed, including workspace dependencies, lockfile, imports, scripts, and documentation links. Keep module boundaries cohesive and distinguish Actor scheduling from distributed allocation.
+- [x] **W1.2 Version inventory and identity:** classify existing generation/version/fingerprint fields as release compatibility, configuration/protocol consistency, or runtime safety. Define and automatically supply the exact Lattice identity across participating crates; retain necessary terms, epochs, generations, and incarnations.
+- [x] **W1.3 Framework admission gate:** apply the exact identity check to bootstrap/connection setup, candidate startup, and the minimal etcd framework marker before version-sensitive payload/state consumption. Specify the small retained marker format jointly with W3.1. Mismatches fail clearly; they do not select an older codec or bypass storage guards.
 - **W1.4 Deferred application release redesign:** not an implementation task or completion prerequisite. Design `AppVersion` together with old-release shard migration and rolling-update/rollback semantics in a separate effort. The old application release model, admission guards, and release-biased placement are removed first; their removal does not provide a replacement rolling-update guarantee.
-- [ ] **W1.5 Remove superseded surfaces:** migrate consumers and remove obsolete framework compatibility knobs and paths after their replacements are wired. Do not reintroduce the removed application release model or its metadata. Update examples and upgrade guidance; do not retain forwarding aliases solely to hide an incomplete rename.
+- [x] **W1.5 Remove superseded surfaces:** migrate consumers and remove obsolete framework compatibility knobs and paths after their replacements are wired. Do not reintroduce the removed application release model or its metadata. Update examples and upgrade guidance; do not retain forwarding aliases solely to hide an incomplete rename.
 
 **Exit evidence:** affected consumers compile with the new public surface; tests reject mixed Lattice versions at the early gates, retain mapping/protocol mismatch detection, and keep runtime authority safeguards intact. Application rolling-release guarantees are explicitly absent. Searches find no unintended old names or redundant framework compatibility negotiations. No `AppVersion` API or new rollout policy is required. This package does not claim that runtime reset or cluster shutdown is implemented; those operational guarantees remain gated on package 3.
 
@@ -780,13 +780,64 @@ Within each slice, migrate every producer and consumer of a changed contract and
 
 ### 9.6 Verification and completion tracking
 
+#### Work package 1 completed (2026-09-25)
+
+- Renamed `lattice-placement` to `lattice-coordination` and migrated consumers,
+  examples, simulation fixtures, Docker configuration, imports, and documentation.
+  Public APIs use `ActorGroupId`, Cluster/Group Coordinators and session handles,
+  `group` fields and `groups` collections. Coordinator host configuration exposes
+  `cluster` and `group`. Storage request/record types live in `storage::records`.
+  No old-name forwarding aliases remain.
+- `CoordinatorScope::Cluster/Group` and serialized group fields now use the new
+  terminology. Existing physical `membership/` and `domains/` etcd key families
+  remain for W3; this does not implement the target run-scoped layout.
+- `LatticeVersion` equals the automatic Cargo package version for all builds.
+  There is no source digest. Same-version source differences are the developer's
+  responsibility. Participating actor/remoting/coordination/service crates check
+  their linked release version against the model crate at compile time.
+- Bootstrap requests/responses and handshake requests/ACKs check the exact version
+  in a small envelope before decoding their inner payload. The fixed `LTCE`
+  framing magic is only a discriminator, not a negotiated version. Business
+  frames carry no additional per-frame framework identity.
+- Removed transport major/minor fields, mandatory feature bits, Coordinator
+  protocol/control generations, and watch generations. Removed the old default
+  mapper serialization fallback: mapper ID/version are explicit configuration
+  fields, with no silent legacy `shard_hash_version` translation.
+- `ensure_framework` initializes `meta/framework` (exact version, UTF-8),
+  `schema/limits`, and required counters/revision in one empty-prefix transaction.
+  Matching concurrent initializers revalidate the winner. Missing/foreign markers
+  or legacy `schema_generation` keys fail without writes. Inconsistent limits or
+  incomplete initialization metadata fail separately. No schema generation is
+  written, so pre-identity binaries cannot accept the new namespace.
+- Coordinator startup checks the marker before granting a lease, campaigning,
+  or decoding recovery records. In-memory startup follows the same identity rule.
+  The old migration API/CLI, its migration failpoints/tests, and attached offline
+  counter inspection/repair commands are removed. Normal runtime capacity counters
+  and reconciliation are retained. This is not a new cleanup/reset tool.
+- The [version inventory](cluster-control-plane-preparation.md#w1-version-inventory-and-disposition)
+  distinguishes removed compatibility machinery from retained protocol/configuration
+  fingerprints, mapper/policy versions, terms, revisions, assignment generations,
+  grant sequences, incarnations, activation IDs, and transport sequence identities.
+- Validation: model/remoting/coordination/service library tests passed (14/105/114/73).
+  All 17 Bootstrap integration tests passed, including foreign Bootstrap and
+  Handshake rejection before Association registration. An isolated Docker etcd
+  passed the framework-identity test and all 7 etcd acceptance tests (with
+  `test-failpoints`), including concurrent initialization, candidate rejection
+  before malformed state recovery, lease expiry, guarded commits, capacity and paging.
+  Workspace all-target/all-feature compilation passed. Doc-test commands completed
+  successfully (these four crates currently expose no runnable doctests). The three\n  actor-group simulation unit tests, Docker Compose validation, and repository\n  structure check also passed; all 18 ops/telemetry unit tests passed. The temporary\n  isolated etcd container was stopped and automatically removed after validation.
+- No live cluster data was changed. Full workspace tests, multi-process chaos,
+  and load tests were not run; those remain part of the coupled final W2/W3
+  acceptance. Cluster shutdown, run epochs, reset/cleanup, dynamic candidacy,
+  new grant timing, and application rolling releases are not claimed here.
+
 - Use focused unit, integration, UI/API, and doctests for the slice being changed, plus compilation of affected reverse dependencies. Consolidate expensive workspace runs rather than repeating the full suite after every naming or documentation edit.
 - Run formatting checks and `bash scripts/check-structure.sh` after structural changes. Preserve `foo.rs` plus `foo/`, explicit imports, and the effective-LOC limit without shrinking useful documentation.
 - Use deterministic time/failpoints where possible for authority races and interrupted operations. Verify storage transaction/lease behavior with isolated etcd integration fixtures; in-memory tests alone cannot establish those guarantees.
 - Before the final cutover, run the agreed workspace regression suite and multi-process failure scenarios once the coupled paths are complete. Validate representative startup, discovery/watch, renewal, transfer, shutdown, and reconnect load against budgets fixed during preparation. Record failures or untested environments explicitly rather than treating skipped coverage as success.
 - Check off a work item only with implementation and relevant evidence. Record changed surfaces, exact validation performed, remaining blockers, and any approved decision changes here. Mark each package complete only when its exit evidence and cross-package dependencies are satisfied.
 
-This phase updates documentation only; it does not implement the design, migrate storage, or clean up data.
+Implementation status is recorded above. No live etcd cleanup or storage migration has been executed.
 
 ## 10. Earlier control-plane analysis: minimal etcd state and candidate topology
 
@@ -901,4 +952,4 @@ must be measured.
 
 The original open questions have been consolidated into section 9. The target data model is in section 7; discovery and dynamic candidate management are in sections 3.4 and 3.5; recovery and degraded-operation boundaries are in section 5.1; full-cluster cleanup/reset is in section 6. Representative-scale validation must cover steady-state discovery/watch/write load, simultaneous startup, candidate replacement, leader failover, and etcd reconnection. Do not maintain an independent decision list here.
 
-No protocol, schema, or deployment change has been implemented by this document.
+This historical analysis does not define additional implementation work; see section 9.6 for the current checkpoint.

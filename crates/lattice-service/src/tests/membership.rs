@@ -1,4 +1,4 @@
-//! Cluster membership: discovery-driven join, leave, per-domain health and Coordinator rollover.
+//! Cluster membership: discovery-driven join, leave, per-group health and Coordinator rollover.
 
 use lattice_actor::runtime::ActorRuntime;
 use lattice_model::actor::ActorId;
@@ -17,6 +17,18 @@ use std::{
 
 use futures_util::Stream;
 use lattice_actor_distributed::registry::{ActorAddressConfig, ActorRegistry, ActorRegistryConfig};
+use lattice_coordination::{
+    control::{DEFAULT_MAX_CONTROL_PAYLOAD, PlacementControlRouter},
+    coordinator::MemberStatus,
+    failpoints,
+    region::EntityConfig,
+    runtime::{
+        GroupCoordinatorConfig,
+        host::{CoordinatorHost, CoordinatorHostConfig},
+    },
+    storage::{ActorGroupStore, InMemoryCoordinationStore, MembershipStore},
+    types::{NodeKey, PlacementSlotKey},
+};
 use lattice_discovery::{
     provider::{
         CoordinatorDirectorySnapshot, CoordinatorDiscovery, DiscoveryError, DiscoveryOrigin,
@@ -29,18 +41,6 @@ use lattice_model::{
     cluster::CoordinatorScope,
     cluster::{ClusterId, EntityType, NodeEndpoint, NodeIncarnation},
 };
-use lattice_placement::{
-    control::{DEFAULT_MAX_CONTROL_PAYLOAD, PlacementControlRouter},
-    coordinator::MemberStatus,
-    failpoints,
-    region::EntityConfig,
-    runtime::{
-        PlacementDomainLeaderConfig,
-        host::{CoordinatorHost, CoordinatorHostConfig},
-    },
-    storage::{InMemoryPlacementStore, MembershipStore, PlacementDomainStore},
-    types::{NodeKey, PlacementSlotKey},
-};
 use tokio::{sync::watch::Receiver, time::Instant};
 
 use super::support::*;
@@ -48,7 +48,7 @@ use crate::{
     builder::{LatticeService, LatticeServiceBuilder},
     cluster::api::ClusterEvent,
     config::ClusterJoinConfig,
-    lifecycle::{NodeLifecycleState, PlacementDomainState},
+    lifecycle::{ActorGroupState, NodeLifecycleState},
     test_support::{network_test_guard, unused_address},
 };
 
@@ -86,7 +86,7 @@ fn discovery_snapshot(
     address: NodeEndpoint,
 ) -> CoordinatorDirectorySnapshot {
     CoordinatorDirectorySnapshot {
-        scope: CoordinatorScope::Placement(placement_domain()),
+        scope: CoordinatorScope::Group(actor_group()),
         generation,
         targets: vec![DiscoveryTarget {
             address,
@@ -153,7 +153,7 @@ async fn static_discovery_joins_and_leaves_without_manual_peer_connection() {
     ))
     .unwrap();
     let associations = coordinator_builder.association_manager();
-    let store = Arc::new(InMemoryPlacementStore::new(32, 32).unwrap());
+    let store = Arc::new(InMemoryCoordinationStore::new(32, 32).unwrap());
     let host = CoordinatorHost::elect(
         store.clone(),
         associations,
@@ -162,11 +162,11 @@ async fn static_discovery_joins_and_leaves_without_manual_peer_connection() {
             address: coordinator_address.clone(),
             incarnation: coordinator_incarnation,
         },
-        BTreeSet::from([placement_domain()]),
+        BTreeSet::from([actor_group()]),
         CoordinatorHostConfig {
-            placement: PlacementDomainLeaderConfig {
+            group: GroupCoordinatorConfig {
                 renewal_interval: Duration::from_millis(100),
-                ..PlacementDomainLeaderConfig::default()
+                ..GroupCoordinatorConfig::default()
             },
             ..CoordinatorHostConfig::default()
         },
@@ -198,7 +198,7 @@ async fn static_discovery_joins_and_leaves_without_manual_peer_connection() {
     .unwrap()
     .coordinator_discovery(Arc::new(
         StaticDiscovery::new(
-            CoordinatorScope::Membership,
+            CoordinatorScope::Cluster,
             "test-membership",
             vec![StaticEndpoint {
                 address: coordinator_address,
@@ -241,9 +241,9 @@ async fn static_discovery_joins_and_leaves_without_manual_peer_connection() {
     assert!(
         member
             .health_snapshot()
-            .domains
+            .groups
             .values()
-            .all(|state| *state == PlacementDomainState::Terminated)
+            .all(|state| *state == ActorGroupState::Terminated)
     );
     assert!(store.get_member("member").await.unwrap().is_none());
     assert!(
@@ -263,7 +263,7 @@ async fn two_discovered_members_leave_sequentially_without_losing_coordinator_se
     let first_address = unused_address().await;
     let second_address = unused_address().await;
     let cluster_id = ClusterId::new("service-multi-member-test").unwrap();
-    let store = Arc::new(InMemoryPlacementStore::new(64, 64).unwrap());
+    let store = Arc::new(InMemoryCoordinationStore::new(64, 64).unwrap());
     let coordinator = coordinator_service(
         store.clone(),
         cluster_id.clone(),
@@ -296,13 +296,13 @@ async fn two_discovered_members_leave_sequentially_without_losing_coordinator_se
             NodeIncarnation::new(incarnation).unwrap(),
         ))
         .unwrap()
-        .proxy_entity::<PingProtocol>(proxy_options(placement_domain(), "membership-probe"))
+        .proxy_entity::<PingProtocol>(proxy_options(actor_group(), "membership-probe"))
         .unwrap()
-        .domain_capacity(placement_domain(), 1)
+        .group_capacity(actor_group(), 1)
         .unwrap()
-        .coordinator_discovery(discovery(CoordinatorScope::Membership))
+        .coordinator_discovery(discovery(CoordinatorScope::Cluster))
         .unwrap()
-        .coordinator_discovery(discovery(CoordinatorScope::Placement(placement_domain())))
+        .coordinator_discovery(discovery(CoordinatorScope::Group(actor_group())))
         .unwrap()
         .join_config(ClusterJoinConfig {
             retry_initial: Duration::from_millis(10),
@@ -346,17 +346,17 @@ async fn two_discovered_members_leave_sequentially_without_losing_coordinator_se
 }
 
 #[tokio::test]
-async fn one_domain_coordinator_loss_leaves_other_domain_ready() {
+async fn one_group_coordinator_loss_leaves_other_group_ready() {
     let _network = network_test_guard().await;
     let membership_address = unused_address().await;
     let coordinator_a_address = unused_address().await;
     let coordinator_b_address = unused_address().await;
     let member_address = unused_address().await;
-    let cluster_id = ClusterId::new("service-domain-isolation-test").unwrap();
-    let store = Arc::new(InMemoryPlacementStore::new(64, 64).unwrap());
-    let domain_a = placement_domain();
-    let domain_b = secondary_domain();
-    let membership_coordinator = coordinator_service_for_domains(
+    let cluster_id = ClusterId::new("service-group-isolation-test").unwrap();
+    let store = Arc::new(InMemoryCoordinationStore::new(64, 64).unwrap());
+    let group_a = actor_group();
+    let group_b = secondary_group();
+    let membership_coordinator = coordinator_service_for_groups(
         store.clone(),
         cluster_id.clone(),
         "membership-coordinator",
@@ -365,22 +365,22 @@ async fn one_domain_coordinator_loss_leaves_other_domain_ready() {
         BTreeSet::new(),
     )
     .await;
-    let coordinator_a = coordinator_service_for_domains(
+    let coordinator_a = coordinator_service_for_groups(
         store.clone(),
         cluster_id.clone(),
         "coordinator-a",
         coordinator_a_address.clone(),
         NodeIncarnation::new(401).unwrap(),
-        BTreeSet::from([domain_a.clone()]),
+        BTreeSet::from([group_a.clone()]),
     )
     .await;
-    let coordinator_b = coordinator_service_for_domains(
+    let coordinator_b = coordinator_service_for_groups(
         store,
         cluster_id.clone(),
         "coordinator-b",
         coordinator_b_address.clone(),
         NodeIncarnation::new(402).unwrap(),
-        BTreeSet::from([domain_b.clone()]),
+        BTreeSet::from([group_b.clone()]),
     )
     .await;
     membership_coordinator.start().await.unwrap();
@@ -403,36 +403,36 @@ async fn one_domain_coordinator_loss_leaves_other_domain_ready() {
     };
     let member = LatticeService::builder(node_config(
         cluster_id,
-        "multi-domain-member",
+        "multi-group-member",
         member_address,
         NodeIncarnation::new(403).unwrap(),
     ))
     .unwrap()
-    .proxy_entity::<PingProtocol>(proxy_options(domain_a.clone(), "domain-a-proxy"))
+    .proxy_entity::<PingProtocol>(proxy_options(group_a.clone(), "group-a-proxy"))
     .unwrap()
-    .proxy_entity::<PingProtocol>(proxy_options(domain_b.clone(), "domain-b-proxy"))
+    .proxy_entity::<PingProtocol>(proxy_options(group_b.clone(), "group-b-proxy"))
     .unwrap()
-    .domain_capacity(domain_a.clone(), 1)
+    .group_capacity(group_a.clone(), 1)
     .unwrap()
-    .domain_capacity(domain_b.clone(), 1)
+    .group_capacity(group_b.clone(), 1)
     .unwrap()
     .coordinator_discovery(discovery(
-        CoordinatorScope::Membership,
+        CoordinatorScope::Cluster,
         "membership",
         "membership-coordinator",
         membership_address,
     ))
     .unwrap()
     .coordinator_discovery(discovery(
-        CoordinatorScope::Placement(domain_a.clone()),
-        "domain-a",
+        CoordinatorScope::Group(group_a.clone()),
+        "group-a",
         "coordinator-a",
         coordinator_a_address,
     ))
     .unwrap()
     .coordinator_discovery(discovery(
-        CoordinatorScope::Placement(domain_b.clone()),
-        "domain-b",
+        CoordinatorScope::Group(group_b.clone()),
+        "group-b",
         "coordinator-b",
         coordinator_b_address,
     ))
@@ -451,8 +451,8 @@ async fn one_domain_coordinator_loss_leaves_other_domain_ready() {
         loop {
             let snapshot = health.borrow().clone();
             if snapshot.node == NodeLifecycleState::Ready
-                && snapshot.domains.get(&domain_a) == Some(&PlacementDomainState::Ready)
-                && snapshot.domains.get(&domain_b) == Some(&PlacementDomainState::Ready)
+                && snapshot.groups.get(&group_a) == Some(&ActorGroupState::Ready)
+                && snapshot.groups.get(&group_b) == Some(&ActorGroupState::Ready)
             {
                 break;
             }
@@ -467,8 +467,8 @@ async fn one_domain_coordinator_loss_leaves_other_domain_ready() {
         loop {
             let snapshot = health.borrow().clone();
             if snapshot.node == NodeLifecycleState::Ready
-                && snapshot.domains.get(&domain_a) == Some(&PlacementDomainState::Degraded)
-                && snapshot.domains.get(&domain_b) == Some(&PlacementDomainState::Ready)
+                && snapshot.groups.get(&group_a) == Some(&ActorGroupState::Degraded)
+                && snapshot.groups.get(&group_b) == Some(&ActorGroupState::Ready)
             {
                 break;
             }
@@ -492,7 +492,7 @@ async fn coordinator_rollover_recovers_after_blocked_session_registration() {
     let address_a = unused_address().await;
     let address_b = unused_address().await;
     let member_address = unused_address().await;
-    let store = Arc::new(InMemoryPlacementStore::new(32, 32).unwrap());
+    let store = Arc::new(InMemoryCoordinationStore::new(32, 32).unwrap());
     let coordinator_a = coordinator_service(
         store.clone(),
         cluster_id.clone(),
@@ -522,7 +522,7 @@ async fn coordinator_rollover_recovers_after_blocked_session_registration() {
         binding.as_ref(),
     ));
     let entity_config = EntityConfig::new(
-        placement_domain(),
+        actor_group(),
         EntityType::new("rollover-ping").unwrap(),
         ProtocolId::new(PROTOCOL_ID).unwrap(),
         8,
@@ -546,15 +546,15 @@ async fn coordinator_rollover_recovers_after_blocked_session_registration() {
     .unwrap()
     .host_entity_with_registry(entity_config, registry, binding, PingLoader)
     .unwrap()
-    .domain_capacity(placement_domain(), 1)
+    .group_capacity(actor_group(), 1)
     .unwrap()
     .coordinator_discovery(Arc::new(WatchDiscovery {
-        scope: CoordinatorScope::Membership,
+        scope: CoordinatorScope::Cluster,
         snapshots: discovery_rx.clone(),
     }))
     .unwrap()
     .coordinator_discovery(Arc::new(WatchDiscovery {
-        scope: CoordinatorScope::Placement(placement_domain()),
+        scope: CoordinatorScope::Group(actor_group()),
         snapshots: discovery_rx,
     }))
     .unwrap()
@@ -591,8 +591,7 @@ async fn coordinator_rollover_recovers_after_blocked_session_registration() {
     cluster
         .wait_for(Duration::from_secs(5), |state| {
             state.health.node == NodeLifecycleState::JoiningMembership
-                && state.health.domains.get(&placement_domain())
-                    == Some(&PlacementDomainState::Degraded)
+                && state.health.groups.get(&actor_group()) == Some(&ActorGroupState::Degraded)
         })
         .await
         .expect("member did not observe membership loss before Coordinator replacement");
@@ -649,7 +648,7 @@ async fn coordinator_rollover_recovers_after_blocked_session_registration() {
     .await
     .unwrap_or_else(|_| {
         panic!(
-            "placement domain did not return to Ready; lifecycle: {:?}; health: {:?}; members: {:?}",
+            "placement group did not return to Ready; lifecycle: {:?}; health: {:?}; members: {:?}",
             member.node_lifecycle_state(),
             member.health_snapshot(),
             member.member_snapshot(),
@@ -675,18 +674,18 @@ async fn an_active_shard_recovers_after_a_transient_association_loss() {
     let coordinator_address = unused_address().await;
     let member_address = unused_address().await;
     let cluster_id = ClusterId::new("service-association-recovery-test").unwrap();
-    let store = Arc::new(InMemoryPlacementStore::new(64, 64).unwrap());
+    let store = Arc::new(InMemoryCoordinationStore::new(64, 64).unwrap());
     let coordinator_incarnation = NodeIncarnation::new(451).unwrap();
     let member_incarnation = NodeIncarnation::new(452).unwrap();
-    let primary_domain = placement_domain();
-    let secondary_domain = secondary_domain();
-    let coordinator = coordinator_service_for_domains(
+    let primary_group = actor_group();
+    let secondary_group = secondary_group();
+    let coordinator = coordinator_service_for_groups(
         store.clone(),
         cluster_id.clone(),
         "coordinator",
         coordinator_address.clone(),
         coordinator_incarnation,
-        BTreeSet::from([primary_domain.clone(), secondary_domain.clone()]),
+        BTreeSet::from([primary_group.clone(), secondary_group.clone()]),
     )
     .await;
     coordinator.start().await.unwrap();
@@ -706,7 +705,7 @@ async fn an_active_shard_recovers_after_a_transient_association_loss() {
     };
     let primary_entity_type = EntityType::new("association-recovery-primary").unwrap();
     let primary_config = EntityConfig::new(
-        primary_domain.clone(),
+        primary_group.clone(),
         primary_entity_type.clone(),
         ProtocolId::new(PROTOCOL_ID).unwrap(),
         1,
@@ -717,7 +716,7 @@ async fn an_active_shard_recovers_after_a_transient_association_loss() {
     .unwrap();
     let secondary_entity_type = EntityType::new("association-recovery-secondary").unwrap();
     let secondary_config = EntityConfig::new(
-        secondary_domain.clone(),
+        secondary_group.clone(),
         secondary_entity_type.clone(),
         ProtocolId::new(PROTOCOL_ID + 1).unwrap(),
         1,
@@ -779,19 +778,15 @@ async fn an_active_shard_recovers_after_a_transient_association_loss() {
         PingLoader,
     )
     .unwrap()
-    .domain_capacity(primary_domain.clone(), 1)
+    .group_capacity(primary_group.clone(), 1)
     .unwrap()
-    .domain_capacity(secondary_domain.clone(), 1)
+    .group_capacity(secondary_group.clone(), 1)
     .unwrap()
-    .coordinator_discovery(discovery(CoordinatorScope::Membership))
+    .coordinator_discovery(discovery(CoordinatorScope::Cluster))
     .unwrap()
-    .coordinator_discovery(discovery(CoordinatorScope::Placement(
-        primary_domain.clone(),
-    )))
+    .coordinator_discovery(discovery(CoordinatorScope::Group(primary_group.clone())))
     .unwrap()
-    .coordinator_discovery(discovery(CoordinatorScope::Placement(
-        secondary_domain.clone(),
-    )))
+    .coordinator_discovery(discovery(CoordinatorScope::Group(secondary_group.clone())))
     .unwrap()
     .join_config(ClusterJoinConfig {
         retry_initial: Duration::from_millis(10),
@@ -836,12 +831,12 @@ async fn an_active_shard_recovers_after_a_transient_association_loss() {
         Pong(3)
     );
     let primary_slot_key = PlacementSlotKey::Shard {
-        domain: primary_domain.clone(),
+        group: primary_group.clone(),
         entity_type: primary_entity_type,
         shard_id: primary_config.shard_for(&primary_entity_id).unwrap(),
     };
     let secondary_slot_key = PlacementSlotKey::Shard {
-        domain: secondary_domain.clone(),
+        group: secondary_group.clone(),
         entity_type: secondary_entity_type,
         shard_id: secondary_config.shard_for(&secondary_entity_id).unwrap(),
     };
@@ -851,12 +846,11 @@ async fn an_active_shard_recovers_after_a_transient_association_loss() {
     std::thread::sleep(Duration::from_secs(7));
     cluster
         .wait_for(Duration::from_secs(5), |state| {
-            state.health.domains.get(&primary_domain) == Some(&PlacementDomainState::Degraded)
-                && state.health.domains.get(&secondary_domain)
-                    == Some(&PlacementDomainState::Degraded)
+            state.health.groups.get(&primary_group) == Some(&ActorGroupState::Degraded)
+                && state.health.groups.get(&secondary_group) == Some(&ActorGroupState::Degraded)
         })
         .await
-        .expect("placement domain did not observe the transient association loss");
+        .expect("placement group did not observe the transient association loss");
     cluster
         .wait_ready(Duration::from_secs(10))
         .await
@@ -914,7 +908,7 @@ async fn a_member_hosting_a_shard_leaves_by_handing_it_over_rather_than_timing_o
     let first_address = unused_address().await;
     let second_address = unused_address().await;
     let cluster_id = ClusterId::new("service-drain-handover-test").unwrap();
-    let store = Arc::new(InMemoryPlacementStore::new(64, 64).unwrap());
+    let store = Arc::new(InMemoryCoordinationStore::new(64, 64).unwrap());
     let coordinator = coordinator_service(
         store.clone(),
         cluster_id.clone(),
@@ -941,7 +935,7 @@ async fn a_member_hosting_a_shard_leaves_by_handing_it_over_rather_than_timing_o
     };
     let entity_type = EntityType::new("drained-ping").unwrap();
     let entity_config = EntityConfig::new(
-        placement_domain(),
+        actor_group(),
         entity_type.clone(),
         ProtocolId::new(PROTOCOL_ID).unwrap(),
         1,
@@ -973,11 +967,11 @@ async fn a_member_hosting_a_shard_leaves_by_handing_it_over_rather_than_timing_o
         .unwrap()
         .host_entity_with_registry(entity_config.clone(), registry, binding, PingLoader)
         .unwrap()
-        .domain_capacity(placement_domain(), 1)
+        .group_capacity(actor_group(), 1)
         .unwrap()
-        .coordinator_discovery(discovery(CoordinatorScope::Membership))
+        .coordinator_discovery(discovery(CoordinatorScope::Cluster))
         .unwrap()
-        .coordinator_discovery(discovery(CoordinatorScope::Placement(placement_domain())))
+        .coordinator_discovery(discovery(CoordinatorScope::Group(actor_group())))
         .unwrap()
         .join_config(ClusterJoinConfig {
             retry_initial: Duration::from_millis(10),
@@ -1012,7 +1006,7 @@ async fn a_member_hosting_a_shard_leaves_by_handing_it_over_rather_than_timing_o
     );
 
     let slot_key = PlacementSlotKey::Shard {
-        domain: placement_domain(),
+        group: actor_group(),
         entity_type,
         shard_id: entity_config.shard_for(&entity_id).unwrap(),
     };

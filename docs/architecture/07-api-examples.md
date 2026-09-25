@@ -147,7 +147,7 @@ async fn main() -> anyhow::Result<()> {
     let application = LatticeService::builder(NodeConfig::from_env()?)
         .host_entity::<PlayerActor, PlayerProtocol, _>(
             EntityOptions::new(
-                PlacementDomainId::new("player")?,
+                ActorGroupId::new("player")?,
                 EntityType::new("player")?,
                 256,
             )
@@ -156,13 +156,13 @@ async fn main() -> anyhow::Result<()> {
         )?
         .host_singleton::<MatchmakerActor, MatchmakerProtocol, _>(
             SingletonOptions::new(
-                PlacementDomainId::new("matchmaking")?,
+                ActorGroupId::new("matchmaking")?,
                 SingletonKind::new("matchmaker")?,
             ),
             MatchmakerFactory::new(app),
         )?
-        .domain_capacity(PlacementDomainId::new("player")?, 8)?
-        .domain_capacity(PlacementDomainId::new("matchmaking")?, 1)?
+        .group_capacity(ActorGroupId::new("player")?, 8)?
+        .group_capacity(ActorGroupId::new("matchmaking")?, 1)?
         .build_embedded(
             placement_store,
             EmbeddedCoordinatorConfig::new(coordinator_node_config),
@@ -181,13 +181,13 @@ that deployment is `Ready`. Embedded mode also requires every managed Coordinato
 `Active` or `Standby`; a `Failed` scope is never hidden behind node readiness. Dedicated candidates
 use the same per-scope rule, and `Ready + Standby` is a healthy candidate.
 
-`shutdown()` is graceful: it closes admission, drains every configured placement domain, and returns
+`shutdown()` is graceful: it closes admission, drains every configured actor group, and returns
 a structured intervention error if retained `StopFailed` Actors prevent durability. It never falls
 back to discarding state. An operator may invoke the explicitly destructive `force_shutdown()` only
 under the force-stop/data-loss procedure in the operations runbook.
 
 `MemberHello` joins the membership scope; the two explicit configurations create independent
-`PlacementDomainHello` sessions with separate capacity, snapshots, terms, routing, and failure
+`ActorGroupHello` sessions with separate capacity, snapshots, terms, routing, and failure
 state. CoordinatorHost may run in dedicated or co-located processes. Business nodes never receive a
 general-purpose placement-store handle in `ClientOnly` mode; embedded candidates intentionally carry
 Coordinator credentials and should be used only where that wider trust boundary is acceptable.
@@ -299,7 +299,7 @@ let ticket = matchmaker
 let matchmaker_watch = ctx.watch_current(matchmaker.clone()).await?;
 ```
 
-The serialized `SingletonRef` includes its explicit placement domain. The local proxy follows only
+The serialized `SingletonRef` includes its explicit actor group. The local proxy follows only
 that domain's assignments. `watch_current` returns `WatchError::Unavailable` when no activation
 exists; failover terminates the old activation watch and the replacement must be watched explicitly.
 

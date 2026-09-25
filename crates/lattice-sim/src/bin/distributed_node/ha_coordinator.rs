@@ -5,7 +5,7 @@ async fn coordinator(artifact: PathBuf, node_id: String, port: u16) -> Result<()
         .collect::<Vec<_>>();
     let run_id = std::env::var("LATTICE_RUN_ID")?;
     let store = Arc::new(
-        EtcdPlacementStore::connect(EtcdPlacementConfig {
+        EtcdCoordinationStore::connect(EtcdCoordinationConfig {
             endpoints,
             cluster_prefix: format!("/lattice-ha/{run_id}"),
             list_page_size: 64,
@@ -33,13 +33,13 @@ async fn coordinator(artifact: PathBuf, node_id: String, port: u16) -> Result<()
         address,
         incarnation,
     };
-    let config = PlacementDomainLeaderConfig {
+    let config = GroupCoordinatorConfig {
         leader_lease_ttl: Duration::from_secs(10),
         renewal_interval: Duration::from_secs(1),
-        ..PlacementDomainLeaderConfig::default()
+        ..GroupCoordinatorConfig::default()
     };
     let mut next_term = 1_u64;
-    let scope = CoordinatorScope::Placement(placement_domain());
+    let scope = CoordinatorScope::Group(actor_group());
     loop {
         match store.get_leader(&scope).await {
             Ok(Some(current)) => {
@@ -47,7 +47,7 @@ async fn coordinator(artifact: PathBuf, node_id: String, port: u16) -> Result<()
             }
             Ok(None) => {
                 let term = CoordinatorTerm::new(next_term)?;
-                match PlacementDomainLeader::elect(
+                match GroupCoordinator::elect(
                     store.clone(),
                     associations.clone(),
                     node.clone(),

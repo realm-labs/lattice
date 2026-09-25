@@ -1,6 +1,6 @@
 fn fixture_entity_config() -> Result<EntityConfig, Box<dyn Error>> {
     Ok(EntityConfig::new(
-        placement_domain(),
+        actor_group(),
         EntityType::new("distributed-entity")?,
         ProtocolId::new(PROTOCOL_ID)?,
         16,
@@ -17,7 +17,7 @@ fn fixture_entity_slot(
 ) -> Result<PlacementSlot, Box<dyn Error>> {
     Ok(PlacementSlot {
         key: PlacementSlotKey::Shard {
-            domain: config.domain.clone(),
+            group: config.group.clone(),
             entity_type: config.entity_type.clone(),
             shard_id: config.shard_for(entity_id).expect("fixture uses Xxh3V1"),
         },
@@ -26,7 +26,7 @@ fn fixture_entity_slot(
         target: None,
         assignment_generation: AssignmentGeneration::new(1)?,
         version: PlacementVersion::new(
-            config.domain.clone(),
+            config.group.clone(),
             CoordinatorTerm::new(1)?,
             Revision::new(1)?,
         ),
@@ -36,8 +36,8 @@ fn fixture_entity_slot(
     })
 }
 
-fn placement_domain() -> PlacementDomainId {
-    PlacementDomainId::new("distributed-simulation").expect("static placement domain is valid")
+fn actor_group() -> ActorGroupId {
+    ActorGroupId::new("distributed-simulation").expect("static placement group is valid")
 }
 
 async fn wait_for_file(path: &PathBuf) -> Result<Vec<u8>, Box<dyn Error>> {

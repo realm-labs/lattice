@@ -14,11 +14,11 @@ use lattice_remoting::{
     association::{AssociationManager, AssociationState},
     bootstrap::{
         BootstrapHandler, BootstrapLeader, BootstrapProbeTarget, BootstrapRejectionCode,
-        BootstrapRequest, BootstrapResponse, BootstrapResult, BootstrapRoute,
+        BootstrapRequest, BootstrapResult, BootstrapRoute,
     },
     config::RemotingConfig,
     endpoint::{EndpointError, RemotingEndpoint},
-    handshake::{FeatureBits, NodeIdentity},
+    handshake::NodeIdentity,
     messaging::{
         error::RemoteMessageError, inbound::InboundDispatch, outbound::OutboundMessaging,
         target::ExactActorTarget,
@@ -288,10 +288,9 @@ async fn ordinary_member_returns_authoritative_leader_redirect() {
     let cluster = ClusterId::new("redirect-test").unwrap();
     let server_identity = identity(cluster.clone(), "member", 2, server_port);
     let leader = BootstrapLeader {
-        scope: CoordinatorScope::Membership,
+        scope: CoordinatorScope::Cluster,
         identity: identity(cluster.clone(), "leader", 4, server_port + 10),
         term: 7,
-        protocol_generation: 3,
     };
     let (server, _) = endpoint(server_identity.clone());
     server.install_bootstrap_handler(Arc::new(RedirectHandler {
@@ -406,33 +405,43 @@ async fn business_frame_before_association_is_rejected_without_registry_entry() 
 }
 
 #[tokio::test]
-async fn missing_required_bootstrap_feature_is_stably_rejected() {
+async fn mismatched_framework_setup_is_rejected_before_association() {
     let server_port = free_port().await;
-    let cluster = ClusterId::new("feature-test").unwrap();
+    let cluster = ClusterId::new("framework-test").unwrap();
     let server_identity = identity(cluster.clone(), "server", 2, server_port);
-    let client_identity = identity(cluster.clone(), "client", 1, server_port - 1);
     let (server, manager) = endpoint(server_identity.clone());
     server.bind().await.unwrap();
-    let mut connection = connect_tcp(
-        &server_identity.address,
-        FrameCodec::new(RemotingConfig::default().max_frame_size).unwrap(),
-    )
-    .await
-    .unwrap();
-    let mut request =
-        BootstrapRequest::new(CoordinatorScope::Membership, client_identity, cluster, None);
-    request.features = FeatureBits::NONE;
-
-    connection.write_frame(&request.to_frame()).await.unwrap();
-    let response = BootstrapResponse::from_frame(&connection.read_frame().await.unwrap()).unwrap();
-
-    assert!(matches!(
-        response.result,
-        BootstrapResult::Rejected {
-            code: BootstrapRejectionCode::MissingRequiredFeature
+    for kind in [FrameKind::BootstrapRequest, FrameKind::Handshake] {
+        let mut connection = connect_tcp(
+            &server_identity.address,
+            FrameCodec::new(RemotingConfig::default().max_frame_size).unwrap(),
+        )
+        .await
+        .unwrap();
+        #[derive(Clone, PartialEq, prost::Message)]
+        struct IdentityEnvelope {
+            #[prost(string, tag = "1")]
+            identity: String,
+            #[prost(bytes = "vec", tag = "2")]
+            payload: Vec<u8>,
         }
-    ));
-    assert!(manager.is_empty());
+        // Invalid inner payload proves rejection does not depend on a compatible codec.
+        let frame = Frame::encode_message(
+            kind,
+            &IdentityEnvelope {
+                identity: "other-version".to_owned(),
+                payload: vec![0xff],
+            },
+        );
+        connection.write_frame(&frame).await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), connection.read_frame())
+                .await
+                .unwrap()
+                .is_err()
+        );
+        assert!(manager.is_empty());
+    }
     server.shutdown().await.unwrap();
 }
 
@@ -554,7 +563,7 @@ async fn tls_probe_binds_returned_identity_to_certificate_incarnation() {
 
     let response = client
         .probe_candidate(BootstrapProbeTarget {
-            scope: CoordinatorScope::Membership,
+            scope: CoordinatorScope::Cluster,
             address: server_identity.address.clone(),
             expected_node_id: Some("server".to_string()),
             tls_server_name: Some("lattice.test".to_string()),
@@ -585,7 +594,7 @@ async fn tls_probe_rejects_certificate_for_different_incarnation() {
 
     let result = client
         .probe_candidate(BootstrapProbeTarget {
-            scope: CoordinatorScope::Membership,
+            scope: CoordinatorScope::Cluster,
             address: server_identity.address.clone(),
             expected_node_id: Some("server".to_string()),
             tls_server_name: Some("lattice.test".to_string()),
@@ -874,7 +883,7 @@ fn identity(cluster_id: ClusterId, node_id: &str, incarnation: u128, port: u16) 
 
 fn target(identity: &NodeIdentity, expected_node_id: Option<&str>) -> BootstrapProbeTarget {
     BootstrapProbeTarget {
-        scope: CoordinatorScope::Membership,
+        scope: CoordinatorScope::Cluster,
         address: identity.address.clone(),
         expected_node_id: expected_node_id.map(str::to_string),
         tls_server_name: None,

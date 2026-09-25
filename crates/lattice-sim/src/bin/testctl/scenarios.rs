@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use super::{MultiDomainHostArtifact, Profile, ScopedLeadershipArtifact};
+use super::{MultiGroupHostArtifact, Profile, ScopedLeadershipArtifact};
 
 pub(super) fn wait_for_host_scope(
     path: &Path,
@@ -12,7 +12,7 @@ pub(super) fn wait_for_host_scope(
     let deadline = Instant::now() + timeout;
     loop {
         if let Ok(encoded) = std::fs::read(path)
-            && let Ok(host) = serde_json::from_slice::<MultiDomainHostArtifact>(&encoded)
+            && let Ok(host) = serde_json::from_slice::<MultiGroupHostArtifact>(&encoded)
             && let Some(leader) = host.scopes.get(scope)
             && leader.term > minimum_term
         {
@@ -40,7 +40,7 @@ pub(super) fn wait_for_scope_across_hosts(
         for name in host_artifacts {
             let path = artifacts.join(name);
             if let Ok(encoded) = std::fs::read(&path)
-                && let Ok(host) = serde_json::from_slice::<MultiDomainHostArtifact>(&encoded)
+                && let Ok(host) = serde_json::from_slice::<MultiGroupHostArtifact>(&encoded)
                 && let Some(leader) = host.scopes.get(scope)
                 && leader.term > minimum_term
             {
@@ -62,14 +62,14 @@ pub(super) fn for_profile(profile: Profile) -> Vec<&'static str> {
         Profile::Sim => vec!["seeded-simulation-suite"],
         Profile::Model => vec![
             "bounded-state-explorer",
-            "multi-domain-bounded-state-explorer",
+            "multi-group-bounded-state-explorer",
         ],
         Profile::E2e => vec![
             "exact-actor-ref-child-watch",
             "gateway-entity-ref-remote-shard",
             "static-discovery-lifecycle",
             "config-store-discovery-lifecycle",
-            "multi-domain-failover",
+            "multi-group-failover",
             "single-member-etcd",
             "tcp",
             "mutual-tls",
@@ -82,17 +82,17 @@ pub(super) fn for_profile(profile: Profile) -> Vec<&'static str> {
         ],
         Profile::Scale => vec!["sixty-four-node-convergence"],
         Profile::Chaos => vec![
-            "multi-domain-failover",
+            "multi-group-failover",
             "control-plane-store-outage-recovery",
             "membership-leader-hard-crash-recovery",
             "member-hard-crash-recovery",
             "etcd-hard-crash-recovery",
             "docker-fault-sequence",
-            "one-domain-coordinator-loss",
+            "one-group-coordinator-loss",
             "membership-loss",
             "drain-force-remove",
             "etcd-lease-expiry",
-            "multi-domain-trace-replay",
+            "multi-group-trace-replay",
             "seed-corpus",
         ],
         Profile::Partition => vec![

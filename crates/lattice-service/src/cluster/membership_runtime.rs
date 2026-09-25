@@ -1,11 +1,11 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use lattice_placement::{
+use lattice_coordination::{
+    cluster_session::{ClusterSession, ClusterSessionHandle, ClusterSessionState},
     control::PlacementControlEvent,
     coordinator::{MemberChange, MemberEvent, MemberHello},
-    membership_session::{MembershipCoordinatorHandle, MembershipSession, MembershipSessionState},
-    session::{LogicCoordinatorConfig, LogicPlacementEffect},
+    session::{GroupSessionConfig, LogicPlacementEffect},
 };
 use lattice_remoting::{
     association::AssociationManager, bootstrap::BootstrapLeader, watch::WatchRegistry,
@@ -17,7 +17,7 @@ use super::{
     peers::PeerReconciler,
 };
 use crate::lifecycle::{
-    NodeLifecycle, NodeLifecycleState, PlacementDomainState, ProductionLifecycleDriver,
+    ActorGroupState, NodeLifecycle, NodeLifecycleState, ProductionLifecycleDriver,
     ServiceHealthSnapshot, ServiceLifecycleEvent,
 };
 
@@ -26,7 +26,7 @@ pub(crate) struct MembershipJoinRuntime {
     pub hello: MemberHello,
     pub associations: Arc<AssociationManager>,
     pub controls: Option<mpsc::Receiver<PlacementControlEvent>>,
-    pub config: LogicCoordinatorConfig,
+    pub config: GroupSessionConfig,
     pub effect_capacity: usize,
     pub peers: Arc<PeerReconciler>,
     pub watches: Arc<Mutex<WatchRegistry>>,
@@ -35,18 +35,18 @@ pub(crate) struct MembershipJoinRuntime {
     pub health: Arc<Mutex<ServiceHealthSnapshot>>,
     pub bootstrap_view: Arc<BootstrapView>,
     pub ready: watch::Sender<bool>,
-    pub handle: Arc<Mutex<Option<MembershipCoordinatorHandle>>>,
+    pub handle: Arc<Mutex<Option<ClusterSessionHandle>>>,
 }
 
-struct MembershipSessionRun {
+struct ClusterSessionRun {
     leader: BootstrapLeader,
-    session: MembershipSession,
-    state: Arc<Mutex<MembershipSessionState>>,
+    session: ClusterSession,
+    state: Arc<Mutex<ClusterSessionState>>,
     controls: mpsc::Receiver<PlacementControlEvent>,
     effects: mpsc::Receiver<LogicPlacementEffect>,
 }
 
-struct MembershipSessionReturn {
+struct ClusterSessionReturn {
     controls: mpsc::Receiver<PlacementControlEvent>,
     retry: bool,
 }
@@ -78,7 +78,7 @@ impl MembershipJoinRuntime {
                             controls = Some(receiver);
                             break;
                         }
-                        let Ok((session, handle, effects)) = MembershipSession::new(
+                        let Ok((session, handle, effects)) = ClusterSession::new(
                             self.hello.clone(),
                             association.key().clone(),
                             self.associations.clone(),
@@ -95,7 +95,7 @@ impl MembershipJoinRuntime {
                         let session_started = Instant::now();
                         let returned = self
                             .run_session(
-                                MembershipSessionRun {
+                                ClusterSessionRun {
                                     leader: leader.clone(),
                                     session,
                                     state,
@@ -162,11 +162,11 @@ impl MembershipJoinRuntime {
 
     async fn run_session(
         &self,
-        run: MembershipSessionRun,
+        run: ClusterSessionRun,
         join_events: &mut mpsc::Receiver<JoinEvent>,
         shutdown: &mut watch::Receiver<bool>,
-    ) -> MembershipSessionReturn {
-        let MembershipSessionRun {
+    ) -> ClusterSessionReturn {
+        let ClusterSessionRun {
             leader,
             session,
             state,
@@ -198,7 +198,7 @@ impl MembershipJoinRuntime {
                     .recovering_membership();
                 let node_state = self.lifecycle_driver.state();
                 if node_state == NodeLifecycleState::JoiningMembership
-                    && (recovering || self.all_domains_ready())
+                    && (recovering || self.all_groups_ready())
                 {
                     let _ = self
                         .lifecycle_driver
@@ -209,7 +209,7 @@ impl MembershipJoinRuntime {
                 result = &mut task => {
                     self.mark_membership_lost();
                     return match result {
-                        Ok((Ok(()), controls)) => MembershipSessionReturn {
+                        Ok((Ok(()), controls)) => ClusterSessionReturn {
                             controls,
                             retry: false,
                         },
@@ -220,7 +220,7 @@ impl MembershipJoinRuntime {
                                 error = ?error,
                                 "membership session stopped; reconciliation required"
                             );
-                            MembershipSessionReturn {
+                            ClusterSessionReturn {
                                 controls,
                                 retry,
                             }
@@ -231,7 +231,7 @@ impl MembershipJoinRuntime {
                                 %error,
                                 "membership session task failed; reconciliation required"
                             );
-                            MembershipSessionReturn {
+                            ClusterSessionReturn {
                                 controls: closed_controls(),
                                 retry: false,
                             }
@@ -245,7 +245,7 @@ impl MembershipJoinRuntime {
                         {
                             self.mark_membership_lost();
                             let _ = session_shutdown.send(true);
-                            return MembershipSessionReturn {
+                            return ClusterSessionReturn {
                                 controls: task.await
                                 .map(|(_, controls)| controls)
                                 .unwrap_or_else(|_| closed_controls()),
@@ -255,7 +255,7 @@ impl MembershipJoinRuntime {
                         Some(JoinEvent::TerminalFailure(_)) | None => {
                             self.mark_membership_lost();
                             let _ = session_shutdown.send(true);
-                            return MembershipSessionReturn {
+                            return ClusterSessionReturn {
                                 controls: task.await
                                 .map(|(_, controls)| controls)
                                 .unwrap_or_else(|_| closed_controls()),
@@ -274,7 +274,7 @@ impl MembershipJoinRuntime {
                             .map(|(_, controls)| controls)
                             .unwrap_or_else(|_| closed_controls());
                         let retry = !controls.is_closed();
-                        return MembershipSessionReturn {
+                        return ClusterSessionReturn {
                             controls,
                             retry,
                         };
@@ -291,7 +291,7 @@ impl MembershipJoinRuntime {
                             retry,
                             "membership session effect failed; reconciliation required"
                         );
-                        return MembershipSessionReturn {
+                        return ClusterSessionReturn {
                             controls,
                             retry,
                         };
@@ -301,7 +301,7 @@ impl MembershipJoinRuntime {
                 changed = shutdown.changed() => {
                     if changed.is_err() || *shutdown.borrow() {
                         let _ = session_shutdown.send(true);
-                        return MembershipSessionReturn {
+                        return ClusterSessionReturn {
                             controls: task.await
                             .map(|(_, controls)| controls)
                             .unwrap_or_else(|_| closed_controls()),
@@ -339,13 +339,13 @@ impl MembershipJoinRuntime {
         }
     }
 
-    fn all_domains_ready(&self) -> bool {
+    fn all_groups_ready(&self) -> bool {
         self.health
             .lock()
             .expect("service health poisoned")
-            .domains
+            .groups
             .values()
-            .all(|state| *state == PlacementDomainState::Ready)
+            .all(|state| *state == ActorGroupState::Ready)
     }
 
     fn mark_membership_lost(&self) {

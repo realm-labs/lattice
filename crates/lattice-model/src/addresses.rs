@@ -3,8 +3,8 @@ use std::marker::PhantomData;
 use serde::{Deserialize, Serialize, de::Error as SerdeDeError};
 
 use crate::primitives::{
-    ActivationId, ActorId, ActorPath, ClusterId, ConfigFingerprint, EntityType, ErasedProtocol,
-    ModelError, NodeEndpoint, NodeIncarnation, PlacementDomainId, ProtocolId, ProtocolTag,
+    ActivationId, ActorGroupId, ActorId, ActorPath, ClusterId, ConfigFingerprint, EntityType,
+    ErasedProtocol, ModelError, NodeEndpoint, NodeIncarnation, ProtocolId, ProtocolTag,
     SingletonKind,
 };
 
@@ -141,7 +141,7 @@ impl<'de, P: ProtocolTag> Deserialize<'de> for ActorAddress<P> {
 #[serde(bound = "")]
 pub struct EntityAddress<P: ProtocolTag = ErasedProtocol> {
     cluster_id: ClusterId,
-    domain: PlacementDomainId,
+    group: ActorGroupId,
     entity_type: EntityType,
     entity_id: ActorId,
     protocol_id: ProtocolId,
@@ -153,7 +153,7 @@ pub struct EntityAddress<P: ProtocolTag = ErasedProtocol> {
 impl<P: ProtocolTag> EntityAddress<P> {
     fn from_parts(
         cluster_id: ClusterId,
-        domain: PlacementDomainId,
+        group: ActorGroupId,
         entity_type: EntityType,
         entity_id: ActorId,
         protocol_id: ProtocolId,
@@ -162,7 +162,7 @@ impl<P: ProtocolTag> EntityAddress<P> {
         validate_protocol::<P>(protocol_id)?;
         Ok(Self {
             cluster_id,
-            domain,
+            group,
             entity_type,
             entity_id,
             protocol_id,
@@ -175,8 +175,8 @@ impl<P: ProtocolTag> EntityAddress<P> {
         &self.cluster_id
     }
 
-    pub fn domain(&self) -> &PlacementDomainId {
-        &self.domain
+    pub fn group(&self) -> &ActorGroupId {
+        &self.group
     }
 
     pub fn entity_type(&self) -> &EntityType {
@@ -198,7 +198,7 @@ impl<P: ProtocolTag> EntityAddress<P> {
     pub fn try_typed<Q: ProtocolTag>(&self) -> Result<EntityAddress<Q>, ModelError> {
         EntityAddress::from_parts(
             self.cluster_id.clone(),
-            self.domain.clone(),
+            self.group.clone(),
             self.entity_type.clone(),
             self.entity_id.clone(),
             self.protocol_id,
@@ -209,7 +209,7 @@ impl<P: ProtocolTag> EntityAddress<P> {
     pub fn erase(&self) -> EntityAddress<ErasedProtocol> {
         EntityAddress {
             cluster_id: self.cluster_id.clone(),
-            domain: self.domain.clone(),
+            group: self.group.clone(),
             entity_type: self.entity_type.clone(),
             entity_id: self.entity_id.clone(),
             protocol_id: self.protocol_id,
@@ -222,7 +222,7 @@ impl<P: ProtocolTag> EntityAddress<P> {
 impl EntityAddress<ErasedProtocol> {
     pub fn new(
         cluster_id: ClusterId,
-        domain: PlacementDomainId,
+        group: ActorGroupId,
         entity_type: EntityType,
         entity_id: ActorId,
         protocol_id: ProtocolId,
@@ -230,7 +230,7 @@ impl EntityAddress<ErasedProtocol> {
     ) -> Result<Self, ModelError> {
         Self::from_parts(
             cluster_id,
-            domain,
+            group,
             entity_type,
             entity_id,
             protocol_id,
@@ -242,7 +242,7 @@ impl EntityAddress<ErasedProtocol> {
 #[derive(Deserialize)]
 struct EntityAddressData {
     cluster_id: ClusterId,
-    domain: PlacementDomainId,
+    group: ActorGroupId,
     entity_type: EntityType,
     entity_id: ActorId,
     protocol_id: ProtocolId,
@@ -257,7 +257,7 @@ impl<'de, P: ProtocolTag> Deserialize<'de> for EntityAddress<P> {
         let data = EntityAddressData::deserialize(deserializer)?;
         Self::from_parts(
             data.cluster_id,
-            data.domain,
+            data.group,
             data.entity_type,
             data.entity_id,
             data.protocol_id,
@@ -271,7 +271,7 @@ impl<'de, P: ProtocolTag> Deserialize<'de> for EntityAddress<P> {
 #[serde(bound = "")]
 pub struct SingletonAddress<P: ProtocolTag = ErasedProtocol> {
     cluster_id: ClusterId,
-    domain: PlacementDomainId,
+    group: ActorGroupId,
     singleton_kind: SingletonKind,
     protocol_id: ProtocolId,
     singleton_config_fingerprint: ConfigFingerprint,
@@ -282,7 +282,7 @@ pub struct SingletonAddress<P: ProtocolTag = ErasedProtocol> {
 impl<P: ProtocolTag> SingletonAddress<P> {
     fn from_parts(
         cluster_id: ClusterId,
-        domain: PlacementDomainId,
+        group: ActorGroupId,
         singleton_kind: SingletonKind,
         protocol_id: ProtocolId,
         singleton_config_fingerprint: ConfigFingerprint,
@@ -290,7 +290,7 @@ impl<P: ProtocolTag> SingletonAddress<P> {
         validate_protocol::<P>(protocol_id)?;
         Ok(Self {
             cluster_id,
-            domain,
+            group,
             singleton_kind,
             protocol_id,
             singleton_config_fingerprint,
@@ -302,8 +302,8 @@ impl<P: ProtocolTag> SingletonAddress<P> {
         &self.cluster_id
     }
 
-    pub fn domain(&self) -> &PlacementDomainId {
-        &self.domain
+    pub fn group(&self) -> &ActorGroupId {
+        &self.group
     }
 
     pub fn singleton_kind(&self) -> &SingletonKind {
@@ -321,7 +321,7 @@ impl<P: ProtocolTag> SingletonAddress<P> {
     pub fn try_typed<Q: ProtocolTag>(&self) -> Result<SingletonAddress<Q>, ModelError> {
         SingletonAddress::from_parts(
             self.cluster_id.clone(),
-            self.domain.clone(),
+            self.group.clone(),
             self.singleton_kind.clone(),
             self.protocol_id,
             self.singleton_config_fingerprint,
@@ -331,7 +331,7 @@ impl<P: ProtocolTag> SingletonAddress<P> {
     pub fn erase(&self) -> SingletonAddress<ErasedProtocol> {
         SingletonAddress {
             cluster_id: self.cluster_id.clone(),
-            domain: self.domain.clone(),
+            group: self.group.clone(),
             singleton_kind: self.singleton_kind.clone(),
             protocol_id: self.protocol_id,
             singleton_config_fingerprint: self.singleton_config_fingerprint,
@@ -343,14 +343,14 @@ impl<P: ProtocolTag> SingletonAddress<P> {
 impl SingletonAddress<ErasedProtocol> {
     pub fn new(
         cluster_id: ClusterId,
-        domain: PlacementDomainId,
+        group: ActorGroupId,
         singleton_kind: SingletonKind,
         protocol_id: ProtocolId,
         singleton_config_fingerprint: ConfigFingerprint,
     ) -> Result<Self, ModelError> {
         Self::from_parts(
             cluster_id,
-            domain,
+            group,
             singleton_kind,
             protocol_id,
             singleton_config_fingerprint,
@@ -361,7 +361,7 @@ impl SingletonAddress<ErasedProtocol> {
 #[derive(Deserialize)]
 struct SingletonAddressData {
     cluster_id: ClusterId,
-    domain: PlacementDomainId,
+    group: ActorGroupId,
     singleton_kind: SingletonKind,
     protocol_id: ProtocolId,
     singleton_config_fingerprint: ConfigFingerprint,
@@ -375,7 +375,7 @@ impl<'de, P: ProtocolTag> Deserialize<'de> for SingletonAddress<P> {
         let data = SingletonAddressData::deserialize(deserializer)?;
         Self::from_parts(
             data.cluster_id,
-            data.domain,
+            data.group,
             data.singleton_kind,
             data.protocol_id,
             data.singleton_config_fingerprint,
@@ -509,7 +509,7 @@ mod tests {
 
         let entity = EntityAddress::new(
             ClusterId::new("test").unwrap(),
-            PlacementDomainId::new("world").unwrap(),
+            ActorGroupId::new("world").unwrap(),
             EntityType::new("world").unwrap(),
             ActorId::new(b"entity-1".to_vec()).unwrap(),
             ProtocolId::new(7).unwrap(),
@@ -524,7 +524,7 @@ mod tests {
 
         let singleton = SingletonAddress::new(
             ClusterId::new("test").unwrap(),
-            PlacementDomainId::new("control").unwrap(),
+            ActorGroupId::new("control").unwrap(),
             SingletonKind::new("leader").unwrap(),
             ProtocolId::new(7).unwrap(),
             ConfigFingerprint::new([2; 32]),

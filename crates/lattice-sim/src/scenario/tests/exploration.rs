@@ -4,7 +4,7 @@
 //! checks the safety properties the reducer must hold in every reachable state, independently of
 //! the seeded workload.
 
-use lattice_placement::handoff::{HandoffEffect, HandoffMachine, HandoffPhase};
+use lattice_coordination::handoff::{HandoffEffect, HandoffMachine, HandoffPhase};
 
 use crate::{
     explorer::Explorable,

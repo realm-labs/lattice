@@ -155,7 +155,6 @@ async fn receiving_a_handshake_does_not_restart_the_inbound_setup_deadline() {
                 lane: LaneKind::Control,
                 connection_nonce: 1,
                 maximum_frame_size: server.config.max_frame_size,
-                features: FeatureBits::REQUIRED_V3,
             }
             .to_frame(),
         )

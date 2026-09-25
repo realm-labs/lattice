@@ -22,27 +22,24 @@ use lattice_actor_distributed::{
     },
     registry::{ActorAddressConfig, ActorLoader, ActorRegistry, ActorRegistryConfig},
 };
-use lattice_discovery::provider::CoordinatorDiscovery;
-use lattice_model::{
-    actor::{ProtocolId, RecipientAddress},
-    cluster::CoordinatorScope,
-    cluster::PlacementDomainId,
-};
-use lattice_placement::{
+use lattice_coordination::{
     control::{PlacementControlDirectory, PlacementControlEvent, PlacementControlRouter},
-    coordinator::{LeaderRecord, MemberEvent, MemberHello, PlacementDomainHello, SingletonConfig},
+    coordinator::{ActorGroupHello, LeaderRecord, MemberEvent, MemberHello, SingletonConfig},
     mapping::{ShardMapper, Xxh3V1ShardMapper},
     region::EntityConfig,
     runtime::{
-        CoordinatorHandle,
+        GroupCoordinatorHandle,
         host::{CoordinatorHost, CoordinatorHostScopeState},
     },
-    session::{
-        LogicCoordinatorConfig, LogicCoordinatorHandle, LogicPlacementEffect,
-        PlacementDomainSession,
-    },
-    storage::{CoordinatorLeaseStore, MembershipStore, PlacementDomainStore, ScopedElectionStore},
+    session::{GroupSession, GroupSessionConfig, GroupSessionHandle, LogicPlacementEffect},
+    storage::{ActorGroupStore, CoordinatorLeaseStore, MembershipStore, ScopedElectionStore},
     types::NodeKey,
+};
+use lattice_discovery::provider::CoordinatorDiscovery;
+use lattice_model::{
+    actor::{ProtocolId, RecipientAddress},
+    cluster::ActorGroupId,
+    cluster::CoordinatorScope,
 };
 #[cfg(feature = "tls")]
 use lattice_remoting::endpoint::EndpointSecurity;
@@ -60,10 +57,10 @@ use tokio::sync::{mpsc, watch};
 
 use crate::{
     backend::{
-        DomainRouterDirectory, LogicalRouter, ServiceInboundDispatch, ServiceRecipientBackend,
+        GroupRouterDirectory, LogicalRouter, ServiceInboundDispatch, ServiceRecipientBackend,
     },
     cluster::{
-        ClusterRouterError, DomainLogicalRouter, LogicalBufferConfig,
+        ClusterRouterError, GroupLogicalRouter, LogicalBufferConfig,
         join::{BootstrapView, JoinController},
         members::{MemberDirectory, MemberSnapshot},
         membership_runtime::MembershipJoinRuntime,
@@ -75,7 +72,7 @@ use crate::{
     error::ServiceError,
     exact_tell_routes::ExactTellRouteCache,
     lifecycle::{
-        NodeAdmissionGate, NodeLifecycle, NodeLifecycleState, PlacementDomainState,
+        ActorGroupState, NodeAdmissionGate, NodeLifecycle, NodeLifecycleState,
         ProductionLifecycleDriver, ServiceHealthSnapshot, ServiceLifecycleEvent,
     },
     registration::{EntityOptions, SingletonOptions},
@@ -84,13 +81,13 @@ use crate::{
 
 type ActorSystemInstaller =
     Box<dyn Fn(&ActorSystem) -> Result<(), ProtocolRegistrationError> + Send + Sync>;
-type DomainEntityInstaller =
-    dyn Fn(&mut DomainLogicalRouter) -> Result<(), ClusterRouterError> + Send + Sync;
+type GroupEntityInstaller =
+    dyn Fn(&mut GroupLogicalRouter) -> Result<(), ClusterRouterError> + Send + Sync;
 
 #[derive(Clone)]
 pub(crate) struct LogicalEntityInstaller {
-    pub domain: PlacementDomainId,
-    pub install: Arc<DomainEntityInstaller>,
+    pub group: ActorGroupId,
+    pub install: Arc<GroupEntityInstaller>,
 }
 
 pub struct LatticeServiceBuilder {
@@ -117,22 +114,22 @@ pub struct LatticeServiceBuilder {
     discoveries: BTreeMap<CoordinatorScope, Arc<dyn CoordinatorDiscovery>>,
     join_config: ClusterJoinConfig,
     member_event_capacity: usize,
-    domain_capacity: BTreeMap<PlacementDomainId, u64>,
+    group_capacity: BTreeMap<ActorGroupId, u64>,
 }
 
 struct LogicRuntimeAssembly {
-    domain: PlacementDomainId,
-    session: PlacementDomainSession,
+    group: ActorGroupId,
+    session: GroupSession,
     controls: mpsc::Receiver<PlacementControlEvent>,
     effects: mpsc::Receiver<LogicPlacementEffect>,
-    handle: LogicCoordinatorHandle,
+    handle: GroupSessionHandle,
     router: Arc<dyn LogicalRouter>,
 }
 
 struct CoordinatorRuntimeAssembly {
     future: Pin<Box<dyn Future<Output = ()> + Send>>,
     shutdown: watch::Sender<bool>,
-    handles: BTreeMap<PlacementDomainId, CoordinatorHandle>,
+    handles: BTreeMap<ActorGroupId, GroupCoordinatorHandle>,
     bootstrap_leaders: Vec<BootstrapLeader>,
     directory: watch::Receiver<BTreeMap<CoordinatorScope, LeaderRecord>>,
     scope_states: watch::Receiver<BTreeMap<CoordinatorScope, CoordinatorHostScopeState>>,
@@ -185,7 +182,7 @@ impl LatticeServiceBuilder {
             discoveries: BTreeMap::new(),
             join_config: ClusterJoinConfig::default(),
             member_event_capacity: 256,
-            domain_capacity: BTreeMap::new(),
+            group_capacity: BTreeMap::new(),
             associations,
             messaging,
         })
@@ -208,28 +205,28 @@ impl LatticeServiceBuilder {
         &self.config
     }
 
-    pub(crate) fn hosted_domains(&self) -> BTreeSet<PlacementDomainId> {
+    pub(crate) fn hosted_groups(&self) -> BTreeSet<ActorGroupId> {
         self.entity_configs
             .iter()
-            .map(|config| config.domain.clone())
+            .map(|config| config.group.clone())
             .chain(
                 self.singleton_configs
                     .iter()
-                    .map(|config| config.domain.clone()),
+                    .map(|config| config.group.clone()),
             )
             .collect()
     }
 
-    pub(crate) fn placement_domains(&self) -> BTreeSet<PlacementDomainId> {
+    pub(crate) fn actor_groups(&self) -> BTreeSet<ActorGroupId> {
         self.entity_configs
             .iter()
             .chain(self.proxied_entity_configs.iter())
-            .map(|config| config.domain.clone())
+            .map(|config| config.group.clone())
             .chain(
                 self.singleton_configs
                     .iter()
                     .chain(self.proxied_singleton_configs.iter())
-                    .map(|config| config.domain.clone()),
+                    .map(|config| config.group.clone()),
             )
             .collect()
     }
@@ -294,7 +291,7 @@ impl LatticeServiceBuilder {
 
     /// Advanced entity registration using a prebuilt registry and binding.
     ///
-    /// The entity declaration is advertised in `PlacementDomainHello`, its protocol is
+    /// The entity declaration is advertised in `ActorGroupHello`, its protocol is
     /// installed in the service catalogue, and the loader is re-registered
     /// automatically whenever discovery selects a new Coordinator.
     pub fn host_entity_with_registry<D: ActorDefinition<Protocol = P>, A, L, P>(
@@ -347,12 +344,12 @@ impl LatticeServiceBuilder {
             .iter()
             .chain(self.proxied_entity_configs.iter())
             .any(|registered| {
-                registered.domain == config.domain && registered.entity_type == config.entity_type
+                registered.group == config.group && registered.entity_type == config.entity_type
             })
         {
             return Err(ServiceError::LogicalRouter(
                 ClusterRouterError::DuplicateEntity {
-                    domain: config.domain,
+                    group: config.group,
                     entity_type: config.entity_type,
                 },
             ));
@@ -360,7 +357,7 @@ impl LatticeServiceBuilder {
         self = self.register_actor(registry.clone(), protocol.clone())?;
         self.entity_configs.push(config.clone());
         self.entity_installers.push(LogicalEntityInstaller {
-            domain: config.domain.clone(),
+            group: config.group.clone(),
             install: Arc::new(move |router| {
                 router.register_entity_with_mapper(
                     config.clone(),
@@ -415,12 +412,12 @@ impl LatticeServiceBuilder {
             .iter()
             .chain(self.proxied_entity_configs.iter())
             .any(|registered| {
-                registered.domain == config.domain && registered.entity_type == config.entity_type
+                registered.group == config.group && registered.entity_type == config.entity_type
             })
         {
             return Err(ServiceError::LogicalRouter(
                 ClusterRouterError::DuplicateEntity {
-                    domain: config.domain,
+                    group: config.group,
                     entity_type: config.entity_type,
                 },
             ));
@@ -429,7 +426,7 @@ impl LatticeServiceBuilder {
         self = self.register_protocol(protocol)?;
         self.proxied_entity_configs.push(config.clone());
         self.entity_installers.push(LogicalEntityInstaller {
-            domain: config.domain.clone(),
+            group: config.group.clone(),
             install: Arc::new(move |router| {
                 router.register_entity_proxy_with_mapper(
                     config.clone(),
@@ -490,11 +487,11 @@ impl LatticeServiceBuilder {
             .singleton_configs
             .iter()
             .chain(self.proxied_singleton_configs.iter())
-            .any(|registered| registered.domain == config.domain && registered.kind == config.kind)
+            .any(|registered| registered.group == config.group && registered.kind == config.kind)
         {
             return Err(ServiceError::LogicalRouter(
                 ClusterRouterError::DuplicateSingleton {
-                    domain: config.domain,
+                    group: config.group,
                     kind: config.kind,
                 },
             ));
@@ -502,7 +499,7 @@ impl LatticeServiceBuilder {
         self = self.register_actor(registry.clone(), protocol.clone())?;
         self.singleton_configs.push(config.clone());
         self.entity_installers.push(LogicalEntityInstaller {
-            domain: config.domain.clone(),
+            group: config.group.clone(),
             install: Arc::new(move |router| {
                 router.register_singleton(
                     config.clone(),
@@ -544,11 +541,11 @@ impl LatticeServiceBuilder {
             .singleton_configs
             .iter()
             .chain(self.proxied_singleton_configs.iter())
-            .any(|registered| registered.domain == config.domain && registered.kind == config.kind)
+            .any(|registered| registered.group == config.group && registered.kind == config.kind)
         {
             return Err(ServiceError::LogicalRouter(
                 ClusterRouterError::DuplicateSingleton {
-                    domain: config.domain,
+                    group: config.group,
                     kind: config.kind,
                 },
             ));
@@ -557,7 +554,7 @@ impl LatticeServiceBuilder {
         self = self.register_protocol(protocol)?;
         self.proxied_singleton_configs.push(config.clone());
         self.entity_installers.push(LogicalEntityInstaller {
-            domain: config.domain.clone(),
+            group: config.group.clone(),
             install: Arc::new(move |router| {
                 router.register_singleton_proxy(config.clone(), fingerprint)
             }),
@@ -623,7 +620,7 @@ impl LatticeServiceBuilder {
     ) -> Result<Self, ServiceError> {
         let scope = discovery.scope().clone();
         if self.discoveries.insert(scope, discovery).is_some() {
-            return Err(ServiceError::InvalidPlacementDomains);
+            return Err(ServiceError::InvalidActorGroups);
         }
         Ok(self)
     }
@@ -638,17 +635,12 @@ impl LatticeServiceBuilder {
         self
     }
 
-    pub fn domain_capacity(
+    pub fn group_capacity(
         mut self,
-        domain: PlacementDomainId,
+        group: ActorGroupId,
         capacity_units: u64,
     ) -> Result<Self, ServiceError> {
-        if capacity_units == 0
-            || self
-                .domain_capacity
-                .insert(domain, capacity_units)
-                .is_some()
-        {
+        if capacity_units == 0 || self.group_capacity.insert(group, capacity_units).is_some() {
             return Err(ServiceError::InvalidCapacity);
         }
         Ok(self)
@@ -658,17 +650,17 @@ impl LatticeServiceBuilder {
         mut self,
         router: Arc<dyn LogicalRouter>,
         dispatch: Arc<PlacementControlRouter>,
-        session: PlacementDomainSession,
+        session: GroupSession,
         controls: mpsc::Receiver<PlacementControlEvent>,
         effects: mpsc::Receiver<LogicPlacementEffect>,
     ) -> Self {
         let handle = session.control_handle();
-        let domain = handle.domain().clone();
+        let group = handle.group().clone();
         self.control_scope = Some(session.coordinator_key().clone());
         self.logical = Some(router.clone());
         self.control_dispatch = dispatch;
         self.logic_runtime = Some(LogicRuntimeAssembly {
-            domain,
+            group,
             session,
             controls,
             effects,
@@ -685,25 +677,25 @@ impl LatticeServiceBuilder {
         controls: mpsc::Receiver<PlacementControlEvent>,
     ) -> Self
     where
-        S: CoordinatorLeaseStore + ScopedElectionStore + MembershipStore + PlacementDomainStore,
+        S: CoordinatorLeaseStore + ScopedElectionStore + MembershipStore + ActorGroupStore,
     {
         let directory = host.subscribe_directory();
         let scope_states = host.subscribe_scope_states();
         let mut scope_records = Vec::new();
         if let Some(CoordinatorHostScopeState::Active(record)) =
-            host.scope_state(&CoordinatorScope::Membership)
+            host.scope_state(&CoordinatorScope::Cluster)
         {
             scope_records.push(record.clone());
         }
         scope_records.extend(
-            host.active_domain_leaders()
+            host.active_group_leaders()
                 .map(|(_, record)| record.clone()),
         );
         let handles = host
-            .active_domain_leaders()
-            .filter_map(|(domain, _)| {
-                host.domain_handle(domain)
-                    .map(|handle| (domain.clone(), handle))
+            .active_group_leaders()
+            .filter_map(|(group, _)| {
+                host.group_handle(group)
+                    .map(|handle| (group.clone(), handle))
             })
             .collect::<BTreeMap<_, _>>();
         let (shutdown, shutdown_rx) = watch::channel(false);
@@ -718,7 +710,6 @@ impl LatticeServiceBuilder {
                     incarnation: record.node.incarnation,
                 },
                 term: record.term.get(),
-                protocol_generation: record.protocol_generation,
             })
             .collect();
         self.control_dispatch = dispatch;
@@ -760,7 +751,7 @@ impl LatticeServiceBuilder {
                 PlacementControlDirectory::new(
                     self.member_event_capacity,
                     self.config.maximum_actor_protocols,
-                    lattice_placement::control::DEFAULT_MAX_CONTROL_PAYLOAD,
+                    lattice_coordination::control::DEFAULT_MAX_CONTROL_PAYLOAD,
                 )
                 .map_err(ServiceError::PlacementControl)?,
             );
@@ -774,25 +765,25 @@ impl LatticeServiceBuilder {
                     fingerprint: *fingerprint,
                 })
                 .collect();
-            let domains = self
+            let groups = self
                 .entity_configs
                 .iter()
                 .chain(self.proxied_entity_configs.iter())
-                .map(|config| config.domain.clone())
+                .map(|config| config.group.clone())
                 .chain(
                     self.singleton_configs
                         .iter()
                         .chain(self.proxied_singleton_configs.iter())
-                        .map(|config| config.domain.clone()),
+                        .map(|config| config.group.clone()),
                 )
                 .collect::<BTreeSet<_>>();
-            if !domains.is_empty() {
+            if !groups.is_empty() {
                 let directory = Arc::new(
-                    DomainRouterDirectory::new(
-                        domains.iter().cloned(),
+                    GroupRouterDirectory::new(
+                        groups.iter().cloned(),
                         self.config.maximum_actor_protocols,
                     )
-                    .map_err(|_| ServiceError::InvalidPlacementDomains)?,
+                    .map_err(|_| ServiceError::InvalidActorGroups)?,
                 );
                 self.logical = Some(directory.clone());
                 discovered_router = Some(directory);
@@ -809,11 +800,11 @@ impl LatticeServiceBuilder {
                 protocols,
                 remoting_capabilities: BTreeSet::new(),
             };
-            let membership_scope = CoordinatorScope::Membership;
+            let membership_scope = CoordinatorScope::Cluster;
             let membership_discovery = self
                 .discoveries
                 .remove(&membership_scope)
-                .ok_or(ServiceError::InvalidPlacementDomains)?;
+                .ok_or(ServiceError::InvalidActorGroups)?;
             let membership_controls = dispatch
                 .register(membership_scope)
                 .map_err(ServiceError::PlacementControl)?;
@@ -822,15 +813,15 @@ impl LatticeServiceBuilder {
                 membership_controls,
                 member_hello.clone(),
             ));
-            for domain in domains {
-                let scope = CoordinatorScope::Placement(domain.clone());
+            for group in groups {
+                let scope = CoordinatorScope::Group(group.clone());
                 let discovery = self
                     .discoveries
                     .remove(&scope)
-                    .ok_or(ServiceError::InvalidPlacementDomains)?;
+                    .ok_or(ServiceError::InvalidActorGroups)?;
                 let capacity = self
-                    .domain_capacity
-                    .remove(&domain)
+                    .group_capacity
+                    .remove(&group)
                     .ok_or(ServiceError::InvalidCapacity)?;
                 let controls = dispatch
                     .register(scope)
@@ -838,32 +829,32 @@ impl LatticeServiceBuilder {
                 let hosted = self
                     .entity_configs
                     .iter()
-                    .filter(|config| config.domain == domain)
+                    .filter(|config| config.group == group)
                     .cloned()
                     .collect::<Vec<_>>();
                 let proxied = self
                     .proxied_entity_configs
                     .iter()
-                    .filter(|config| config.domain == domain)
+                    .filter(|config| config.group == group)
                     .cloned()
                     .collect::<Vec<_>>();
                 let hosted_singletons = self
                     .singleton_configs
                     .iter()
-                    .filter(|config| config.domain == domain)
+                    .filter(|config| config.group == group)
                     .cloned()
                     .collect::<Vec<_>>();
                 let proxied_singletons = self
                     .proxied_singleton_configs
                     .iter()
-                    .filter(|config| config.domain == domain)
+                    .filter(|config| config.group == group)
                     .cloned()
                     .collect::<Vec<_>>();
                 auto_join.push((
                     discovery,
                     controls,
                     member_hello.clone(),
-                    PlacementDomainHello::builder(node.clone(), domain, capacity)
+                    ActorGroupHello::builder(node.clone(), group, capacity)
                         .hosted_entity_types(
                             hosted
                                 .iter()
@@ -893,8 +884,8 @@ impl LatticeServiceBuilder {
                         .build(),
                 ));
             }
-            if !self.discoveries.is_empty() || !self.domain_capacity.is_empty() {
-                return Err(ServiceError::InvalidPlacementDomains);
+            if !self.discoveries.is_empty() || !self.group_capacity.is_empty() {
+                return Err(ServiceError::InvalidActorGroups);
             }
         }
         let associations = self.associations;
@@ -918,7 +909,7 @@ impl LatticeServiceBuilder {
                 self.config.remoting.max_prepared_exact_tell_routes,
             ),
             watches: watches.clone(),
-            maximum_control_payload: lattice_placement::control::DEFAULT_MAX_CONTROL_PAYLOAD,
+            maximum_control_payload: lattice_coordination::control::DEFAULT_MAX_CONTROL_PAYLOAD,
             supervisor: supervisor.clone(),
             logical: logical.clone(),
             admission: admission.clone(),
@@ -940,7 +931,7 @@ impl LatticeServiceBuilder {
                 hosts.clone(),
                 watches.clone(),
                 supervisor.clone(),
-                lattice_placement::control::DEFAULT_MAX_CONTROL_PAYLOAD,
+                lattice_coordination::control::DEFAULT_MAX_CONTROL_PAYLOAD,
                 self.control_scope,
             )
             .map_err(ServiceError::Control)?,
@@ -992,24 +983,24 @@ impl LatticeServiceBuilder {
         let (lifecycle_events, _) = watch::channel(NodeLifecycleState::Booting);
         let mut initial_logic_handles = BTreeMap::new();
         if let Some(runtime) = self.logic_runtime.as_ref() {
-            initial_logic_handles.insert(runtime.domain.clone(), runtime.handle.clone());
+            initial_logic_handles.insert(runtime.group.clone(), runtime.handle.clone());
         }
         let logic_handles = Arc::new(Mutex::new(initial_logic_handles));
         let (drain_ready, _) = watch::channel(BTreeMap::new());
         let (drain_blockers, _) = watch::channel(BTreeMap::new());
-        let mut configured_domains = auto_join
+        let mut configured_groups = auto_join
             .iter()
-            .map(|(_, _, _, hello)| hello.domain.clone())
+            .map(|(_, _, _, hello)| hello.group.clone())
             .collect::<BTreeSet<_>>();
         if let Some(runtime) = self.logic_runtime.as_ref() {
-            configured_domains.insert(runtime.domain.clone());
+            configured_groups.insert(runtime.group.clone());
         }
         let health = Arc::new(Mutex::new(ServiceHealthSnapshot {
             node: NodeLifecycleState::Booting,
-            domains: configured_domains
+            groups: configured_groups
                 .iter()
                 .cloned()
-                .map(|domain| (domain, PlacementDomainState::Joining))
+                .map(|group| (group, ActorGroupState::Joining))
                 .collect(),
             coordinator_scopes: BTreeMap::new(),
         }));
@@ -1037,7 +1028,7 @@ impl LatticeServiceBuilder {
         let membership_handle = Arc::new(Mutex::new(None));
         let join_runtimes = auto_join
             .into_iter()
-            .map(|(discovery, controls, _member_hello, domain_hello)| {
+            .map(|(discovery, controls, _member_hello, group_hello)| {
                 let controller = JoinController::new(
                     discovery,
                     endpoint.clone(),
@@ -1047,10 +1038,10 @@ impl LatticeServiceBuilder {
                 .map_err(ServiceError::Join)?;
                 Ok(LogicJoinRuntime {
                     controller: Arc::new(controller),
-                    domain_hello,
+                    group_hello,
                     associations: associations.clone(),
                     controls: Some(controls),
-                    config: LogicCoordinatorConfig::default(),
+                    config: GroupSessionConfig::default(),
                     effect_capacity: self.member_event_capacity,
                     router: discovered_router
                         .clone()
@@ -1087,7 +1078,7 @@ impl LatticeServiceBuilder {
                     hello,
                     associations: associations.clone(),
                     controls: Some(controls),
-                    config: LogicCoordinatorConfig::default(),
+                    config: GroupSessionConfig::default(),
                     effect_capacity: self.member_event_capacity,
                     peers: peers.clone(),
                     watches: watches.clone(),
@@ -1130,7 +1121,7 @@ impl LatticeServiceBuilder {
             bootstrap_view,
             drain_ready,
             drain_blockers,
-            configured_domains,
+            configured_groups,
             drain_operation: Mutex::new(None),
             join_config: self.join_config,
             force_actor_shutdown: AtomicBool::new(false),

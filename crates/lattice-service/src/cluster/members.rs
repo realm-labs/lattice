@@ -3,11 +3,11 @@ use std::{
     sync::Mutex,
 };
 
-use lattice_model::cluster::NodeIncarnation;
-use lattice_placement::{
+use lattice_coordination::{
     coordinator::{MemberChange, MemberEvent, MemberRecord, MemberStatus},
     types::{MembershipVersion, NodeKey},
 };
+use lattice_model::cluster::NodeIncarnation;
 use thiserror::Error;
 use tokio::sync::broadcast;
 
@@ -175,13 +175,13 @@ pub enum MemberDirectoryError {
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
 
-    use lattice_model::cluster::{NodeEndpoint, NodeIncarnation};
-    use lattice_placement::{
+    use lattice_coordination::{
         coordinator::{
             MemberChange, MemberEvent, MemberHello, MemberRecord, MemberRemovalReason, MemberStatus,
         },
         types::{CoordinatorTerm, MembershipVersion, NodeKey, Revision},
     };
+    use lattice_model::cluster::{NodeEndpoint, NodeIncarnation};
 
     use super::{MemberDirectory, MemberDirectoryError};
 

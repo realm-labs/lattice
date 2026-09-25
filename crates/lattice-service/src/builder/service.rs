@@ -11,11 +11,11 @@ use lattice_actor_distributed::{
     recipient::{WatchSubscription, WatchTarget},
     registry::ActorCellDiagnostics,
 };
+use lattice_coordination::{cluster_session::ClusterSessionHandle, types::PlacementSlotKey};
 use lattice_model::{
     actor::{ActorAddress, EntityAddress, SingletonAddress},
     cluster::ClusterId,
 };
-use lattice_placement::{membership_session::MembershipCoordinatorHandle, types::PlacementSlotKey};
 use tokio::{sync::broadcast::Receiver, time::Instant};
 
 use crate::{
@@ -30,12 +30,12 @@ use crate::{
 };
 
 use super::{
-    ActorSystem, Arc, Association, AssociationManager, AtomicBool, BTreeMap, BTreeSet,
-    BootstrapLeader, BootstrapView, ClusterJoinConfig, CoordinatorHandle,
-    CoordinatorHostScopeState, CoordinatorRuntimeAssembly, LatticeServiceBuilder,
-    LogicCoordinatorHandle, LogicJoinRuntime, LogicRuntimeAssembly, MemberDirectory, MemberEvent,
-    MemberSnapshot, MembershipJoinRuntime, Message, Mutex, NodeConfig, NodeIdentity, NodeKey,
-    NodeLifecycleState, OutboundMessaging, PeerReconciler, PlacementDomainId, PlacementDomainState,
+    ActorGroupId, ActorGroupState, ActorSystem, Arc, Association, AssociationManager, AtomicBool,
+    BTreeMap, BTreeSet, BootstrapLeader, BootstrapView, ClusterJoinConfig,
+    CoordinatorHostScopeState, CoordinatorRuntimeAssembly, GroupCoordinatorHandle,
+    GroupSessionHandle, LatticeServiceBuilder, LogicJoinRuntime, LogicRuntimeAssembly,
+    MemberDirectory, MemberEvent, MemberSnapshot, MembershipJoinRuntime, Message, Mutex,
+    NodeConfig, NodeIdentity, NodeKey, NodeLifecycleState, OutboundMessaging, PeerReconciler,
     ProductionLifecycleDriver, ProtocolHostRegistry, RecipientAddress, RecipientError,
     RemotingEndpoint, Request, ServiceError, ServiceHealthSnapshot, ServiceLifecycleEvent,
     SupportsAsk, SupportsTell, TaskSupervisor, WatchRegistry, watch,
@@ -54,14 +54,14 @@ pub struct LatticeService {
     pub(super) join_runtimes: Mutex<Vec<LogicJoinRuntime>>,
     pub(super) membership_join_runtime: Mutex<Option<MembershipJoinRuntime>>,
     pub(super) membership_required: bool,
-    pub(super) membership_handle: Arc<Mutex<Option<MembershipCoordinatorHandle>>>,
+    pub(super) membership_handle: Arc<Mutex<Option<ClusterSessionHandle>>>,
     pub(super) logic_shutdown: Mutex<Option<watch::Sender<bool>>>,
     pub(super) join_shutdown: Mutex<Option<watch::Sender<bool>>>,
-    pub(super) logic_handles: Arc<Mutex<BTreeMap<PlacementDomainId, LogicCoordinatorHandle>>>,
+    pub(super) logic_handles: Arc<Mutex<BTreeMap<ActorGroupId, GroupSessionHandle>>>,
     pub(super) watches: Arc<Mutex<WatchRegistry>>,
     pub(super) coordinator_runtime: Mutex<Option<CoordinatorRuntimeAssembly>>,
     pub(super) coordinator_shutdown: Mutex<Option<watch::Sender<bool>>>,
-    pub(super) coordinator_handles: Mutex<BTreeMap<PlacementDomainId, CoordinatorHandle>>,
+    pub(super) coordinator_handles: Mutex<BTreeMap<ActorGroupId, GroupCoordinatorHandle>>,
     pub(super) lifecycle_driver: ProductionLifecycleDriver,
     pub(super) lifecycle_events: watch::Sender<NodeLifecycleState>,
     pub(super) health: Arc<Mutex<ServiceHealthSnapshot>>,
@@ -69,10 +69,9 @@ pub struct LatticeService {
     pub(super) members: Arc<MemberDirectory>,
     pub(super) peers: Arc<PeerReconciler>,
     pub(super) bootstrap_view: Arc<BootstrapView>,
-    pub(super) drain_ready: watch::Sender<BTreeMap<PlacementDomainId, String>>,
-    pub(super) drain_blockers:
-        watch::Sender<BTreeMap<PlacementDomainId, BTreeSet<PlacementSlotKey>>>,
-    pub(super) configured_domains: BTreeSet<PlacementDomainId>,
+    pub(super) drain_ready: watch::Sender<BTreeMap<ActorGroupId, String>>,
+    pub(super) drain_blockers: watch::Sender<BTreeMap<ActorGroupId, BTreeSet<PlacementSlotKey>>>,
+    pub(super) configured_groups: BTreeSet<ActorGroupId>,
     pub(super) drain_operation: Mutex<Option<String>>,
     pub(super) join_config: ClusterJoinConfig,
     pub(super) force_actor_shutdown: AtomicBool,
@@ -220,11 +219,11 @@ impl LatticeService {
         &self.supervisor
     }
 
-    pub fn coordinator(&self, domain: &PlacementDomainId) -> Option<CoordinatorHandle> {
+    pub fn coordinator(&self, group: &ActorGroupId) -> Option<GroupCoordinatorHandle> {
         self.coordinator_handles
             .lock()
             .expect("service Coordinator handles poisoned")
-            .get(domain)
+            .get(group)
             .cloned()
     }
 
@@ -375,7 +374,6 @@ impl LatticeService {
                                 incarnation: record.node.incarnation,
                             },
                             term: record.term.get(),
-                            protocol_generation: record.protocol_generation,
                         })
                         .collect();
                     bootstrap_view.replace(leaders);
@@ -476,7 +474,7 @@ impl LatticeService {
                 .lock()
                 .expect("service logic shutdown poisoned") = Some(shutdown);
             let LogicRuntimeAssembly {
-                domain,
+                group,
                 session,
                 controls,
                 mut effects,
@@ -509,7 +507,7 @@ impl LatticeService {
                 let _ = session.run(controls, shutdown_rx).await;
             })?;
             let applier = LogicEffectApplier {
-                domain: domain.clone(),
+                group: group.clone(),
                 incarnation: self.endpoint.local_identity().incarnation,
                 router,
                 peers: self.peers.clone(),
@@ -524,11 +522,10 @@ impl LatticeService {
                     if applier.apply(effect, &handle).await.is_err() {
                         tracing::warn!(
                             target: "lattice.cluster.logic",
-                            domain = %domain.as_str(),
+                            group = %group.as_str(),
                             "logic placement effect failed; reconciliation required"
                         );
-                        lifecycle_driver
-                            .set_domain_state(domain.clone(), PlacementDomainState::Degraded);
+                        lifecycle_driver.set_group_state(group.clone(), ActorGroupState::Degraded);
                         let _ = lifecycle_driver.transition(ServiceLifecycleEvent::CoordinatorLost);
                         break;
                     }
@@ -594,10 +591,10 @@ impl LatticeService {
             }
             let retry_at =
                 (Instant::now() + self.join_config.leadership_refresh_interval).min(deadline);
-            if self.configured_domains.iter().all(|domain| {
+            if self.configured_groups.iter().all(|group| {
                 ready
                     .borrow()
-                    .get(domain)
+                    .get(group)
                     .is_some_and(|completed| completed == &operation_id)
             }) {
                 let membership = self
@@ -623,7 +620,7 @@ impl LatticeService {
                             "membership drain confirmation pending; retrying within the leave deadline"
                         ),
                     }
-                } else if !self.membership_required && self.configured_domains.is_empty() {
+                } else if !self.membership_required && self.configured_groups.is_empty() {
                     self.transition(ServiceLifecycleEvent::DrainComplete)?;
                     return self.stop_components().await;
                 }
@@ -645,7 +642,7 @@ impl LatticeService {
     /// it, is indistinguishable from a slow one until the leave deadline expires. Waiting it out
     /// turns a graceful leave into the crash path it exists to avoid, so the command is re-driven
     /// on whichever sessions are live while the deadline lasts. It is idempotent on its operation
-    /// ID, and a domain that already reported ready is left alone.
+    /// ID, and a group that already reported ready is left alone.
     fn redrive_drain(&self, operation_id: &str) {
         let handles = self
             .logic_handles
@@ -653,9 +650,9 @@ impl LatticeService {
             .expect("logic handles poisoned")
             .clone();
         let completed = self.drain_ready.borrow().clone();
-        for (domain, handle) in &handles {
+        for (group, handle) in &handles {
             if completed
-                .get(domain)
+                .get(group)
                 .is_some_and(|current| current == operation_id)
             {
                 continue;
@@ -663,7 +660,7 @@ impl LatticeService {
             if let Err(error) = handle.begin_drain(operation_id.to_owned()) {
                 tracing::warn!(
                     target: "lattice.cluster.lifecycle",
-                    domain = %domain.as_str(),
+                    group = %group.as_str(),
                     %error,
                     "graceful leave could not re-send its drain request"
                 );
@@ -811,9 +808,9 @@ impl LatticeService {
             runtime.shutdown();
         }
         if self.node_lifecycle_state() == NodeLifecycleState::Stopping {
-            for domain in &self.configured_domains {
+            for group in &self.configured_groups {
                 self.lifecycle_driver
-                    .set_domain_state(domain.clone(), PlacementDomainState::Terminated);
+                    .set_group_state(group.clone(), ActorGroupState::Terminated);
             }
             self.transition(ServiceLifecycleEvent::ShutdownComplete)?;
         }
@@ -826,7 +823,7 @@ impl LatticeService {
             .borrow()
             .iter()
             .filter(|(_, slots)| !slots.is_empty())
-            .map(|(domain, slots)| (domain.clone(), slots.iter().cloned().collect()))
+            .map(|(group, slots)| (group.clone(), slots.iter().cloned().collect()))
             .collect();
         let report = LifecycleInterventionReport {
             blocked_slots,
@@ -845,8 +842,8 @@ impl LatticeService {
 #[cfg(test)]
 mod drain_deadline_tests {
     use super::*;
+    use lattice_coordination::{cluster_session::ClusterSession, coordinator::MemberHello};
     use lattice_model::cluster::{NodeEndpoint, NodeIncarnation};
-    use lattice_placement::{coordinator::MemberHello, membership_session::MembershipSession};
     use lattice_remoting::config::RemotingConfig;
 
     fn service() -> LatticeService {
@@ -932,7 +929,7 @@ mod drain_deadline_tests {
             protocols: Vec::new(),
             remoting_capabilities: Default::default(),
         };
-        let (_session, handle, _effects) = MembershipSession::new(
+        let (_session, handle, _effects) = ClusterSession::new(
             hello,
             association.key().clone(),
             service.associations.clone(),
@@ -967,11 +964,11 @@ mod drain_deadline_tests {
     #[tokio::test(start_paused = true)]
     async fn leave_retries_the_replacement_membership_session_with_the_same_operation_and_deadline()
     {
-        use lattice_model::cluster::CoordinatorScope;
-        use lattice_placement::control::{
+        use lattice_coordination::control::{
             PlacementControlCommand, PlacementControlRouter, control_stream_id,
             decode_control_command, encode_control_command_for_term,
         };
+        use lattice_model::cluster::CoordinatorScope;
         use lattice_remoting::control::{CommandId, ControlDispatch, decode_control_envelope};
         let service = Arc::new(service());
         let identity = service.endpoint.local_identity();
@@ -994,7 +991,7 @@ mod drain_deadline_tests {
                 NodeIncarnation::new(2).unwrap(),
             )
             .unwrap();
-        let (_old_session, old_handle, _old_effects) = MembershipSession::new(
+        let (_old_session, old_handle, _old_effects) = ClusterSession::new(
             hello.clone(),
             stale.key().clone(),
             service.associations.clone(),
@@ -1017,7 +1014,7 @@ mod drain_deadline_tests {
                 NodeIncarnation::new(3).unwrap(),
             )
             .unwrap();
-        let (session, handle, _effects) = MembershipSession::new(
+        let (session, handle, _effects) = ClusterSession::new(
             hello,
             replacement.key().clone(),
             service.associations.clone(),
@@ -1043,7 +1040,7 @@ mod drain_deadline_tests {
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
         let payload = encode_control_command_for_term(
-            &CoordinatorScope::Membership,
+            &CoordinatorScope::Cluster,
             2,
             &PlacementControlCommand::DrainCommitted {
                 operation_id,
@@ -1055,7 +1052,7 @@ mod drain_deadline_tests {
         controls
             .apply(
                 replacement.key().clone(),
-                control_stream_id(&CoordinatorScope::Membership),
+                control_stream_id(&CoordinatorScope::Cluster),
                 CommandId::generate(),
                 payload,
             )

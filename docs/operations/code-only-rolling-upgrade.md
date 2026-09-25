@@ -18,14 +18,20 @@ Until that design is implemented, deploy one application version at a time:
    lifecycle APIs. Keep required Coordinators available until draining completes.
 2. Stop all old application and Coordinator processes and confirm their leases and
    ownership are no longer live.
-3. Perform any required explicit offline state/schema migration.
+3. For a framework identity change, prepare a fresh coordination namespace. Existing
+   runtime metadata is not upgraded or automatically deleted. Handle durable business
+   data separately; legacy storage migration tooling has been removed.
 4. Start the new Coordinators and application nodes, verify readiness, then reopen
    admission.
 
-Transport, Coordinator control, storage-schema, message-protocol, and placement
+Exact framework admission, business-message protocol fingerprints, and allocation
 configuration checks remain independent safeguards. They do not validate handler
 semantics, durable business-state compatibility, or the application service ABI.
 
-The strict automatic Lattice identity, cluster-wide shutdown, and scoped runtime
-reset described in the [control-plane memo](../cluster-control-plane-memo.md) are
-planned work, not capabilities added by removal of the release mechanism.
+Automatic exact Lattice identity checks now guard bootstrap, handshakes, and
+Coordinator namespace initialization. Published packages and development builds use
+the exact Cargo package version without a source digest. Same-version source changes
+are not detected: developers must deploy consistent builds and bump the version for
+incompatible protocol or storage changes. A restart alone does not change the identity.
+Cluster-wide shutdown and scoped runtime reset remain
+planned; see the [implementation checkpoint](../cluster-control-plane-memo.md#96-verification-and-completion-tracking).

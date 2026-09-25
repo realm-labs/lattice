@@ -7,19 +7,19 @@ use std::{
 
 use async_trait::async_trait;
 use lattice_actor_distributed::host::ProtocolHostRegistry;
-use lattice_model::cluster::{ClusterId, NodeIncarnation};
-use lattice_placement::session::{
-    LogicCoordinatorConfig, LogicCoordinatorHandle, LogicPlacementEffect, PlacementDomainSession,
+use lattice_coordination::session::{
+    GroupSession, GroupSessionConfig, GroupSessionHandle, LogicPlacementEffect,
 };
+use lattice_model::cluster::{ClusterId, NodeIncarnation};
 use lattice_remoting::{
     config::RemotingConfig, endpoint::RemotingEndpoint, handshake::NodeIdentity,
     watch::WatchRegistry,
 };
 use tokio::sync::watch;
 
-use super::support::{attach_coordinator, domain, test_hello};
+use super::support::{attach_coordinator, group, test_hello};
 use crate::{
-    backend::{DomainRouterDirectory, ServiceInboundDispatch},
+    backend::{GroupRouterDirectory, ServiceInboundDispatch},
     cluster::{members::MemberDirectory, peers::PeerReconciler, runtime::LogicEffectApplier, *},
     lifecycle::NodeAdmissionGate,
     supervisor::TaskSupervisor,
@@ -94,11 +94,7 @@ impl LogicalRouter for PendingDrainRouter {
 async fn test_effect_applier(
     router: Arc<dyn LogicalRouter>,
     node_id: &str,
-) -> (
-    LogicEffectApplier,
-    LogicCoordinatorHandle,
-    PlacementDomainSession,
-) {
+) -> (LogicEffectApplier, GroupSessionHandle, GroupSession) {
     let cluster_id = ClusterId::new("effect-applier-test").unwrap();
     let local_incarnation = NodeIncarnation::new(41).unwrap();
     let coordinator_incarnation = NodeIncarnation::new(42).unwrap();
@@ -130,11 +126,11 @@ async fn test_effect_applier(
         BTreeSet::new(),
         BTreeSet::new(),
     );
-    let (session, _effects) = PlacementDomainSession::new(
-        hello.domain,
+    let (session, _effects) = GroupSession::new(
+        hello.group,
         coordinator,
         associations.clone(),
-        LogicCoordinatorConfig::default(),
+        GroupSessionConfig::default(),
         32,
         1,
     )
@@ -163,7 +159,7 @@ async fn test_effect_applier(
     let (drain_ready, _) = watch::channel(BTreeMap::new());
     let (drain_blockers, _) = watch::channel(BTreeMap::new());
     let applier = LogicEffectApplier {
-        domain: domain(),
+        group: group(),
         incarnation: local_incarnation,
         router,
         peers: Arc::new(PeerReconciler::new(
@@ -186,7 +182,7 @@ async fn stop_failed_slot_watcher_runs_under_the_task_supervisor() {
     let (applier, handle, _session) =
         test_effect_applier(Arc::new(PendingDrainRouter), "stop-failed-watcher").await;
     let slot = PlacementSlotKey::Singleton {
-        domain: domain(),
+        group: group(),
         kind: SingletonKind::new("watched-singleton").unwrap(),
     };
 
@@ -234,11 +230,11 @@ async fn drain_ready_for_a_foreign_incarnation_never_reaches_the_coordinator() {
         BTreeSet::new(),
         BTreeSet::new(),
     );
-    let (logic, _effects) = PlacementDomainSession::new(
-        hello.domain,
+    let (logic, _effects) = GroupSession::new(
+        hello.group,
         coordinator,
         associations.clone(),
-        LogicCoordinatorConfig::default(),
+        GroupSessionConfig::default(),
         32,
         1,
     )
@@ -267,9 +263,9 @@ async fn drain_ready_for_a_foreign_incarnation_never_reaches_the_coordinator() {
     let (drain_ready, _) = watch::channel(BTreeMap::new());
     let (drain_blockers, _) = watch::channel(BTreeMap::new());
     let applier = LogicEffectApplier {
-        domain: domain(),
+        group: group(),
         incarnation: local_incarnation,
-        router: Arc::new(DomainRouterDirectory::new([domain()], 4).unwrap()),
+        router: Arc::new(GroupRouterDirectory::new([group()], 4).unwrap()),
         peers: Arc::new(PeerReconciler::new(
             cluster_id,
             endpoint,

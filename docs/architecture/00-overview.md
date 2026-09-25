@@ -19,14 +19,14 @@ All cross-node messages
   -> framed TCP, optionally TLS
 
 Control plane
-  -> membership leader plus independent placement-domain leaders
+  -> Cluster Coordinator plus independent Group Coordinators
   -> independent etcd
 ```
 
 The framework has one internal transport model. It does not expose gRPC or Direct Link as parallel business APIs. Business code exchanges typed messages through actor references; remoting serializes those messages and manages node associations internally.
 
 Unlike Akka/Pekko Cluster, lattice does not use Gossip. Membership leadership and each
-placement-domain leadership, shard ownership, claim, and singleton record are stored in etcd under
+Group Coordinatorship, shard ownership, claim, and singleton record are stored in etcd under
 their exact scope. Normal actor messages never pass through etcd or a control-plane leader.
 
 ### 0.1 Why Direct Link Disappears
@@ -175,10 +175,10 @@ Association(local NodeIncarnation, remote NodeIncarnation)
 
 All connections share Association identity, protocol negotiation, authorization, lifecycle, metrics, and closing. They use separate bounded queues and socket-owner tasks so bulk writes cannot head-of-line block heartbeat, DeathWatch, Coordinator control, asks, or replies. The group is created lazily per communicating node pair and is not a business-visible connection pool.
 
-The control connection carries one Association-scoped reliable control stream. Commands that must survive reconnect use sequence numbers, cumulative acknowledgements, a bounded replay outbox, and idempotent application. DeathWatch, membership/domain state, claims, handoff, drain, and Singleton control reuse this mechanism; tell/ask business frames do not.
+The control connection carries one Association-scoped reliable control stream. Commands that must survive reconnect use sequence numbers, cumulative acknowledgements, a bounded replay outbox, and idempotent application. DeathWatch, cluster/group state, claims, handoff, drain, and Singleton control reuse this mechanism; tell/ask business frames do not.
 
-Only CoordinatorHost processes receive generation-5 membership/domain write credentials. Ordinary
-nodes discover one membership scope plus every placement domain they host or proxy; after bootstrap,
+Only CoordinatorHost processes receive cluster/group write credentials. Ordinary
+nodes discover one membership scope plus every actor group they host or proxy; after bootstrap,
 control moves to remoting. etcd is not connected to actor mailboxes, ShardRegion hot paths, Gateway
 forwarding, or EventBus delivery.
 
@@ -198,7 +198,7 @@ still keep credentials and failure domains narrow.
 | Shard host | Owns Shard tasks and activates entities for eligible entity types | Role/capacity eligibility plus valid shard claims |
 | Singleton proxy | Resolves `SingletonRef` and buffers briefly during failover | Present where a singleton is called |
 | Singleton host | Runs SingletonManager and singleton activation | Role eligibility plus valid singleton claim |
-| CoordinatorHost | Independently campaigns for membership and explicitly configured placement domains | The only role with generation-5 control-store credentials |
+| CoordinatorHost | Independently campaigns for membership and explicitly configured actor groups | The only role with control-store credentials |
 | Event subscriber | Converts typed broker events into service work or actor messages | Optional broker connection |
 | Ops endpoint | Health, readiness, metrics, inspection, drain/admin adapter | Optional external HTTP adapter |
 
@@ -324,7 +324,7 @@ Routing rules:
 2. `EntityRef` always enters the caller's local ShardRegion. The Region derives `shard_id` from the `entity_id`; it never extracts routing identity from the business payload.
 3. `SingletonRef` always enters the caller's local SingletonProxy.
 4. Local and remote delivery converge on the same bounded mailbox and typed `Handler<M>`.
-5. Known entity/singleton homes use only cached state from their exact placement domain and direct remoting; they do not query etcd or hop through a leader.
+5. Known entity/singleton homes use only cached state from their exact actor group and direct remoting; they do not query etcd or hop through a leader.
 
 ### 4.2 Tell, Ask, Watch, and Event Delivery
 
@@ -364,7 +364,7 @@ sequenceDiagram
     N-->>M: JoinReady(snapshot version)
     M->>E: exact Joining to Up transaction
     M-->>N: MemberDelta(Up)
-    N->>C: domain bootstrap + PlacementDomainHello
+    N->>C: domain bootstrap + ActorGroupHello
     C-->>N: bounded snapshot for exactly one domain
     N->>N: validate scope, count, bytes, digest and PlacementVersion
     N->>R: atomically install this domain's configs, slots, claims and plans
@@ -381,7 +381,7 @@ sequenceDiagram
 ```
 
 Every node has one membership session carrying bounded `MemberHello`. It also has one
-`PlacementDomainSession` per explicitly hosted/proxied domain carrying `PlacementDomainHello`,
+`GroupSession` per explicitly hosted/proxied domain carrying `ActorGroupHello`,
 positive domain capacity, configurations, constraints, and subscriptions. There is no implicit
 default domain. Each snapshot/delta stream contains exactly one scope; a new Region/Proxy is Ready
 only after its domain snapshot is installed.
@@ -483,13 +483,13 @@ flowchart TB
     subgraph Service["Service and domain"]
         direction LR
         Node["NodeLifecycleState<br/>Booting → JoiningMembership → Ready<br/>Draining → Stopping → Terminated"]
-        Domain["PlacementDomainState<br/>Joining ↔ Ready ↔ Degraded<br/>Draining → Terminated"]
+        Domain["ActorGroupState<br/>Joining ↔ Ready ↔ Degraded<br/>Draining → Terminated"]
     end
 
     subgraph Control["Connections and control plane"]
         direction LR
         Association["AssociationState<br/>Establishing → Active ↔ Reconnecting<br/>Closing → Closed"]
-        Membership["MemberStatus / DomainMemberStatus<br/>Joining → Up → Leaving"]
+        Membership["MemberStatus / GroupMemberStatus<br/>Joining → Up → Leaving"]
         Coordinator["CoordinatorScopeState<br/>Standby ↔ Active<br/>Failed"]
     end
 
@@ -536,7 +536,7 @@ Legend:
   four principal failure paths.
 - `Panicked`, `ActorPanicked`, and member removal are termination results, request outcomes, or
   events rather than persistent lifecycle states.
-- Each placement domain, Coordinator scope, and Association advances independently; the atlas is
+- Each actor group, Coordinator scope, and Association advances independently; the atlas is
   not a global transaction.
 - The state machines below and [Actor Runtime](01-actor-runtime.md),
   [Remoting and RPC](02-rpc.md), and [Placement](03-placement.md) remain authoritative for detailed
@@ -681,12 +681,12 @@ A failed Actor stopping durability hook never drops the Actor instance or emits 
 Force stop is an explicit, ticketed data-loss operation and is never a graceful-shutdown fallback.
 Only a valid claim holder may serve a shard or singleton generation.
 Shard and Singleton use one placement-slot authority engine for generation, claim, drain, and fencing while retaining distinct routing and lifecycle semantics.
-Allocation/rebalance strategies return proposals only; the placement-domain leader revalidates and persists every move before the existing handoff/claim state machine changes authority.
+Allocation/rebalance strategies return proposals only; the Group Coordinator revalidates and persists every move before the existing handoff/claim state machine changes authority.
 Automatic rebalance is bounded per domain by freshness, hysteresis, cooldown, minimum residence and concurrency limits, and stops while that domain is degraded or unreconciled.
 Control commands use bounded sequenced delivery plus idempotent reconciliation; business tell/ask frames are never replayed by that mechanism.
 Control-connection loss stops new Association data admission in v1.
 Known routes continue during temporary loss of their domain leader while claims remain valid.
-Unknown placement cannot be invented during placement-domain leader loss.
+Unknown placement cannot be invented during Group Coordinator loss.
 No membership or placement transaction can read or mutate another scope/domain.
 etcd is control-plane storage, never a per-message routing database.
 ```
@@ -706,8 +706,8 @@ lattice-actor-distributed
 lattice-remoting
   codec registry, wire frames, TCP/TLS associations, tell/ask/watch transport
 
-lattice-placement
-  membership/domain protocols, CoordinatorHost, generation-5 etcd metadata, shards, claims, singletons
+lattice-coordination
+  cluster/group protocols, CoordinatorHost, etcd metadata, shards, claims, singletons
 
 lattice-service
   process assembly, ShardRegions, SingletonProxies, drain and shutdown
@@ -729,14 +729,14 @@ lattice exposes no framework gRPC service or business transport through it.
 ## 8. Verification Architecture
 
 Distributed correctness is tested at four layers: pure state-machine reducers, deterministic seeded
-multi-domain simulation/model exploration and trace replay, real Docker multi-process/TCP/TLS/etcd
+multi-group simulation/model exploration and trace replay, real Docker multi-process/TCP/TLS/etcd
 scenarios, and chaos/soak runs. The e2e topology includes a dedicated membership host, three domain
-leaders, a multi-domain standby, and two logic nodes; one-domain loss must not change unrelated
+leaders, a multi-group standby, and two logic nodes; one-group loss must not change unrelated
 terms or readiness.
 
 The Logic service lifecycle is one of those production reducers. Service start/shutdown executes its
 `Booting -> JoiningMembership -> Ready -> Draining/Stopping -> Terminated` transitions. Each
-placement domain independently executes `Joining -> Ready/Degraded -> Draining -> Terminated`;
+actor group independently executes `Joining -> Ready/Degraded -> Draining -> Terminated`;
 `Degraded` is not a node lifecycle state. `lattice-sim::ServiceLifecycleAdapter` invokes the same
 production reducer rather than a test-only model.
 

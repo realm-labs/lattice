@@ -156,21 +156,21 @@ Composite sources merge in order; later values override earlier values. Final co
 
 Bootstrap candidates come from the static, ConfigStore, DNS, and Kubernetes EndpointSlice providers
 defined in [Cluster Discovery Providers](../cluster-discovery.md). These providers expose addresses
-only. The authenticated bootstrap probe and `MembershipLeader` admission establish exact identity
+only. The authenticated bootstrap probe and `ClusterCoordinator` admission establish exact identity
 and membership; a separate scoped probe establishes each configured placement-domain session.
 Provider data is never a routing or placement authority.
 
 CoordinatorHost processes receive authenticated etcd configuration and the authority to campaign
 for explicitly configured scopes. Ordinary runtime and Gateway nodes receive only narrow bootstrap
-clients that locate the membership leader and required placement-domain leaders.
+clients that locate the Cluster Coordinator and required Group Coordinators.
 
 ```rust
 let bootstrap = ConfigSource::file("config/player-service.toml").load()?;
-let player_domain = PlacementDomainId::new("player")?;
+let player_domain = ActorGroupId::new("player")?;
 let service = LatticeService::builder(bootstrap.section::<NodeConfig>("node")?)
     .coordinator_discovery(membership_discovery()?)?
     .coordinator_discovery(placement_discovery(player_domain.clone())?)?
-    .domain_capacity(player_domain, 8)?
+    .group_capacity(player_domain, 8)?
     .build()?;
 
 let event_bus = NatsEventBus::connect(bootstrap.section("event_bus")?).await?;

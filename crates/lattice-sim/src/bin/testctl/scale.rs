@@ -65,7 +65,7 @@ pub(super) fn run(artifacts: &Path) -> Result<(), String> {
                 &artifacts.join("scale-convergence.json"),
                 &ConvergenceArtifact {
                     expected_members,
-                    membership_coordinator: "domain-membership",
+                    membership_coordinator: "group-membership",
                     logic_nodes: expected_logic,
                     membership_term: version.term,
                     membership_revision: version.revision,
@@ -147,7 +147,7 @@ fn evaluate_convergence(
     let mut expected_version = None;
     let mut expected_directory = None;
     for (index, node) in nodes.iter().enumerate() {
-        if node.lifecycle != "Ready" || !node.domains.is_empty() {
+        if node.lifecycle != "Ready" || !node.groups.is_empty() {
             return Ok(None);
         }
         let Some(version) = node.membership_version else {
@@ -265,7 +265,7 @@ fn observation(
 ) -> String {
     let ready = nodes
         .iter()
-        .filter(|node| node.lifecycle == "Ready" && node.domains.is_empty())
+        .filter(|node| node.lifecycle == "Ready" && node.groups.is_empty())
         .count();
     let complete_membership = nodes
         .iter()
@@ -300,7 +300,7 @@ mod tests {
                 node_id: format!("logic-{index:02}"),
                 incarnation: index as u128 + 100,
                 lifecycle: "Ready".to_owned(),
-                domains: Default::default(),
+                groups: Default::default(),
                 membership_version: Some(version),
                 members: members.clone(),
                 join_millis: Some(100),
@@ -360,7 +360,7 @@ mod tests {
     fn convergence_artifact_streams_full_u128_incarnations() {
         let artifact = ConvergenceArtifact {
             expected_members: 1,
-            membership_coordinator: "domain-membership",
+            membership_coordinator: "group-membership",
             logic_nodes: 1,
             membership_term: 1,
             membership_revision: 2,

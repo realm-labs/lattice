@@ -22,7 +22,7 @@ suspect after: 3 missed heartbeats
 maximum ask deadline: 30 s
 membership/domain snapshot chunk: 192 KiB; maximum assembled snapshot: 64 MiB / 5 s per session
 claim grant: 15 s TTL, renew every 5 s, 2 s local safety margin
-placement-domain leader recovery objective: less than claim TTL minus safety margin
+Group Coordinator recovery objective: less than claim TTL minus safety margin
 placement capacity: explicit positive units per node and joined domain; no global default pool
 entity passivation: 10 min, configured per type
 ShardRegion buffer: 1024 messages per shard, 10000 messages / 64 MiB per region
@@ -96,4 +96,4 @@ The framework does not require a business database and does not persist actor st
 
 ## 7. Summary
 
-Use concrete `ActorRef` for one live activation, `EntityRef` for a movable/passivated sharded identity, and `SingletonRef` for a failover-capable singleton. Logical references include an explicit placement domain. Shard and Singleton keep separate public semantics while sharing domain authority; membership/domain protocols use reliable control without replaying business traffic. etcd and scoped leaders establish control-plane truth and stay out of healthy known message paths.
+Use concrete `ActorRef` for one live activation, `EntityRef` for a movable/passivated sharded identity, and `SingletonRef` for a failover-capable singleton. Logical references include an explicit actor group. Shard and Singleton keep separate public semantics while sharing domain authority; membership/domain protocols use reliable control without replaying business traffic. etcd and scoped leaders establish control-plane truth and stay out of healthy known message paths.

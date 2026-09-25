@@ -134,7 +134,6 @@ impl JoinController {
                         leader_node_id = %leader.identity.node_id,
                         leader_incarnation = leader.identity.incarnation.get(),
                         coordinator_term = leader.term,
-                        protocol_generation = leader.protocol_generation,
                         "authenticated Coordinator bootstrap leader selected"
                     );
                     if let Ok(association) =
@@ -383,7 +382,7 @@ fn select_leader(mut leaders: Vec<BootstrapLeader>) -> Result<BootstrapLeader, J
     if leaders.is_empty() {
         return Err(JoinError::NoLeader);
     }
-    leaders.sort_by_key(|leader| (leader.term, leader.protocol_generation));
+    leaders.sort_by_key(|leader| leader.term);
     let selected = leaders.pop().expect("nonempty leader candidates");
     if leaders
         .iter()
@@ -573,22 +572,21 @@ mod tests {
         test_support::{network_test_guard, unused_address},
     };
 
-    fn leader(node: &str, term: u64, generation: u64) -> BootstrapLeader {
+    fn leader(node: &str, term: u64, incarnation: u64) -> BootstrapLeader {
         BootstrapLeader {
-            scope: CoordinatorScope::Membership,
+            scope: CoordinatorScope::Cluster,
             identity: NodeIdentity {
                 cluster_id: ClusterId::new("cluster").unwrap(),
                 node_id: node.to_string(),
                 address: NodeEndpoint::new(node, 7447).unwrap(),
-                incarnation: NodeIncarnation::new(u128::from(term + generation)).unwrap(),
+                incarnation: NodeIncarnation::new(u128::from(incarnation)).unwrap(),
             },
             term,
-            protocol_generation: generation,
         }
     }
 
     #[test]
-    fn selects_highest_term_then_generation() {
+    fn selects_highest_term() {
         assert_eq!(
             select_leader(vec![leader("a", 1, 9), leader("b", 2, 1)])
                 .unwrap()
@@ -693,10 +691,9 @@ mod tests {
         let (server, _) = endpoint(server_identity.clone());
         let view = Arc::new(BootstrapView::new(server_identity.clone()));
         let current = BootstrapLeader {
-            scope: CoordinatorScope::Membership,
+            scope: CoordinatorScope::Cluster,
             identity: server_identity.clone(),
             term: 1,
-            protocol_generation: 1,
         };
         view.install(current.clone());
         server.install_bootstrap_handler(view.clone());
@@ -705,7 +702,7 @@ mod tests {
 
         let discovery = Arc::new(
             StaticDiscovery::new(
-                CoordinatorScope::Membership,
+                CoordinatorScope::Cluster,
                 "join-refresh",
                 vec![StaticEndpoint {
                     address: server_address,
@@ -771,7 +768,7 @@ mod tests {
             }
             event => panic!("unexpected refreshed join event: {event:?}"),
         }
-        view.clear(&CoordinatorScope::Membership);
+        view.clear(&CoordinatorScope::Cluster);
         assert!(matches!(
             tokio::time::timeout(Duration::from_secs(2), events.recv())
                 .await

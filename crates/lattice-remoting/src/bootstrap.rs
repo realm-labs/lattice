@@ -1,12 +1,13 @@
 use std::time::Duration;
 
+use crate::framework::{decode_framework_frame, encode_framework_frame};
+use lattice_model::cluster::ActorGroupId;
 use lattice_model::cluster::CoordinatorScope;
-use lattice_model::cluster::PlacementDomainId;
 use lattice_model::cluster::{ClusterId, NodeEndpoint, NodeIncarnation};
 use prost::{Enumeration, Message};
 
-use crate::handshake::{FeatureBits, NodeIdentity};
-use crate::wire::{Frame, FrameKind, TRANSPORT_MAJOR, TRANSPORT_MINOR, WireError};
+use crate::handshake::NodeIdentity;
+use crate::wire::{Frame, FrameKind, WireError};
 
 pub const MAX_BOOTSTRAP_REASON_BYTES: usize = 256;
 pub const MAX_BOOTSTRAP_RETRY_AFTER: Duration = Duration::from_secs(30);
@@ -26,9 +27,7 @@ pub struct BootstrapRequest {
     pub local: NodeIdentity,
     pub requested_cluster_id: ClusterId,
     pub expected_node_id: Option<String>,
-    pub transport_major: u16,
-    pub transport_minor: u16,
-    pub features: FeatureBits,
+
     pub nonce: u128,
 }
 
@@ -46,9 +45,6 @@ impl BootstrapRequest {
             local,
             requested_cluster_id,
             expected_node_id,
-            transport_major: TRANSPORT_MAJOR,
-            transport_minor: TRANSPORT_MINOR,
-            features: FeatureBits::REQUIRED_V3,
             nonce,
         }
     }
@@ -56,7 +52,7 @@ impl BootstrapRequest {
     pub fn direct_peer(local: NodeIdentity, expected: &NodeIdentity) -> Self {
         let requested_cluster_id = local.cluster_id.clone();
         let mut request = Self::new(
-            CoordinatorScope::Membership,
+            CoordinatorScope::Cluster,
             local,
             requested_cluster_id,
             Some(expected.node_id.clone()),
@@ -66,7 +62,7 @@ impl BootstrapRequest {
     }
 
     pub fn to_frame(&self) -> Frame {
-        Frame::encode_message(
+        encode_framework_frame(
             FrameKind::BootstrapRequest,
             &BootstrapRequestWire::from(self),
         )
@@ -76,21 +72,14 @@ impl BootstrapRequest {
         if frame.kind != FrameKind::BootstrapRequest {
             return Err(BootstrapError::WrongFrameKind);
         }
-        let wire = frame
-            .decode_message::<BootstrapRequestWire>()
-            .map_err(BootstrapError::Wire)?;
+        let wire =
+            decode_framework_frame::<BootstrapRequestWire>(frame).map_err(BootstrapError::Wire)?;
         Self::try_from(wire)
     }
 
     pub fn rejection(&self, local: &NodeIdentity) -> Option<BootstrapRejectionCode> {
         if self.nonce == 0 || validate_identity(&self.local).is_err() {
             return Some(BootstrapRejectionCode::InvalidIdentity);
-        }
-        if self.transport_major != TRANSPORT_MAJOR || self.transport_minor > TRANSPORT_MINOR {
-            return Some(BootstrapRejectionCode::IncompatibleTransport);
-        }
-        if !self.features.contains(FeatureBits::REQUIRED_V3) {
-            return Some(BootstrapRejectionCode::MissingRequiredFeature);
         }
         if self.requested_cluster_id != local.cluster_id
             || self.local.cluster_id != self.requested_cluster_id
@@ -123,7 +112,6 @@ pub struct BootstrapLeader {
     pub scope: CoordinatorScope,
     pub identity: NodeIdentity,
     pub term: u64,
-    pub protocol_generation: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -152,21 +140,13 @@ pub enum BootstrapResult {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BootstrapResponse {
     pub nonce: u128,
-    pub transport_major: u16,
-    pub transport_minor: u16,
-    pub features: FeatureBits,
+
     pub result: BootstrapResult,
 }
 
 impl BootstrapResponse {
     pub fn new(nonce: u128, result: BootstrapResult) -> Self {
-        Self {
-            nonce,
-            transport_major: TRANSPORT_MAJOR,
-            transport_minor: TRANSPORT_MINOR,
-            features: FeatureBits::REQUIRED_V3,
-            result,
-        }
+        Self { nonce, result }
     }
 
     pub fn rejected(nonce: u128, code: BootstrapRejectionCode) -> Self {
@@ -174,7 +154,7 @@ impl BootstrapResponse {
     }
 
     pub fn to_frame(&self) -> Frame {
-        Frame::encode_message(
+        encode_framework_frame(
             FrameKind::BootstrapResponse,
             &BootstrapResponseWire::from(self),
         )
@@ -184,21 +164,14 @@ impl BootstrapResponse {
         if frame.kind != FrameKind::BootstrapResponse {
             return Err(BootstrapError::WrongFrameKind);
         }
-        let wire = frame
-            .decode_message::<BootstrapResponseWire>()
-            .map_err(BootstrapError::Wire)?;
+        let wire =
+            decode_framework_frame::<BootstrapResponseWire>(frame).map_err(BootstrapError::Wire)?;
         Self::try_from(wire)
     }
 
     pub fn validate_for(&self, request: &BootstrapRequest) -> Result<(), BootstrapError> {
         if self.nonce != request.nonce {
             return Err(BootstrapError::NonceMismatch);
-        }
-        if self.transport_major != TRANSPORT_MAJOR
-            || self.transport_minor > TRANSPORT_MINOR
-            || !self.features.contains(FeatureBits::REQUIRED_V3)
-        {
-            return Err(BootstrapError::IncompatibleTransport);
         }
         match &self.result {
             BootstrapResult::Identity { remote, leader }
@@ -241,8 +214,6 @@ impl BootstrapResponse {
 pub enum BootstrapRejectionCode {
     ClusterMismatch = 1,
     ExpectedNodeMismatch = 2,
-    IncompatibleTransport = 3,
-    MissingRequiredFeature = 4,
     InvalidIdentity = 5,
     AuthenticationFailure = 6,
 }
@@ -280,8 +251,6 @@ pub enum BootstrapError {
     InvalidResult,
     #[error("bootstrap response nonce does not match the request")]
     NonceMismatch,
-    #[error("bootstrap transport version or required features are incompatible")]
-    IncompatibleTransport,
     #[error("bootstrap response is invalid")]
     InvalidResponse,
     #[error("bootstrap returned identity for a different cluster or expected node")]
@@ -290,12 +259,6 @@ pub enum BootstrapError {
 
 #[derive(Clone, PartialEq, Message)]
 struct BootstrapRequestWire {
-    #[prost(uint32, tag = "1")]
-    transport_major: u32,
-    #[prost(uint32, tag = "2")]
-    transport_minor: u32,
-    #[prost(uint64, tag = "3")]
-    features: u64,
     #[prost(string, tag = "4")]
     requested_cluster_id: String,
     #[prost(message, optional, tag = "5")]
@@ -307,19 +270,13 @@ struct BootstrapRequestWire {
     #[prost(uint32, tag = "8")]
     scope_kind: u32,
     #[prost(string, tag = "9")]
-    placement_domain: String,
+    actor_group: String,
     #[prost(enumeration = "BootstrapPurpose", tag = "10")]
     purpose: i32,
 }
 
 #[derive(Clone, PartialEq, Message)]
 struct BootstrapResponseWire {
-    #[prost(uint32, tag = "1")]
-    transport_major: u32,
-    #[prost(uint32, tag = "2")]
-    transport_minor: u32,
-    #[prost(uint64, tag = "3")]
-    features: u64,
     #[prost(bytes = "vec", tag = "4")]
     nonce: Vec<u8>,
     #[prost(enumeration = "BootstrapResultKind", tag = "5")]
@@ -356,12 +313,10 @@ struct BootstrapLeaderWire {
     identity: Option<NodeIdentityWire>,
     #[prost(uint64, tag = "2")]
     term: u64,
-    #[prost(uint64, tag = "3")]
-    protocol_generation: u64,
     #[prost(uint32, tag = "4")]
     scope_kind: u32,
     #[prost(string, tag = "5")]
-    placement_domain: String,
+    actor_group: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Enumeration)]
@@ -377,15 +332,12 @@ enum BootstrapResultKind {
 impl From<&BootstrapRequest> for BootstrapRequestWire {
     fn from(value: &BootstrapRequest) -> Self {
         Self {
-            transport_major: u32::from(value.transport_major),
-            transport_minor: u32::from(value.transport_minor),
-            features: value.features.bits(),
             requested_cluster_id: value.requested_cluster_id.as_str().to_string(),
             local: Some(NodeIdentityWire::from(&value.local)),
             expected_node_id: value.expected_node_id.clone(),
             nonce: value.nonce.to_be_bytes().to_vec(),
             scope_kind: scope_kind(&value.scope),
-            placement_domain: scope_domain(&value.scope),
+            actor_group: scope_group(&value.scope),
             purpose: value.purpose as i32,
         }
     }
@@ -398,7 +350,7 @@ impl TryFrom<BootstrapRequestWire> for BootstrapRequest {
         Ok(Self {
             purpose: BootstrapPurpose::try_from(value.purpose)
                 .map_err(|_| BootstrapError::InvalidIdentity)?,
-            scope: decode_scope(value.scope_kind, value.placement_domain)?,
+            scope: decode_scope(value.scope_kind, value.actor_group)?,
             local: value
                 .local
                 .ok_or(BootstrapError::InvalidIdentity)?
@@ -406,11 +358,6 @@ impl TryFrom<BootstrapRequestWire> for BootstrapRequest {
             requested_cluster_id: ClusterId::new(value.requested_cluster_id)
                 .map_err(|_| BootstrapError::InvalidIdentity)?,
             expected_node_id: value.expected_node_id,
-            transport_major: u16::try_from(value.transport_major)
-                .map_err(|_| BootstrapError::IncompatibleTransport)?,
-            transport_minor: u16::try_from(value.transport_minor)
-                .map_err(|_| BootstrapError::IncompatibleTransport)?,
-            features: FeatureBits::from_bits(value.features),
             nonce: parse_u128(&value.nonce)?,
         })
     }
@@ -462,9 +409,6 @@ impl From<&BootstrapResponse> for BootstrapResponseWire {
                 ),
             };
         Self {
-            transport_major: u32::from(value.transport_major),
-            transport_minor: u32::from(value.transport_minor),
-            features: value.features.bits(),
             nonce: value.nonce.to_be_bytes().to_vec(),
             result_kind: result_kind as i32,
             remote,
@@ -510,11 +454,6 @@ impl TryFrom<BootstrapResponseWire> for BootstrapResponse {
         };
         Ok(Self {
             nonce: parse_u128(&value.nonce)?,
-            transport_major: u16::try_from(value.transport_major)
-                .map_err(|_| BootstrapError::IncompatibleTransport)?,
-            transport_minor: u16::try_from(value.transport_minor)
-                .map_err(|_| BootstrapError::IncompatibleTransport)?,
-            features: FeatureBits::from_bits(value.features),
             result,
         })
     }
@@ -558,9 +497,8 @@ impl From<&BootstrapLeader> for BootstrapLeaderWire {
         Self {
             identity: Some(NodeIdentityWire::from(&value.identity)),
             term: value.term,
-            protocol_generation: value.protocol_generation,
             scope_kind: scope_kind(&value.scope),
-            placement_domain: scope_domain(&value.scope),
+            actor_group: scope_group(&value.scope),
         }
     }
 }
@@ -570,15 +508,14 @@ impl TryFrom<BootstrapLeaderWire> for BootstrapLeader {
 
     fn try_from(value: BootstrapLeaderWire) -> Result<Self, Self::Error> {
         let leader = Self {
-            scope: decode_scope(value.scope_kind, value.placement_domain)?,
+            scope: decode_scope(value.scope_kind, value.actor_group)?,
             identity: value
                 .identity
                 .ok_or(BootstrapError::InvalidIdentity)?
                 .try_into()?,
             term: value.term,
-            protocol_generation: value.protocol_generation,
         };
-        if leader.term == 0 || leader.protocol_generation == 0 {
+        if leader.term == 0 {
             return Err(BootstrapError::InvalidResponse);
         }
         Ok(leader)
@@ -609,7 +546,6 @@ fn validate_leader(
     if leader.identity.cluster_id != request.requested_cluster_id
         || leader.scope != request.scope
         || leader.term == 0
-        || leader.protocol_generation == 0
     {
         return Err(BootstrapError::IdentityMismatch);
     }
@@ -618,23 +554,23 @@ fn validate_leader(
 
 fn scope_kind(scope: &CoordinatorScope) -> u32 {
     match scope {
-        CoordinatorScope::Membership => 1,
-        CoordinatorScope::Placement(_) => 2,
+        CoordinatorScope::Cluster => 1,
+        CoordinatorScope::Group(_) => 2,
     }
 }
 
-fn scope_domain(scope: &CoordinatorScope) -> String {
+fn scope_group(scope: &CoordinatorScope) -> String {
     match scope {
-        CoordinatorScope::Membership => String::new(),
-        CoordinatorScope::Placement(domain) => domain.as_str().to_string(),
+        CoordinatorScope::Cluster => String::new(),
+        CoordinatorScope::Group(group) => group.as_str().to_string(),
     }
 }
 
-fn decode_scope(kind: u32, domain: String) -> Result<CoordinatorScope, BootstrapError> {
-    match (kind, domain.is_empty()) {
-        (1, true) => Ok(CoordinatorScope::Membership),
-        (2, false) => PlacementDomainId::new(domain)
-            .map(CoordinatorScope::Placement)
+fn decode_scope(kind: u32, group: String) -> Result<CoordinatorScope, BootstrapError> {
+    match (kind, group.is_empty()) {
+        (1, true) => Ok(CoordinatorScope::Cluster),
+        (2, false) => ActorGroupId::new(group)
+            .map(CoordinatorScope::Group)
             .map_err(|_| BootstrapError::InvalidIdentity),
         _ => Err(BootstrapError::InvalidIdentity),
     }
@@ -674,7 +610,7 @@ mod tests {
     #[test]
     fn request_and_response_round_trip_with_exact_identity() {
         let request = BootstrapRequest::new(
-            CoordinatorScope::Membership,
+            CoordinatorScope::Cluster,
             identity("client", 1, 7447),
             ClusterId::new("test").unwrap(),
             Some("server".to_string()),
@@ -694,9 +630,9 @@ mod tests {
     }
 
     #[test]
-    fn nonce_expected_identity_and_required_feature_are_fenced() {
-        let mut request = BootstrapRequest::new(
-            CoordinatorScope::Membership,
+    fn nonce_and_expected_identity_are_fenced() {
+        let request = BootstrapRequest::new(
+            CoordinatorScope::Cluster,
             identity("client", 1, 7447),
             ClusterId::new("test").unwrap(),
             Some("expected".to_string()),
@@ -712,10 +648,9 @@ mod tests {
             response.validate_for(&request),
             Err(BootstrapError::NonceMismatch)
         ));
-        request.features = FeatureBits::NONE;
         assert_eq!(
-            request.rejection(&identity("server", 2, 7448)),
-            Some(BootstrapRejectionCode::MissingRequiredFeature)
+            request.rejection(&identity("replacement", 2, 7448)),
+            Some(BootstrapRejectionCode::ExpectedNodeMismatch)
         );
     }
 }

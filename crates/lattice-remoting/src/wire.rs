@@ -7,8 +7,10 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 use prost::Message;
 use thiserror::Error;
 
-pub const TRANSPORT_MAJOR: u16 = 1;
-pub const TRANSPORT_MINOR: u16 = 4;
+use crate::association::budget::QueuedBytes;
+
+// Stable framing discriminator, not a compatibility version. Setup checks LatticeVersion.
+const FRAME_MAGIC: &[u8; 4] = b"LTCE";
 const HEADER_LEN: usize = 8;
 pub(crate) const WIRE_HEADER_LEN: usize = 4 + HEADER_LEN;
 pub(crate) const MAX_FRAME_PAYLOAD_SEGMENTS: usize = 4;
@@ -92,7 +94,7 @@ pub struct Frame {
     coalesced: OnceLock<Bytes>,
     // Local ownership only: never encoded, and a cloned frame must acquire its
     // own reservation when it is admitted again.
-    pub(crate) outbound_budget: Option<crate::association::budget::QueuedBytes>,
+    pub(crate) outbound_budget: Option<QueuedBytes>,
 }
 
 #[derive(Debug, Clone)]
@@ -342,8 +344,7 @@ impl FrameCodec {
         let mut header = [0_u8; WIRE_HEADER_LEN];
         let mut output = header.as_mut_slice();
         output.put_u32(frame_len as u32);
-        output.put_u16(TRANSPORT_MAJOR);
-        output.put_u16(TRANSPORT_MINOR);
+        output.put_slice(FRAME_MAGIC);
         output.put_u16(frame.kind as u16);
         output.put_u16(0);
         Ok(header)
@@ -383,11 +384,10 @@ impl FrameCodec {
                 actual: input.len(),
             });
         }
-        let major = input.get_u16();
-        let minor = input.get_u16();
-        if major != TRANSPORT_MAJOR || minor > TRANSPORT_MINOR {
-            return Err(WireError::UnsupportedVersion { major, minor });
+        if &input[..4] != FRAME_MAGIC {
+            return Err(WireError::InvalidPreamble);
         }
+        input.advance(4);
         let kind = FrameKind::try_from(input.get_u16())?;
         let reserved = input.get_u16();
         if reserved != 0 {
@@ -399,6 +399,11 @@ impl FrameCodec {
 
 #[derive(Debug, Error)]
 pub enum WireError {
+    #[error("framework identity mismatch: expected {expected}, received {actual}")]
+    FrameworkMismatch {
+        expected: &'static str,
+        actual: String,
+    },
     #[error("frame limit {0} is too small")]
     InvalidFrameLimit(usize),
     #[error("frame size {actual} exceeds maximum {maximum}")]
@@ -407,8 +412,8 @@ pub enum WireError {
     Truncated,
     #[error("declared frame length {declared} does not match {actual} available bytes")]
     InvalidLength { declared: usize, actual: usize },
-    #[error("unsupported transport version {major}.{minor}")]
-    UnsupportedVersion { major: u16, minor: u16 },
+    #[error("invalid frame preamble")]
+    InvalidPreamble,
     #[error("unknown frame kind {0}")]
     UnknownFrameKind(u16),
     #[error("reserved frame bits are nonzero: {0:#x}")]
@@ -443,6 +448,18 @@ mod tests {
         let encoded = codec.encode(&frame).unwrap();
         let decoded = codec.decode(encoded).unwrap();
         assert_eq!(decoded, frame);
+    }
+
+    #[test]
+    fn pre_identity_framing_is_rejected() {
+        let codec = FrameCodec::new(1024).unwrap();
+        let frame = Frame::new(FrameKind::Handshake, Bytes::new());
+        let mut old = codec.encode(&frame).unwrap().to_vec();
+        old[4..8].copy_from_slice(&[0, 1, 0, 4]);
+        assert!(matches!(
+            codec.decode(Bytes::from(old)),
+            Err(WireError::InvalidPreamble)
+        ));
     }
 
     #[test]

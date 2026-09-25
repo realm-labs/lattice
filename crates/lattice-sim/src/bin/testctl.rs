@@ -38,7 +38,7 @@ use std::{
 use clap::{Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 use testctl_artifacts::{
-    Manifest, MonitorCommand, MonitorResult, MultiDomainHostArtifact, MultiDomainLogicArtifact,
+    Manifest, MonitorCommand, MonitorResult, MultiGroupHostArtifact, MultiGroupLogicArtifact,
     ScopedLeadershipArtifact, write_json, write_json_atomic, write_junit,
 };
 use testctl_commands::{cargo, cargo_test_exact, command, output};
@@ -159,10 +159,10 @@ fn run_profile(
                     "scenario::tests::bounded_state_explorer_checks_every_production_handoff_transition",
                 )
             });
-            runner.run("multi-domain-bounded-state-explorer", || {
+            runner.run("multi-group-bounded-state-explorer", || {
                 cargo_test_exact(
                     "lattice-sim",
-                    "domains::tests::multi_domain_bounded_state_explorer_checks_every_production_reducer_transition",
+                    "groups::tests::multi_group_bounded_state_explorer_checks_every_production_reducer_transition",
                 )
             });
         }
@@ -179,12 +179,12 @@ fn run_profile(
             runner.run("config-store-discovery-lifecycle", || {
                 testctl_discovery::verify_case(artifacts, "discovery-config.json", "config-store")
             });
-            runner.run("multi-domain-failover", || multi_domain_real(artifacts));
+            runner.run("multi-group-failover", || multi_group_real(artifacts));
             runner.run("single-member-etcd", || {
                 cargo(&[
                     "test",
                     "-p",
-                    "lattice-placement",
+                    "lattice-coordination",
                     "--test",
                     "etcd_acceptance",
                     "--",
@@ -220,13 +220,13 @@ fn run_profile(
             runner.run("etcd-coordinator-failover", || ha_etcd_real(artifacts));
             runner.run("leader-recovery-resume", || {
                 cargo_test_exact(
-                    "lattice-placement",
+                    "lattice-coordination",
                     "runtime::tests::recovery_tests::leader_recovery_resumes_persisted_handoff",
                 )
             });
             runner.run("singleton-forward-recovery", || {
                 cargo_test_exact(
-                    "lattice-placement",
+                    "lattice-coordination",
                     "runtime::tests::recovery_tests::singleton_owner_loss_recovers_forward_after_leader_restart",
                 )
             });
@@ -235,7 +235,7 @@ fn run_profile(
             testctl_scale::run(artifacts)
         }),
         Profile::Chaos => {
-            runner.run("multi-domain-failover", || multi_domain_real(artifacts));
+            runner.run("multi-group-failover", || multi_group_real(artifacts));
             runner.run("control-plane-store-outage-recovery", || {
                 control_plane_store_outage_real(artifacts)
             });
@@ -249,12 +249,12 @@ fn run_profile(
                 testctl_crashes::etcd(artifacts)
             });
             runner.run("docker-fault-sequence", || testctl_chaos::verify(artifacts));
-            runner.run("one-domain-coordinator-loss", || {
+            runner.run("one-group-coordinator-loss", || {
                 cargo(&[
                     "test",
                     "-p",
                     "lattice-service",
-                    "one_domain_coordinator_loss_leaves_other_domain_ready",
+                    "one_group_coordinator_loss_leaves_other_group_ready",
                 ])
             });
             runner.run("membership-loss", || {
@@ -269,7 +269,7 @@ fn run_profile(
                 cargo(&[
                     "test",
                     "-p",
-                    "lattice-placement",
+                    "lattice-coordination",
                     "join_drain_and_force_remove_are_revisioned_idempotent_and_fenced",
                 ])
             });
@@ -277,20 +277,20 @@ fn run_profile(
                 cargo(&[
                     "test",
                     "-p",
-                    "lattice-placement",
+                    "lattice-coordination",
                     "--test",
                     "etcd_acceptance",
-                    "real_etcd_guarded_domain_commits_and_lease_expiry",
+                    "real_etcd_guarded_group_commits_and_lease_expiry",
                     "--",
                     "--nocapture",
                 ])
             });
-            runner.run("multi-domain-trace-replay", || {
+            runner.run("multi-group-trace-replay", || {
                 cargo(&[
                     "test",
                     "-p",
                     "lattice-sim",
-                    "multi_domain_trace_replays_independent_elections_and_handoffs",
+                    "multi_group_trace_replays_independent_elections_and_handoffs",
                 ])
             });
             runner.run("seed-corpus", || {
@@ -402,9 +402,9 @@ fn run_profile(
     result
 }
 
-fn multi_domain_real(artifacts: &Path) -> Result<(), String> {
+fn multi_group_real(artifacts: &Path) -> Result<(), String> {
     let run_id = std::env::var("LATTICE_RUN_ID")
-        .map_err(|_| "multi-domain e2e requires LATTICE_RUN_ID".to_owned())?;
+        .map_err(|_| "multi-group e2e requires LATTICE_RUN_ID".to_owned())?;
     let containers = labeled_containers(&run_id)?;
     let container = |needle: &str| {
         containers
@@ -412,11 +412,11 @@ fn multi_domain_real(artifacts: &Path) -> Result<(), String> {
             .find(|name| name.contains(needle) && !name.contains("runner"))
             .ok_or_else(|| format!("missing labeled {needle} container"))
     };
-    let membership_container = container("domain-membership")?;
-    let alpha_container = container("domain-alpha")?;
-    let beta_container = container("domain-beta")?;
-    let gamma_container = container("domain-gamma")?;
-    let standby_container = container("domain-standby")?;
+    let membership_container = container("group-membership")?;
+    let alpha_container = container("group-alpha")?;
+    let beta_container = container("group-beta")?;
+    let gamma_container = container("group-gamma")?;
+    let standby_container = container("group-standby")?;
     for name in [
         membership_container,
         alpha_container,
@@ -428,40 +428,40 @@ fn multi_domain_real(artifacts: &Path) -> Result<(), String> {
     }
 
     let membership = wait_for_host_scope(
-        &artifacts.join("domain-membership.json"),
+        &artifacts.join("group-membership.json"),
         "membership",
         0,
         Duration::from_secs(120),
     )?;
-    if membership.node_id != "domain-membership" {
+    if membership.node_id != "group-membership" {
         return Err("dedicated membership host did not retain membership leadership".to_owned());
     }
     let alpha = wait_for_host_scope(
-        &artifacts.join("domain-alpha.json"),
-        "placement:domain-alpha",
+        &artifacts.join("group-alpha.json"),
+        "placement:group-alpha",
         0,
         Duration::from_secs(120),
     )?;
     let beta = wait_for_host_scope(
-        &artifacts.join("domain-beta.json"),
-        "placement:domain-beta",
+        &artifacts.join("group-beta.json"),
+        "placement:group-beta",
         0,
         Duration::from_secs(120),
     )?;
     let gamma = wait_for_host_scope(
-        &artifacts.join("domain-gamma.json"),
-        "placement:domain-gamma",
+        &artifacts.join("group-gamma.json"),
+        "placement:group-gamma",
         0,
         Duration::from_secs(120),
     )?;
     let delta = wait_for_host_scope(
-        &artifacts.join("domain-alpha.json"),
-        "placement:domain-delta",
+        &artifacts.join("group-alpha.json"),
+        "placement:group-delta",
         0,
         Duration::from_secs(120),
     )?;
     if delta.node_id != alpha.node_id {
-        return Err("domain alpha host did not initially lead both alpha and delta".to_owned());
+        return Err("group alpha host did not initially lead both alpha and delta".to_owned());
     }
     let leaders = [
         alpha.node_id.as_str(),
@@ -472,17 +472,17 @@ fn multi_domain_real(artifacts: &Path) -> Result<(), String> {
     .collect::<BTreeSet<_>>();
     if leaders.len() != 3 {
         return Err(format!(
-            "expected three independently distributed domain leaders, found {leaders:?}"
+            "expected three independently distributed group leaders, found {leaders:?}"
         ));
     }
-    for name in ["domain-logic-a.json", "domain-logic-b.json"] {
+    for name in ["group-logic-a.json", "group-logic-b.json"] {
         wait_for_logic_ready(&artifacts.join(name), Duration::from_secs(30))?;
     }
 
     command("docker", &["stop", "--time", "1", alpha_container])?;
     let replacement = wait_for_host_scope_while_checking_logic(
         artifacts,
-        "placement:domain-alpha",
+        "placement:group-alpha",
         alpha.term,
         Duration::from_secs(60),
     );
@@ -492,33 +492,33 @@ fn multi_domain_real(artifacts: &Path) -> Result<(), String> {
     })();
     let replacement = replacement?;
     restart_result?;
-    if replacement.node_id != "domain-standby" {
+    if replacement.node_id != "group-standby" {
         return Err(format!(
-            "domain alpha failed over to {}, expected domain-standby",
+            "group alpha failed over to {}, expected group-standby",
             replacement.node_id
         ));
     }
     let delta_replacement = wait_for_host_scope(
-        &artifacts.join("domain-standby.json"),
-        "placement:domain-delta",
+        &artifacts.join("group-standby.json"),
+        "placement:group-delta",
         delta.term,
         Duration::from_secs(60),
     )?;
-    if delta_replacement.node_id != "domain-standby" {
+    if delta_replacement.node_id != "group-standby" {
         return Err(format!(
-            "domain delta failed over to {}, expected domain-standby",
+            "group delta failed over to {}, expected group-standby",
             delta_replacement.node_id
         ));
     }
     let beta_after = wait_for_host_scope(
-        &artifacts.join("domain-beta.json"),
-        "placement:domain-beta",
+        &artifacts.join("group-beta.json"),
+        "placement:group-beta",
         0,
         Duration::from_secs(2),
     )?;
     let gamma_after = wait_for_host_scope(
-        &artifacts.join("domain-gamma.json"),
-        "placement:domain-gamma",
+        &artifacts.join("group-gamma.json"),
+        "placement:group-gamma",
         0,
         Duration::from_secs(2),
     )?;
@@ -527,19 +527,19 @@ fn multi_domain_real(artifacts: &Path) -> Result<(), String> {
         || gamma_after.node_id != gamma.node_id
         || gamma_after.term != gamma.term
     {
-        return Err("domain alpha failure changed beta or gamma leadership".to_owned());
+        return Err("group alpha failure changed beta or gamma leadership".to_owned());
     }
-    for name in ["domain-logic-a.json", "domain-logic-b.json"] {
+    for name in ["group-logic-a.json", "group-logic-b.json"] {
         wait_for_logic_ready(&artifacts.join(name), Duration::from_secs(30))?;
     }
     command("docker", &["stop", "--time", "1", membership_container])?;
     let membership_replacement = wait_for_scope_across_hosts(
         artifacts,
         &[
-            "domain-alpha.json",
-            "domain-beta.json",
-            "domain-gamma.json",
-            "domain-standby.json",
+            "group-alpha.json",
+            "group-beta.json",
+            "group-gamma.json",
+            "group-standby.json",
         ],
         "membership",
         membership.term,
@@ -557,11 +557,11 @@ fn multi_domain_real(artifacts: &Path) -> Result<(), String> {
             membership_replacement.node_id
         ));
     }
-    for name in ["domain-logic-a.json", "domain-logic-b.json"] {
+    for name in ["group-logic-a.json", "group-logic-b.json"] {
         wait_for_logic_ready(&artifacts.join(name), Duration::from_secs(30))?;
     }
     write_json(
-        &artifacts.join("multi-domain-failover.json"),
+        &artifacts.join("multi-group-failover.json"),
         &serde_json::json!({
             "membership": {
                 "node_id": membership.node_id,
@@ -606,7 +606,7 @@ fn multi_domain_real(artifacts: &Path) -> Result<(), String> {
                 "incarnation": membership_replacement.incarnation.to_string(),
             },
             "unrelated_terms_unchanged": true,
-            "logic_nodes": ["domain-logic-a", "domain-logic-b"],
+            "logic_nodes": ["group-logic-a", "group-logic-b"],
         }),
     )
 }
@@ -619,19 +619,19 @@ fn wait_for_host_scope_while_checking_logic(
 ) -> Result<ScopedLeadershipArtifact, String> {
     let deadline = Instant::now() + timeout;
     loop {
-        for name in ["domain-logic-a.json", "domain-logic-b.json"] {
+        for name in ["group-logic-a.json", "group-logic-b.json"] {
             let logic = read_logic(&artifacts.join(name))?;
             if logic.lifecycle != "Ready"
-                || logic.domains.get("domain-beta").map(String::as_str) != Some("Ready")
-                || logic.domains.get("domain-gamma").map(String::as_str) != Some("Ready")
+                || logic.groups.get("group-beta").map(String::as_str) != Some("Ready")
+                || logic.groups.get("group-gamma").map(String::as_str) != Some("Ready")
             {
                 return Err(format!(
-                    "unrelated domain degraded during alpha failover: {logic:?}"
+                    "unrelated group degraded during alpha failover: {logic:?}"
                 ));
             }
         }
         if let Ok(leader) = wait_for_host_scope(
-            &artifacts.join("domain-standby.json"),
+            &artifacts.join("group-standby.json"),
             scope,
             minimum_term,
             Duration::from_millis(10),
@@ -639,13 +639,13 @@ fn wait_for_host_scope_while_checking_logic(
             return Ok(leader);
         }
         if Instant::now() >= deadline {
-            return Err("standby did not acquire failed placement domain".to_owned());
+            return Err("standby did not acquire failed placement group".to_owned());
         }
         std::thread::sleep(Duration::from_millis(50));
     }
 }
 
-fn read_logic(path: &Path) -> Result<MultiDomainLogicArtifact, String> {
+fn read_logic(path: &Path) -> Result<MultiGroupLogicArtifact, String> {
     let deadline = Instant::now() + Duration::from_millis(250);
     loop {
         match std::fs::read(path)
@@ -662,18 +662,13 @@ fn read_logic(path: &Path) -> Result<MultiDomainLogicArtifact, String> {
 fn require_logic_ready(path: &Path) -> Result<(), String> {
     let logic = read_logic(path)?;
     if logic.lifecycle == "Ready"
-        && [
-            "domain-alpha",
-            "domain-beta",
-            "domain-gamma",
-            "domain-delta",
-        ]
-        .into_iter()
-        .all(|domain| logic.domains.get(domain).map(String::as_str) == Some("Ready"))
+        && ["group-alpha", "group-beta", "group-gamma", "group-delta"]
+            .into_iter()
+            .all(|group| logic.groups.get(group).map(String::as_str) == Some("Ready"))
     {
         Ok(())
     } else {
-        Err(format!("multi-domain logic node is not ready: {logic:?}"))
+        Err(format!("multi-group logic node is not ready: {logic:?}"))
     }
 }
 
@@ -701,11 +696,11 @@ fn control_plane_store_outage_real(artifacts: &Path) -> Result<(), String> {
             .ok_or_else(|| format!("missing labeled {needle} container"))
     };
     let coordinator_names = [
-        "domain-membership",
-        "domain-alpha",
-        "domain-beta",
-        "domain-gamma",
-        "domain-standby",
+        "group-membership",
+        "group-alpha",
+        "group-beta",
+        "group-gamma",
+        "group-standby",
     ];
     let coordinators = coordinator_names
         .iter()
@@ -717,8 +712,8 @@ fn control_plane_store_outage_real(artifacts: &Path) -> Result<(), String> {
     }
 
     let logic_paths = [
-        artifacts.join("domain-logic-a.json"),
-        artifacts.join("domain-logic-b.json"),
+        artifacts.join("group-logic-a.json"),
+        artifacts.join("group-logic-b.json"),
     ];
     for path in &logic_paths {
         wait_for_logic_ready(path, Duration::from_secs(30))?;
@@ -840,7 +835,7 @@ fn control_plane_store_outage_real(artifacts: &Path) -> Result<(), String> {
 fn wait_for_logic_unready(
     paths: &[PathBuf],
     timeout: Duration,
-) -> Result<Vec<MultiDomainLogicArtifact>, String> {
+) -> Result<Vec<MultiGroupLogicArtifact>, String> {
     let deadline = Instant::now() + timeout;
     loop {
         let snapshots = match paths
@@ -860,7 +855,7 @@ fn wait_for_logic_unready(
             }
         };
         if snapshots.iter().all(|logic| {
-            logic.lifecycle != "Ready" || logic.domains.values().any(|state| state != "Ready")
+            logic.lifecycle != "Ready" || logic.groups.values().any(|state| state != "Ready")
         }) {
             return Ok(snapshots);
         }

@@ -17,18 +17,18 @@ use lattice_actor_distributed::{
     reply::ReplyTo,
     traits::Responder,
 };
+use lattice_coordination::{
+    control::{DEFAULT_MAX_CONTROL_PAYLOAD, PlacementControlCommand, PlacementControlRouter},
+    coordinator::{
+        ActorGroupHello, MemberHello, SnapshotLimits, SnapshotRecord, SnapshotVersion,
+        build_snapshot,
+    },
+    session::{GroupSession, GroupSessionConfig, GroupSessionError},
+    types::{ClaimGrant, GrantSequence, PlacementSlot},
+};
 use lattice_model::{
     cluster::CoordinatorScope,
     cluster::{ClusterId, EntityType, NodeEndpoint, NodeIncarnation, SingletonKind},
-};
-use lattice_placement::{
-    control::{DEFAULT_MAX_CONTROL_PAYLOAD, PlacementControlCommand, PlacementControlRouter},
-    coordinator::{
-        MemberHello, PlacementDomainHello, SnapshotLimits, SnapshotRecord, SnapshotVersion,
-        build_snapshot,
-    },
-    session::{LogicCoordinatorConfig, LogicSessionError, PlacementDomainSession},
-    types::{ClaimGrant, GrantSequence, PlacementSlot},
 };
 use lattice_remoting::{
     association::{AssociationKey, LaneAttachment, LaneKind},
@@ -40,8 +40,8 @@ use crate::cluster::*;
 
 pub(super) const TEST_PROTOCOL_ID: u64 = 77;
 
-pub(super) fn domain() -> PlacementDomainId {
-    PlacementDomainId::new("service-test").unwrap()
+pub(super) fn group() -> ActorGroupId {
+    ActorGroupId::new("service-test").unwrap()
 }
 
 #[derive(Clone, lattice_actor::Request)]
@@ -189,7 +189,7 @@ pub(super) fn attach_coordinator(
 
 pub(super) struct TestHello {
     pub(super) member: MemberHello,
-    pub(super) domain: PlacementDomainHello,
+    pub(super) group: ActorGroupHello,
 }
 
 pub(super) fn test_hello(
@@ -206,7 +206,7 @@ pub(super) fn test_hello(
             protocols: Vec::new(),
             remoting_capabilities: BTreeSet::new(),
         },
-        domain: PlacementDomainHello::builder(node, domain(), 1)
+        group: ActorGroupHello::builder(node, group(), 1)
             .hosted_entity_types(hosted_entity_types)
             .singleton_eligibility(singleton_eligibility)
             .used_singletons(used_singletons)
@@ -223,18 +223,18 @@ pub(super) async fn stage_logic_runtime(
     Arc<Mutex<LogicPlacementState>>,
     Arc<PlacementControlRouter>,
     watch::Sender<bool>,
-    JoinHandle<Result<(), LogicSessionError>>,
+    JoinHandle<Result<(), GroupSessionError>>,
 ) {
     let (control, controls) =
         PlacementControlRouter::bounded(64, DEFAULT_MAX_CONTROL_PAYLOAD).unwrap();
     let control = Arc::new(control);
     let version = slots.iter().map(|slot| slot.version.clone()).max().unwrap();
     let coordinator_term = version.term.get();
-    let (logic, _effects) = PlacementDomainSession::new(
-        hello.domain,
+    let (logic, _effects) = GroupSession::new(
+        hello.group,
         coordinator.clone(),
         associations,
-        LogicCoordinatorConfig::default(),
+        GroupSessionConfig::default(),
         64,
         coordinator_term,
     )
@@ -254,17 +254,17 @@ pub(super) async fn stage_logic_runtime(
         .map(|slot| {
             let key = match &slot.key {
                 PlacementSlotKey::Shard {
-                    domain,
+                    group,
                     entity_type,
                     shard_id,
                 } => format!(
-                    "domain/{}/shard/{}/{}",
-                    domain.as_str(),
+                    "group/{}/shard/{}/{}",
+                    group.as_str(),
                     entity_type.as_str(),
                     shard_id.get()
                 ),
-                PlacementSlotKey::Singleton { domain, kind } => {
-                    format!("domain/{}/singleton/{}", domain.as_str(), kind.as_str())
+                PlacementSlotKey::Singleton { group, kind } => {
+                    format!("group/{}/singleton/{}", group.as_str(), kind.as_str())
                 }
             };
             SnapshotRecord {
@@ -274,7 +274,7 @@ pub(super) async fn stage_logic_runtime(
         })
         .collect();
     let limits = SnapshotLimits::default();
-    let scope = CoordinatorScope::Placement(version.domain.clone());
+    let scope = CoordinatorScope::Group(version.group.clone());
     let (begin, chunks, end) = build_snapshot(
         &scope,
         version.term.get(),
@@ -294,7 +294,7 @@ pub(super) async fn stage_logic_runtime(
     for slot in slots {
         if slot.owner.as_ref() == Some(&hello.member.node) {
             commands.push(PlacementControlCommand::ClaimGranted(ClaimGrant {
-                domain: slot.key.domain().clone(),
+                group: slot.key.group().clone(),
                 slot: slot.key,
                 owner: hello.member.node.clone(),
                 coordinator_term: slot.version.term,
@@ -308,12 +308,10 @@ pub(super) async fn stage_logic_runtime(
         control
             .apply(
                 coordinator.clone(),
-                lattice_placement::control::control_stream_id(&CoordinatorScope::Placement(
-                    domain(),
-                )),
+                lattice_coordination::control::control_stream_id(&CoordinatorScope::Group(group())),
                 CommandId::generate(),
-                lattice_placement::control::encode_control_command_for_term(
-                    &CoordinatorScope::Placement(domain()),
+                lattice_coordination::control::encode_control_command_for_term(
+                    &CoordinatorScope::Group(group()),
                     coordinator_term,
                     &command,
                     DEFAULT_MAX_CONTROL_PAYLOAD,

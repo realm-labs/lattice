@@ -8,11 +8,13 @@ use lattice_actor_distributed::{
     error::ActorFailure,
     registry::{ActorCreateContext, ActorRegistryConfig},
 };
+use lattice_coordination::types::{
+    AssignmentGeneration, CoordinatorTerm, PlacementVersion, Revision,
+};
 use lattice_model::{
     actor::ProtocolId,
     cluster::{ClusterId, EntityType, NodeEndpoint, NodeIncarnation, SingletonKind},
 };
-use lattice_placement::types::{AssignmentGeneration, CoordinatorTerm, PlacementVersion, Revision};
 use lattice_remoting::config::RemotingConfig;
 use tokio::sync::Semaphore;
 
@@ -65,7 +67,7 @@ async fn loading_obeys_retirement(singleton: bool, fence: bool) {
         NodeIncarnation::new(2).unwrap(),
     );
     let entity = EntityConfig::new(
-        domain(),
+        group(),
         EntityType::new("activation-fencing").unwrap(),
         ProtocolId::new(TEST_PROTOCOL_ID).unwrap(),
         16,
@@ -75,19 +77,19 @@ async fn loading_obeys_retirement(singleton: bool, fence: bool) {
     )
     .unwrap();
     let singleton_config = SingletonConfig::new(
-        domain(),
+        group(),
         SingletonKind::new("activation-fencing").unwrap(),
         ProtocolId::new(TEST_PROTOCOL_ID).unwrap(),
     );
     let entity_id = ActorId::new(b"loading".to_vec()).unwrap();
     let slot_key = if singleton {
         PlacementSlotKey::Singleton {
-            domain: domain(),
+            group: group(),
             kind: singleton_config.kind.clone(),
         }
     } else {
         PlacementSlotKey::Shard {
-            domain: domain(),
+            group: group(),
             entity_type: entity.entity_type.clone(),
             shard_id: entity.shard_for(&entity_id).unwrap(),
         }
@@ -109,7 +111,7 @@ async fn loading_obeys_retirement(singleton: bool, fence: bool) {
         target: None,
         assignment_generation: AssignmentGeneration::new(1).unwrap(),
         version: PlacementVersion::new(
-            domain(),
+            group(),
             CoordinatorTerm::new(1).unwrap(),
             Revision::new(1).unwrap(),
         ),
@@ -129,7 +131,7 @@ async fn loading_obeys_retirement(singleton: bool, fence: bool) {
         entered: Arc::new(Semaphore::new(0)),
         release: Arc::new(Semaphore::new(0)),
     };
-    let mut router = DomainLogicalRouter::new(
+    let mut router = GroupLogicalRouter::new(
         node,
         state,
         associations,
@@ -201,7 +203,7 @@ async fn loading_obeys_retirement(singleton: bool, fence: bool) {
                     LogicalSingletonTarget {
                         reference: SingletonAddress::new(
                             cluster_id,
-                            domain(),
+                            group(),
                             singleton_config.kind.clone(),
                             singleton_config.protocol_id,
                             singleton_config.fingerprint(),

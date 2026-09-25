@@ -160,7 +160,7 @@ impl EndpointSliceSource for FakeEndpointSliceSource {
 
 fn config() -> KubernetesEndpointSliceConfig {
     KubernetesEndpointSliceConfig {
-        scope: CoordinatorScope::Membership,
+        scope: CoordinatorScope::Cluster,
         namespace: "lattice".to_string(),
         service: "cluster".to_string(),
         label_selector: Some("app=lattice".to_string()),

@@ -1,0 +1,39 @@
+[package]
+name = "lattice-coordination"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+test-failpoints = ["lattice-failpoint/enabled"]
+test-harness = []
+
+[dependencies]
+async-trait.workspace = true
+blake3.workspace = true
+bytes = { workspace = true, features = ["serde"] }
+dashmap.workspace = true
+etcd-client.workspace = true
+http.workspace = true
+lattice-failpoint.workspace = true
+lattice-model.workspace = true
+lattice-remoting.workspace = true
+prost.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["fs", "macros", "rt", "sync", "time"] }
+tokio-stream.workspace = true
+tower.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+xxhash-rust.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "test-util"] }
+base64.workspace = true
+lattice-config.workspace = true
+rcgen.workspace = true
+tempfile.workspace = true
+trybuild.workspace = true

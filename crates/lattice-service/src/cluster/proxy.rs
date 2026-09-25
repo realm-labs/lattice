@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
+use lattice_coordination::{control::PlacementControlCommand, types::ShardId};
 use lattice_model::cluster::CoordinatorScope;
-use lattice_placement::{control::PlacementControlCommand, types::ShardId};
 use lattice_remoting::association::Association;
 
 use super::{
@@ -29,13 +29,13 @@ pub(super) struct EntityProxyRoute {
 impl EntityProxyRoute {
     fn slot_key(&self, target: &EntityAddress) -> Result<PlacementSlotKey, RemoteMessageError> {
         if target.protocol_id() != self.config.protocol_id
-            || target.domain() != &self.config.domain
+            || target.group() != &self.config.group
             || target.config_fingerprint() != self.config.fingerprint()
         {
             return Err(RemoteMessageError::ProtocolFingerprintMismatch);
         }
         Ok(PlacementSlotKey::Shard {
-            domain: self.config.domain.clone(),
+            group: self.config.group.clone(),
             entity_type: self.config.entity_type.clone(),
             shard_id: self
                 .mapper
@@ -68,7 +68,7 @@ impl EntityProxyRoute {
         request_id: u128,
     ) -> Result<(), RemoteMessageError> {
         let PlacementSlotKey::Shard {
-            domain,
+            group,
             entity_type,
             shard_id,
         } = key
@@ -88,12 +88,12 @@ impl EntityProxyRoute {
             .expect("logic placement state poisoned")
             .coordinator_term()
             .ok_or(RemoteMessageError::ShardUnavailable)?;
-        let payload = lattice_placement::control::encode_control_command_for_term(
-            &CoordinatorScope::Placement(domain.clone()),
+        let payload = lattice_coordination::control::encode_control_command_for_term(
+            &CoordinatorScope::Group(group.clone()),
             coordinator_term,
             &PlacementControlCommand::ResolveShard {
                 request_id,
-                domain: domain.clone(),
+                group: group.clone(),
                 entity_type: entity_type.clone(),
                 shard_id: *shard_id,
             },
@@ -102,8 +102,8 @@ impl EntityProxyRoute {
         .map_err(|_| RemoteMessageError::InvalidPayload)?;
         association
             .admit_control_command_in(
-                lattice_placement::control::control_stream_id(&CoordinatorScope::Placement(
-                    domain.clone(),
+                lattice_coordination::control::control_stream_id(&CoordinatorScope::Group(
+                    group.clone(),
                 )),
                 payload,
             )

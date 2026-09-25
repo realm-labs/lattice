@@ -1,4 +1,4 @@
-//! Fault injection against the production placement domain leader.
+//! Fault injection against the production placement group leader.
 //!
 //! Every case here arms one failpoint, drives the real leader through the operation that reaches
 //! it, and asserts the divergence the decision was supposed to cause — a refused commit, durable
@@ -6,7 +6,7 @@
 //! then is evidence recorded, so the matrix cannot count a boundary the coordinator ignored.
 
 use crate::failpoints::Failpoint;
-use lattice_placement::{
+use lattice_coordination::{
     control::PlacementControlCommand,
     handoff::HandoffPhase,
     plan::PlanStatus,

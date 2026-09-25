@@ -1,42 +1,10 @@
+use crate::framework::{decode_framework_frame, encode_framework_frame};
 use lattice_model::cluster::{ClusterId, NodeEndpoint, NodeIncarnation};
 use prost::Message;
 use thiserror::Error;
 
 use crate::association::{AssociationId, LaneKind};
-use crate::wire::{Frame, FrameKind, TRANSPORT_MAJOR, TRANSPORT_MINOR, WireError};
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct FeatureBits(u64);
-
-impl FeatureBits {
-    pub const NONE: Self = Self(0);
-    pub const RELIABLE_CONTROL: Self = Self(1 << 0);
-    pub const PROTOCOL_CATALOGUE: Self = Self(1 << 1);
-    pub const MULTI_LANE: Self = Self(1 << 2);
-    pub const BOOTSTRAP_PROBE: Self = Self(1 << 3);
-    pub const DOMAIN_SCOPED_LOGICAL_TARGETS: Self = Self(1 << 4);
-    pub const EXACT_TARGET_DICTIONARY: Self = Self(1 << 5);
-    pub const REQUIRED_V2: Self = Self(
-        Self::RELIABLE_CONTROL.0
-            | Self::PROTOCOL_CATALOGUE.0
-            | Self::MULTI_LANE.0
-            | Self::BOOTSTRAP_PROBE.0
-            | Self::DOMAIN_SCOPED_LOGICAL_TARGETS.0,
-    );
-    pub const REQUIRED_V3: Self = Self(Self::REQUIRED_V2.0 | Self::EXACT_TARGET_DICTIONARY.0);
-
-    pub const fn from_bits(bits: u64) -> Self {
-        Self(bits)
-    }
-
-    pub const fn bits(self) -> u64 {
-        self.0
-    }
-
-    pub const fn contains(self, required: Self) -> bool {
-        self.0 & required.0 == required.0
-    }
-}
+use crate::wire::{Frame, FrameKind, WireError};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NodeIdentity {
@@ -54,7 +22,6 @@ pub struct Handshake {
     pub lane: LaneKind,
     pub connection_nonce: u128,
     pub maximum_frame_size: usize,
-    pub features: FeatureBits,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -77,7 +44,7 @@ impl HandshakeAck {
 
     pub fn to_frame(&self) -> Frame {
         let (lane_kind, lane_index) = lane_to_wire(self.lane);
-        Frame::encode_message(
+        encode_framework_frame(
             FrameKind::HandshakeAck,
             &HandshakeAckWire {
                 association_id: self.association_id.get().to_be_bytes().to_vec(),
@@ -93,9 +60,8 @@ impl HandshakeAck {
         if frame.kind != FrameKind::HandshakeAck {
             return Err(HandshakeError::WrongFrameKind);
         }
-        let wire = frame
-            .decode_message::<HandshakeAckWire>()
-            .map_err(HandshakeError::Wire)?;
+        let wire =
+            decode_framework_frame::<HandshakeAckWire>(frame).map_err(HandshakeError::Wire)?;
         Ok(Self {
             association_id: AssociationId::new(parse_u128(&wire.association_id)?)
                 .ok_or(HandshakeError::InvalidIdentity)?,
@@ -120,23 +86,20 @@ impl HandshakeAck {
 
 impl Handshake {
     pub fn to_frame(&self) -> Frame {
-        Frame::encode_message(FrameKind::Handshake, &HandshakeWire::from(self))
+        encode_framework_frame(FrameKind::Handshake, &HandshakeWire::from(self))
     }
 
     pub fn from_frame(frame: &Frame) -> Result<Self, HandshakeError> {
         if frame.kind != FrameKind::Handshake {
             return Err(HandshakeError::WrongFrameKind);
         }
-        let wire = frame
-            .decode_message::<HandshakeWire>()
-            .map_err(HandshakeError::Wire)?;
+        let wire = decode_framework_frame::<HandshakeWire>(frame).map_err(HandshakeError::Wire)?;
         Self::try_from(wire)
     }
 }
 
 pub struct HandshakeValidator {
     local: NodeIdentity,
-    required_features: FeatureBits,
     maximum_frame_size: usize,
     bulk_stripes: usize,
 }
@@ -153,7 +116,6 @@ impl HandshakeValidator {
         }
         Ok(Self {
             local,
-            required_features: FeatureBits::REQUIRED_V3,
             maximum_frame_size,
             bulk_stripes,
         })
@@ -167,9 +129,6 @@ impl HandshakeValidator {
         }
         if handshake.source.cluster_id != self.local.cluster_id {
             return Err(HandshakeError::ClusterMismatch);
-        }
-        if !handshake.features.contains(self.required_features) {
-            return Err(HandshakeError::MissingFeatures);
         }
         if handshake.connection_nonce == 0 || handshake.maximum_frame_size == 0 {
             return Err(HandshakeError::InvalidLimits);
@@ -185,10 +144,6 @@ impl HandshakeValidator {
 
 #[derive(Clone, PartialEq, Message)]
 struct HandshakeWire {
-    #[prost(uint32, tag = "1")]
-    protocol_major: u32,
-    #[prost(uint32, tag = "2")]
-    protocol_minor: u32,
     #[prost(string, tag = "3")]
     cluster_id: String,
     #[prost(string, tag = "4")]
@@ -217,8 +172,6 @@ struct HandshakeWire {
     connection_nonce: Vec<u8>,
     #[prost(uint32, tag = "16")]
     maximum_frame_size: u32,
-    #[prost(uint64, tag = "17")]
-    features: u64,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -239,8 +192,6 @@ impl From<&Handshake> for HandshakeWire {
     fn from(value: &Handshake) -> Self {
         let (lane_kind, lane_index) = lane_to_wire(value.lane);
         Self {
-            protocol_major: u32::from(TRANSPORT_MAJOR),
-            protocol_minor: u32::from(TRANSPORT_MINOR),
             cluster_id: value.source.cluster_id.as_str().to_owned(),
             source_node_id: value.source.node_id.clone(),
             source_host: value.source.address.host().to_owned(),
@@ -260,7 +211,6 @@ impl From<&Handshake> for HandshakeWire {
             lane_index,
             connection_nonce: value.connection_nonce.to_be_bytes().to_vec(),
             maximum_frame_size: value.maximum_frame_size.min(u32::MAX as usize) as u32,
-            features: value.features.bits(),
         }
     }
 }
@@ -269,14 +219,6 @@ impl TryFrom<HandshakeWire> for Handshake {
     type Error = HandshakeError;
 
     fn try_from(value: HandshakeWire) -> Result<Self, Self::Error> {
-        if value.protocol_major != u32::from(TRANSPORT_MAJOR)
-            || value.protocol_minor > u32::from(TRANSPORT_MINOR)
-        {
-            return Err(HandshakeError::UnsupportedVersion {
-                major: value.protocol_major,
-                minor: value.protocol_minor,
-            });
-        }
         let cluster_id =
             ClusterId::new(value.cluster_id).map_err(|_| HandshakeError::InvalidIdentity)?;
         let source = NodeIdentity {
@@ -303,7 +245,6 @@ impl TryFrom<HandshakeWire> for Handshake {
             lane,
             connection_nonce: parse_u128(&value.connection_nonce)?,
             maximum_frame_size: value.maximum_frame_size as usize,
-            features: FeatureBits::from_bits(value.features),
         };
         validate_node(&handshake.source)?;
         validate_node(&handshake.expected_remote)?;
@@ -357,16 +298,12 @@ pub enum HandshakeError {
     WrongFrameKind,
     #[error("handshake frame is invalid")]
     Wire(#[source] WireError),
-    #[error("unsupported handshake transport version {major}.{minor}")]
-    UnsupportedVersion { major: u32, minor: u32 },
     #[error("handshake node identity is invalid")]
     InvalidIdentity,
     #[error("handshake names a different destination identity or incarnation")]
     WrongDestination,
     #[error("handshake cluster ID differs")]
     ClusterMismatch,
-    #[error("handshake is missing mandatory transport features")]
-    MissingFeatures,
     #[error("handshake lane is invalid")]
     InvalidLane,
     #[error("handshake limits are invalid")]
@@ -399,7 +336,6 @@ mod tests {
             lane: LaneKind::Control,
             connection_nonce: 10,
             maximum_frame_size: 256 * 1024,
-            features: FeatureBits::REQUIRED_V3,
         };
         let decoded = Handshake::from_frame(&handshake.to_frame()).unwrap();
         HandshakeValidator::new(local.clone(), 256 * 1024, 1)

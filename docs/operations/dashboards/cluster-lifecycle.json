@@ -64,11 +64,11 @@
     {
       "id": 7,
       "type": "timeseries",
-      "title": "Placement-domain leaders and sessions",
+      "title": "Actor-group leaders and sessions",
       "targets": [
-        {"refId": "A", "expr": "max by (domain, state) (lattice_domain_leader_term{cluster=~\"$cluster\",domain=~\"$domain\"})"},
-        {"refId": "B", "expr": "min by (domain) (lattice_domain_session_ready{cluster=~\"$cluster\",domain=~\"$domain\"})"},
-        {"refId": "C", "expr": "lattice_domain_leader_concentration_max{cluster=~\"$cluster\"}"}
+        {"refId": "A", "expr": "max by (group, state) (lattice_group_leader_term{cluster=~\"$cluster\",group=~\"$group\"})"},
+        {"refId": "B", "expr": "min by (group) (lattice_group_session_ready{cluster=~\"$cluster\",group=~\"$group\"})"},
+        {"refId": "C", "expr": "lattice_group_leader_concentration_max{cluster=~\"$cluster\"}"}
       ]
     },
     {
@@ -76,8 +76,8 @@
       "type": "timeseries",
       "title": "Domain route availability and unresolved requests",
       "targets": [
-        {"refId": "A", "expr": "min by (domain) (lattice_domain_route_available{cluster=~\"$cluster\",domain=~\"$domain\"})"},
-        {"refId": "B", "expr": "sum by (domain) (lattice_domain_unresolved_requests{cluster=~\"$cluster\",domain=~\"$domain\"})"}
+        {"refId": "A", "expr": "min by (group) (lattice_group_route_available{cluster=~\"$cluster\",group=~\"$group\"})"},
+        {"refId": "B", "expr": "sum by (group) (lattice_group_unresolved_requests{cluster=~\"$cluster\",group=~\"$group\"})"}
       ]
     },
     {
@@ -85,9 +85,9 @@
       "type": "timeseries",
       "title": "Domain membership, capacity, and load",
       "targets": [
-        {"refId": "A", "expr": "sum by (domain) (lattice_domain_members{cluster=~\"$cluster\",domain=~\"$domain\"})"},
-        {"refId": "B", "expr": "sum by (domain) (lattice_domain_capacity_units{cluster=~\"$cluster\",domain=~\"$domain\"})"},
-        {"refId": "C", "expr": "sum by (domain) (lattice_domain_load_units{cluster=~\"$cluster\",domain=~\"$domain\"})"}
+        {"refId": "A", "expr": "sum by (group) (lattice_group_members{cluster=~\"$cluster\",group=~\"$group\"})"},
+        {"refId": "B", "expr": "sum by (group) (lattice_group_capacity_units{cluster=~\"$cluster\",group=~\"$group\"})"},
+        {"refId": "C", "expr": "sum by (group) (lattice_group_load_units{cluster=~\"$cluster\",group=~\"$group\"})"}
       ]
     },
     {
@@ -95,19 +95,19 @@
       "type": "timeseries",
       "title": "Domain authority and reconciliation",
       "targets": [
-        {"refId": "A", "expr": "sum by (domain) (lattice_domain_slots{cluster=~\"$cluster\",domain=~\"$domain\"})"},
-        {"refId": "B", "expr": "sum by (domain) (lattice_domain_claims{cluster=~\"$cluster\",domain=~\"$domain\"})"},
-        {"refId": "C", "expr": "sum by (domain) (lattice_domain_plans{cluster=~\"$cluster\",domain=~\"$domain\"})"},
-        {"refId": "D", "expr": "max by (domain) (lattice_domain_reconciliation_backlog{cluster=~\"$cluster\",domain=~\"$domain\"})"},
-        {"refId": "E", "expr": "max by (domain) (lattice_domain_reconciliation_oldest_millis{cluster=~\"$cluster\",domain=~\"$domain\"})"}
+        {"refId": "A", "expr": "sum by (group) (lattice_group_slots{cluster=~\"$cluster\",group=~\"$group\"})"},
+        {"refId": "B", "expr": "sum by (group) (lattice_group_claims{cluster=~\"$cluster\",group=~\"$group\"})"},
+        {"refId": "C", "expr": "sum by (group) (lattice_group_plans{cluster=~\"$cluster\",group=~\"$group\"})"},
+        {"refId": "D", "expr": "max by (group) (lattice_group_reconciliation_backlog{cluster=~\"$cluster\",group=~\"$group\"})"},
+        {"refId": "E", "expr": "max by (group) (lattice_group_reconciliation_oldest_millis{cluster=~\"$cluster\",group=~\"$group\"})"}
       ]
     },
     {
       "id": 11,
       "type": "timeseries",
-      "title": "Cross-domain drain progress",
+      "title": "Cross-group drain progress",
       "targets": [
-        {"refId": "A", "expr": "max by (domain, state) (lattice_domain_drain_remaining_authorities{cluster=~\"$cluster\",domain=~\"$domain\"})"}
+        {"refId": "A", "expr": "max by (group, state) (lattice_group_drain_remaining_authorities{cluster=~\"$cluster\",group=~\"$group\"})"}
       ]
     }
   ],
@@ -121,9 +121,9 @@
         "allValue": ".*"
       },
       {
-        "name": "domain",
+        "name": "group",
         "type": "query",
-        "query": "label_values(lattice_domain_leader_term{cluster=~\"$cluster\"}, domain)",
+        "query": "label_values(lattice_group_leader_term{cluster=~\"$cluster\"}, group)",
         "includeAll": true,
         "allValue": ".*"
       }

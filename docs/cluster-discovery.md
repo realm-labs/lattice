@@ -1,12 +1,12 @@
 # Cluster Discovery Providers
 
 Discovery publishes bootstrap candidates only. A discovered address is not a member, is not
-eligible for business routing, and does not become authoritative until the `MembershipLeader`
+eligible for business routing, and does not become authoritative until the `ClusterCoordinator`
 admits the exact probed `NodeIncarnation`. Provider updates never add or remove members.
 
 Membership discovery and placement-domain discovery are separate inputs. Every node configures
 membership discovery. A node that hosts actors additionally configures one candidate discovery
-stream for every explicit `PlacementDomainId` it joins. Reusing the same provider implementation
+stream for every explicit `ActorGroupId` it joins. Reusing the same provider implementation
 is allowed, but collapsing those streams into one unscoped candidate set is not.
 
 Applications construct providers through their defining module paths and may combine them with
@@ -153,7 +153,7 @@ The process shutdown handler must keep `HealthHttpServer` running while it await
 `application.shutdown()`. Entering drain closes `/readyz` immediately while `/livez` remains open;
 only after the application drain completes should the handler signal the health server to stop.
 Applications that serve only a subset of placement domains can use
-`HealthReadinessPolicy::required_domains(...)`; the default requires every configured logic domain,
+`HealthReadinessPolicy::required_groups(...)`; the default requires every configured logic domain,
 and embedded deployments additionally require every managed Coordinator scope to be `Active` or
 `Standby`.
 

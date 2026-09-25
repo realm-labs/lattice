@@ -64,8 +64,8 @@ services:
       etcd-single: {condition: service_healthy}
       discovery-static-member: {condition: service_healthy}
       discovery-config-member: {condition: service_healthy}
-      domain-logic-a: {condition: service_healthy}
-      domain-logic-b: {condition: service_healthy}
+      group-logic-a: {condition: service_healthy}
+      group-logic-b: {condition: service_healthy}
     environment:
       LATTICE_RUN_ID: ${LATTICE_RUN_ID:-local}
       LATTICE_TEST_SEED: ${LATTICE_TEST_SEED:-1}
@@ -165,7 +165,7 @@ services:
       timeout: 1s
       retries: 600
 
-  domain-membership:
+  group-membership:
     <<: *runner
     profiles: [e2e, chaos, scale, partition]
     depends_on:
@@ -173,95 +173,95 @@ services:
     environment:
       LATTICE_RUN_ID: ${LATTICE_RUN_ID:-local}
       LATTICE_ETCD_ENDPOINTS: http://etcd-single:2379
-    command: ["/cargo-target/${LATTICE_CARGO_PROFILE_DIR:-debug}/distributed-node", "domain-host", "--node-id", "domain-membership", "--port", "29300", "--reference", "/artifacts/domain-membership.json"]
+    command: ["/cargo-target/${LATTICE_CARGO_PROFILE_DIR:-debug}/distributed-node", "group-host", "--node-id", "group-membership", "--port", "29300", "--reference", "/artifacts/group-membership.json"]
     healthcheck:
-      test: ["CMD-SHELL", "grep -q '\"membership\"' /artifacts/domain-membership.json"]
+      test: ["CMD-SHELL", "grep -q '\"membership\"' /artifacts/group-membership.json"]
       interval: 1s
       timeout: 1s
       retries: 600
 
-  domain-alpha:
+  group-alpha:
     <<: *runner
     profiles: [e2e, chaos, partition]
     depends_on:
-      domain-membership: {condition: service_healthy}
+      group-membership: {condition: service_healthy}
     environment:
       LATTICE_RUN_ID: ${LATTICE_RUN_ID:-local}
       LATTICE_ETCD_ENDPOINTS: http://etcd-single:2379
-    command: ["/cargo-target/${LATTICE_CARGO_PROFILE_DIR:-debug}/distributed-node", "domain-host", "--node-id", "domain-alpha", "--port", "29301", "--domains", "alpha,delta", "--reference", "/artifacts/domain-alpha.json"]
+    command: ["/cargo-target/${LATTICE_CARGO_PROFILE_DIR:-debug}/distributed-node", "group-host", "--node-id", "group-alpha", "--port", "29301", "--groups", "alpha,delta", "--reference", "/artifacts/group-alpha.json"]
     healthcheck:
-      test: ["CMD-SHELL", "grep -q 'placement:domain-alpha' /artifacts/domain-alpha.json"]
+      test: ["CMD-SHELL", "grep -q 'placement:group-alpha' /artifacts/group-alpha.json"]
       interval: 1s
       timeout: 1s
       retries: 600
 
-  domain-beta:
+  group-beta:
     <<: *runner
     profiles: [e2e, chaos, partition]
     depends_on:
-      domain-membership: {condition: service_healthy}
+      group-membership: {condition: service_healthy}
     environment:
       LATTICE_RUN_ID: ${LATTICE_RUN_ID:-local}
       LATTICE_ETCD_ENDPOINTS: http://etcd-single:2379
-    command: ["/cargo-target/${LATTICE_CARGO_PROFILE_DIR:-debug}/distributed-node", "domain-host", "--node-id", "domain-beta", "--port", "29302", "--domains", "beta", "--reference", "/artifacts/domain-beta.json"]
+    command: ["/cargo-target/${LATTICE_CARGO_PROFILE_DIR:-debug}/distributed-node", "group-host", "--node-id", "group-beta", "--port", "29302", "--groups", "beta", "--reference", "/artifacts/group-beta.json"]
     healthcheck:
-      test: ["CMD-SHELL", "grep -q 'placement:domain-beta' /artifacts/domain-beta.json"]
+      test: ["CMD-SHELL", "grep -q 'placement:group-beta' /artifacts/group-beta.json"]
       interval: 1s
       timeout: 1s
       retries: 600
 
-  domain-gamma:
+  group-gamma:
     <<: *runner
     profiles: [e2e, chaos, partition]
     depends_on:
-      domain-membership: {condition: service_healthy}
+      group-membership: {condition: service_healthy}
     environment:
       LATTICE_RUN_ID: ${LATTICE_RUN_ID:-local}
       LATTICE_ETCD_ENDPOINTS: http://etcd-single:2379
-    command: ["/cargo-target/${LATTICE_CARGO_PROFILE_DIR:-debug}/distributed-node", "domain-host", "--node-id", "domain-gamma", "--port", "29303", "--domains", "gamma", "--reference", "/artifacts/domain-gamma.json"]
+    command: ["/cargo-target/${LATTICE_CARGO_PROFILE_DIR:-debug}/distributed-node", "group-host", "--node-id", "group-gamma", "--port", "29303", "--groups", "gamma", "--reference", "/artifacts/group-gamma.json"]
     healthcheck:
-      test: ["CMD-SHELL", "grep -q 'placement:domain-gamma' /artifacts/domain-gamma.json"]
+      test: ["CMD-SHELL", "grep -q 'placement:group-gamma' /artifacts/group-gamma.json"]
       interval: 1s
       timeout: 1s
       retries: 600
 
-  domain-standby:
+  group-standby:
     <<: *runner
     profiles: [e2e, chaos, partition]
     depends_on:
-      domain-alpha: {condition: service_healthy}
-      domain-beta: {condition: service_healthy}
-      domain-gamma: {condition: service_healthy}
+      group-alpha: {condition: service_healthy}
+      group-beta: {condition: service_healthy}
+      group-gamma: {condition: service_healthy}
     environment:
       LATTICE_RUN_ID: ${LATTICE_RUN_ID:-local}
       LATTICE_ETCD_ENDPOINTS: http://etcd-single:2379
-    command: ["/cargo-target/${LATTICE_CARGO_PROFILE_DIR:-debug}/distributed-node", "domain-host", "--node-id", "domain-standby", "--port", "29304", "--domains", "alpha,beta,gamma,delta,split", "--reference", "/artifacts/domain-standby.json"]
+    command: ["/cargo-target/${LATTICE_CARGO_PROFILE_DIR:-debug}/distributed-node", "group-host", "--node-id", "group-standby", "--port", "29304", "--groups", "alpha,beta,gamma,delta,split", "--reference", "/artifacts/group-standby.json"]
     healthcheck:
-      test: ["CMD", "test", "-s", "/artifacts/domain-standby.json"]
+      test: ["CMD", "test", "-s", "/artifacts/group-standby.json"]
       interval: 1s
       timeout: 1s
       retries: 600
 
-  domain-logic-a:
+  group-logic-a:
     <<: *runner
     profiles: [e2e, chaos]
     depends_on:
-      domain-standby: {condition: service_healthy}
-    command: ["/cargo-target/${LATTICE_CARGO_PROFILE_DIR:-debug}/distributed-node", "domain-logic", "--node-id", "domain-logic-a", "--port", "29310", "--reference", "/artifacts/domain-logic-a.json"]
+      group-standby: {condition: service_healthy}
+    command: ["/cargo-target/${LATTICE_CARGO_PROFILE_DIR:-debug}/distributed-node", "group-logic", "--node-id", "group-logic-a", "--port", "29310", "--reference", "/artifacts/group-logic-a.json"]
     healthcheck:
-      test: ["CMD", "jq", "-e", ".lifecycle == \"Ready\" and (.domains | length == 4 and all(.[]; . == \"Ready\"))", "/artifacts/domain-logic-a.json"]
+      test: ["CMD", "jq", "-e", ".lifecycle == \"Ready\" and (.groups | length == 4 and all(.[]; . == \"Ready\"))", "/artifacts/group-logic-a.json"]
       interval: 1s
       timeout: 1s
       retries: 600
 
-  domain-logic-b:
+  group-logic-b:
     <<: *runner
     profiles: [e2e, chaos]
     depends_on:
-      domain-standby: {condition: service_healthy}
-    command: ["/cargo-target/${LATTICE_CARGO_PROFILE_DIR:-debug}/distributed-node", "domain-logic", "--node-id", "domain-logic-b", "--port", "29311", "--reference", "/artifacts/domain-logic-b.json"]
+      group-standby: {condition: service_healthy}
+    command: ["/cargo-target/${LATTICE_CARGO_PROFILE_DIR:-debug}/distributed-node", "group-logic", "--node-id", "group-logic-b", "--port", "29311", "--reference", "/artifacts/group-logic-b.json"]
     healthcheck:
-      test: ["CMD", "jq", "-e", ".lifecycle == \"Ready\" and (.domains | length == 4 and all(.[]; . == \"Ready\"))", "/artifacts/domain-logic-b.json"]
+      test: ["CMD", "jq", "-e", ".lifecycle == \"Ready\" and (.groups | length == 4 and all(.[]; . == \"Ready\"))", "/artifacts/group-logic-b.json"]
       interval: 1s
       timeout: 1s
       retries: 600
@@ -272,10 +272,10 @@ services:
     profiles: [partition]
     cap_add: [NET_ADMIN]
     depends_on:
-      domain-standby: {condition: service_healthy}
+      group-standby: {condition: service_healthy}
     environment:
       LATTICE_RUN_ID: ${LATTICE_RUN_ID:-local}
-    command: ["/cargo-target/${LATTICE_CARGO_PROFILE_DIR:-debug}/distributed-node", "split-entity-host", "--node-id", "split-node-a", "--port", "29306", "--domains", "split", "--reference", "/artifacts/partition/split-node-a.json"]
+    command: ["/cargo-target/${LATTICE_CARGO_PROFILE_DIR:-debug}/distributed-node", "split-entity-host", "--node-id", "split-node-a", "--port", "29306", "--groups", "split", "--reference", "/artifacts/partition/split-node-a.json"]
     healthcheck:
       test: ["CMD", "jq", "-e", ".lifecycle == \"Ready\" and .served > 0", "/artifacts/partition/split-node-a.json"]
       interval: 1s
@@ -287,21 +287,21 @@ services:
     profiles: [partition]
     cap_add: [NET_ADMIN]
     depends_on:
-      domain-standby: {condition: service_healthy}
+      group-standby: {condition: service_healthy}
     environment:
       LATTICE_RUN_ID: ${LATTICE_RUN_ID:-local}
-    command: ["/cargo-target/${LATTICE_CARGO_PROFILE_DIR:-debug}/distributed-node", "split-entity-host", "--node-id", "split-node-b", "--port", "29307", "--domains", "split", "--reference", "/artifacts/partition/split-node-b.json"]
+    command: ["/cargo-target/${LATTICE_CARGO_PROFILE_DIR:-debug}/distributed-node", "split-entity-host", "--node-id", "split-node-b", "--port", "29307", "--groups", "split", "--reference", "/artifacts/partition/split-node-b.json"]
     healthcheck:
       test: ["CMD", "jq", "-e", ".lifecycle == \"Ready\" and .served > 0", "/artifacts/partition/split-node-b.json"]
       interval: 1s
       timeout: 1s
       retries: 600
 
-  domain-logic-scale:
+  group-logic-scale:
     <<: *runner
     profiles: [scale]
     depends_on:
-      domain-membership: {condition: service_healthy}
+      group-membership: {condition: service_healthy}
     environment:
       LATTICE_SCALE_EXPECTED_MEMBERS: ${LATTICE_SCALE_EXPECTED_MEMBERS:-64}
       LATTICE_SCALE_STARTUP_WINDOW_SECONDS: ${LATTICE_SCALE_STARTUP_WINDOW_SECONDS:-0}
@@ -322,7 +322,7 @@ services:
           delay="$$(printf '%s' "$${HOSTNAME}" | cksum | awk -v window="$${window}" '{print $$1 % (window + 1)}')";
         fi;
         sleep "$${delay}";
-        exec /cargo-target/${LATTICE_CARGO_PROFILE_DIR:-debug}/distributed-node domain-logic
+        exec /cargo-target/${LATTICE_CARGO_PROFILE_DIR:-debug}/distributed-node group-logic
         --node-id "$${HOSTNAME}"
         --address-host "$$(hostname -i | awk '{print $$1}')"
         --port 29310
@@ -437,8 +437,8 @@ services:
     depends_on:
       fixture-server: {condition: service_healthy}
       etcd-single: {condition: service_healthy}
-      domain-logic-a: {condition: service_healthy}
-      domain-logic-b: {condition: service_healthy}
+      group-logic-a: {condition: service_healthy}
+      group-logic-b: {condition: service_healthy}
     volumes:
       - ../..:/workspace:ro
       - ../../target/test-artifacts/${LATTICE_RUN_ID:-local}:/artifacts
@@ -479,7 +479,7 @@ services:
     <<: *runner
     profiles: [scale]
     depends_on:
-      domain-membership: {condition: service_healthy}
+      group-membership: {condition: service_healthy}
     environment:
       LATTICE_RUN_ID: ${LATTICE_RUN_ID:-local}
       LATTICE_TEST_SEED: ${LATTICE_TEST_SEED:-1}

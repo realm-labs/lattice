@@ -15,19 +15,19 @@ use lattice_actor_distributed::{
     protocol::{ActorProtocolBinding, DispatchError, DispatchMode, DispatchReply, Protocol},
     registry::{ActorDefinition, ActorLoader, ActorRegistry},
 };
-use lattice_model::{
-    actor::{ActorAddress, EntityAddress, ProtocolId, SingletonAddress},
-    cluster::{
-        ClusterId, ConfigFingerprint, EntityType, NodeEndpoint, NodeIncarnation, PlacementDomainId,
-        SingletonKind,
-    },
-};
-use lattice_placement::{
+use lattice_coordination::{
     coordinator::SingletonConfig,
     mapping::{ShardMapper, ShardMapperBinding, ShardMappingError, Xxh3V1ShardMapper},
     region::EntityConfig,
     session::LogicPlacementState,
     types::{NodeKey, PlacementSlot, PlacementSlotKey, PlacementSlotState},
+};
+use lattice_model::{
+    actor::{ActorAddress, EntityAddress, ProtocolId, SingletonAddress},
+    cluster::{
+        ActorGroupId, ClusterId, ConfigFingerprint, EntityType, NodeEndpoint, NodeIncarnation,
+        SingletonKind,
+    },
 };
 use lattice_remoting::{
     association::{AssociationKey, AssociationManager, AssociationState},
@@ -83,7 +83,7 @@ impl Default for LogicalBufferConfig {
             maximum_messages: 10_000,
             maximum_bytes: 64 * 1024 * 1024,
             maximum_residence: Duration::from_secs(30),
-            maximum_control_payload: lattice_placement::control::DEFAULT_MAX_CONTROL_PAYLOAD,
+            maximum_control_payload: lattice_coordination::control::DEFAULT_MAX_CONTROL_PAYLOAD,
         }
     }
 }
@@ -103,7 +103,7 @@ impl LogicalBufferConfig {
     }
 }
 
-pub struct DomainLogicalRouter {
+pub struct GroupLogicalRouter {
     local_node: NodeKey,
     state: Arc<Mutex<LogicPlacementState>>,
     associations: Arc<AssociationManager>,
@@ -111,8 +111,8 @@ pub struct DomainLogicalRouter {
     messaging: Arc<OutboundMessaging>,
     coordinator: AssociationKey,
     buffer_config: LogicalBufferConfig,
-    entities: BTreeMap<(PlacementDomainId, EntityType), Arc<dyn EntityRoute>>,
-    singletons: BTreeMap<(PlacementDomainId, SingletonKind), Arc<dyn SingletonRoute>>,
+    entities: BTreeMap<(ActorGroupId, EntityType), Arc<dyn EntityRoute>>,
+    singletons: BTreeMap<(ActorGroupId, SingletonKind), Arc<dyn SingletonRoute>>,
     maximum_registrations: usize,
 }
 
@@ -194,14 +194,14 @@ pub enum ClusterRouterError {
     ProtocolMismatch,
     #[error("cluster logical router shard mapper does not match its config")]
     ShardMapping(#[from] ShardMappingError),
-    #[error("entity type {entity_type:?} is already registered in placement domain {domain}")]
+    #[error("entity type {entity_type:?} is already registered in placement group {group}")]
     DuplicateEntity {
-        domain: PlacementDomainId,
+        group: ActorGroupId,
         entity_type: EntityType,
     },
-    #[error("singleton kind {kind:?} is already registered in placement domain {domain}")]
+    #[error("singleton kind {kind:?} is already registered in placement group {group}")]
     DuplicateSingleton {
-        domain: PlacementDomainId,
+        group: ActorGroupId,
         kind: SingletonKind,
     },
 }

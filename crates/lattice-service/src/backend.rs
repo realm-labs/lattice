@@ -10,12 +10,12 @@ use lattice_actor_distributed::{
     host::ProtocolHostRegistry,
     recipient::{ImmediateRecipientTellDispatch, RecipientBackend, RecipientTell},
 };
+use lattice_coordination::types::PlacementSlotKey;
 use lattice_model::{
     actor::WatchId,
     actor::{ActorAddress, EntityAddress, RecipientAddress, SingletonAddress},
-    cluster::{ClusterId, NodeEndpoint, NodeIncarnation, PlacementDomainId},
+    cluster::{ActorGroupId, ClusterId, NodeEndpoint, NodeIncarnation},
 };
-use lattice_placement::types::PlacementSlotKey;
 use lattice_remoting::{
     association::{Association, AssociationError, AssociationId, AssociationManager},
     messaging::{
@@ -296,24 +296,24 @@ impl LogicalRouter for SwitchableDomainRouter {
     }
 }
 
-/// Bounded logical router directory with one independently switchable entry per domain.
-pub struct DomainRouterDirectory {
-    routers: BTreeMap<PlacementDomainId, Arc<SwitchableDomainRouter>>,
+/// Bounded logical router directory with one independently switchable entry per group.
+pub struct GroupRouterDirectory {
+    routers: BTreeMap<ActorGroupId, Arc<SwitchableDomainRouter>>,
 }
 
-impl DomainRouterDirectory {
+impl GroupRouterDirectory {
     pub(crate) fn new(
-        domains: impl IntoIterator<Item = PlacementDomainId>,
-        maximum_domains: usize,
+        domains: impl IntoIterator<Item = ActorGroupId>,
+        maximum_groups: usize,
     ) -> Result<Self, RemoteMessageError> {
-        if maximum_domains == 0 {
+        if maximum_groups == 0 {
             return Err(RemoteMessageError::Unauthorized);
         }
         let routers = domains
             .into_iter()
-            .map(|domain| (domain, Arc::new(SwitchableDomainRouter::new())))
+            .map(|group| (group, Arc::new(SwitchableDomainRouter::new())))
             .collect::<BTreeMap<_, _>>();
-        if routers.is_empty() || routers.len() > maximum_domains {
+        if routers.is_empty() || routers.len() > maximum_groups {
             return Err(RemoteMessageError::Unauthorized);
         }
         Ok(Self { routers })
@@ -321,35 +321,35 @@ impl DomainRouterDirectory {
 
     pub(crate) fn install(
         &self,
-        domain: &PlacementDomainId,
+        group: &ActorGroupId,
         router: Arc<dyn LogicalRouter>,
     ) -> Result<(), RemoteMessageError> {
         self.routers
-            .get(domain)
+            .get(group)
             .ok_or(RemoteMessageError::ShardUnavailable)?
             .install(router);
         Ok(())
     }
 
-    pub(crate) fn clear(&self, domain: &PlacementDomainId) {
-        if let Some(router) = self.routers.get(domain) {
+    pub(crate) fn clear(&self, group: &ActorGroupId) {
+        if let Some(router) = self.routers.get(group) {
             router.clear();
         }
     }
 
     fn router(
         &self,
-        domain: &PlacementDomainId,
+        group: &ActorGroupId,
     ) -> Result<Arc<SwitchableDomainRouter>, RemoteMessageError> {
         self.routers
-            .get(domain)
+            .get(group)
             .cloned()
             .ok_or(RemoteMessageError::ShardUnavailable)
     }
 }
 
 #[async_trait]
-impl LogicalRouter for DomainRouterDirectory {
+impl LogicalRouter for GroupRouterDirectory {
     async fn tell_entity(
         &self,
         target: EntityAddress,
@@ -357,7 +357,7 @@ impl LogicalRouter for DomainRouterDirectory {
         message_id: u64,
         payload: Bytes,
     ) -> Result<(), RemoteMessageError> {
-        self.router(target.domain())?
+        self.router(target.group())?
             .tell_entity(target, fingerprint, message_id, payload)
             .await
     }
@@ -370,7 +370,7 @@ impl LogicalRouter for DomainRouterDirectory {
         payload: Bytes,
         deadline: Instant,
     ) -> Result<Bytes, AskError> {
-        self.router(target.domain())
+        self.router(target.group())
             .map_err(AskError::Protocol)?
             .ask_entity(target, fingerprint, message_id, payload, deadline)
             .await
@@ -383,7 +383,7 @@ impl LogicalRouter for DomainRouterDirectory {
         message_id: u64,
         payload: Bytes,
     ) -> Result<(), RemoteMessageError> {
-        self.router(target.domain())?
+        self.router(target.group())?
             .tell_singleton(target, fingerprint, message_id, payload)
             .await
     }
@@ -396,7 +396,7 @@ impl LogicalRouter for DomainRouterDirectory {
         payload: Bytes,
         deadline: Instant,
     ) -> Result<Bytes, AskError> {
-        self.router(target.domain())
+        self.router(target.group())
             .map_err(AskError::Protocol)?
             .ask_singleton(target, fingerprint, message_id, payload, deadline)
             .await
@@ -406,7 +406,7 @@ impl LogicalRouter for DomainRouterDirectory {
         &self,
         target: EntityAddress,
     ) -> Result<Option<ActorAddress>, WatchError> {
-        self.router(target.domain())
+        self.router(target.group())
             .map_err(|_| WatchError::Unavailable)?
             .resolve_entity_current(target)
             .await
@@ -416,22 +416,22 @@ impl LogicalRouter for DomainRouterDirectory {
         &self,
         target: SingletonAddress,
     ) -> Result<Option<ActorAddress>, WatchError> {
-        self.router(target.domain())
+        self.router(target.group())
             .map_err(|_| WatchError::Unavailable)?
             .resolve_singleton_current(target)
             .await
     }
 
     async fn drain_slot(&self, slot: PlacementSlotKey) -> Result<bool, RemoteMessageError> {
-        self.router(slot.domain())?.drain_slot(slot).await
+        self.router(slot.group())?.drain_slot(slot).await
     }
 
     async fn stop_fenced_slot(&self, slot: PlacementSlotKey) -> Result<(), RemoteMessageError> {
-        self.router(slot.domain())?.stop_fenced_slot(slot).await
+        self.router(slot.group())?.stop_fenced_slot(slot).await
     }
 
     async fn wait_slot_drained(&self, slot: PlacementSlotKey) -> Result<(), RemoteMessageError> {
-        self.router(slot.domain())?.wait_slot_drained(slot).await
+        self.router(slot.group())?.wait_slot_drained(slot).await
     }
 
     async fn receive_entity_tell(
@@ -440,7 +440,7 @@ impl LogicalRouter for DomainRouterDirectory {
         message_id: u64,
         payload: Bytes,
     ) -> Result<(), RemoteMessageError> {
-        self.router(target.reference.domain())?
+        self.router(target.reference.group())?
             .receive_entity_tell(target, message_id, payload)
             .await
     }
@@ -452,7 +452,7 @@ impl LogicalRouter for DomainRouterDirectory {
         payload: Bytes,
         deadline: Instant,
     ) -> Result<Bytes, RemoteMessageError> {
-        self.router(target.reference.domain())?
+        self.router(target.reference.group())?
             .receive_entity_ask(target, message_id, payload, deadline)
             .await
     }
@@ -463,7 +463,7 @@ impl LogicalRouter for DomainRouterDirectory {
         message_id: u64,
         payload: Bytes,
     ) -> Result<(), RemoteMessageError> {
-        self.router(target.reference.domain())?
+        self.router(target.reference.group())?
             .receive_singleton_tell(target, message_id, payload)
             .await
     }
@@ -475,7 +475,7 @@ impl LogicalRouter for DomainRouterDirectory {
         payload: Bytes,
         deadline: Instant,
     ) -> Result<Bytes, RemoteMessageError> {
-        self.router(target.reference.domain())?
+        self.router(target.reference.group())?
             .receive_singleton_ask(target, message_id, payload, deadline)
             .await
     }

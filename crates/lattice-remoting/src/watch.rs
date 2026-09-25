@@ -41,12 +41,9 @@ pub enum WatchCommand {
 }
 
 const WATCH_CONTROL_MAGIC: &[u8; 4] = b"LWCH";
-pub const WATCH_CONTROL_GENERATION: u32 = 3;
 
 #[derive(Clone, PartialEq, Message)]
 struct WatchControlEnvelopeWire {
-    #[prost(uint32, tag = "1")]
-    generation: u32,
     #[prost(oneof = "watch_control_envelope_wire::Command", tags = "2, 3, 4, 5")]
     command: Option<watch_control_envelope_wire::Command>,
 }
@@ -171,9 +168,6 @@ pub fn decode_watch_command(
         .ok_or(WatchError::InvalidCommand)?;
     let envelope =
         WatchControlEnvelopeWire::decode(encoded).map_err(|_| WatchError::InvalidCommand)?;
-    if envelope.generation != WATCH_CONTROL_GENERATION {
-        return Err(WatchError::GenerationMismatch);
-    }
     command_from_wire(envelope)
 }
 
@@ -203,7 +197,6 @@ fn command_to_wire(command: &WatchCommand) -> WatchControlEnvelopeWire {
         }),
     };
     WatchControlEnvelopeWire {
-        generation: WATCH_CONTROL_GENERATION,
         command: Some(command),
     }
 }
@@ -718,8 +711,6 @@ pub enum WatchError {
     InvalidCommand,
     #[error("watch control command exceeds its payload bound")]
     PayloadTooLarge,
-    #[error("watch control schema generation differs")]
-    GenerationMismatch,
     #[error("watch subscription closed before a terminal event")]
     Closed,
 }
@@ -834,8 +825,7 @@ mod tests {
     }
 
     #[test]
-    fn panicked_termination_requires_watch_generation_three() {
-        assert_eq!(WATCH_CONTROL_GENERATION, 3);
+    fn panicked_termination_round_trips() {
         let target = actor(1);
         let command = WatchCommand::Terminated {
             watch_id: WatchId::new(7, 9).unwrap(),
@@ -844,15 +834,6 @@ mod tests {
         };
         let encoded = encode_watch_command(&command, 4096).unwrap();
         assert_eq!(decode_watch_command(&encoded, 4096).unwrap(), command);
-
-        let mut envelope = command_to_wire(&command);
-        envelope.generation = 2;
-        let mut legacy = WATCH_CONTROL_MAGIC.to_vec();
-        legacy.extend_from_slice(&envelope.encode_to_vec());
-        assert_eq!(
-            decode_watch_command(&legacy, 4096).unwrap_err(),
-            WatchError::GenerationMismatch
-        );
     }
 
     #[tokio::test]

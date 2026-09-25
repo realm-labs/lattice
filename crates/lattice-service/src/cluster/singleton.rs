@@ -1,19 +1,19 @@
 use lattice_actor_distributed::registry::{ActorDefinition, ActorQuarantineError};
-use lattice_model::cluster::CoordinatorScope;
-use lattice_placement::{
+use lattice_coordination::{
     control::PlacementControlCommand, types::PlacementSlot as PlacementSlotRecord,
 };
+use lattice_model::cluster::CoordinatorScope;
 use lattice_remoting::messaging::error::RemoteFailureCode;
 
 use super::{
-    Actor, ActorAddress, ActorHandle, ActorId, ActorLoader, ActorProtocolBinding, ActorRegistry,
-    Arc, AskError, AssociationKey, AssociationManager, AssociationState, Bytes, ConfigFingerprint,
-    DispatchMode, DispatchReply, Instant, LOGICAL_RESOLVE_MESSAGE_ID, LogicPlacementState,
-    LogicalSingletonTarget, Mutex, NodeKey, OutboundMessage, OutboundMessaging, PlacementDomainId,
-    PlacementSlot, PlacementSlotKey, PlacementSlotState, Protocol, ProtocolFingerprint, ProtocolId,
-    RemoteMessageError, RouteBuffer, SingletonAddress, SingletonKind, WatchError, async_trait,
-    decode_resolved_actor, drain_actor_ids, map_ask, map_dispatch, map_tell,
-    next_logical_resolution,
+    Actor, ActorAddress, ActorGroupId, ActorHandle, ActorId, ActorLoader, ActorProtocolBinding,
+    ActorRegistry, Arc, AskError, AssociationKey, AssociationManager, AssociationState, Bytes,
+    ConfigFingerprint, DispatchMode, DispatchReply, Instant, LOGICAL_RESOLVE_MESSAGE_ID,
+    LogicPlacementState, LogicalSingletonTarget, Mutex, NodeKey, OutboundMessage,
+    OutboundMessaging, PlacementSlot, PlacementSlotKey, PlacementSlotState, Protocol,
+    ProtocolFingerprint, ProtocolId, RemoteMessageError, RouteBuffer, SingletonAddress,
+    SingletonKind, WatchError, async_trait, decode_resolved_actor, drain_actor_ids, map_ask,
+    map_dispatch, map_tell, next_logical_resolution,
 };
 
 #[async_trait]
@@ -75,7 +75,7 @@ pub(super) struct SingletonRouteHost<
     pub(super) messaging: Arc<OutboundMessaging>,
     pub(super) coordinator: AssociationKey,
     pub(super) buffer: RouteBuffer,
-    pub(super) domain: PlacementDomainId,
+    pub(super) group: ActorGroupId,
     pub(super) kind: SingletonKind,
     pub(super) actor_id: ActorId,
     pub(super) config_fingerprint: ConfigFingerprint,
@@ -90,7 +90,7 @@ impl<D: ActorDefinition<Protocol = P>, A: Actor, L: ActorLoader<A>, P: Protocol>
 {
     fn slot(&self, target: &SingletonAddress) -> Result<PlacementSlotRecord, RemoteMessageError> {
         if target.protocol_id() != self.protocol_id
-            || target.domain() != &self.domain
+            || target.group() != &self.group
             || target.config_fingerprint() != self.config_fingerprint
         {
             return Err(RemoteMessageError::ProtocolFingerprintMismatch);
@@ -99,7 +99,7 @@ impl<D: ActorDefinition<Protocol = P>, A: Actor, L: ActorLoader<A>, P: Protocol>
             .lock()
             .expect("logic placement state poisoned")
             .slot(&PlacementSlotKey::Singleton {
-                domain: self.domain.clone(),
+                group: self.group.clone(),
                 kind: self.kind.clone(),
             })
             .cloned()
@@ -128,12 +128,12 @@ impl<D: ActorDefinition<Protocol = P>, A: Actor, L: ActorLoader<A>, P: Protocol>
             .expect("logic placement state poisoned")
             .coordinator_term()
             .ok_or(RemoteMessageError::ShardUnavailable)?;
-        let payload = lattice_placement::control::encode_control_command_for_term(
-            &CoordinatorScope::Placement(self.domain.clone()),
+        let payload = lattice_coordination::control::encode_control_command_for_term(
+            &CoordinatorScope::Group(self.group.clone()),
             coordinator_term,
             &PlacementControlCommand::ResolveSingleton {
                 request_id,
-                domain: self.domain.clone(),
+                group: self.group.clone(),
                 kind: self.kind.clone(),
             },
             self.buffer.config.maximum_control_payload,
@@ -141,8 +141,8 @@ impl<D: ActorDefinition<Protocol = P>, A: Actor, L: ActorLoader<A>, P: Protocol>
         .map_err(|_| RemoteMessageError::InvalidPayload)?;
         association
             .admit_control_command_in(
-                lattice_placement::control::control_stream_id(&CoordinatorScope::Placement(
-                    self.domain.clone(),
+                lattice_coordination::control::control_stream_id(&CoordinatorScope::Group(
+                    self.group.clone(),
                 )),
                 payload,
             )
@@ -164,7 +164,7 @@ impl<D: ActorDefinition<Protocol = P>, A: Actor, L: ActorLoader<A>, P: Protocol>
             Err(_) => {}
         }
         let key = PlacementSlotKey::Singleton {
-            domain: self.domain.clone(),
+            group: self.group.clone(),
             kind: self.kind.clone(),
         };
         let candidate_request_id = next_logical_resolution(self.local_node.incarnation);
@@ -218,11 +218,11 @@ impl<D: ActorDefinition<Protocol = P>, A: Actor, L: ActorLoader<A>, P: Protocol>
         target: &LogicalSingletonTarget,
     ) -> Result<PlacementSlotKey, RemoteMessageError> {
         let key = PlacementSlotKey::Singleton {
-            domain: self.domain.clone(),
+            group: self.group.clone(),
             kind: self.kind.clone(),
         };
         if target.reference.protocol_id() != self.protocol_id
-            || target.reference.domain() != &self.domain
+            || target.reference.group() != &self.group
             || target.reference.config_fingerprint() != self.config_fingerprint
         {
             return Err(RemoteMessageError::ProtocolFingerprintMismatch);
@@ -406,7 +406,7 @@ impl<D: ActorDefinition<Protocol = P>, A: Actor, L: ActorLoader<A>, P: Protocol>
         target: SingletonAddress,
     ) -> Result<Option<ActorAddress>, WatchError> {
         let key = PlacementSlotKey::Singleton {
-            domain: self.domain.clone(),
+            group: self.group.clone(),
             kind: self.kind.clone(),
         };
         let slot = self.slot(&target).map_err(|_| WatchError::Unavailable)?;
@@ -494,7 +494,7 @@ impl<D: ActorDefinition<Protocol = P>, A: Actor, L: ActorLoader<A>, P: Protocol>
         let actor_id = self.actor_id.clone();
         self.registry.wait_actor_ids_terminal([actor_id]).await;
         let key = PlacementSlotKey::Singleton {
-            domain: self.domain.clone(),
+            group: self.group.clone(),
             kind: self.kind.clone(),
         };
         let still_owned = self

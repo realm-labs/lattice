@@ -128,7 +128,7 @@ fn run_etcd_acceptance_command(mut command: Command) -> Result<(), String> {
         .args([
             "test",
             "-p",
-            "lattice-placement",
+            "lattice-coordination",
             "--test",
             "etcd_acceptance",
             "--",

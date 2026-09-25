@@ -1,20 +1,20 @@
 //! Driving the production handoff reducer.
 //!
-//! Scenario steps are translated into the events [`HandoffMachine`](lattice_placement::handoff::HandoffMachine)
+//! Scenario steps are translated into the events [`HandoffMachine`](lattice_coordination::handoff::HandoffMachine)
 //! accepts, and the effects it returns are applied back onto the scenario state. A rejected
 //! transition is a legitimate outcome the workload retries; only a rejection that still moved the
 //! reducer forward is a fault.
 
 use crate::failpoints::Failpoint;
-use lattice_failpoint as failpoint;
-use lattice_placement::{
+use lattice_coordination::{
     handoff::{HandoffEffect, HandoffError, HandoffEvent},
     types::{AssignmentGeneration, CoordinatorTerm, PlacementVersion, Revision},
 };
+use lattice_failpoint as failpoint;
 
 use super::{
-    HandoffStep, MAXIMUM_ATTEMPTS, Scenario, ScenarioError, ScenarioEvent, incarnation, node,
-    placement_domain,
+    HandoffStep, MAXIMUM_ATTEMPTS, Scenario, ScenarioError, ScenarioEvent, actor_group,
+    incarnation, node,
 };
 use crate::fault::{FailAction, FaultOrigin, FaultOutcome, FaultTarget};
 
@@ -97,7 +97,7 @@ pub(super) fn handoff_event(step: HandoffStep) -> HandoffEvent {
         HandoffStep::ApplyBarrier(session) => HandoffEvent::AppliedRevision {
             session,
             version: PlacementVersion::new(
-                placement_domain(),
+                actor_group(),
                 CoordinatorTerm::new(1).unwrap(),
                 Revision::new(2).unwrap(),
             ),

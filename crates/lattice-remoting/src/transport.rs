@@ -679,7 +679,7 @@ mod tests {
     use super::*;
     use crate::{
         association::{AssociationId, LaneKind},
-        handshake::{FeatureBits, Handshake, NodeIdentity},
+        handshake::{Handshake, NodeIdentity},
         protocol::{ProtocolDescriptor, ProtocolFingerprint},
         wire::{FrameEnvelope, FrameKind, INLINE_FRAME_SEGMENT_CAPACITY},
     };
@@ -1052,7 +1052,6 @@ mod tests {
                 lane: LaneKind::Control,
                 connection_nonce: 10,
                 maximum_frame_size: 4096,
-                features: FeatureBits::REQUIRED_V3,
             },
             &[client_protocol],
             8,

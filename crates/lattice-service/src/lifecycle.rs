@@ -7,8 +7,8 @@ use std::{
     time::Instant,
 };
 
-use lattice_model::{cluster::CoordinatorScope, cluster::PlacementDomainId};
-use lattice_placement::types::PlacementSlotKey;
+use lattice_coordination::types::PlacementSlotKey;
+use lattice_model::{cluster::ActorGroupId, cluster::CoordinatorScope};
 use thiserror::Error;
 use tokio::sync::watch::Sender;
 
@@ -46,7 +46,7 @@ pub enum NodeLifecycleState {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PlacementDomainState {
+pub enum ActorGroupState {
     Joining,
     Ready,
     Degraded,
@@ -57,7 +57,7 @@ pub enum PlacementDomainState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServiceHealthSnapshot {
     pub node: NodeLifecycleState,
-    pub domains: BTreeMap<PlacementDomainId, PlacementDomainState>,
+    pub groups: BTreeMap<ActorGroupId, ActorGroupState>,
     pub coordinator_scopes: BTreeMap<CoordinatorScope, CoordinatorScopeState>,
 }
 
@@ -70,7 +70,7 @@ pub enum CoordinatorScopeState {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LifecycleInterventionReport {
-    pub blocked_slots: BTreeMap<PlacementDomainId, Vec<PlacementSlotKey>>,
+    pub blocked_slots: BTreeMap<ActorGroupId, Vec<PlacementSlotKey>>,
     pub retained_actor_cells: Vec<String>,
 }
 
@@ -131,7 +131,7 @@ pub enum AdmissionScope {
     External,
     /// Logical destinations (`EntityAddress`, `SingletonAddress`) resolved through placement.
     ///
-    /// Governed by the placement domain session plus the installed claim deadline, which fences
+    /// Governed by the placement group session plus the installed claim deadline, which fences
     /// itself without any membership input.
     Logical,
     /// Exact activations addressed by a fully bound `ActorAddress`.
@@ -436,27 +436,27 @@ impl ProductionLifecycleDriver {
         Ok(next)
     }
 
-    pub fn set_domain_state(&self, domain: PlacementDomainId, state: PlacementDomainState) {
+    pub fn set_group_state(&self, group: ActorGroupId, state: ActorGroupState) {
         let node = self.state();
         let valid = match node {
-            NodeLifecycleState::Terminated => state == PlacementDomainState::Terminated,
+            NodeLifecycleState::Terminated => state == ActorGroupState::Terminated,
             NodeLifecycleState::Draining | NodeLifecycleState::Stopping => matches!(
                 state,
-                PlacementDomainState::Draining | PlacementDomainState::Terminated
+                ActorGroupState::Draining | ActorGroupState::Terminated
             ),
             NodeLifecycleState::Booting
             | NodeLifecycleState::JoiningMembership
             | NodeLifecycleState::Ready => true,
         };
         if !valid {
-            tracing::debug!(?node, ?state, %domain, "ignored late domain health transition during termination");
+            tracing::debug!(?node, ?state, %group, "ignored late group health transition during termination");
             return;
         }
         let mut health = self.health.lock().expect("service health poisoned");
-        if health.domains.get(&domain) == Some(&state) {
+        if health.groups.get(&group) == Some(&state) {
             return;
         }
-        health.domains.insert(domain, state);
+        health.groups.insert(group, state);
         self.health_events.send_replace(health.clone());
     }
 
@@ -470,12 +470,12 @@ impl ProductionLifecycleDriver {
             ServiceLifecycleEffect::BeginPlacementDrain => {
                 let mut health = self.health.lock().expect("service health poisoned");
                 let mut changed = false;
-                for state in health.domains.values_mut() {
+                for state in health.groups.values_mut() {
                     if !matches!(
                         state,
-                        PlacementDomainState::Terminated | PlacementDomainState::Draining
+                        ActorGroupState::Terminated | ActorGroupState::Draining
                     ) {
-                        *state = PlacementDomainState::Draining;
+                        *state = ActorGroupState::Draining;
                         changed = true;
                     }
                 }
@@ -606,15 +606,15 @@ mod tests {
     use super::*;
 
     fn production_driver(
-        domains: impl IntoIterator<Item = PlacementDomainId>,
+        groups: impl IntoIterator<Item = ActorGroupId>,
     ) -> ProductionLifecycleDriver {
         let lifecycle = Arc::new(Mutex::new(NodeLifecycle::default()));
         let (lifecycle_events, _) = tokio::sync::watch::channel(NodeLifecycleState::Booting);
         let health = Arc::new(Mutex::new(ServiceHealthSnapshot {
             node: NodeLifecycleState::Booting,
-            domains: domains
+            groups: groups
                 .into_iter()
-                .map(|domain| (domain, PlacementDomainState::Joining))
+                .map(|group| (group, ActorGroupState::Joining))
                 .collect(),
             coordinator_scopes: BTreeMap::new(),
         }));
@@ -630,7 +630,7 @@ mod tests {
     }
 
     fn observed_driver(
-        domain: &PlacementDomainId,
+        group: &ActorGroupId,
     ) -> (
         ProductionLifecycleDriver,
         tokio::sync::watch::Receiver<ServiceHealthSnapshot>,
@@ -639,7 +639,7 @@ mod tests {
         let (lifecycle_events, _) = tokio::sync::watch::channel(NodeLifecycleState::Booting);
         let health = Arc::new(Mutex::new(ServiceHealthSnapshot {
             node: NodeLifecycleState::Booting,
-            domains: [(domain.clone(), PlacementDomainState::Joining)]
+            groups: [(group.clone(), ActorGroupState::Joining)]
                 .into_iter()
                 .collect(),
             coordinator_scopes: BTreeMap::new(),
@@ -658,18 +658,18 @@ mod tests {
     }
 
     #[test]
-    fn repeated_domain_and_node_states_do_not_republish_health() {
-        let domain = PlacementDomainId::new("republish-test").unwrap();
-        let (driver, mut health) = observed_driver(&domain);
+    fn repeated_group_and_node_states_do_not_republish_health() {
+        let group = ActorGroupId::new("republish-test").unwrap();
+        let (driver, mut health) = observed_driver(&group);
         driver
             .transition(ServiceLifecycleEvent::RemotingReady)
             .unwrap();
-        driver.set_domain_state(domain.clone(), PlacementDomainState::Ready);
+        driver.set_group_state(group.clone(), ActorGroupState::Ready);
         assert!(health.has_changed().unwrap());
         health.mark_unchanged();
 
         for _ in 0..8 {
-            driver.set_domain_state(domain.clone(), PlacementDomainState::Ready);
+            driver.set_group_state(group.clone(), ActorGroupState::Ready);
         }
         driver
             .transition(ServiceLifecycleEvent::MembershipLost)
@@ -900,8 +900,8 @@ mod tests {
 
     #[test]
     fn production_driver_consumes_admission_drain_and_identity_effects() {
-        let domain = PlacementDomainId::new("driver-test").unwrap();
-        let driver = production_driver([domain.clone()]);
+        let group = ActorGroupId::new("driver-test").unwrap();
+        let driver = production_driver([group.clone()]);
         let (runtime_shutdown, runtime_shutdown_rx) = tokio::sync::watch::channel(false);
         driver.register_runtime_shutdown(runtime_shutdown);
         driver

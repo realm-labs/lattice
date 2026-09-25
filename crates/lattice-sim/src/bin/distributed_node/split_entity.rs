@@ -51,8 +51,8 @@ struct SplitHostArtifact {
     incarnation: u128,
     unix_millis: u128,
     lifecycle: String,
-    domain: String,
-    domain_state: String,
+    group: String,
+    group_state: String,
     probes: u64,
     served: u64,
     rejected: u64,
@@ -203,9 +203,9 @@ fn append_activation_event(
     )
 }
 
-fn split_entity_config(domain: &str) -> Result<EntityConfig, Box<dyn Error>> {
+fn split_entity_config(group: &str) -> Result<EntityConfig, Box<dyn Error>> {
     Ok(EntityConfig::new(
-        distributed_domain(domain)?,
+        distributed_group(group)?,
         EntityType::new("split-brain-entity")?,
         ProtocolId::new(SPLIT_PROTOCOL_ID)?,
         1,
@@ -247,7 +247,7 @@ struct SplitHost {
     artifact: PathBuf,
     node_id: String,
     port: u16,
-    domain: String,
+    group: String,
     journal: PathBuf,
     probes: PathBuf,
 }
@@ -260,7 +260,7 @@ async fn split_entity_host(
     artifact: PathBuf,
     node_id: String,
     port: u16,
-    domain: String,
+    group: String,
 ) -> Result<(), Box<dyn Error>> {
     let directory = artifact
         .parent()
@@ -273,7 +273,7 @@ async fn split_entity_host(
         artifact,
         node_id,
         port,
-        domain,
+        group,
     };
     // Latch shutdown without cancelling an in-flight lifecycle operation.
     let stopping = Arc::new(AtomicBool::new(false));
@@ -294,15 +294,15 @@ impl SplitHost {
         stopping: &AtomicBool,
     ) -> Result<(), Box<dyn Error>> {
         let config = node_config(
-            ClusterId::new("docker-domain-e2e")?,
+            ClusterId::new("docker-group-e2e")?,
             &self.node_id,
             NodeEndpoint::new(self.node_id.clone(), self.port)?,
             NodeIncarnation::generate(),
         );
         let cluster = config.cluster_id.clone();
         let incarnation = config.incarnation;
-        let entity = split_entity_config(&self.domain)?;
-        let placement_domain = entity.domain.clone();
+        let entity = split_entity_config(&self.group)?;
+        let actor_group = entity.group.clone();
         let protocol = Arc::new(SplitProtocol::bind::<SplitEntityActor>()?);
         let mut environment = ActorEnvironment::builder();
         environment.insert(ActivationDirectory::new(8)?)?;
@@ -336,22 +336,22 @@ impl SplitHost {
                     journal: self.journal.clone(),
                 },
             )?
-            .domain_capacity(placement_domain.clone(), 1)?
-            .coordinator_discovery(domain_static_discovery(
-                CoordinatorScope::Membership,
+            .group_capacity(actor_group.clone(), 1)?
+            .coordinator_discovery(group_static_discovery(
+                CoordinatorScope::Cluster,
                 "membership",
                 &[
-                    ("domain-membership", 29300),
-                    ("domain-alpha", 29301),
-                    ("domain-beta", 29302),
-                    ("domain-gamma", 29303),
-                    ("domain-standby", 29304),
+                    ("group-membership", 29300),
+                    ("group-alpha", 29301),
+                    ("group-beta", 29302),
+                    ("group-gamma", 29303),
+                    ("group-standby", 29304),
                 ],
             )?)?
-            .coordinator_discovery(domain_static_discovery(
-                CoordinatorScope::Placement(placement_domain.clone()),
+            .coordinator_discovery(group_static_discovery(
+                CoordinatorScope::Group(actor_group.clone()),
                 "split",
-                &[("domain-standby", 29304)],
+                &[("group-standby", 29304)],
             )?)?
             .join_config(ClusterJoinConfig {
                 retry_initial: Duration::from_millis(25),
@@ -391,11 +391,11 @@ impl SplitHost {
                     incarnation: incarnation.get(),
                     unix_millis: unix_millis(),
                     lifecycle: format!("{:?}", service.node_lifecycle_state()),
-                    domain: placement_domain.as_str().to_owned(),
-                    domain_state: health
+                    group: actor_group.as_str().to_owned(),
+                    group_state: health
                         .borrow()
-                        .domains
-                        .get(&placement_domain)
+                        .groups
+                        .get(&actor_group)
                         .map_or_else(|| "Absent".to_owned(), |state| format!("{state:?}")),
                     probes: counters.probes,
                     served: counters.served,

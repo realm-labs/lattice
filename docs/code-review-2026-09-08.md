@@ -10,7 +10,7 @@ The original review changed only this document and its index link. Findings belo
 
 ## 1. Scope and Evidence
 
-The review uses source code as its primary evidence, cross-checked against the dependency graph, existing tests, minimal reproductions, and architecture documents. It examines `lattice-actor`, `lattice-actor-distributed`, `lattice-remoting`, `lattice-placement`, and `lattice-service` in depth; checks relevant boundaries in discovery, the Kubernetes adapter, EventBus, Gateway, and Ops; and samples dependencies and interfaces in MongoDB, configuration, ID generation, telemetry, and examples. **This is not a line-by-line audit of all source code and does not include a complete correctness assessment of MongoDB persistence.**
+The review uses source code as its primary evidence, cross-checked against the dependency graph, existing tests, minimal reproductions, and architecture documents. It examines `lattice-actor`, `lattice-actor-distributed`, `lattice-remoting`, `lattice-coordination`, and `lattice-service` in depth; checks relevant boundaries in discovery, the Kubernetes adapter, EventBus, Gateway, and Ops; and samples dependencies and interfaces in MongoDB, configuration, ID generation, telemetry, and examples. **This is not a line-by-line audit of all source code and does not include a complete correctness assessment of MongoDB persistence.**
 
 The workspace contains 21 library/tool crates and 3 example packages. Rust files under `crates/` total approximately 129,000 lines, including tests, comments, and blank lines; placement, service, and remoting account for approximately 65,000 lines. This scale calls for explicit maintenance boundaries, but line count alone does not establish overengineering.
 
@@ -109,11 +109,11 @@ Regression criteria: removing a previously Active association during backoff, co
 
 ### R5: The Final Membership Leave Acknowledgement Can Wait Forever
 
-Locations: [membership_session.rs:75](../crates/lattice-placement/src/membership_session.rs#L75), [service.rs:622](../crates/lattice-service/src/builder/service.rs#L622).
+Locations: [cluster_session.rs:75](../crates/lattice-coordination/src/cluster_session.rs#L75), [service.rs:622](../crates/lattice-service/src/builder/service.rs#L622).
 
-After every domain reports drain completion, `leave(deadline)` directly awaits `MembershipCoordinatorHandle::complete_drain()`. That method checks `control_command_pending` every 10ms, without a deadline or detection of session replacement. If the Membership Coordinator becomes unreachable after admission and the old association receives no ACK, the outer deadline cannot terminate this await.
+After every domain reports drain completion, `leave(deadline)` directly awaits `ClusterSessionHandle::complete_drain()`. That method checks `control_command_pending` every 10ms, without a deadline or detection of session replacement. If the Membership Coordinator becomes unreachable after admission and the old association receives no ACK, the outer deadline cannot terminate this await.
 
-Impact: `shutdown()` no longer honors `leave_timeout`, and a rolling departure can hang indefinitely. The [corresponding placement implementation](../crates/lattice-placement/src/session/handle.rs#L131) already has an ACK timeout, showing behavioral drift between the two flows.
+Impact: `shutdown()` no longer honors `leave_timeout`, and a rolling departure can hang indefinitely. The [corresponding placement implementation](../crates/lattice-coordination/src/session/handle.rs#L131) already has an ACK timeout, showing behavioral drift between the two flows.
 
 Recommendation: propagate one absolute deadline through the entire leave operation and record the current phase. When leadership/session changes, retry the same operation_id within the remaining time. Do not restart a full timeout on each reconnect.
 
@@ -121,11 +121,11 @@ Regression criteria: disconnect control traffic after the final membership comma
 
 ### R6: A Transport ACK Does Not Prove an Authoritative Drain Commit
 
-Locations: [lane/control.rs:42](../crates/lattice-remoting/src/lane/control.rs#L42), [host/routing.rs:41](../crates/lattice-placement/src/runtime/host/routing.rs#L41), [service.rs:628](../crates/lattice-service/src/builder/service.rs#L628), [members.rs:149](../crates/lattice-service/src/cluster/members.rs#L149).
+Locations: [lane/control.rs:42](../crates/lattice-remoting/src/lane/control.rs#L42), [host/routing.rs:41](../crates/lattice-coordination/src/runtime/host/routing.rs#L41), [service.rs:628](../crates/lattice-service/src/builder/service.rs#L628), [members.rs:149](../crates/lattice-service/src/cluster/members.rs#L149).
 
 The reliable control layer advances its sequence and sends an ACK even for `InvalidCommand`, which prevents invalid commands from blocking subsequent control traffic. However, the drain handle returns success as soon as the command is no longer pending. A stale-term `MembershipDrainComplete` rejected after leadership changes receives the same transport ACK.
 
-The service then immediately calls `fence_incarnation`, removing itself from the local directory before checking whether that directory still contains it. The local mutation has already eliminated the wait condition, so it cannot prove that MembershipLeader committed removal. The comment on `fence_incarnation` assumes that authoritative removal has committed, but the caller has not established that precondition.
+The service then immediately calls `fence_incarnation`, removing itself from the local directory before checking whether that directory still contains it. The local mutation has already eliminated the wait condition, so it cannot prove that ClusterCoordinator committed removal. The comment on `fence_incarnation` assumes that authoritative removal has committed, but the caller has not established that precondition.
 
 Impact: leave may return success while other nodes still see the old membership. A new incarnation using the same node_id may have to wait for the old lease to expire before joining. Placement's complete_member_drain also relies solely on ACK state; its `drain_ready` and resend behavior across leadership changes should be checked together. This finding does not establish a bypass of claim fencing.
 
@@ -147,7 +147,7 @@ Recommendation: establish one deadline starting at accept for the entire inbound
 
 ### R8: CoordinatorHost Does Not Handle JoinError from a Panicking Domain Task
 
-Locations: [host.rs:374](../crates/lattice-placement/src/runtime/host.rs#L374), [host.rs:391](../crates/lattice-placement/src/runtime/host.rs#L391).
+Locations: [host.rs:374](../crates/lattice-coordination/src/runtime/host.rs#L374), [host.rs:391](../crates/lattice-coordination/src/runtime/host.rs#L391).
 
 `tasks.join_next()` handles only `Ok((domain, result))`. Clearing the sender, marking the domain Failed, publishing the directory, and campaigning again all occur inside that branch. A domain runtime panic yields `Err(JoinError)`, bypassing every one of those actions. The campaign scan selects only domains whose `sender.is_none()`.
 
@@ -159,7 +159,7 @@ Regression criteria: use a strategy that panics once. Verify that the domain lea
 
 ### R9: Membership Snapshot Timeout Checks Use a Constant Timestamp
 
-Locations: [membership_session.rs:254](../crates/lattice-placement/src/membership_session.rs#L254), [coordinator.rs:704](../crates/lattice-placement/src/coordinator.rs#L704), [coordinator.rs:736](../crates/lattice-placement/src/coordinator.rs#L736).
+Locations: [cluster_session.rs:254](../crates/lattice-coordination/src/cluster_session.rs#L254), [coordinator.rs:704](../crates/lattice-coordination/src/coordinator.rs#L704), [coordinator.rs:736](../crates/lattice-coordination/src/coordinator.rs#L736).
 
 SnapshotStager's begin, push, and finish all receive `MonotonicTime::from_millis(0)`, while expiry checks depend on the supplied now value. If sequence and other conditions are satisfied, chunks or the end marker arriving after the staging timeout are still accepted by the time checks.
 
@@ -198,7 +198,7 @@ The following are source-confirmed, without dedicated runtime reproductions. The
 | `lattice-actor` local kernel | Sound. It has no remoting dependency; local mailboxes, tasks, supervision, and DeathWatch can be used independently |
 | `lattice-model` address data and distributed bound references | Sound. Serializable addresses are separated from sending capabilities, avoiding persistence of runtime resources |
 | `lattice-remoting` | Sound. One association model with bounded control, interactive, and bulk lanes avoids another application-facing transport |
-| `lattice-placement` | Sound. etcd authority, leader guards, generation/claims, handoff, and pure state transitions serve explicit consistency requirements |
+| `lattice-coordination` | Sound. etcd authority, leader guards, generation/claims, handoff, and pure state transitions serve explicit consistency requirements |
 | Membership and placement domains | Sound. Member authority is isolated from each domain's placement authority, so a domain-local failure need not clear all data-plane state |
 | `lattice-service` | Its position as the assembly layer is appropriate. Its implementation burden should be reduced where it combines assembly, routing, control effect application, and leave coordination |
 | etcd, Kubernetes, MongoDB, and OTLP adapters | Separate dependency directions are appropriate. Optional integrations are not all embedded in the local Actor kernel |
@@ -303,14 +303,14 @@ Environment: Windows / PowerShell, `rustc 1.98.0`, `cargo 1.98.0`. CI is configu
 Executed:
 
 ```powershell
-cargo test -p lattice-actor -p lattice-actor-distributed -p lattice-placement -p lattice-service -p lattice-remoting -p lattice-discovery -p lattice-discovery-k8s --lib --locked --offline
+cargo test -p lattice-actor -p lattice-actor-distributed -p lattice-coordination -p lattice-service -p lattice-remoting -p lattice-discovery -p lattice-discovery-k8s --lib --locked --offline
 ```
 
 | crate | Passed |
 |---|---:|
 | lattice-actor | 44 |
 | lattice-actor-distributed | 4 |
-| lattice-placement | 112 |
+| lattice-coordination | 112 |
 | lattice-service | 64 |
 | lattice-remoting | 89 |
 | lattice-discovery | 12 |

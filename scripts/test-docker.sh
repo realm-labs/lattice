@@ -157,10 +157,10 @@ esac
 if [ "$profile" = scale ]; then
   docker compose -f "$compose" -p "$project" --profile "$profile" up \
     --no-build \
-    --scale "domain-logic-scale=$LATTICE_SCALE_LOGIC_NODES" \
+    --scale "group-logic-scale=$LATTICE_SCALE_LOGIC_NODES" \
     --abort-on-container-exit \
     --exit-code-from "$service" \
-    domain-logic-scale "$service"
+    group-logic-scale "$service"
 else
   docker compose -f "$compose" -p "$project" --profile "$profile" up \
     --no-build --abort-on-container-exit --exit-code-from "$service" "$service"

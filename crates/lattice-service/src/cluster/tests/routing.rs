@@ -11,12 +11,7 @@ use std::{
 };
 
 use lattice_actor_distributed::registry::{ActorAddressConfig, ActorRegistryConfig};
-use lattice_model::{
-    actor::ProtocolId,
-    cluster::CoordinatorScope,
-    cluster::{ClusterId, EntityType, NodeEndpoint, NodeIncarnation},
-};
-use lattice_placement::{
+use lattice_coordination::{
     control::{
         DEFAULT_MAX_CONTROL_PAYLOAD, PlacementControlCommand, PlacementControlRouter,
         PlacementResolutionFailure, decode_control_command,
@@ -24,11 +19,16 @@ use lattice_placement::{
     coordinator::{
         SingletonConfig, SnapshotLimits, SnapshotRecord, SnapshotVersion, build_snapshot,
     },
-    session::{LogicCoordinatorConfig, PlacementDomainSession},
+    session::{GroupSession, GroupSessionConfig},
     types::{
         AssignmentGeneration, ClaimGrant, CoordinatorTerm, GrantSequence, PlacementSlot,
         PlacementVersion, Revision,
     },
+};
+use lattice_model::{
+    actor::ProtocolId,
+    cluster::CoordinatorScope,
+    cluster::{ClusterId, EntityType, NodeEndpoint, NodeIncarnation},
 };
 use lattice_remoting::{
     association::{AssociationKey, LaneAttachment, LaneKind},
@@ -68,7 +68,7 @@ async fn unavailable_resolution_fails_fast_and_clears_route_single_flight() {
         coordinator_incarnation,
     );
     let entity_config = EntityConfig::new(
-        domain(),
+        group(),
         EntityType::new("unavailable-entity").unwrap(),
         ProtocolId::new(TEST_PROTOCOL_ID).unwrap(),
         16,
@@ -78,7 +78,7 @@ async fn unavailable_resolution_fails_fast_and_clears_route_single_flight() {
     )
     .unwrap();
     let singleton_config = SingletonConfig::new(
-        domain(),
+        group(),
         SingletonKind::new("unavailable-singleton").unwrap(),
         ProtocolId::new(TEST_PROTOCOL_ID).unwrap(),
     );
@@ -91,11 +91,11 @@ async fn unavailable_resolution_fails_fast_and_clears_route_single_flight() {
     let (control, controls) =
         PlacementControlRouter::bounded(32, DEFAULT_MAX_CONTROL_PAYLOAD).unwrap();
     let control = Arc::new(control);
-    let (logic, _effects) = PlacementDomainSession::new(
-        hello.domain,
+    let (logic, _effects) = GroupSession::new(
+        hello.group,
         coordinator.clone(),
         associations.clone(),
-        LogicCoordinatorConfig::default(),
+        GroupSessionConfig::default(),
         32,
         1,
     )
@@ -105,7 +105,7 @@ async fn unavailable_resolution_fails_fast_and_clears_route_single_flight() {
     let logic_task = tokio::spawn(logic.run(controls, shutdown_rx));
     let protocol = EntityProtocol::build().unwrap();
     let fingerprint = protocol.fingerprint();
-    let mut router = DomainLogicalRouter::new(
+    let mut router = GroupLogicalRouter::new(
         local_node,
         state,
         associations.clone(),
@@ -133,7 +133,7 @@ async fn unavailable_resolution_fails_fast_and_clears_route_single_flight() {
         )
         .unwrap();
     let shard_key = PlacementSlotKey::Shard {
-        domain: domain(),
+        group: group(),
         entity_type: entity_config.entity_type.clone(),
         shard_id: entity_config.shard_for(reference.entity_id()).unwrap(),
     };
@@ -155,22 +155,22 @@ async fn unavailable_resolution_fails_fast_and_clears_route_single_flight() {
                         let resolved = match scoped.command {
                             PlacementControlCommand::ResolveShard {
                                 request_id,
-                                domain,
+                                group,
                                 entity_type,
                                 shard_id,
                             } => Some((
                                 request_id,
                                 PlacementSlotKey::Shard {
-                                    domain,
+                                    group,
                                     entity_type,
                                     shard_id,
                                 },
                             )),
                             PlacementControlCommand::ResolveSingleton {
                                 request_id,
-                                domain,
+                                group,
                                 kind,
-                            } => Some((request_id, PlacementSlotKey::Singleton { domain, kind })),
+                            } => Some((request_id, PlacementSlotKey::Singleton { group, kind })),
                             _ => None,
                         };
                         if let Some((request_id, slot)) = resolved
@@ -194,12 +194,12 @@ async fn unavailable_resolution_fails_fast_and_clears_route_single_flight() {
             control
                 .apply(
                     coordinator,
-                    lattice_placement::control::control_stream_id(&CoordinatorScope::Placement(
-                        domain(),
+                    lattice_coordination::control::control_stream_id(&CoordinatorScope::Group(
+                        group(),
                     )),
                     CommandId::generate(),
-                    lattice_placement::control::encode_control_command_for_term(
-                        &CoordinatorScope::Placement(domain()),
+                    lattice_coordination::control::encode_control_command_for_term(
+                        &CoordinatorScope::Group(group()),
                         1,
                         &PlacementControlCommand::ResolutionFailed {
                             request_id,
@@ -245,11 +245,11 @@ async fn unavailable_resolution_fails_fast_and_clears_route_single_flight() {
         .filter_map(|scoped| match scoped.command {
             PlacementControlCommand::ResolveShard {
                 request_id,
-                domain,
+                group,
                 entity_type,
                 shard_id,
             } => (PlacementSlotKey::Shard {
-                domain,
+                group,
                 entity_type,
                 shard_id,
             } == shard_key)
@@ -296,14 +296,14 @@ async fn unavailable_resolution_fails_fast_and_clears_route_single_flight() {
 
     let singleton = SingletonAddress::new(
         cluster_id,
-        domain(),
+        group(),
         singleton_config.kind.clone(),
         singleton_config.protocol_id,
         singleton_config.fingerprint(),
     )
     .unwrap();
     let singleton_key = PlacementSlotKey::Singleton {
-        domain: domain(),
+        group: group(),
         kind: singleton_config.kind,
     };
     let singleton_call = tokio::spawn({
@@ -374,7 +374,7 @@ async fn stale_generation_never_reaches_entity_loader() {
             .unwrap();
     }
     let entity_config = EntityConfig::new(
-        domain(),
+        group(),
         EntityType::new("entity").unwrap(),
         ProtocolId::new(TEST_PROTOCOL_ID).unwrap(),
         16,
@@ -385,7 +385,7 @@ async fn stale_generation_never_reaches_entity_loader() {
     .unwrap();
     let entity_id = ActorId::new(b"player-42".to_vec()).unwrap();
     let slot_key = PlacementSlotKey::Shard {
-        domain: domain(),
+        group: group(),
         entity_type: entity_config.entity_type.clone(),
         shard_id: entity_config.shard_for(&entity_id).unwrap(),
     };
@@ -398,11 +398,11 @@ async fn stale_generation_never_reaches_entity_loader() {
     let (control_router, controls) =
         PlacementControlRouter::bounded(32, DEFAULT_MAX_CONTROL_PAYLOAD).unwrap();
     let control_router = Arc::new(control_router);
-    let (logic, _effects) = PlacementDomainSession::new(
-        hello.domain,
+    let (logic, _effects) = GroupSession::new(
+        hello.group,
         association_key.clone(),
         associations.clone(),
-        LogicCoordinatorConfig::default(),
+        GroupSessionConfig::default(),
         32,
         1,
     )
@@ -420,7 +420,7 @@ async fn stale_generation_never_reaches_entity_loader() {
         target: None,
         assignment_generation: AssignmentGeneration::new(2).unwrap(),
         version: PlacementVersion::new(
-            domain(),
+            group(),
             CoordinatorTerm::new(1).unwrap(),
             Revision::new(1).unwrap(),
         ),
@@ -429,7 +429,7 @@ async fn stale_generation_never_reaches_entity_loader() {
         barrier_sessions: Default::default(),
     };
     let limits = SnapshotLimits::default();
-    let scope = CoordinatorScope::Placement(domain());
+    let scope = CoordinatorScope::Group(group());
     let (begin, chunks, end) = build_snapshot(
         &scope,
         slot.version.term.get(),
@@ -437,8 +437,8 @@ async fn stale_generation_never_reaches_entity_loader() {
         SnapshotVersion::Placement(slot.version.clone()),
         vec![SnapshotRecord {
             key: format!(
-                "domain/{}/shard/{}/{}",
-                domain().as_str(),
+                "group/{}/shard/{}/{}",
+                group().as_str(),
                 entity_config.entity_type.as_str(),
                 entity_config.shard_for(&entity_id).unwrap().get()
             ),
@@ -456,7 +456,7 @@ async fn stale_generation_never_reaches_entity_loader() {
         .chain(std::iter::once(PlacementControlCommand::SnapshotEnd(end)))
         .chain(std::iter::once(PlacementControlCommand::ClaimGranted(
             ClaimGrant {
-                domain: domain(),
+                group: group(),
                 slot: slot_key.clone(),
                 owner: local_node.clone(),
                 coordinator_term: CoordinatorTerm::new(1).unwrap(),
@@ -469,12 +469,10 @@ async fn stale_generation_never_reaches_entity_loader() {
         control_router
             .apply(
                 association_key.clone(),
-                lattice_placement::control::control_stream_id(&CoordinatorScope::Placement(
-                    domain(),
-                )),
+                lattice_coordination::control::control_stream_id(&CoordinatorScope::Group(group())),
                 CommandId::generate(),
-                lattice_placement::control::encode_control_command_for_term(
-                    &CoordinatorScope::Placement(domain()),
+                lattice_coordination::control::encode_control_command_for_term(
+                    &CoordinatorScope::Group(group()),
                     1,
                     &command,
                     DEFAULT_MAX_CONTROL_PAYLOAD,
@@ -501,7 +499,7 @@ async fn stale_generation_never_reaches_entity_loader() {
     ));
     let loads = Arc::new(AtomicUsize::new(0));
     let observed_token = Arc::new(AtomicU64::new(0));
-    let mut router = DomainLogicalRouter::new(
+    let mut router = GroupLogicalRouter::new(
         local_node.clone(),
         state,
         associations,

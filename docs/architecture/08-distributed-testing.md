@@ -230,7 +230,7 @@ shutdown_after_fence_before_task_join
 Failpoint behavior is test-only and cannot be enabled by unauthenticated production traffic. Each critical boundary is exercised against the relevant fault set:
 
 `lattice-failpoint` owns only the hook mechanism and `FailpointId`. Stable IDs live beside their
-production boundaries in `lattice-remoting::failpoints` and `lattice-placement::failpoints`.
+production boundaries in `lattice-remoting::failpoints` and `lattice-coordination::failpoints`.
 Enabling `lattice-failpoint/enabled` installs test hooks; the default production build reduces a
 hit to a no-op. `lattice-sim::failpoints` aggregates the subsystem IDs into its exhaustive
 27-boundary catalogue and machine-checks that every name has a call site.
@@ -245,8 +245,8 @@ its consequence observed, and it distinguishes a production call site changing i
 from the simulated executor applying the consequence. It is a coverage measurement rather than a
 gate, and `FaultMatrix::missing` enumerates what is absent.
 
-Coordinator boundaries are driven through `lattice-placement`'s `test-harness` feature, which
-exposes a real `PlacementDomainLeader` over an in-memory store and directly attached lane sessions.
+Coordinator boundaries are driven through `lattice-coordination`'s `test-harness` feature, which
+exposes a real `GroupCoordinator` over an in-memory store and directly attached lane sessions.
 What remains uncovered needs a bind listener, real etcd, the member-side session pipeline, or live
 task shutdown — or is a target axis the boundary cannot reach at all, such as a source or network
 fault at a commit that is refused before any message exists. Those are recorded as missing rather
@@ -442,8 +442,8 @@ Its structured oracle stops an elected scope leader, requires a candidate to pub
 with its exact boot incarnation, restarts the old host, and checks that it cannot displace the
 current leader.
 
-The e2e profile runs a dedicated membership host, four placement domains, three initially distinct
-placement leaders, a host leading both alpha and delta, a standby campaigning for all scopes, and
+The e2e profile runs a dedicated membership host, four actor groups, three initially distinct
+Group Coordinators, a host leading both alpha and delta, a standby campaigning for all scopes, and
 two logic nodes subscribed to all domains. Killing the alpha host must fail over both alpha and
 delta at independent higher terms while beta/gamma leadership and readiness stay unchanged. It then
 kills the membership host, requires an independent higher-term membership takeover, and waits for

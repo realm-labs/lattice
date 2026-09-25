@@ -1,8 +1,8 @@
 # Cluster discovery and member lifecycle runbook
 
 Discovery records are reachability hints only. Never repair membership by editing DNS,
-EndpointSlices, or the ConfigStore discovery document. The membership leader owns the exact member
-revision and incarnation. Each placement-domain leader independently owns that domain's members,
+EndpointSlices, or the ConfigStore discovery document. The Cluster Coordinator owns the exact member
+revision and incarnation. Each Group Coordinator independently owns that domain's members,
 configuration, slots, claims, plans, and revision.
 
 ## Signals and first checks
@@ -10,12 +10,12 @@ configuration, slots, claims, plans, and revision.
 The dashboard at `docs/operations/dashboards/cluster-lifecycle.json` groups discovery, bootstrap,
 node lifecycle, domain leader/session, route availability, capacity/load, authority inventory,
 reconciliation, cross-domain drain, removal, and stale-incarnation signals. Queries use bounded
-labels such as cluster, placement domain, provider, lifecycle state, and reason. Node IDs,
+labels such as cluster, actor group, provider, lifecycle state, and reason. Node IDs,
 addresses, operation IDs, and certificate identities belong in traces and bounded inspection
 output, not metric labels. Leader concentration is aggregated without a host label.
 
 For every incident, capture the exact cluster ID, node ID/incarnation, membership term/revision,
-affected placement domain and its term/revision, discovery generations, selected bootstrap
+affected actor group and its term/revision, discovery generations, selected bootstrap
 endpoints, and current membership/domain snapshots before taking a mutating action.
 
 ## Stuck Joining
@@ -25,7 +25,7 @@ endpoints, and current membership/domain snapshots before taking a mutating acti
    candidate set explains reachability only; it does not imply missing membership.
 3. Probe a candidate with the configured TLS hostname. Check cluster mismatch, expected-node
    mismatch, feature/version rejection, certificate URI identity, redirect loops, and RetryAfter.
-4. Inspect the membership leader for a `Joining` record with the node's exact incarnation and snapshot
+4. Inspect the Cluster Coordinator for a `Joining` record with the node's exact incarnation and snapshot
    revision. A different live incarnation under the same node ID must be drained or force-removed;
    never rewrite discovery to make the new process inherit it.
 5. If the join is retryable, repair discovery/network/TLS and let the supervised backoff continue.
@@ -35,7 +35,7 @@ endpoints, and current membership/domain snapshots before taking a mutating acti
 
 1. Verify external admission is closed. Preserve cluster-internal admission governed by still-valid
    domain routes and claims.
-2. Compare the last membership term/revision with the membership leader. Same-term conflicting
+2. Compare the last membership term/revision with the Cluster Coordinator. Same-term conflicting
    leaders are a safety incident; stop changes and preserve artifacts.
 3. Restore membership-scope discovery or its authenticated redirect path. Discovery is never a
    member directory and cannot extend placement claims.
@@ -86,10 +86,10 @@ Service.
    recovered, choose an explicitly authorized force action as described below; a timeout alone
    does not authorize discarding Actor state.
 
-Coordinator control generation 10 is required for these completion semantics. Generation 9/10
-coexistence is unsupported; follow the
-[full-stop upgrade boundary](code-only-rolling-upgrade.md#full-stop-boundary). Storage remains
-generation 5.
+These completion semantics belong to the admitted exact Lattice package version.
+Mixed framework versions are unsupported; follow the
+[full-stop upgrade boundary](code-only-rolling-upgrade.md#full-stop-boundary).
+There is no independent control or storage compatibility generation.
 
 ## Actor StopFailed and quarantine
 

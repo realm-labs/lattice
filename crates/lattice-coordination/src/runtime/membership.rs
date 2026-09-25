@@ -1,0 +1,1080 @@
+use lattice_model::{
+    cluster::CoordinatorScope,
+    cluster::{ActorGroupId, NodeIncarnation},
+};
+use lattice_remoting::{association::AssociationKey, control::ControlDispatchError};
+
+use super::{
+    ActorGroupHello, ActorGroupStore, AllocationError, Association, AssociationError,
+    AssociationState, Bytes, ClaimGrant, ClaimLease, CoordinatorLeaseStore,
+    CoordinatorRuntimeError, Duration, GroupCoordinator, GroupCoordinatorConfig, HandoffEvent,
+    HandoffPhase, Instant, MemberRecord, MemberRemovalReason, MemberSession, MemberStatus,
+    MembershipStore, MembershipVersion, NodeKey, PlacementControlCommand, PlacementSlotKey,
+    PlacementSlotState, PlacementVersion, PlanReason, RebalanceTrigger, ScopedElectionStore,
+    SnapshotRecord, build_snapshot,
+};
+use crate::{
+    control::{
+        PlacementControlEventKind, PlacementResolutionFailure, encode_control_command_for_term,
+    },
+    coordinator::{CoordinatorDelta, GroupMemberRecord, GroupMemberStatus, SnapshotVersion},
+    storage::{
+        StorageError,
+        records::{
+            CreateGroupMember, PutEntityConfig, PutSingletonConfig, RemoveGroupMember,
+            UpdateGroupMember,
+        },
+    },
+    types::MonotonicTime,
+};
+
+impl<S> GroupCoordinator<S>
+where
+    S: CoordinatorLeaseStore + ScopedElectionStore + MembershipStore + ActorGroupStore,
+{
+    pub(super) async fn handle_control(
+        &mut self,
+        event: PlacementControlEventKind,
+    ) -> Result<(), CoordinatorRuntimeError> {
+        match event {
+            PlacementControlEventKind::GlobalMemberRemoved { node, reason } => {
+                self.remove_global_member_participation(node, reason)
+                    .await?;
+            }
+            PlacementControlEventKind::Reconcile { association, .. } => {
+                self.reconciliation.focused = true;
+                if let Some(hello) = self
+                    .sessions
+                    .get(&association.remote_incarnation)
+                    .map(|session| session.hello.clone())
+                {
+                    self.send_snapshot(hello, association).await?;
+                }
+            }
+            PlacementControlEventKind::Command(inbound) => {
+                let remote = inbound.association.remote_incarnation;
+                let expected_scope = CoordinatorScope::Group(self.version.group.clone());
+                if inbound.scope != expected_scope {
+                    return Err(CoordinatorRuntimeError::UnauthorizedCommand);
+                }
+                match inbound.command {
+                    PlacementControlCommand::MemberHello(_) => {
+                        return Err(CoordinatorRuntimeError::UnauthorizedCommand);
+                    }
+                    PlacementControlCommand::ActorGroupHello(hello) => {
+                        self.register(hello, inbound.association).await?;
+                    }
+                    PlacementControlCommand::NodeHeartbeat {
+                        incarnation,
+                        sequence,
+                    } => {
+                        if incarnation != remote || sequence == 0 {
+                            return Err(CoordinatorRuntimeError::UnauthorizedCommand);
+                        }
+                        let session = self
+                            .sessions
+                            .get_mut(&remote)
+                            .ok_or(CoordinatorRuntimeError::UnknownSession)?;
+                        if sequence > session.heartbeat_sequence {
+                            session.heartbeat_sequence = sequence;
+                            session.last_heartbeat = Instant::now();
+                            self.store.keep_lease_alive(session.lease_id).await?;
+                        }
+                    }
+                    PlacementControlCommand::JoinReady { snapshot_version } => {
+                        self.mark_member_up(remote, snapshot_version, &inbound.association)
+                            .await?;
+                    }
+                    PlacementControlCommand::AppliedRevision(version) => {
+                        let session = self
+                            .sessions
+                            .get_mut(&remote)
+                            .ok_or(CoordinatorRuntimeError::UnknownSession)?;
+                        if session
+                            .applied_version
+                            .as_ref()
+                            .is_none_or(|current| &version > current)
+                        {
+                            session.applied_version = Some(version.clone());
+                        }
+                        let barriers = self
+                            .handoffs
+                            .iter()
+                            .filter_map(|(key, handoff)| {
+                                (handoff.phase == HandoffPhase::Invalidating
+                                    && handoff.required_sessions().contains(&remote)
+                                    && version.satisfies(&handoff.barrier_version()))
+                                .then_some(key.clone())
+                            })
+                            .collect::<Vec<_>>();
+                        for key in barriers {
+                            self.transition_handoff(
+                                key,
+                                HandoffEvent::AppliedRevision {
+                                    session: remote,
+                                    version: version.clone(),
+                                },
+                            )
+                            .await?;
+                        }
+                        let ready_member = self.sessions.get(&remote).and_then(|session| {
+                            (!session.claims_reconciled
+                                && session.placement_up()
+                                && session
+                                    .applied_version
+                                    .as_ref()
+                                    .is_some_and(|applied| applied.satisfies(&self.version)))
+                            .then(|| session.hello.clone())
+                        });
+                        if let Some(hello) = ready_member {
+                            self.reconcile_claims_for(&hello).await?;
+                        }
+                    }
+                    PlacementControlCommand::NodeLoad(report) => {
+                        if self
+                            .sessions
+                            .get(&remote)
+                            .is_none_or(|session| session.hello.node != report.node)
+                        {
+                            return Err(CoordinatorRuntimeError::UnauthorizedCommand);
+                        }
+                        let received = self.now();
+                        if self
+                            .loads
+                            .report_node(report)
+                            .map_err(CoordinatorRuntimeError::Coordinator)?
+                        {
+                            self.node_load_received.insert(remote, received);
+                        }
+                    }
+                    PlacementControlCommand::ShardLoad(report) => {
+                        if self
+                            .sessions
+                            .get(&remote)
+                            .is_none_or(|session| session.hello.node != report.node)
+                        {
+                            return Err(CoordinatorRuntimeError::UnauthorizedCommand);
+                        }
+                        let received = self.now();
+                        let key = (remote, report.entity_type.clone(), report.shard_id);
+                        if self
+                            .loads
+                            .report_shard(report)
+                            .map_err(CoordinatorRuntimeError::Coordinator)?
+                        {
+                            self.shard_load_received.insert(key, received);
+                        }
+                    }
+                    PlacementControlCommand::SubscribeEntity(entity_type) => {
+                        let mut hello = self
+                            .sessions
+                            .get(&remote)
+                            .ok_or(CoordinatorRuntimeError::UnknownSession)?
+                            .hello
+                            .clone();
+                        hello.proxied_entity_types.insert(entity_type);
+                        let association = self.persist_group_hello(remote, hello.clone()).await?;
+                        self.send_snapshot(hello, association).await?;
+                    }
+                    PlacementControlCommand::SubscribeSingleton(kind) => {
+                        let mut hello = self
+                            .sessions
+                            .get(&remote)
+                            .ok_or(CoordinatorRuntimeError::UnknownSession)?
+                            .hello
+                            .clone();
+                        hello.used_singletons.insert(kind);
+                        let association = self.persist_group_hello(remote, hello.clone()).await?;
+                        self.send_snapshot(hello, association).await?;
+                    }
+                    PlacementControlCommand::SlotDrained { slot, generation } => {
+                        let source = self
+                            .sessions
+                            .get(&remote)
+                            .ok_or(CoordinatorRuntimeError::UnknownSession)?
+                            .hello
+                            .node
+                            .clone();
+                        self.transition_handoff(
+                            slot,
+                            HandoffEvent::SourceDrained { source, generation },
+                        )
+                        .await?;
+                    }
+                    PlacementControlCommand::SlotStopFailed { slot, generation } => {
+                        let source = self
+                            .sessions
+                            .get(&remote)
+                            .ok_or(CoordinatorRuntimeError::UnknownSession)?
+                            .hello
+                            .node
+                            .clone();
+                        self.transition_handoff(
+                            slot,
+                            HandoffEvent::SourceStopFailed { source, generation },
+                        )
+                        .await?;
+                    }
+                    PlacementControlCommand::SlotReady { slot, generation } => {
+                        let target = self
+                            .sessions
+                            .get(&remote)
+                            .ok_or(CoordinatorRuntimeError::UnknownSession)?
+                            .hello
+                            .node
+                            .clone();
+                        if self.handoffs.contains_key(&slot) {
+                            self.transition_handoff(
+                                slot,
+                                HandoffEvent::TargetReady { target, generation },
+                            )
+                            .await?;
+                        } else {
+                            self.complete_initial_ready(&slot, &target, generation)
+                                .await?;
+                        }
+                    }
+                    PlacementControlCommand::BeginDrain {
+                        operation_id,
+                        expected_incarnation,
+                    } => {
+                        self.begin_member_drain(remote, operation_id, expected_incarnation)
+                            .await?;
+                    }
+                    PlacementControlCommand::DrainComplete {
+                        operation_id,
+                        node_id,
+                        expected_incarnation,
+                    } => {
+                        self.confirm_member_drain(
+                            &inbound.association,
+                            &node_id,
+                            &operation_id,
+                            expected_incarnation,
+                        )
+                        .await?;
+                    }
+                    PlacementControlCommand::ResolveShard {
+                        request_id,
+                        group,
+                        entity_type,
+                        shard_id,
+                    } => {
+                        if request_id == 0 || group != self.version.group {
+                            return Err(CoordinatorRuntimeError::UnauthorizedCommand);
+                        }
+                        let session = self
+                            .sessions
+                            .get(&remote)
+                            .ok_or(CoordinatorRuntimeError::UnknownSession)?;
+                        if !session.hello.subscribes_to(&entity_type) {
+                            return Err(CoordinatorRuntimeError::UnauthorizedCommand);
+                        }
+                        let hello = session.hello.clone();
+                        let association = session.association.clone();
+                        let slot = PlacementSlotKey::Shard {
+                            group,
+                            entity_type: entity_type.clone(),
+                            shard_id,
+                        };
+                        match self.ensure_shard_allocated(entity_type, shard_id).await {
+                            Ok(published) => {
+                                if !self.resolution_delta_reached(remote, published) {
+                                    self.send_snapshot(hello, association).await?;
+                                }
+                            }
+                            Err(CoordinatorRuntimeError::Allocation(
+                                AllocationError::NoEligibleNode,
+                            ))
+                            | Err(CoordinatorRuntimeError::IneligibleTarget) => {
+                                self.send_resolution_failure(association, request_id, slot)
+                                    .await?
+                            }
+                            Err(CoordinatorRuntimeError::StaleHandoff) => {
+                                self.send_snapshot(hello, association).await?
+                            }
+                            Err(error) => return Err(error),
+                        }
+                    }
+                    PlacementControlCommand::ResolveSingleton {
+                        request_id,
+                        group,
+                        kind,
+                    } => {
+                        if request_id == 0 || group != self.version.group {
+                            return Err(CoordinatorRuntimeError::UnauthorizedCommand);
+                        }
+                        let session = self
+                            .sessions
+                            .get(&remote)
+                            .ok_or(CoordinatorRuntimeError::UnknownSession)?;
+                        if !session.hello.used_singletons.contains(&kind)
+                            && !session.hello.singleton_eligibility.contains(&kind)
+                        {
+                            return Err(CoordinatorRuntimeError::UnauthorizedCommand);
+                        }
+                        let hello = session.hello.clone();
+                        let association = session.association.clone();
+                        let slot = PlacementSlotKey::Singleton {
+                            group,
+                            kind: kind.clone(),
+                        };
+                        match self.ensure_singleton_allocated(kind).await {
+                            Ok(published) => {
+                                if !self.resolution_delta_reached(remote, published) {
+                                    self.send_snapshot(hello, association).await?;
+                                }
+                            }
+                            Err(CoordinatorRuntimeError::IneligibleTarget) => {
+                                self.send_resolution_failure(association, request_id, slot)
+                                    .await?
+                            }
+                            Err(CoordinatorRuntimeError::StaleHandoff) => {
+                                self.send_snapshot(hello, association).await?
+                            }
+                            Err(error) => return Err(error),
+                        }
+                    }
+                    PlacementControlCommand::SnapshotBegin(_)
+                    | PlacementControlCommand::SnapshotChunk(_)
+                    | PlacementControlCommand::SnapshotEnd(_)
+                    | PlacementControlCommand::StateDelta(_)
+                    | PlacementControlCommand::ClaimGranted(_)
+                    | PlacementControlCommand::ResolutionFailed { .. }
+                    | PlacementControlCommand::MemberUp(_)
+                    | PlacementControlCommand::MemberDelta(_)
+                    | PlacementControlCommand::DrainReady { .. }
+                    | PlacementControlCommand::MembershipDrainComplete { .. }
+                    | PlacementControlCommand::DrainCommitted { .. }
+                    | PlacementControlCommand::ForceRemove { .. }
+                    | PlacementControlCommand::DrainSlot { .. } => {
+                        return Err(CoordinatorRuntimeError::UnauthorizedCommand);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// A resolution that allocated the slot already published its delta to every subscribed live
+    /// session. Re-encoding the whole group snapshot for the requester would make cold start cost
+    /// one full snapshot per unknown shard per region.
+    fn resolution_delta_reached(&self, remote: NodeIncarnation, published: bool) -> bool {
+        published
+            && self
+                .sessions
+                .get(&remote)
+                .is_some_and(MemberSession::placement_up)
+    }
+
+    async fn send_resolution_failure(
+        &self,
+        association_key: AssociationKey,
+        request_id: u128,
+        slot: PlacementSlotKey,
+    ) -> Result<(), CoordinatorRuntimeError> {
+        let association = self
+            .associations
+            .get(&association_key)
+            .ok_or(CoordinatorRuntimeError::AssociationUnavailable)?;
+        send_control_with_backpressure(
+            &association,
+            &self.version.group,
+            self.version.term.get(),
+            PlacementControlCommand::ResolutionFailed {
+                request_id,
+                slot,
+                reason: PlacementResolutionFailure::NoEligibleHost,
+            },
+            &self.config,
+        )
+        .await
+    }
+
+    pub(super) fn now(&self) -> MonotonicTime {
+        MonotonicTime::from_millis(
+            u64::try_from(self.origin.elapsed().as_millis()).unwrap_or(u64::MAX),
+        )
+    }
+
+    pub(super) fn remember_claim(&mut self, lease_id: i64, grant: ClaimGrant) {
+        self.expiring_claims.remove(&grant.slot);
+        self.claims
+            .insert(grant.slot.clone(), ClaimLease { lease_id, grant });
+    }
+
+    pub(super) fn release_claim(&mut self, key: &PlacementSlotKey) -> Option<ClaimLease> {
+        self.expiring_claims.remove(key);
+        self.claims.remove(key)
+    }
+
+    pub(super) fn claim_is_expiring(&self, key: &PlacementSlotKey, lease_id: i64) -> bool {
+        self.expiring_claims.get(key) == Some(&lease_id)
+    }
+
+    fn grant_window_open(&self, session: &MemberSession) -> bool {
+        self.config
+            .member_heartbeat_timeout
+            .checked_sub(self.config.claim_ttl)
+            .is_some_and(|window| Instant::now().duration_since(session.last_heartbeat) <= window)
+    }
+
+    pub(super) fn grant_authority(
+        &self,
+        grant: &ClaimGrant,
+    ) -> Result<(), CoordinatorRuntimeError> {
+        let session = self
+            .sessions
+            .get(&grant.owner.incarnation)
+            .filter(|session| session.hello.node == grant.owner)
+            .ok_or(CoordinatorRuntimeError::UnknownSession)?;
+        if !self.grant_window_open(session) {
+            return Ok(());
+        }
+        let association = self
+            .associations
+            .get(&session.association)
+            .ok_or(CoordinatorRuntimeError::AssociationUnavailable)?;
+        send_claim_grant(
+            &association,
+            &self.version.group,
+            self.version.term.get(),
+            grant.clone(),
+            &self.config,
+        )
+    }
+
+    pub(super) async fn register(
+        &mut self,
+        hello: ActorGroupHello,
+        association_key: AssociationKey,
+    ) -> Result<(), CoordinatorRuntimeError> {
+        hello
+            .validate(&self.config.session_limits)
+            .map_err(CoordinatorRuntimeError::Coordinator)?;
+        if hello.group != self.version.group
+            || hello.node.incarnation != association_key.remote_incarnation
+            || hello.node.address != association_key.remote_address
+            || self.sessions.len() == self.config.maximum_sessions
+                && !self.sessions.contains_key(&hello.node.incarnation)
+        {
+            return Err(CoordinatorRuntimeError::UnauthorizedCommand);
+        }
+        let record = self
+            .store
+            .get_member(&hello.node.node_id)
+            .await?
+            .filter(|record| record.node == hello.node && record.status == MemberStatus::Up)
+            .ok_or(CoordinatorRuntimeError::MemberNotReady)?;
+        self.gracefully_removed_sessions
+            .remove(&hello.node.incarnation);
+        // Membership can rejoin the same process under a new durable lease while this
+        // group still retains its previous session. The live global record authorizes
+        // replacing that session; its old lease must not reject the new hello.
+        if self
+            .sessions
+            .get(&hello.node.incarnation)
+            .is_some_and(|session| {
+                session.record != record
+                    && session.hello == hello
+                    && session.association == association_key
+            })
+        {
+            self.sessions.remove(&hello.node.incarnation);
+            self.loads.forget_incarnation(hello.node.incarnation);
+            self.node_load_received.remove(&hello.node.incarnation);
+            self.shard_load_received
+                .retain(|(owner, _, _), _| owner != &hello.node.incarnation);
+        }
+        if let Some(session) = self.sessions.get_mut(&hello.node.incarnation) {
+            if session.record != record
+                || session.hello != hello
+                || session.association != association_key
+            {
+                return Err(CoordinatorRuntimeError::UnauthorizedCommand);
+            }
+            session.last_heartbeat = Instant::now();
+            session.heartbeat_sequence = 0;
+            session.snapshot_version = Some(self.membership_version);
+            let status = session.record.status;
+            let record = session.record.clone();
+            // A new hello starts a new logic-session sequence even when the node incarnation and
+            // transport association are unchanged. Discard the previous latest-value samples so
+            // the first heartbeat-scoped report from the replacement session is accepted.
+            self.loads.forget_incarnation(hello.node.incarnation);
+            self.node_load_received.remove(&hello.node.incarnation);
+            self.shard_load_received
+                .retain(|(owner, _, _), _| owner != &hello.node.incarnation);
+            self.send_snapshot(hello, association_key.clone()).await?;
+            if status == MemberStatus::Up {
+                let association = self
+                    .associations
+                    .get(&association_key)
+                    .ok_or(CoordinatorRuntimeError::AssociationUnavailable)?;
+                send_control_with_backpressure(
+                    &association,
+                    &self.version.group,
+                    self.version.term.get(),
+                    PlacementControlCommand::MemberUp(record),
+                    &self.config,
+                )
+                .await?;
+            }
+            return Ok(());
+        }
+        self.persist_hello_configs(&hello).await?;
+        let record = self
+            .store
+            .get_member(&hello.node.node_id)
+            .await?
+            .filter(|current| current == &record)
+            .ok_or(CoordinatorRuntimeError::StaleMember)?;
+        if record.version > self.membership_version {
+            self.membership_version = record.version;
+        }
+        let joined_at = self.now();
+        self.sessions.insert(
+            hello.node.incarnation,
+            MemberSession {
+                hello: hello.clone(),
+                record: record.clone(),
+                group_record: None,
+                association: association_key.clone(),
+                lease_id: record.lease_id,
+                heartbeat_sequence: 0,
+                last_heartbeat: Instant::now(),
+                applied_version: None,
+                snapshot_version: Some(self.membership_version),
+                claims_reconciled: false,
+                draining: record.status == MemberStatus::Leaving,
+                drain_operation: None,
+                drain_ready: false,
+                joined_at,
+            },
+        );
+        // Domain participation is durable before the placement snapshot is cut.
+        // Otherwise a failover can advance the group revision after the member
+        // applies its snapshot, leaving authority replay permanently gated on a
+        // revision the member was never sent.
+        self.ensure_group_member_up(hello.node.incarnation).await?;
+        // Persisting the new group member advances the shared placement
+        // revision. Existing sessions must observe that revision before any
+        // later slot delta, otherwise their strict reducer sees a gap and
+        // tears down the Coordinator association.
+        self.synchronize_sessions().await?;
+        if record.status == MemberStatus::Up {
+            let session = self
+                .sessions
+                .get(&hello.node.incarnation)
+                .ok_or(CoordinatorRuntimeError::UnknownSession)?;
+            let association = self
+                .associations
+                .get(&session.association)
+                .ok_or(CoordinatorRuntimeError::AssociationUnavailable)?;
+            send_control_with_backpressure(
+                &association,
+                &self.version.group,
+                self.version.term.get(),
+                PlacementControlCommand::MemberUp(record),
+                &self.config,
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    async fn synchronize_sessions(&mut self) -> Result<(), CoordinatorRuntimeError> {
+        let version = self.version.clone();
+        let sessions = self
+            .sessions
+            .values()
+            .filter(|session| session.placement_attached())
+            .map(|session| {
+                (
+                    session.hello.clone(),
+                    session.association.clone(),
+                    session
+                        .applied_version
+                        .as_ref()
+                        .is_some_and(|current| current.accepts_delta_after(&version)),
+                )
+            })
+            .collect::<Vec<_>>();
+        for (hello, association_key, accepts_delta) in sessions {
+            // A session whose association has already gone cannot be synchronized. It will observe
+            // a revision gap and re-register, which is the documented recovery. Failing here would
+            // instead abort the caller, and this runs on the renewal path where that ends the
+            // group leader.
+            if self.associations.get(&association_key).is_none() {
+                continue;
+            }
+            if accepts_delta {
+                let association = self
+                    .associations
+                    .get(&association_key)
+                    .ok_or(CoordinatorRuntimeError::AssociationUnavailable)?;
+                send_control_with_backpressure(
+                    &association,
+                    &self.version.group,
+                    self.version.term.get(),
+                    PlacementControlCommand::StateDelta(CoordinatorDelta {
+                        version: version.clone(),
+                        records: Vec::new(),
+                    }),
+                    &self.config,
+                )
+                .await?;
+            } else {
+                self.send_snapshot(hello, association_key).await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn persist_hello_configs(
+        &mut self,
+        hello: &ActorGroupHello,
+    ) -> Result<(), CoordinatorRuntimeError> {
+        for config in &hello.entity_configs {
+            if self.entity_configs.len() == self.config.maximum_entity_configs
+                && !self.entity_configs.contains_key(&config.entity_type)
+            {
+                return Err(CoordinatorRuntimeError::ConfigurationCapacity);
+            }
+            if self
+                .entity_configs
+                .get(&config.entity_type)
+                .is_some_and(|current| current != config)
+            {
+                return Err(CoordinatorRuntimeError::ConfigurationConflict);
+            }
+            if !self.strategies.contains_key(&(
+                config.allocation_policy_id.clone(),
+                config.allocation_policy_version,
+            )) {
+                return Err(CoordinatorRuntimeError::UnknownStrategy);
+            }
+            if !self.entity_configs.contains_key(&config.entity_type) {
+                let committed = self
+                    .store
+                    .put_entity_config(
+                        &self.leader_guard,
+                        PutEntityConfig {
+                            expected: None,
+                            config: config.clone(),
+                        },
+                    )
+                    .await?;
+                self.version = committed.version;
+            }
+            self.entity_configs
+                .insert(config.entity_type.clone(), config.clone());
+        }
+        for config in &hello.singleton_configs {
+            if self.singleton_configs.len() == self.config.maximum_singleton_configs
+                && !self.singleton_configs.contains_key(&config.kind)
+            {
+                return Err(CoordinatorRuntimeError::ConfigurationCapacity);
+            }
+            if self
+                .singleton_configs
+                .get(&config.kind)
+                .is_some_and(|current| current != config)
+            {
+                return Err(CoordinatorRuntimeError::ConfigurationConflict);
+            }
+            if !self.singleton_configs.contains_key(&config.kind) {
+                let committed = self
+                    .store
+                    .put_singleton_config(
+                        &self.leader_guard,
+                        PutSingletonConfig {
+                            expected: None,
+                            config: config.clone(),
+                        },
+                    )
+                    .await?;
+                self.version = committed.version;
+            }
+            self.singleton_configs
+                .insert(config.kind.clone(), config.clone());
+        }
+        Ok(())
+    }
+
+    pub(super) fn next_version(&self) -> Result<PlacementVersion, CoordinatorRuntimeError> {
+        self.version
+            .next_revision()
+            .map_err(|_| CoordinatorRuntimeError::RevisionExhausted)
+    }
+
+    pub(super) async fn persist_group_hello(
+        &mut self,
+        incarnation: NodeIncarnation,
+        hello: ActorGroupHello,
+    ) -> Result<AssociationKey, CoordinatorRuntimeError> {
+        hello
+            .validate(&self.config.session_limits)
+            .map_err(CoordinatorRuntimeError::Coordinator)?;
+        let session = self
+            .sessions
+            .get(&incarnation)
+            .ok_or(CoordinatorRuntimeError::UnknownSession)?;
+        if session.record.status != MemberStatus::Up || hello.node != session.record.node {
+            return Err(CoordinatorRuntimeError::StaleMember);
+        }
+        if hello == session.hello {
+            return Ok(session.association.clone());
+        }
+        self.persist_hello_configs(&hello).await?;
+        let session = self
+            .sessions
+            .get(&incarnation)
+            .ok_or(CoordinatorRuntimeError::UnknownSession)?;
+        let association = session.association.clone();
+        let global_member = session.record.clone();
+        let expected = session
+            .group_record
+            .clone()
+            .ok_or(CoordinatorRuntimeError::StaleMember)?;
+        let mut member = expected.clone();
+        member.hello = hello.clone();
+        member.version = self.next_version()?;
+        let member = self
+            .store
+            .update_group_member(
+                &self.leader_guard,
+                UpdateGroupMember {
+                    expected_global_member: global_member,
+                    expected,
+                    member,
+                },
+            )
+            .await?
+            .member;
+        self.version = member.version.clone();
+        let session = self
+            .sessions
+            .get_mut(&incarnation)
+            .ok_or(CoordinatorRuntimeError::UnknownSession)?;
+        session.hello = hello;
+        session.group_record = Some(member);
+        Ok(association)
+    }
+
+    pub(super) async fn mark_member_up(
+        &mut self,
+        incarnation: NodeIncarnation,
+        snapshot_version: MembershipVersion,
+        association_key: &AssociationKey,
+    ) -> Result<(), CoordinatorRuntimeError> {
+        let session = self
+            .sessions
+            .get(&incarnation)
+            .ok_or(CoordinatorRuntimeError::UnknownSession)?;
+        if &session.association != association_key || session.record.node.incarnation != incarnation
+        {
+            return Err(CoordinatorRuntimeError::StaleMember);
+        }
+        if session.snapshot_version != Some(snapshot_version) {
+            if session
+                .snapshot_version
+                .is_some_and(|current| snapshot_version < current)
+            {
+                return Ok(());
+            }
+            return Err(CoordinatorRuntimeError::StaleMember);
+        }
+        if session.record.status != MemberStatus::Up {
+            return Err(CoordinatorRuntimeError::StaleMember);
+        }
+        let hello = session.hello.clone();
+        let member = session.record.clone();
+        self.ensure_group_member_up(incarnation).await?;
+        let association = self
+            .associations
+            .get(association_key)
+            .ok_or(CoordinatorRuntimeError::AssociationUnavailable)?;
+        send_control_with_backpressure(
+            &association,
+            &self.version.group,
+            self.version.term.get(),
+            PlacementControlCommand::MemberUp(member),
+            &self.config,
+        )
+        .await?;
+        let placement_ready = self.sessions.get(&incarnation).is_some_and(|session| {
+            !session.claims_reconciled
+                && session
+                    .applied_version
+                    .as_ref()
+                    .is_some_and(|applied| applied.satisfies(&self.version))
+        });
+        if placement_ready {
+            self.reconcile_claims_for(&hello).await?;
+        }
+        self.resume_handoffs_for(&hello.node).await
+    }
+
+    async fn ensure_group_member_up(
+        &mut self,
+        incarnation: NodeIncarnation,
+    ) -> Result<(), CoordinatorRuntimeError> {
+        let session = self
+            .sessions
+            .get(&incarnation)
+            .ok_or(CoordinatorRuntimeError::UnknownSession)?;
+        if session.record.status != MemberStatus::Up {
+            return Err(CoordinatorRuntimeError::StaleMember);
+        }
+        let global_member = session.record.clone();
+        let hello = session.hello.clone();
+        let existing = self
+            .store
+            .get_group_member(&hello.group, &hello.node.node_id)
+            .await?;
+        let member = match existing {
+            Some(current)
+                if current.node == hello.node
+                    && current.hello == hello
+                    && current.status == GroupMemberStatus::Up
+                    && current.version.term == self.version.term =>
+            {
+                current
+            }
+            Some(expected) => {
+                if expected.node != hello.node {
+                    let predecessor = expected.node.clone();
+                    self.store
+                        .remove_group_member(&self.leader_guard, RemoveGroupMember { expected })
+                        .await?;
+                    self.version = PlacementVersion::new(
+                        self.version.group.clone(),
+                        self.version.term,
+                        self.store
+                            .get_placement_revision(&self.version.group)
+                            .await?,
+                    );
+                    self.finish_node_removal(predecessor, MemberRemovalReason::IncarnationReplaced)
+                        .await?;
+                    let member = GroupMemberRecord {
+                        node: hello.node.clone(),
+                        hello,
+                        status: GroupMemberStatus::Up,
+                        version: self.next_version()?,
+                    };
+                    self.store
+                        .create_group_member(
+                            &self.leader_guard,
+                            CreateGroupMember {
+                                expected_global_member: global_member,
+                                member,
+                            },
+                        )
+                        .await?
+                        .member
+                } else {
+                    let member = GroupMemberRecord {
+                        node: hello.node.clone(),
+                        hello,
+                        status: GroupMemberStatus::Up,
+                        version: self.next_version()?,
+                    };
+                    self.store
+                        .update_group_member(
+                            &self.leader_guard,
+                            UpdateGroupMember {
+                                expected_global_member: global_member,
+                                expected,
+                                member,
+                            },
+                        )
+                        .await?
+                        .member
+                }
+            }
+            None => {
+                let member = GroupMemberRecord {
+                    node: hello.node.clone(),
+                    hello,
+                    status: GroupMemberStatus::Up,
+                    version: self.next_version()?,
+                };
+                self.store
+                    .create_group_member(
+                        &self.leader_guard,
+                        CreateGroupMember {
+                            expected_global_member: global_member,
+                            member,
+                        },
+                    )
+                    .await?
+                    .member
+            }
+        };
+        if member.version > self.version {
+            self.version = member.version.clone();
+        }
+        self.sessions
+            .get_mut(&incarnation)
+            .ok_or(CoordinatorRuntimeError::UnknownSession)?
+            .group_record = Some(member);
+        Ok(())
+    }
+}
+
+include!("membership_domain_ops.rs");
+
+pub(super) fn control_dispatch_error(error: &CoordinatorRuntimeError) -> ControlDispatchError {
+    match error {
+        CoordinatorRuntimeError::NotLeader
+        | CoordinatorRuntimeError::AssociationUnavailable
+        | CoordinatorRuntimeError::Association(_)
+        | CoordinatorRuntimeError::MemberNotReady => ControlDispatchError::RetryLater(
+            lattice_remoting::control::ControlRetryReason::AssociationStarting,
+        ),
+        CoordinatorRuntimeError::ControlClosed | CoordinatorRuntimeError::OperationClosed => {
+            ControlDispatchError::consumer_closed()
+        }
+        CoordinatorRuntimeError::ControlBackpressure => ControlDispatchError::RetryLater(
+            lattice_remoting::control::ControlRetryReason::ConsumerBusy,
+        ),
+        CoordinatorRuntimeError::Storage(
+            StorageError::LeadershipLost
+            | StorageError::Unavailable
+            | StorageError::Deadline
+            | StorageError::OutcomeUnknown
+            | StorageError::Authentication,
+        ) => ControlDispatchError::RetryLater(
+            lattice_remoting::control::ControlRetryReason::ConsumerBusy,
+        ),
+        _ => ControlDispatchError::InvalidCommand,
+    }
+}
+
+pub(super) async fn send_control_with_backpressure(
+    association: &Association,
+    group: &ActorGroupId,
+    coordinator_term: u64,
+    command: PlacementControlCommand,
+    config: &GroupCoordinatorConfig,
+) -> Result<(), CoordinatorRuntimeError> {
+    if association.state() == AssociationState::Closed {
+        return Err(CoordinatorRuntimeError::AssociationUnavailable);
+    }
+    let scope = CoordinatorScope::Group(group.clone());
+    let payload = encode_control_command_for_term(
+        &scope,
+        coordinator_term,
+        &command,
+        config.maximum_control_payload,
+    )
+    .map_err(CoordinatorRuntimeError::Control)?;
+    association
+        .admit_control_command_in_wait(
+            crate::control::control_stream_id(&scope),
+            payload,
+            Duration::from_millis(config.snapshot_limits.staging_timeout_millis),
+        )
+        .await?;
+    Ok(())
+}
+
+/// Grants are latest-value renewals replayed by the next renewal tick, never by the reliable
+/// control outbox: an outbox replay would extend an owner deadline past the claim-lease keepalive
+/// that backs it.
+pub(super) fn send_claim_grant(
+    association: &Association,
+    group: &ActorGroupId,
+    coordinator_term: u64,
+    grant: ClaimGrant,
+    config: &GroupCoordinatorConfig,
+) -> Result<(), CoordinatorRuntimeError> {
+    let payload = encode_control_command_for_term(
+        &CoordinatorScope::Group(group.clone()),
+        coordinator_term,
+        &PlacementControlCommand::ClaimGranted(grant),
+        config.maximum_control_payload,
+    )
+    .map_err(CoordinatorRuntimeError::Control)?;
+    match association.admit_ephemeral_control(payload) {
+        Ok(())
+        | Err(
+            AssociationError::NotActive
+            | AssociationError::Closed
+            | AssociationError::QueueFull
+            | AssociationError::ByteBudgetExceeded
+            | AssociationError::NodeByteBudgetExceeded,
+        ) => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+pub(super) fn revokes_claim_leases_on_removal(reason: MemberRemovalReason) -> bool {
+    match reason {
+        MemberRemovalReason::GracefulLeave => true,
+        MemberRemovalReason::FailureDetected
+        | MemberRemovalReason::ForceRemoved
+        | MemberRemovalReason::IncarnationReplaced => false,
+    }
+}
+
+pub(super) fn slot_record_key(key: &PlacementSlotKey) -> String {
+    match key {
+        PlacementSlotKey::Shard {
+            group,
+            entity_type,
+            shard_id,
+        } => format!(
+            "group/{}/shard/{}/{}",
+            group.as_str(),
+            entity_type.as_str(),
+            shard_id.get()
+        ),
+        PlacementSlotKey::Singleton { group, kind } => {
+            format!("group/{}/singleton/{}", group.as_str(), kind.as_str())
+        }
+    }
+}
+
+pub(super) fn plan_priority(reason: &PlanReason) -> u8 {
+    match reason {
+        PlanReason::Recovery => 0,
+        PlanReason::Drain => 1,
+        PlanReason::Manual => 2,
+        PlanReason::Automatic => 3,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stale_control_is_acknowledged_while_transient_storage_failure_is_retried() {
+        assert_eq!(
+            control_dispatch_error(&CoordinatorRuntimeError::MemberNotReady),
+            ControlDispatchError::RetryLater(
+                lattice_remoting::control::ControlRetryReason::AssociationStarting
+            )
+        );
+        assert_eq!(
+            control_dispatch_error(&CoordinatorRuntimeError::StaleHandoff),
+            ControlDispatchError::InvalidCommand
+        );
+        assert_eq!(
+            control_dispatch_error(&CoordinatorRuntimeError::Storage(
+                StorageError::CompareFailed
+            )),
+            ControlDispatchError::InvalidCommand
+        );
+        assert_eq!(
+            control_dispatch_error(&CoordinatorRuntimeError::Storage(
+                StorageError::OutcomeUnknown
+            )),
+            ControlDispatchError::RetryLater(
+                lattice_remoting::control::ControlRetryReason::ConsumerBusy
+            )
+        );
+    }
+}

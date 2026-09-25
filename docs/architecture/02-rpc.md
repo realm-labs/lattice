@@ -204,9 +204,9 @@ are not currently supported. Reusing one
 `ProtocolId` with a changed fingerprint is rejected; silent additive
 compatibility guesses are forbidden.
 
-Transport compatibility and business-protocol compatibility are separate fault domains. The initial handshake negotiates only transport version, node identity, limits, security, and mandatory transport features. The protocol catalogue is exchanged afterward over the reliable control channel and is bounded/chunked like other control state. An unsupported or mismatched `ProtocolId` disables delivery for that protocol and excludes the node from hosting dependent entity/singleton types; it does not close an otherwise compatible Association or disable unrelated protocols.
+Transport compatibility and business-protocol compatibility are separate fault domains. Bootstrap and handshake first require the exact automatic Lattice package version, then validate node identity, limits, and security. The protocol catalogue is exchanged afterward over the reliable control channel and is bounded/chunked like other control state. An unsupported or mismatched `ProtocolId` disables delivery for that protocol and excludes the node from hosting dependent entity/singleton types; it does not close an otherwise compatible Association or disable unrelated protocols.
 
-The reliable control envelope and framework control schemas belong to the remoting transport version and do not depend on a business ActorProtocol catalogue, avoiding a negotiation cycle.
+The reliable control envelope and framework control schemas belong to the exact Lattice package version and do not depend on a business ActorProtocol catalogue, avoiding a negotiation cycle.
 
 ## 3. Delivery Semantics
 
@@ -329,7 +329,7 @@ If bulk tell throughput is insufficient, optimize association scheduling, encodi
 
 Discovery supplies only an untrusted candidate address. Before the normal Association handshake, a
 dedicated bootstrap socket verifies the TLS chain and candidate hostname, exchanges a bounded
-nonce-bound bootstrap request/response, validates cluster and required transport features, and binds
+nonce-bound bootstrap request/response, validates the exact Lattice version and cluster, and binds
 the returned node ID/incarnation to the peer certificate. Plaintext probing is permitted only under
 the configured trusted-network policy. Failed probes close without inserting an Association.
 
@@ -346,7 +346,7 @@ Associations are lazy and single-flight:
 first remote send
   -> get_or_connect(AssociationKey)
   -> establish and authenticate control connection
-  -> negotiate AssociationId, incarnations, version, limits and features
+  -> check exact Lattice version; establish AssociationId, incarnations and limits
   -> attach interactive connection
   -> attach configured bulk stripes
   -> Association Ready
@@ -354,7 +354,7 @@ first remote send
 
 Every physical TLS connection authenticates the peer independently. Its binary handshake then binds it to the negotiated `AssociationId`, exact local/remote incarnations, lane kind, and stripe index. Plaintext uses the same structural validation but provides no cryptographic peer authentication.
 
-The control handshake validates cluster ID, advertised endpoint, protocol version, maximum frame size, supported features, and TLS identity when enabled. A stale remote incarnation is rejected and quarantined. Simultaneous dials and duplicate lane attachments are resolved deterministically so only one Association and one connection per declared lane/stripe survive.
+The control handshake validates cluster ID, advertised endpoint, exact Lattice version, maximum frame size, and TLS identity when enabled. A stale remote incarnation is rejected and quarantined. Simultaneous dials and duplicate lane attachments are resolved deterministically so only one Association and one connection per declared lane/stripe survive.
 
 `AssociationId` also defines the in-memory Association epoch. It remains stable while that supervised Association reconnects physical lanes to the same peer incarnation and retains its bounded control reconciliation state. Closing/recreating the logical Association, changing either node incarnation, or losing that state creates a new epoch; old control envelopes cannot cross the boundary.
 
@@ -437,12 +437,12 @@ The configured FD budget must cover at least `listener sockets + active_associat
 ## 5. Wire Protocol
 
 ```text
-magic | major | minor | kind | flags | header_len | payload_len | header | payload
+length:u32 | magic:LTCE | kind:u16 | reserved:u16 | payload
 ```
 
 Frame kinds include bootstrap request/response, handshake, heartbeat, tell, ask, reply, failure, watch, unwatch, terminated, Coordinator control, backpressure, and close. Bootstrap frames are accepted only on probe sockets before Association creation and cannot carry business or placement traffic. Headers carry only routing and protocol metadata; payload bytes are interpreted by the registered actor protocol.
 
-Remoting protocol version negotiation is explicit. Unknown mandatory transport features close the Association. Business protocol compatibility follows the per-ProtocolId fingerprint rule above: a mismatch rejects that protocol without expanding into an Association-wide failure. The legacy gRPC-to-remoting framework migration remains full-stop.
+The fixed framing magic is not a compatibility version. Setup payloads have a small identity envelope: its exact Lattice package version is checked before decoding the inner message. There is no major/minor or feature-bit compatibility negotiation. Business protocol compatibility follows the per-ProtocolId fingerprint rule above: a mismatch rejects that protocol without expanding into an Association-wide failure. Framework upgrades require a full stop.
 
 ## 6. DeathWatch
 

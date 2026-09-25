@@ -55,7 +55,7 @@ pub(super) struct ScopedLeadershipArtifact {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-pub(super) struct MultiDomainHostArtifact {
+pub(super) struct MultiGroupHostArtifact {
     pub node_id: String,
     #[serde(with = "lattice_sim::serde_u128")]
     pub incarnation: u128,
@@ -63,12 +63,12 @@ pub(super) struct MultiDomainHostArtifact {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-pub(super) struct MultiDomainLogicArtifact {
+pub(super) struct MultiGroupLogicArtifact {
     pub node_id: String,
     #[serde(with = "lattice_sim::serde_u128")]
     pub incarnation: u128,
     pub lifecycle: String,
-    pub domains: BTreeMap<String, String>,
+    pub groups: BTreeMap<String, String>,
     #[serde(default)]
     pub membership_version: Option<MembershipVersionArtifact>,
     #[serde(default)]
@@ -99,7 +99,7 @@ pub(super) struct ScaleNodeArtifact {
     #[serde(with = "lattice_sim::serde_u128")]
     pub incarnation: u128,
     pub lifecycle: String,
-    pub domains: BTreeMap<String, String>,
+    pub groups: BTreeMap<String, String>,
     pub membership_version: Option<MembershipVersionArtifact>,
     pub members: Vec<MemberArtifact>,
     pub join_millis: Option<u128>,

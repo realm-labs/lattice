@@ -1,4 +1,4 @@
-# 03. Membership, Placement Domains, Sharding, and Singletons
+# 03. Membership, Actor Groups, Sharding, and Singletons
 
 > Control-plane state and data-plane behavior for logical actor references.
 > Back to: [architecture index](README.md)
@@ -7,8 +7,8 @@
 
 ## 1. Control-Plane Boundary
 
-The membership leader is the sole writer of global exact-node lifecycle. Each `PlacementDomainId`
-has one independent lease-backed placement leader that is the sole writer of that domain's
+The Cluster Coordinator is the sole writer of global exact-node lifecycle. Each `ActorGroupId`
+has one independent lease-backed Group Coordinator that is the sole writer of that domain's
 participants, configuration, shard/singleton assignments, claims, handoffs, plans, and admin
 operations. A supervised `CoordinatorHost` may campaign for several scopes; losing one scope does
 not stop another.
@@ -23,7 +23,8 @@ Normal `ActorRef`, `EntityRef`, and `SingletonRef` messages never go through etc
 Recommended logical keys:
 
 ```text
-/lattice/<cluster>/schema_generation
+/lattice/<cluster>/meta/framework
+/lattice/<cluster>/schema/limits
 /lattice/<cluster>/membership/{leader,term,state_revision}
 /lattice/<cluster>/membership/members/<node_id>
 /lattice/<cluster>/domains/<domain>/{leader,term,state_revision}
@@ -39,15 +40,18 @@ Recommended logical keys:
 
 There are no per-entity placement keys and no concrete actor-path keys. Concrete `ActorRef` identity lives in remoting/runtime state; logical entity activation is local to its shard owner.
 
-Generation 5 is the only runtime schema. `MembershipVersion` orders membership; domain-qualified
-`PlacementVersion` orders each placement stream. Generation 4, `migrating-to-5`, or a different
-durable-limit record prevents startup rather than guessing compatibility.
+The exact Cargo package version in `meta/framework` is the only framework
+compatibility identity. Startup validates it before reading version-sensitive state.
+Only an empty prefix can be initialized; missing/different identities, legacy
+`schema_generation` records, or inconsistent durable limits refuse startup.
+`MembershipVersion` and group-qualified `PlacementVersion` still order runtime
+state; they are not release versions. The existing `membership/` and `domains/`
+key families remain until the run-scoped storage work package.
 
-Coordinator control generation is **10**, independently of storage generation **5**. Membership
-and placement sessions require the scoped `DrainCommitted` contract described in section 11.
-Generation 9 peers are rejected; upgrading control generation requires a
-[full deployment stop](../operations/code-only-rolling-upgrade.md#full-stop-boundary), including
-membership-only gateways and CoordinatorHosts. It does not require a storage migration.
+Bootstrap and handshake admission check the same framework identity. There are no
+separate transport/control/watch generation negotiations. A framework upgrade
+requires a [full deployment stop](../operations/code-only-rolling-upgrade.md#full-stop-boundary);
+configuration and business-protocol fingerprints remain independent checks.
 
 Shard and Singleton remain different public/runtime concepts, but their distributed authority is implemented by one internal placement-slot engine:
 
@@ -78,16 +82,16 @@ the same Association performs the only `Joining -> Up` transition. A Joining sna
 readiness; the local reducer must install its exact `Up` delta. Replayed hello/join-ready commands
 are idempotent.
 
-After global `Up`, each explicit domain session sends bounded `PlacementDomainHello`: domain/config
+After global `Up`, each explicit domain session sends bounded `ActorGroupHello`: domain/config
 fingerprint, positive quota, hosted configurations, proxy subscriptions, and constraints. The
-domain leader persists `DomainMemberRecord` and allocates only when both exact global and domain
+domain leader persists `GroupMemberRecord` and allocates only when both exact global and domain
 records are `Up`. A mismatch rejects only that domain.
 
 Membership and placement snapshots/deltas use distinct reducers and error families. Scope/domain
 mismatch is rejected before mutation. A higher term requires a full snapshot for only that scope;
 lower-term snapshots, events, barriers, and acknowledgements are rejected.
 
-A new placement-domain leader:
+A new Group Coordinator:
 
 1. obtains a higher election term;
 2. reconstructs only its domain members/configuration/assignments/claims/plans/handoffs;
@@ -96,7 +100,7 @@ A new placement-domain leader:
 5. resumes required recovery/drain work, then allocation and automatic rebalancing only after reconciliation and fresh-input checks.
 
 Every authoritative mutation is a named domain transaction comparing an exact
-`PlacementLeaderGuard`, domain revision, global member, domain member/config, and operation-specific
+`GroupLeaderGuard`, domain revision, global member, domain member/config, and operation-specific
 slot/claim/plan predicates. Typed guards make cross-plane use unrepresentable; scoped keys and
 contract tests reject cross-domain mutation. Runtime effects occur only after commit.
 
@@ -113,7 +117,7 @@ Runtime nodes never acquire claims directly from etcd.
 
 ### 3.1 Revisioned State Snapshot
 
-Membership and every placement domain have separate bounded snapshot streams. A domain snapshot
+Membership and every actor group have separate bounded snapshot streams. A domain snapshot
 contains only that domain's configurations, participants, slots, claims, and plans. Adding a Region
 or SingletonProxy installs its domain slice before Ready. Large snapshots use:
 
@@ -297,12 +301,12 @@ RebalanceProposal {
 }
 ```
 
-For the same domain `PlacementView`, policy version, trigger, and limits, a strategy must return the same ordered proposal. The placement-domain leader revalidates sources, generations, eligible targets, pending domain capacity, concurrency limits, and base revision. A failure skips the round and never partially mutates placement.
+For the same domain `PlacementView`, policy version, trigger, and limits, a strategy must return the same ordered proposal. The Group Coordinator revalidates sources, generations, eligible targets, pending domain capacity, concurrency limits, and base revision. A failure skips the round and never partially mutates placement.
 
 ### 6.2 Load and Capacity Model
 
 `MemberHello` supplies global roles, failure-domain attributes, protocols, and remoting capabilities.
-Each `PlacementDomainHello` supplies that domain's hosted/proxied types, constraints, and explicit
+Each `ActorGroupHello` supplies that domain's hosted/proxied types, constraints, and explicit
 positive capacity units. Ready domain participants send bounded latest-value load reports. Two
 domains never consume one unspecified global capacity pool.
 
@@ -335,7 +339,7 @@ inputs. Failure or reconciliation in another domain does not pause this domain.
 
 ### 6.4 Persisted Plan and Limits
 
-The placement-domain leader converts an accepted proposal into a persisted, domain/term/revision-fenced plan before starting a move:
+The Group Coordinator converts an accepted proposal into a persisted, domain/term/revision-fenced plan before starting a move:
 
 ```text
 RebalancePlan {
@@ -374,7 +378,7 @@ Singletons reuse the shared placement move, drain, claim, and fencing machinery 
 ## 7. Handoff
 
 A controlled shard handoff uses its domain's revision stream. Its barrier contains only live sessions
-whose `PlacementDomainHello` subscribes to the affected entity type. Unrelated domains and types
+whose `ActorGroupHello` subscribes to the affected entity type. Unrelated domains and types
 cannot block it.
 
 ```text
@@ -429,7 +433,7 @@ During temporary Coordinator unavailability:
 
 This keeps a short control-plane outage from stopping healthy known data paths without permitting
 split ownership. It is deliberately bounded: a known route stops at its local grant deadline.
-Production configuration must satisfy `placement-domain leader recovery objective < claim TTL -
+Production configuration must satisfy `Group Coordinator recovery objective < claim TTL -
 safety margin`; increasing TTL extends outage tolerance and worst-case crash-failover delay.
 
 ## 9. Passivation
@@ -458,7 +462,7 @@ whole exit, including membership confirmation and local component shutdown:
    domain leader and wait for its `DrainCommitted` response;
 4. retain each domain's confirmed completion while other domains continue draining;
 5. after every required domain is confirmed, send `MembershipDrainComplete` with the same
-   operation and exact node identity, and wait for the membership leader's `DrainCommitted`;
+   operation and exact node identity, and wait for the Cluster Coordinator's `DrainCommitted`;
 6. fence the removed incarnation locally, enter `Stopping`, drain remaining local Actors, and
    join endpoint and supervised tasks before publishing `Terminated`.
 
@@ -493,7 +497,8 @@ Actors remain available for inspection and persistence retry until that choice i
 
 ## 12. Migration Constraint
 
-Generation 4 is not wire/storage compatible with generation 5. Cutover is full-stop: stop old
-processes, require a complete explicit type-to-domain mapping, run the resumable offline migration,
-verify fenced ownership/scoped counters, then start only generation-5 processes. Mixed clusters and
-automatic startup migration are unsupported.
+Different framework versions cannot share a live cluster or coordination namespace.
+Stop the old deployment and follow the explicit full-stop procedure before creating
+a namespace for the new version. The old schema migration CLI has been removed;
+startup never converts old runtime records or overwrites their identity marker.
+Run-scoped cleanup/reset remains a separate work package, not an implemented shortcut.

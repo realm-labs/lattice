@@ -8,17 +8,17 @@
 
 use std::collections::BTreeSet;
 
-use lattice_model::{
-    actor::{ActivationId, ActorAddress, ActorPath, ProtocolId},
-    actor::{WatchId, WatchStatus},
-    cluster::{ClusterId, EntityType, NodeEndpoint, NodeIncarnation, PlacementDomainId},
-};
-use lattice_placement::{
+use lattice_coordination::{
     handoff::{HandoffError, HandoffMachine, HandoffPhase},
     types::{
         AssignmentGeneration, CoordinatorTerm, NodeKey, PlacementSlotKey, PlacementVersion,
         Revision, ShardId,
     },
+};
+use lattice_model::{
+    actor::{ActivationId, ActorAddress, ActorPath, ProtocolId},
+    actor::{WatchId, WatchStatus},
+    cluster::{ActorGroupId, ClusterId, EntityType, NodeEndpoint, NodeIncarnation},
 };
 use lattice_remoting::{
     association::AssociationId,
@@ -133,7 +133,7 @@ impl Scenario {
             .collect::<BTreeSet<_>>();
         let handoff = HandoffMachine::begin(
             PlacementSlotKey::Shard {
-                domain: placement_domain(),
+                group: actor_group(),
                 entity_type: EntityType::new("sim-entity").unwrap(),
                 shard_id: ShardId::new(1),
             },
@@ -142,7 +142,7 @@ impl Scenario {
             target.clone(),
             AssignmentGeneration::new(1).unwrap(),
             PlacementVersion::new(
-                placement_domain(),
+                actor_group(),
                 CoordinatorTerm::new(1).unwrap(),
                 Revision::new(2).unwrap(),
             ),
@@ -307,8 +307,8 @@ impl Scenario {
     }
 }
 
-fn placement_domain() -> PlacementDomainId {
-    PlacementDomainId::new("simulation").unwrap()
+fn actor_group() -> ActorGroupId {
+    ActorGroupId::new("simulation").unwrap()
 }
 
 fn phase_name(phase: HandoffPhase) -> &'static str {

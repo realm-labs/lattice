@@ -1053,8 +1053,8 @@ dependencies = [
  "lattice-actor",
  "lattice-actor-distributed",
  "lattice-codegen",
+ "lattice-coordination",
  "lattice-model",
- "lattice-placement",
  "lattice-remoting",
  "lattice-service",
  "prost",
@@ -2208,6 +2208,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "lattice-coordination"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "base64 0.23.0",
+ "blake3",
+ "bytes",
+ "dashmap",
+ "etcd-client",
+ "http",
+ "lattice-config",
+ "lattice-failpoint",
+ "lattice-model",
+ "lattice-remoting",
+ "prost",
+ "rcgen",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tokio-stream",
+ "tower",
+ "tracing",
+ "trybuild",
+ "uuid",
+ "xxhash-rust",
+]
+
+[[package]]
 name = "lattice-discovery"
 version = "0.1.0"
 dependencies = [
@@ -2310,8 +2340,8 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "axum",
+ "lattice-coordination",
  "lattice-model",
- "lattice-placement",
  "lattice-service",
  "serde",
  "serde_json",
@@ -2320,36 +2350,6 @@ dependencies = [
  "tokio",
  "tower",
  "tracing",
-]
-
-[[package]]
-name = "lattice-placement"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "base64 0.23.0",
- "blake3",
- "bytes",
- "dashmap",
- "etcd-client",
- "http",
- "lattice-config",
- "lattice-failpoint",
- "lattice-model",
- "lattice-remoting",
- "prost",
- "rcgen",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror",
- "tokio",
- "tokio-stream",
- "tower",
- "tracing",
- "trybuild",
- "uuid",
- "xxhash-rust",
 ]
 
 [[package]]
@@ -2385,10 +2385,10 @@ dependencies = [
  "futures-util",
  "lattice-actor",
  "lattice-actor-distributed",
+ "lattice-coordination",
  "lattice-discovery",
  "lattice-failpoint",
  "lattice-model",
- "lattice-placement",
  "lattice-remoting",
  "prost",
  "serde",
@@ -2412,11 +2412,11 @@ dependencies = [
  "lattice-actor-distributed",
  "lattice-config",
  "lattice-config-etcd",
+ "lattice-coordination",
  "lattice-discovery",
  "lattice-discovery-k8s",
  "lattice-failpoint",
  "lattice-model",
- "lattice-placement",
  "lattice-remoting",
  "lattice-service",
  "serde",
@@ -2611,11 +2611,11 @@ dependencies = [
  "lattice-actor-distributed",
  "lattice-codegen",
  "lattice-config",
+ "lattice-coordination",
  "lattice-discovery",
  "lattice-eventbus",
  "lattice-model",
  "lattice-ops",
- "lattice-placement",
  "lattice-remoting",
  "lattice-service",
  "prost",
@@ -3490,8 +3490,8 @@ dependencies = [
  "lattice-actor",
  "lattice-actor-distributed",
  "lattice-codegen",
+ "lattice-coordination",
  "lattice-model",
- "lattice-placement",
  "lattice-remoting",
  "lattice-service",
  "libc",

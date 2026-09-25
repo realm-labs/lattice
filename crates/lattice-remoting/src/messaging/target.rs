@@ -138,7 +138,7 @@ impl LogicalEntityTarget {
     pub(super) fn update_route_hash(&self, hasher: &mut blake3::Hasher) {
         hasher.update(b"logical-entity-target");
         update_route_bytes(hasher, self.reference.cluster_id().as_str().as_bytes());
-        update_route_bytes(hasher, self.reference.domain().as_str().as_bytes());
+        update_route_bytes(hasher, self.reference.group().as_str().as_bytes());
         update_route_bytes(hasher, self.reference.entity_type().as_str().as_bytes());
         update_route_bytes(hasher, self.reference.entity_id().as_bytes());
         update_route_bytes(hasher, self.owner_address.host().as_bytes());
@@ -160,7 +160,7 @@ impl LogicalSingletonTarget {
     pub(super) fn update_route_hash(&self, hasher: &mut blake3::Hasher) {
         hasher.update(b"logical-singleton-target");
         update_route_bytes(hasher, self.reference.cluster_id().as_str().as_bytes());
-        update_route_bytes(hasher, self.reference.domain().as_str().as_bytes());
+        update_route_bytes(hasher, self.reference.group().as_str().as_bytes());
         update_route_bytes(hasher, self.reference.singleton_kind().as_str().as_bytes());
         update_route_bytes(hasher, self.owner_address.host().as_bytes());
         hasher.update(&self.owner_address.port().to_be_bytes());

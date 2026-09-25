@@ -2,7 +2,7 @@
 
 > Status: complete; all lifecycle batches and final acceptance gates passed
 > Review date: 2026-07-16
-> Primary scope: `lattice-actor`, `lattice-service`, lifecycle-facing parts of `lattice-placement`
+> Primary scope: `lattice-actor`, `lattice-service`, lifecycle-facing parts of `lattice-coordination`
 > Architecture baseline: [architecture/](architecture/)
 > Compatibility policy: hard switch; do not preserve contradictory lifecycle behavior
 
@@ -104,7 +104,7 @@ lifecycle behavior.
 6. `NodeLifecycle::transition()` returns admission, drain, fencing, runtime-stop, and identity-release
    effects, but production `LatticeService` drops them. Only the simulator consumes the complete effect
    model; production callers manually reproduce parts of it.
-7. `PlacementDomainState::Draining` is not used by the normal leave path, and normal shutdown does not
+7. `ActorGroupState::Draining` is not used by the normal leave path, and normal shutdown does not
    move every configured domain to `Terminated`.
 8. Forced shutdown publishes node `Terminated` before endpoint and supervised tasks have necessarily
    stopped, contradicting the documented resource postcondition.
@@ -465,7 +465,7 @@ All of the following are mandatory before marking this plan complete:
 - [x] `cargo fmt --all -- --check`
 - [x] `cargo clippy --workspace --all-targets --all-features -- -D warnings`
 - [x] `cargo test -p lattice-actor --all-targets`
-- [x] `cargo test -p lattice-placement --all-targets`
+- [x] `cargo test -p lattice-coordination --all-targets`
 - [x] `cargo test -p lattice-service --all-targets`
 - [x] deterministic lifecycle/placement simulation and replay pass
 - [x] `cargo test --workspace --all-targets --all-features`

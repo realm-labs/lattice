@@ -13,14 +13,14 @@ use lattice_actor_distributed::{
     host::ProtocolHostRegistry,
     registry::{ActorAddressConfig, ActorRegistryConfig},
 };
-use lattice_model::{
-    actor::ProtocolId,
-    cluster::{ClusterId, EntityType, NodeEndpoint, NodeIncarnation},
-};
-use lattice_placement::{
+use lattice_coordination::{
     control::PlacementControlRouter,
     coordinator::SingletonConfig,
     types::{AssignmentGeneration, CoordinatorTerm, PlacementSlot, PlacementVersion, Revision},
+};
+use lattice_model::{
+    actor::ProtocolId,
+    cluster::{ClusterId, EntityType, NodeEndpoint, NodeIncarnation},
 };
 use lattice_remoting::{
     config::RemotingConfig, endpoint::RemotingEndpoint, handshake::NodeIdentity,
@@ -83,7 +83,7 @@ async fn remote_entity_ask_reaches_only_claimed_owner() {
         coordinator_incarnation,
     );
     let entity_config = EntityConfig::new(
-        domain(),
+        group(),
         EntityType::new("remote-entity").unwrap(),
         ProtocolId::new(TEST_PROTOCOL_ID).unwrap(),
         16,
@@ -95,7 +95,7 @@ async fn remote_entity_ask_reaches_only_claimed_owner() {
     let entity_id = ActorId::new(b"account-42".to_vec()).unwrap();
     let entity_slot = PlacementSlot {
         key: PlacementSlotKey::Shard {
-            domain: domain(),
+            group: group(),
             entity_type: entity_config.entity_type.clone(),
             shard_id: entity_config.shard_for(&entity_id).unwrap(),
         },
@@ -104,7 +104,7 @@ async fn remote_entity_ask_reaches_only_claimed_owner() {
         target: None,
         assignment_generation: AssignmentGeneration::new(7).unwrap(),
         version: PlacementVersion::new(
-            domain(),
+            group(),
             CoordinatorTerm::new(3).unwrap(),
             Revision::new(9).unwrap(),
         ),
@@ -114,14 +114,14 @@ async fn remote_entity_ask_reaches_only_claimed_owner() {
     };
     let singleton_kind = SingletonKind::new("remote-singleton").unwrap();
     let singleton_config = SingletonConfig::new(
-        domain(),
+        group(),
         singleton_kind.clone(),
         ProtocolId::new(TEST_PROTOCOL_ID).unwrap(),
     );
     let singleton_fingerprint = singleton_config.fingerprint();
     let singleton_slot = PlacementSlot {
         key: PlacementSlotKey::Singleton {
-            domain: domain(),
+            group: group(),
             kind: singleton_kind.clone(),
         },
         config_fingerprint: singleton_fingerprint,
@@ -129,7 +129,7 @@ async fn remote_entity_ask_reaches_only_claimed_owner() {
         target: None,
         assignment_generation: AssignmentGeneration::new(4).unwrap(),
         version: PlacementVersion::new(
-            domain(),
+            group(),
             CoordinatorTerm::new(3).unwrap(),
             Revision::new(9).unwrap(),
         ),
@@ -182,7 +182,7 @@ async fn remote_entity_ask_reaches_only_claimed_owner() {
     let owner_messaging = Arc::new(OutboundMessaging::new(32).unwrap());
     let source_registry = registry(source_address.clone(), source_incarnation);
     let owner_registry = registry(owner_address.clone(), owner_incarnation);
-    let mut source_router = DomainLogicalRouter::new(
+    let mut source_router = GroupLogicalRouter::new(
         source_node.clone(),
         source_state,
         source_associations.clone(),
@@ -208,7 +208,7 @@ async fn remote_entity_ask_reaches_only_claimed_owner() {
             CountingLoader(source_loads.clone()),
         )
         .unwrap();
-    let mut owner_router = DomainLogicalRouter::new(
+    let mut owner_router = GroupLogicalRouter::new(
         owner_node.clone(),
         owner_state,
         owner_associations.clone(),
@@ -333,7 +333,7 @@ async fn remote_entity_ask_reaches_only_claimed_owner() {
     assert_eq!(current.node_incarnation(), owner_node.incarnation);
     let singleton = SingletonAddress::new(
         cluster_id,
-        domain(),
+        group(),
         singleton_kind,
         ProtocolId::new(TEST_PROTOCOL_ID).unwrap(),
         singleton_fingerprint,

@@ -8,10 +8,10 @@ use std::collections::BTreeSet;
 use lattice_model::actor::TerminatedReason;
 
 use crate::failpoints::Failpoint;
-use lattice_placement::{
+use lattice_coordination::{
     coordinator::MemberHello,
-    runtime::membership_plane::{MembershipLeader, MembershipLeaderConfig},
-    storage::InMemoryPlacementStore,
+    runtime::cluster::{ClusterCoordinator, ClusterCoordinatorConfig},
+    storage::InMemoryCoordinationStore,
 };
 use lattice_remoting::watch::WatchRegistry;
 
@@ -271,12 +271,12 @@ fn terminal_notifications() -> usize {
 async fn production_membership_commit_fails_under_an_injected_store_failure() {
     let injector = SharedFaultInjector::default();
     let installed = injector.install();
-    let store = std::sync::Arc::new(InMemoryPlacementStore::new(8, 8).unwrap());
-    let mut leader = MembershipLeader::elect(
+    let store = std::sync::Arc::new(InMemoryCoordinationStore::new(8, 8).unwrap());
+    let mut leader = ClusterCoordinator::elect(
         store,
         node("coordinator", 5, 29500),
         CoordinatorTerm::new(1).unwrap(),
-        MembershipLeaderConfig::default(),
+        ClusterCoordinatorConfig::default(),
     )
     .await
     .unwrap();
@@ -457,12 +457,12 @@ const EXPECTED_COVERAGE: [&str; 60] = [
 async fn injected_membership_evidence() -> Vec<FaultEvidence> {
     let injector = SharedFaultInjector::default();
     let installed = injector.install();
-    let store = std::sync::Arc::new(InMemoryPlacementStore::new(8, 8).unwrap());
-    let mut leader = MembershipLeader::elect(
+    let store = std::sync::Arc::new(InMemoryCoordinationStore::new(8, 8).unwrap());
+    let mut leader = ClusterCoordinator::elect(
         store,
         node("coordinator", 5, 29500),
         CoordinatorTerm::new(1).unwrap(),
-        MembershipLeaderConfig::default(),
+        ClusterCoordinatorConfig::default(),
     )
     .await
     .unwrap();

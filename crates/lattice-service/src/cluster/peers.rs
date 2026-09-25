@@ -1,10 +1,10 @@
 use std::sync::Arc;
 
-use lattice_model::cluster::ClusterId;
-use lattice_placement::{
+use lattice_coordination::{
     coordinator::{MemberChange, MemberEvent, MemberRecord},
     types::{MembershipVersion, NodeKey},
 };
+use lattice_model::cluster::ClusterId;
 use lattice_remoting::{
     association::{Association, AssociationManager, AssociationState},
     endpoint::{EndpointError, RemotingEndpoint},

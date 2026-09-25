@@ -2,19 +2,19 @@ use std::{fmt, sync::Arc};
 
 use lattice_actor::mailbox::MailboxConfig;
 use lattice_actor_distributed::registry::ActorRegistryConfig;
-use lattice_model::actor::ProtocolId;
-use lattice_model::cluster::{EntityType, PlacementDomainId, SingletonKind};
-use lattice_placement::coordinator::SingletonConfig;
-use lattice_placement::{
+use lattice_coordination::coordinator::SingletonConfig;
+use lattice_coordination::{
     allocation::ShardAllocationStrategy,
     mapping::{ShardMapper, Xxh3V1ShardMapper},
     region::{EntityConfig, RegionError},
 };
+use lattice_model::actor::ProtocolId;
+use lattice_model::cluster::{ActorGroupId, EntityType, SingletonKind};
 
 /// Application-facing declaration for a hosted or proxy-only sharded entity.
 #[derive(Clone)]
 pub struct EntityOptions {
-    pub domain: PlacementDomainId,
+    pub group: ActorGroupId,
     pub entity_type: EntityType,
     pub shard_count: u32,
     pub allocation_policy_id: String,
@@ -25,9 +25,9 @@ pub struct EntityOptions {
 }
 
 impl EntityOptions {
-    pub fn new(domain: PlacementDomainId, entity_type: EntityType, shard_count: u32) -> Self {
+    pub fn new(group: ActorGroupId, entity_type: EntityType, shard_count: u32) -> Self {
         Self {
-            domain,
+            group,
             entity_type,
             shard_count,
             allocation_policy_id: "weighted-least-load".to_owned(),
@@ -76,7 +76,7 @@ impl EntityOptions {
 
     pub fn build(&self, protocol_id: ProtocolId) -> Result<EntityConfig, RegionError> {
         EntityConfig::new(
-            self.domain.clone(),
+            self.group.clone(),
             self.entity_type.clone(),
             protocol_id,
             self.shard_count,
@@ -92,7 +92,7 @@ impl fmt::Debug for EntityOptions {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("EntityOptions")
-            .field("domain", &self.domain)
+            .field("group", &self.group)
             .field("entity_type", &self.entity_type)
             .field("shard_count", &self.shard_count)
             .field("allocation_policy_id", &self.allocation_policy_id)
@@ -108,15 +108,15 @@ impl fmt::Debug for EntityOptions {
 /// Application-facing declaration for a hosted or proxy-only cluster singleton.
 #[derive(Debug, Clone)]
 pub struct SingletonOptions {
-    pub domain: PlacementDomainId,
+    pub group: ActorGroupId,
     pub kind: SingletonKind,
     pub registry: ActorRegistryConfig,
 }
 
 impl SingletonOptions {
-    pub fn new(domain: PlacementDomainId, kind: SingletonKind) -> Self {
+    pub fn new(group: ActorGroupId, kind: SingletonKind) -> Self {
         Self {
-            domain,
+            group,
             kind,
             registry: ActorRegistryConfig::default(),
         }
@@ -133,15 +133,13 @@ impl SingletonOptions {
     }
 
     pub fn build(&self, protocol_id: ProtocolId) -> SingletonConfig {
-        SingletonConfig::new(self.domain.clone(), self.kind.clone(), protocol_id)
+        SingletonConfig::new(self.group.clone(), self.kind.clone(), protocol_id)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use lattice_model::actor::ActorId;
-    use lattice_model::actor::ProtocolId;
-    use lattice_placement::{
+    use lattice_coordination::{
         allocation::{
             AllocationDecision, AllocationError, AllocationRequest, PlacementView, RebalanceLimits,
             RebalanceProposal, RebalanceTrigger,
@@ -149,6 +147,8 @@ mod tests {
         mapping::ShardMappingError,
         types::ShardId,
     };
+    use lattice_model::actor::ActorId;
+    use lattice_model::actor::ProtocolId;
 
     use super::*;
 
@@ -211,7 +211,7 @@ mod tests {
     #[test]
     fn entity_options_persist_the_selected_mapper_identity() {
         let config = EntityOptions::new(
-            PlacementDomainId::new("minecraft").unwrap(),
+            ActorGroupId::new("minecraft").unwrap(),
             EntityType::new("region").unwrap(),
             256,
         )

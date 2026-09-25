@@ -314,7 +314,7 @@ fn entity_target_len(target: &LogicalEntityTarget) -> usize {
         + varint_field_len(7, target.reference.protocol_id().get())
         + bytes_field_len(8, target.reference.config_fingerprint().as_bytes())
         + varint_field_len(9, target.assignment_generation)
-        + string_field_len(10, target.reference.domain().as_str())
+        + string_field_len(10, target.reference.group().as_str())
 }
 
 fn encode_entity_target(target: &LogicalEntityTarget, output: &mut impl BufMut) {
@@ -327,7 +327,7 @@ fn encode_entity_target(target: &LogicalEntityTarget, output: &mut impl BufMut) 
     encode_varint_field(7, target.reference.protocol_id().get(), output);
     encode_bytes_field(8, target.reference.config_fingerprint().as_bytes(), output);
     encode_varint_field(9, target.assignment_generation, output);
-    encode_string_field(10, target.reference.domain().as_str(), output);
+    encode_string_field(10, target.reference.group().as_str(), output);
 }
 
 fn singleton_target_len(target: &LogicalSingletonTarget) -> usize {
@@ -339,7 +339,7 @@ fn singleton_target_len(target: &LogicalSingletonTarget) -> usize {
         + varint_field_len(6, target.reference.protocol_id().get())
         + bytes_field_len(7, target.reference.config_fingerprint().as_bytes())
         + varint_field_len(8, target.assignment_generation)
-        + string_field_len(9, target.reference.domain().as_str())
+        + string_field_len(9, target.reference.group().as_str())
 }
 
 fn encode_singleton_target(target: &LogicalSingletonTarget, output: &mut impl BufMut) {
@@ -351,7 +351,7 @@ fn encode_singleton_target(target: &LogicalSingletonTarget, output: &mut impl Bu
     encode_varint_field(6, target.reference.protocol_id().get(), output);
     encode_bytes_field(7, target.reference.config_fingerprint().as_bytes(), output);
     encode_varint_field(8, target.assignment_generation, output);
-    encode_string_field(9, target.reference.domain().as_str(), output);
+    encode_string_field(9, target.reference.group().as_str(), output);
 }
 
 fn actor_path_len(path: &ActorPath) -> usize {
@@ -465,7 +465,7 @@ const fn encoded_varint_len(value: u64) -> usize {
 mod tests {
     use lattice_model::actor::{ActivationId, EntityAddress, ProtocolId, SingletonAddress};
     use lattice_model::cluster::{
-        ClusterId, ConfigFingerprint, EntityType, NodeEndpoint, NodeIncarnation, PlacementDomainId,
+        ActorGroupId, ClusterId, ConfigFingerprint, EntityType, NodeEndpoint, NodeIncarnation,
         SingletonKind,
     };
 
@@ -508,7 +508,7 @@ mod tests {
         LogicalEntityTarget {
             reference: EntityAddress::new(
                 ClusterId::new("test-cluster").unwrap(),
-                PlacementDomainId::new("world").unwrap(),
+                ActorGroupId::new("world").unwrap(),
                 EntityType::new("player").unwrap(),
                 ActorId::new(b"player-1".to_vec()).unwrap(),
                 ProtocolId::new(7).unwrap(),
@@ -525,7 +525,7 @@ mod tests {
         LogicalSingletonTarget {
             reference: SingletonAddress::new(
                 ClusterId::new("test-cluster").unwrap(),
-                PlacementDomainId::new("world").unwrap(),
+                ActorGroupId::new("world").unwrap(),
                 SingletonKind::new("ranking").unwrap(),
                 ProtocolId::new(7).unwrap(),
                 ConfigFingerprint::new([4; 32]),

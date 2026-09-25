@@ -4,9 +4,35 @@
 > Design and implementation checklist: [cluster control-plane memo](cluster-control-plane-memo.md), especially sections 7-9.
 > This is supporting evidence, not a second decision backlog. Proposed replacements require the contracts tracked in memo section 9. No tests or workload measurements were run for this inspection.
 
-Follow-up cleanup: the old application release model, admission guards, and
-release-biased allocation have since been removed. This does not implement the
-target framework identity, storage layout, or cluster shutdown protocol.
+Follow-up implementation: the old application release mechanism is removed;
+work package 1's coordination crate/API naming and exact package-version boundary
+are implemented and validated against an isolated Docker etcd. The original inventory below predates those edits. The new
+`meta/framework` marker is a persistent exact-identity guard; its initialization
+requires an empty prefix and never overwrites a legacy namespace. The target
+run-scoped storage layout and cluster shutdown protocol are not implemented.
+See the implementation checkpoint in memo section 9.6 for evidence and remaining work.
+
+## W1 version inventory and disposition
+
+This follow-up inventory classifies the fields against the implemented exact-version
+boundary; the original P0 source inventory below remains historical.
+
+| Concept | Disposition | Reason |
+|---|---|---|
+| Lattice package version | Keep; automatic exact equality for published and development builds | One framework admission identity; no source digest or user-maintained setting |
+| Transport major/minor and required feature bits | Removed | Fixed framing magic selects the envelope; exact identity is checked before inner setup decoding |
+| Coordinator protocol/control generation and watch generation | Removed | Their schemas belong to the admitted framework version; no older codec is selected |
+| Storage schema generation and old migration CLI | Removed | Empty-prefix initialization writes `meta/framework`; legacy schemas are rejected without conversion |
+| `schema/limits` | Keep | Concurrent writers must agree on capacity limits; this is configuration, not a version |
+| Protocol IDs, codec/schema descriptors and protocol fingerprints | Keep | Independently registered business-message contracts must agree; these do not provide rolling-release semantics |
+| Mapper/policy IDs and versions, seed, shard count and configuration fingerprints | Keep | Routing/allocation agreement; changing mapping must not silently move logical identities |
+| Election terms, state revisions, assignment generations, grant sequences | Keep | Runtime ordering and fencing, not release compatibility |
+| Node incarnations, activation IDs, session/association IDs, command sequence/ACKs | Keep | Exact-instance identity and stale/replayed-message rejection |
+| AppVersion and rolling-release admission | Deferred | Requires a separate shard migration, rollout and rollback design |
+
+The pre-identity generation-4/5 migration and its attached offline counter repair
+commands are retired. Runtime counter admission/reconciliation remains. New
+run-scoped inspect/reset tooling belongs to W3 and is not implied by W1 completion.
 
 ## 1. Scope and notation
 
@@ -22,7 +48,7 @@ The workspace currently has three direct `etcd-client` consumers: `lattice-place
 
 ### 2.1 Coordination store
 
-Key construction and readers are in [storage/etcd.rs](../crates/lattice-placement/src/storage/etcd.rs); writes are in [transactions.rs](../crates/lattice-placement/src/storage/etcd/transactions.rs) and [transactions_placement.rs](../crates/lattice-placement/src/storage/etcd/transactions_placement.rs). The current schema generation is **6**. The target schema in the memo is not installed.
+Key construction and readers are in [storage/etcd.rs](../crates/lattice-coordination/src/storage/etcd.rs); writes are in [transactions.rs](../crates/lattice-coordination/src/storage/etcd/transactions.rs) and [transactions_placement.rs](../crates/lattice-coordination/src/storage/etcd/transactions_placement.rs). The current schema generation is **6**. The target schema in the memo is not installed.
 
 | Current key under `P/` | Writer / trigger and principal reader | Value growth / update pattern | Lifetime and crash leftovers | Target treatment |
 |---|---|---|---|---|
@@ -40,7 +66,7 @@ Key construction and readers are in [storage/etcd.rs](../crates/lattice-placemen
 | `domains/<D>/admin/<hex-encoded-operation-id>` | Admin operations, including plan/settings transactions; retry deduplication | Bounded operation result/fingerprint plus creation/expiry fields; one record per retained operation | Persistent; expiry is an application field, not an etcd lease | Retain bounded retry evidence with explicit cleanup rules; do not remove before deciding the retry horizon |
 | `domains/<D>/settings/automatic_balance` | `commit_automatic_settings`; startup/recovery and rebalance policy | Small settings record; administrator updates | Persistent | Retain as explicit persistent policy/configuration, not accidental per-run residue |
 
-Current limits and retention are defined in [storage/domain.rs](../crates/lattice-placement/src/storage/domain.rs) and [runtime.rs](../crates/lattice-placement/src/runtime.rs). Runtime defaults include 64 moves per plan, 64 completed plans, and 1,024 admin operation records with a 24-hour retention interval. These are configurable, not measured capacity guarantees. Plan-history and admin cleanup are performed by runtime code; stopping the runtime does not execute an etcd TTL over these records.
+Current limits and retention are defined in [storage/records.rs](../crates/lattice-coordination/src/storage/records.rs) and [runtime.rs](../crates/lattice-coordination/src/runtime.rs). Runtime defaults include 64 moves per plan, 64 completed plans, and 1,024 admin operation records with a 24-hour retention interval. These are configurable, not measured capacity guarantees. Plan-history and admin cleanup are performed by runtime code; stopping the runtime does not execute an etcd TTL over these records.
 
 ### 2.2 Administrative and non-coordination records
 
@@ -53,7 +79,7 @@ Current limits and retention are defined in [storage/domain.rs](../crates/lattic
 | `I/<cluster>/slots/<worker-id>` | `EtcdWorkerIdLeaseStore` acquire/renew/release | Lease-backed worker allocation; exact owner/token protects release/renewal | Separate worker-ID lifecycle; cluster cleanup must not bypass its ownership protocol |
 | `I/<cluster>/history/<worker-id>` | First acquisition and subsequent reuse checks | Persistent marker distinguishing `FirstUse` from `Reused`; written atomically with the first slot allocation | Preserve safety history; not disposable cluster-run data |
 
-Sources: [migration.rs](../crates/lattice-placement/src/storage/etcd/migration.rs), [config client](../crates/lattice-config-etcd/src/client.rs), [config store](../crates/lattice-config-etcd/src/store.rs), [config-backed discovery](../crates/lattice-discovery/src/config_store.rs), and [worker-ID store](../crates/lattice-id-etcd/src/store.rs).
+Sources: the retired migration module (removed by W1), [config client](../crates/lattice-config-etcd/src/client.rs), [config store](../crates/lattice-config-etcd/src/store.rs), [config-backed discovery](../crates/lattice-discovery/src/config_store.rs), and [worker-ID store](../crates/lattice-id-etcd/src/store.rs).
 
 The migration code also recognizes legacy unscoped key families such as `coordinator/leader`, `members/`, `shards/`, and old cardinality keys. They are not current generation-6 runtime writes. Inspect/reset must identify unsupported or interrupted legacy state explicitly rather than assume any unknown key is safe to delete.
 
@@ -76,7 +102,7 @@ The source inspection gives the following transaction boundaries, not just a lis
 6. **Transfer progress:** move reservations/completion currently update slot and plan together; splitting the plan cannot separate publication from recoverability. Participant evidence and safe interrupted construction must be designed before changing serialization.
 7. **Admin retry evidence:** settings/plan mutations may publish their operation result in the same transaction. Cleanup must preserve the intended deduplication contract across timeouts and failover.
 
-The current paged reader in [etcd/page.rs](../crates/lattice-placement/src/storage/etcd/page.rs) groups ranges within one transaction, but its cursor carries a key position rather than a fixed revision for the entire multi-page walk. Do not interpret a series of pages as a frozen shutdown-participant set or completion proof. Sealed manifests/version checks remain necessary in the target protocol. Serialized byte/page budgets also need separate implementation and worst-case tests.
+The current paged reader in [etcd/page.rs](../crates/lattice-coordination/src/storage/etcd/page.rs) groups ranges within one transaction, but its cursor carries a key position rather than a fixed revision for the entire multi-page walk. Do not interpret a series of pages as a frozen shutdown-participant set or completion proof. Sealed manifests/version checks remain necessary in the target protocol. Serialized byte/page budgets also need separate implementation and worst-case tests.
 
 ## 4. Protocol evidence and required decisions
 
@@ -96,10 +122,10 @@ Coordinator renew loop
 
 Evidence:
 
-- [EtcdPlacementStore](../crates/lattice-placement/src/storage/etcd.rs) returns `Result<()>` from keepalive after a positive TTL response; it does not return a usable validity interval to the caller.
-- [runtime/lifecycle.rs](../crates/lattice-placement/src/runtime/lifecycle.rs) renews claims and sends grants on successful renewal. The inspected claim loop awaits leases sequentially; throughput has not been measured.
-- [runtime/membership.rs](../crates/lattice-placement/src/runtime/membership.rs), `send_claim_grant`, deliberately uses ephemeral delivery rather than reliable-outbox replay. Preserve this existing protection.
-- [session/dispatch.rs](../crates/lattice-placement/src/session/dispatch.rs) supplies `self.now()` when processing `ClaimGranted`; [authority.rs](../crates/lattice-placement/src/authority.rs) computes the deadline from that installation time and checks it at admission.
+- [EtcdPlacementStore](../crates/lattice-coordination/src/storage/etcd.rs) returns `Result<()>` from keepalive after a positive TTL response; it does not return a usable validity interval to the caller.
+- [runtime/lifecycle.rs](../crates/lattice-coordination/src/runtime/lifecycle.rs) renews claims and sends grants on successful renewal. The inspected claim loop awaits leases sequentially; throughput has not been measured.
+- [runtime/membership.rs](../crates/lattice-coordination/src/runtime/membership.rs), `send_claim_grant`, deliberately uses ephemeral delivery rather than reliable-outbox replay. Preserve this existing protection.
+- [session/dispatch.rs](../crates/lattice-coordination/src/session/dispatch.rs) supplies `self.now()` when processing `ClaimGranted`; [authority.rs](../crates/lattice-coordination/src/authority.rs) computes the deadline from that installation time and checks it at admission.
 
 The source therefore does not by itself prove the target's delay/suspension-safe deadline contract. Before implementation, specify how a renewal is correlated with freshness, which interval is bounded, how backing-lease remaining validity reaches the owner, and what happens when timing assumptions cannot be met. Simply raising the safety margin is not a substitute for that contract. Build tests for delayed delivery, stalled Coordinator work, owner suspension, failed/ambiguous renewals, and early authority replacement.
 
@@ -113,7 +139,7 @@ Before W2.2, specify the authenticated identity, remove/re-add fencing, and comp
 
 ### 4.3 Transfer safety
 
-[HandoffMachine](../crates/lattice-placement/src/handoff.rs) currently moves through `Invalidating -> Draining -> ReplacingAuthority -> Starting -> Completed`. Its barrier tracks required/applied exact incarnations and accepts explicit session fencing. It distinguishes `SourceDrained`, `SourceAuthorityInvalid`, and `SourceStopFailed`; only a matching target generation can become ready. [Reconciliation](../crates/lattice-placement/src/runtime/reconciliation.rs) reconstructs persisted transitions and can adopt a surviving claim with a new term/grant sequence without rewriting the assignment generation.
+[HandoffMachine](../crates/lattice-coordination/src/handoff.rs) currently moves through `Invalidating -> Draining -> ReplacingAuthority -> Starting -> Completed`. Its barrier tracks required/applied exact incarnations and accepts explicit session fencing. It distinguishes `SourceDrained`, `SourceAuthorityInvalid`, and `SourceStopFailed`; only a matching target generation can become ready. [Reconciliation](../crates/lattice-coordination/src/runtime/reconciliation.rs) reconstructs persisted transitions and can adopt a surviving claim with a new term/grant sequence without rewriting the assignment generation.
 
 Before W3.3, define the evidence behind `SourceAuthorityInvalid`, how outstanding owner deadlines are respected, and how session fencing is durably represented in a sealed participant set. A missing participant record must not become an acknowledgement. Preserve the distinction between graceful completion and failure recovery, including stop-failed state; do not flatten the state machine to a generic owner swap.
 
@@ -131,7 +157,7 @@ The following tests were located, not executed. They are starting points for ext
 
 | Area | Existing evidence to reuse | Required extension |
 |---|---|---|
-| Authority deadline | `lattice-placement/src/lib.rs`: `admission_closes_on_the_grant_deadline_without_any_tick`; `session/tests.rs` | End-to-end delayed renewal, suspension, early replacement and exact retired-instance behavior |
+| Authority deadline | `lattice-coordination/src/lib.rs`: `admission_closes_on_the_grant_deadline_without_any_tick`; `session/tests.rs` | End-to-end delayed renewal, suspension, early replacement and exact retired-instance behavior |
 | Claim expiry | `runtime/tests/claim_expiry.rs`: heartbeat timeout, force-versus-graceful revoke, ephemeral grant delivery | Coordinator/owner network asymmetry and deadline proof assumptions |
 | Election/recovery | `runtime/reconciliation_tests.rs`, `runtime/host/cluster_tests.rs` | Managed eligibility races, concurrent last-candidate removal, removal/re-addition, leader retirement |
 | Transfer restart | `runtime/tests/recovery_tests.rs`, `handoff.rs` tests | Split participant publication/sealing, missing records, failover at every new commit boundary |
@@ -142,7 +168,7 @@ The following tests were located, not executed. They are starting points for ext
 | Shutdown | `lattice-service/src/tests/node_lifecycle.rs`, service lifecycle inline tests | Persisted cross-group close, caller/leader loss, partial stop failure, reset/startup exclusion |
 | Non-runtime exclusions | `lattice-config-etcd/tests/etcd_acceptance.rs`, `lattice-id-etcd/tests/etcd_acceptance.rs` | Reset preserves application config and worker-ID history |
 
-Use existing [placement failpoints](../crates/lattice-placement/src/failpoints.rs), including pre-guarded-commit, after-commit-before-effect, partial barrier, after-drain-before-revoke, and after-new-claim-before-grant boundaries. Extend the failpoints when the transaction layout changes rather than assuming old placements exercise new races.
+Use existing [placement failpoints](../crates/lattice-coordination/src/failpoints.rs), including pre-guarded-commit, after-commit-before-effect, partial barrier, after-drain-before-revoke, and after-new-claim-before-grant boundaries. Extend the failpoints when the transaction layout changes rather than assuming old placements exercise new races.
 
 The real-etcd acceptance harness reads `LATTICE_ETCD_ENDPOINTS` and may return without exercising etcd when it is absent. A successful test-process exit alone is not backend evidence. Run it only against an isolated test deployment and record that the prerequisite was present. Commands will continue to use the current crate name until the rename lands.
 
@@ -154,4 +180,4 @@ No new failing test or pass rate is established by this source audit. Representa
 - Primary reduction candidates are duplicated member descriptions, embedded participant sets, and whole persisted rebalance proposals. Required assignment/claim/transfer evidence is not disposable.
 - Persistent group membership, assignments, plans, counters, settings, and operation records explain why process termination alone does not empty the coordination prefix.
 - P0.1's source inventory is recorded; final field-by-field removal mappings and cleanup predicates depend on the unresolved protocol contracts. P0.2 and P0.3 remain open; P0.4 has a source-level test map only. No work package is marked complete.
-- Next implementation gate: settle package 1's naming/framework-identity contract, while completing the grant, eligibility, transfer, and shutdown contracts before their coupled package 2/3 slices. `AppVersion` and application rolling-release redesign are deferred to a separate effort, including old-release shard migration; they do not block package 1. Remove the old application release model, N/N+1 admission guards, and release-biased placement without a replacement. Retain independent protocol/configuration checks; deploy one application version at a time until rolling updates are separately designed. Track approvals and completion only in memo section 9.
+- At the P0 inspection checkpoint, the next gate was package 1's naming/framework-identity contract (now completed; see memo section 9.6). Continue completing the grant, eligibility, transfer, and shutdown contracts before their coupled package 2/3 slices. `AppVersion` and application rolling-release redesign are deferred to a separate effort, including old-release shard migration; they do not block package 1. Remove the old application release model, N/N+1 admission guards, and release-biased placement without a replacement. Retain independent protocol/configuration checks; deploy one application version at a time until rolling updates are separately designed. Track approvals and completion only in memo section 9.

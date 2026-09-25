@@ -1,7 +1,7 @@
 use super::{
     Actor, ActorAddress, ActorId, ActorLoader, ActorProtocolBinding, ActorRegistry, Arc, AskError,
-    AssociationKey, AssociationManager, BTreeMap, Bytes, ClusterRouterError, DomainLogicalRouter,
-    EntityAddress, EntityConfig, Instant, LOGICAL_RESOLVE_MESSAGE_ID, LogicPlacementState,
+    AssociationKey, AssociationManager, BTreeMap, Bytes, ClusterRouterError, EntityAddress,
+    EntityConfig, GroupLogicalRouter, Instant, LOGICAL_RESOLVE_MESSAGE_ID, LogicPlacementState,
     LogicalBufferConfig, LogicalEntityTarget, LogicalRouter, LogicalSingletonTarget, Mutex,
     NodeKey, OutboundMessaging, PlacementSlotKey, PlacementSlotState, Protocol,
     ProtocolFingerprint, RemoteMessageError, RouteBuffer, ShardMapper, SingletonAddress,
@@ -14,7 +14,7 @@ use super::{
 };
 use lattice_actor_distributed::registry::ActorDefinition;
 
-impl DomainLogicalRouter {
+impl GroupLogicalRouter {
     pub fn new(
         local_node: NodeKey,
         state: Arc<Mutex<LogicPlacementState>>,
@@ -96,22 +96,18 @@ impl DomainLogicalRouter {
             return Err(ClusterRouterError::ProtocolMismatch);
         }
         let mapper = config.bind_mapper(mapper)?;
-        let domain = config.domain.clone();
+        let group = config.group.clone();
         let entity_type = config.entity_type.clone();
-        let key = (domain.clone(), entity_type.clone());
+        let key = (group.clone(), entity_type.clone());
         if self.entities.contains_key(&key) {
-            return Err(ClusterRouterError::DuplicateEntity {
-                domain,
-                entity_type,
-            });
+            return Err(ClusterRouterError::DuplicateEntity { group, entity_type });
         }
         let authority_state = self.state.clone();
         let authority_node = self.local_node.clone();
-        let authority_domain = domain.clone();
+        let authority_group = group.clone();
         let authority_entity_type = entity_type.clone();
         let authority_mapper = mapper.clone();
-        let authority_resolver_name =
-            format!("entity:{}:{}", domain.as_str(), entity_type.as_str());
+        let authority_resolver_name = format!("entity:{}:{}", group.as_str(), entity_type.as_str());
         registry.install_fencing_token_resolver(
             authority_resolver_name,
             move |actor_id, publish| {
@@ -119,7 +115,7 @@ impl DomainLogicalRouter {
                     return publish(None);
                 };
                 let key = PlacementSlotKey::Shard {
-                    domain: authority_domain.clone(),
+                    group: authority_group.clone(),
                     entity_type: authority_entity_type.clone(),
                     shard_id,
                 };
@@ -175,14 +171,11 @@ impl DomainLogicalRouter {
             return Err(ClusterRouterError::Capacity);
         }
         let mapper = config.bind_mapper(mapper)?;
-        let domain = config.domain.clone();
+        let group = config.group.clone();
         let entity_type = config.entity_type.clone();
-        let key = (domain.clone(), entity_type.clone());
+        let key = (group.clone(), entity_type.clone());
         if self.entities.contains_key(&key) {
-            return Err(ClusterRouterError::DuplicateEntity {
-                domain,
-                entity_type,
-            });
+            return Err(ClusterRouterError::DuplicateEntity { group, entity_type });
         }
         self.entities.insert(
             key,
@@ -220,19 +213,19 @@ impl DomainLogicalRouter {
         if protocol.protocol_id() != config.protocol_id || !config.validate() {
             return Err(ClusterRouterError::ProtocolMismatch);
         }
-        let domain = config.domain.clone();
+        let group = config.group.clone();
         let kind = config.kind.clone();
         let config_fingerprint = config.fingerprint();
         let protocol_id = config.protocol_id;
-        let key = (domain.clone(), kind.clone());
+        let key = (group.clone(), kind.clone());
         if self.singletons.contains_key(&key) {
-            return Err(ClusterRouterError::DuplicateSingleton { domain, kind });
+            return Err(ClusterRouterError::DuplicateSingleton { group, kind });
         }
         let authority_state = self.state.clone();
         let authority_node = self.local_node.clone();
-        let authority_domain = domain.clone();
+        let authority_group = group.clone();
         let authority_kind = kind.clone();
-        let authority_resolver_name = format!("singleton:{}:{}", domain.as_str(), kind.as_str());
+        let authority_resolver_name = format!("singleton:{}:{}", group.as_str(), kind.as_str());
         registry.install_fencing_token_resolver(
             authority_resolver_name,
             move |actor_id, publish| {
@@ -240,7 +233,7 @@ impl DomainLogicalRouter {
                     return publish(None);
                 }
                 let key = PlacementSlotKey::Singleton {
-                    domain: authority_domain.clone(),
+                    group: authority_group.clone(),
                     kind: authority_kind.clone(),
                 };
                 let state = authority_state
@@ -266,7 +259,7 @@ impl DomainLogicalRouter {
                 messaging: self.messaging.clone(),
                 coordinator: self.coordinator.clone(),
                 buffer: RouteBuffer::new(self.buffer_config.clone()),
-                domain: config.domain,
+                group: config.group,
                 kind: kind.clone(),
                 config_fingerprint,
                 actor_id: ActorId::new(kind.as_str().to_owned())
@@ -291,11 +284,11 @@ impl DomainLogicalRouter {
         if !config.validate() {
             return Err(ClusterRouterError::ProtocolMismatch);
         }
-        let domain = config.domain.clone();
+        let group = config.group.clone();
         let kind = config.kind.clone();
-        let key = (domain.clone(), kind.clone());
+        let key = (group.clone(), kind.clone());
         if self.singletons.contains_key(&key) {
-            return Err(ClusterRouterError::DuplicateSingleton { domain, kind });
+            return Err(ClusterRouterError::DuplicateSingleton { group, kind });
         }
         self.singletons.insert(
             key,
@@ -316,7 +309,7 @@ impl DomainLogicalRouter {
 }
 
 #[async_trait]
-impl LogicalRouter for DomainLogicalRouter {
+impl LogicalRouter for GroupLogicalRouter {
     async fn tell_entity(
         &self,
         target: EntityAddress,
@@ -325,7 +318,7 @@ impl LogicalRouter for DomainLogicalRouter {
         payload: Bytes,
     ) -> Result<(), RemoteMessageError> {
         self.entities
-            .get(&(target.domain().clone(), target.entity_type().clone()))
+            .get(&(target.group().clone(), target.entity_type().clone()))
             .ok_or(RemoteMessageError::UnsupportedProtocol)?
             .tell(target, fingerprint, message_id, payload)
             .await
@@ -340,7 +333,7 @@ impl LogicalRouter for DomainLogicalRouter {
         deadline: Instant,
     ) -> Result<Bytes, AskError> {
         self.entities
-            .get(&(target.domain().clone(), target.entity_type().clone()))
+            .get(&(target.group().clone(), target.entity_type().clone()))
             .ok_or(AskError::Protocol(RemoteMessageError::UnsupportedProtocol))?
             .ask(target, fingerprint, message_id, payload, deadline)
             .await
@@ -354,7 +347,7 @@ impl LogicalRouter for DomainLogicalRouter {
         payload: Bytes,
     ) -> Result<(), RemoteMessageError> {
         self.singletons
-            .get(&(target.domain().clone(), target.singleton_kind().clone()))
+            .get(&(target.group().clone(), target.singleton_kind().clone()))
             .ok_or(RemoteMessageError::UnsupportedProtocol)?
             .tell(target, fingerprint, message_id, payload)
             .await
@@ -369,7 +362,7 @@ impl LogicalRouter for DomainLogicalRouter {
         deadline: Instant,
     ) -> Result<Bytes, AskError> {
         self.singletons
-            .get(&(target.domain().clone(), target.singleton_kind().clone()))
+            .get(&(target.group().clone(), target.singleton_kind().clone()))
             .ok_or(AskError::Protocol(RemoteMessageError::UnsupportedProtocol))?
             .ask(target, fingerprint, message_id, payload, deadline)
             .await
@@ -380,7 +373,7 @@ impl LogicalRouter for DomainLogicalRouter {
         target: EntityAddress,
     ) -> Result<Option<ActorAddress>, WatchError> {
         self.entities
-            .get(&(target.domain().clone(), target.entity_type().clone()))
+            .get(&(target.group().clone(), target.entity_type().clone()))
             .ok_or(WatchError::NotActive)?
             .resolve_current(target)
             .await
@@ -391,7 +384,7 @@ impl LogicalRouter for DomainLogicalRouter {
         target: SingletonAddress,
     ) -> Result<Option<ActorAddress>, WatchError> {
         self.singletons
-            .get(&(target.domain().clone(), target.singleton_kind().clone()))
+            .get(&(target.group().clone(), target.singleton_kind().clone()))
             .ok_or(WatchError::Unavailable)?
             .resolve_current(target)
             .await
@@ -400,19 +393,19 @@ impl LogicalRouter for DomainLogicalRouter {
     async fn drain_slot(&self, slot: PlacementSlotKey) -> Result<bool, RemoteMessageError> {
         match slot {
             PlacementSlotKey::Shard {
-                domain,
+                group,
                 entity_type,
                 shard_id,
             } => {
                 self.entities
-                    .get(&(domain, entity_type))
+                    .get(&(group, entity_type))
                     .ok_or(RemoteMessageError::UnsupportedProtocol)?
                     .drain(shard_id)
                     .await
             }
-            PlacementSlotKey::Singleton { domain, kind } => {
+            PlacementSlotKey::Singleton { group, kind } => {
                 self.singletons
-                    .get(&(domain, kind))
+                    .get(&(group, kind))
                     .ok_or(RemoteMessageError::UnsupportedProtocol)?
                     .drain()
                     .await
@@ -423,19 +416,19 @@ impl LogicalRouter for DomainLogicalRouter {
     async fn stop_fenced_slot(&self, slot: PlacementSlotKey) -> Result<(), RemoteMessageError> {
         match slot {
             PlacementSlotKey::Shard {
-                domain,
+                group,
                 entity_type,
                 shard_id,
             } => {
                 self.entities
-                    .get(&(domain, entity_type))
+                    .get(&(group, entity_type))
                     .ok_or(RemoteMessageError::UnsupportedProtocol)?
                     .fence(shard_id)
                     .await
             }
-            PlacementSlotKey::Singleton { domain, kind } => {
+            PlacementSlotKey::Singleton { group, kind } => {
                 self.singletons
-                    .get(&(domain, kind))
+                    .get(&(group, kind))
                     .ok_or(RemoteMessageError::UnsupportedProtocol)?
                     .fence()
                     .await
@@ -446,19 +439,19 @@ impl LogicalRouter for DomainLogicalRouter {
     async fn wait_slot_drained(&self, slot: PlacementSlotKey) -> Result<(), RemoteMessageError> {
         match slot {
             PlacementSlotKey::Shard {
-                domain,
+                group,
                 entity_type,
                 shard_id,
             } => {
                 self.entities
-                    .get(&(domain, entity_type))
+                    .get(&(group, entity_type))
                     .ok_or(RemoteMessageError::UnsupportedProtocol)?
                     .wait_drained(shard_id)
                     .await
             }
-            PlacementSlotKey::Singleton { domain, kind } => {
+            PlacementSlotKey::Singleton { group, kind } => {
                 self.singletons
-                    .get(&(domain, kind))
+                    .get(&(group, kind))
                     .ok_or(RemoteMessageError::UnsupportedProtocol)?
                     .wait_drained()
                     .await
@@ -474,7 +467,7 @@ impl LogicalRouter for DomainLogicalRouter {
     ) -> Result<(), RemoteMessageError> {
         self.entities
             .get(&(
-                target.reference.domain().clone(),
+                target.reference.group().clone(),
                 target.reference.entity_type().clone(),
             ))
             .ok_or(RemoteMessageError::UnsupportedProtocol)?
@@ -492,7 +485,7 @@ impl LogicalRouter for DomainLogicalRouter {
         let route = self
             .entities
             .get(&(
-                target.reference.domain().clone(),
+                target.reference.group().clone(),
                 target.reference.entity_type().clone(),
             ))
             .ok_or(RemoteMessageError::UnsupportedProtocol)?;
@@ -512,7 +505,7 @@ impl LogicalRouter for DomainLogicalRouter {
     ) -> Result<(), RemoteMessageError> {
         self.singletons
             .get(&(
-                target.reference.domain().clone(),
+                target.reference.group().clone(),
                 target.reference.singleton_kind().clone(),
             ))
             .ok_or(RemoteMessageError::UnsupportedProtocol)?
@@ -530,7 +523,7 @@ impl LogicalRouter for DomainLogicalRouter {
         let route = self
             .singletons
             .get(&(
-                target.reference.domain().clone(),
+                target.reference.group().clone(),
                 target.reference.singleton_kind().clone(),
             ))
             .ok_or(RemoteMessageError::UnsupportedProtocol)?;

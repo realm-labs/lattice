@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use super::testctl_artifacts::{
-    MembershipVersionArtifact, MultiDomainHostArtifact, MultiDomainLogicArtifact,
+    MembershipVersionArtifact, MultiGroupHostArtifact, MultiGroupLogicArtifact,
     ScopedLeadershipArtifact,
 };
 use super::{
@@ -11,14 +11,14 @@ use super::{
 };
 
 const HOSTS: [(&str, &str); 5] = [
-    ("domain-membership", "domain-membership.json"),
-    ("domain-alpha", "domain-alpha.json"),
-    ("domain-beta", "domain-beta.json"),
-    ("domain-gamma", "domain-gamma.json"),
-    ("domain-standby", "domain-standby.json"),
+    ("group-membership", "group-membership.json"),
+    ("group-alpha", "group-alpha.json"),
+    ("group-beta", "group-beta.json"),
+    ("group-gamma", "group-gamma.json"),
+    ("group-standby", "group-standby.json"),
 ];
 
-const LOGIC_ARTIFACTS: [&str; 2] = ["domain-logic-a.json", "domain-logic-b.json"];
+const LOGIC_ARTIFACTS: [&str; 2] = ["group-logic-a.json", "group-logic-b.json"];
 
 pub(super) fn membership_leader(artifacts: &Path) -> Result<(), String> {
     let run_id = run_id("membership leader hard crash")?;
@@ -91,19 +91,19 @@ pub(super) fn membership_leader(artifacts: &Path) -> Result<(), String> {
 pub(super) fn member(artifacts: &Path) -> Result<(), String> {
     let run_id = run_id("member hard crash")?;
     let containers = labeled_containers(&run_id)?;
-    let container = find_container(&containers, "domain-logic-a")?;
+    let container = find_container(&containers, "group-logic-a")?;
     require_label("container", &container, &run_id)?;
     let logic_paths = logic_paths(artifacts);
     let before = wait_for_valid_cluster(&logic_paths, Duration::from_secs(30))?;
     let killed = before
         .iter()
-        .find(|logic| logic.node_id == "domain-logic-a")
+        .find(|logic| logic.node_id == "group-logic-a")
         .cloned()
-        .ok_or_else(|| "domain-logic-a did not publish cluster state".to_owned())?;
-    let observer_path = artifacts.join("domain-logic-b.json");
+        .ok_or_else(|| "group-logic-a did not publish cluster state".to_owned())?;
+    let observer_path = artifacts.join("group-logic-b.json");
     let before_version = killed
         .membership_version
-        .ok_or_else(|| "domain-logic-a did not publish a membership version".to_owned())?;
+        .ok_or_else(|| "group-logic-a did not publish a membership version".to_owned())?;
     write_json(
         &artifacts.join("member-hard-crash-schedule.json"),
         &serde_json::json!({
@@ -128,7 +128,7 @@ pub(super) fn member(artifacts: &Path) -> Result<(), String> {
         stopped = true;
         let removed = wait_for_member_absent(
             &observer_path,
-            "domain-logic-a",
+            "group-logic-a",
             before_version,
             Duration::from_secs(45),
         )?;
@@ -141,13 +141,13 @@ pub(super) fn member(artifacts: &Path) -> Result<(), String> {
         wait_for_running_container(&container, Duration::from_secs(30))?;
         stopped = false;
         let restarted = wait_for_logic_incarnation(
-            &artifacts.join("domain-logic-a.json"),
+            &artifacts.join("group-logic-a.json"),
             killed.incarnation,
             Duration::from_secs(90),
         )?;
         let recovered = wait_for_member_rejoin(
             &logic_paths,
-            "domain-logic-a",
+            "group-logic-a",
             restarted.incarnation,
             removed_version,
             Duration::from_secs(90),
@@ -266,7 +266,7 @@ fn host_artifact(artifacts: &Path, node_id: &str) -> Result<PathBuf, String> {
         .ok_or_else(|| format!("membership leader {node_id} has no host artifact"))
 }
 
-fn read_host(path: &Path) -> Result<MultiDomainHostArtifact, String> {
+fn read_host(path: &Path) -> Result<MultiGroupHostArtifact, String> {
     serde_json::from_slice(&std::fs::read(path).map_err(|error| error.to_string())?)
         .map_err(|error| error.to_string())
 }
@@ -323,7 +323,7 @@ fn wait_for_host_incarnation(
     node_id: &str,
     old_incarnation: u128,
     timeout: Duration,
-) -> Result<MultiDomainHostArtifact, String> {
+) -> Result<MultiGroupHostArtifact, String> {
     let deadline = Instant::now() + timeout;
     loop {
         if let Ok(host) = read_host(path)
@@ -366,7 +366,7 @@ fn assert_scope_stable(
 fn wait_for_valid_cluster(
     paths: &[PathBuf],
     timeout: Duration,
-) -> Result<Vec<MultiDomainLogicArtifact>, String> {
+) -> Result<Vec<MultiGroupLogicArtifact>, String> {
     let deadline = Instant::now() + timeout;
     loop {
         let snapshots = match paths
@@ -395,7 +395,7 @@ fn wait_for_valid_cluster(
     }
 }
 
-fn cluster_is_valid(snapshots: &[MultiDomainLogicArtifact]) -> bool {
+fn cluster_is_valid(snapshots: &[MultiGroupLogicArtifact]) -> bool {
     let Some(first) = snapshots.first() else {
         return false;
     };
@@ -410,7 +410,7 @@ fn cluster_is_valid(snapshots: &[MultiDomainLogicArtifact]) -> bool {
                         && member.status == "Up"
                 })
         })
-        && ["domain-logic-a", "domain-logic-b"]
+        && ["group-logic-a", "group-logic-b"]
             .into_iter()
             .all(|node_id| {
                 first
@@ -423,16 +423,11 @@ fn cluster_is_valid(snapshots: &[MultiDomainLogicArtifact]) -> bool {
         && first.members.len() == LOGIC_ARTIFACTS.len()
 }
 
-fn logic_is_valid(logic: &MultiDomainLogicArtifact) -> bool {
+fn logic_is_valid(logic: &MultiGroupLogicArtifact) -> bool {
     logic.lifecycle == "Ready"
-        && [
-            "domain-alpha",
-            "domain-beta",
-            "domain-gamma",
-            "domain-delta",
-        ]
-        .into_iter()
-        .all(|domain| logic.domains.get(domain).map(String::as_str) == Some("Ready"))
+        && ["group-alpha", "group-beta", "group-gamma", "group-delta"]
+            .into_iter()
+            .all(|group| logic.groups.get(group).map(String::as_str) == Some("Ready"))
         && logic.membership_version.is_some()
         && !logic.members.is_empty()
         && logic.members.iter().all(|member| member.status == "Up")
@@ -443,7 +438,7 @@ fn wait_for_member_absent(
     node_id: &str,
     minimum_version: MembershipVersionArtifact,
     timeout: Duration,
-) -> Result<MultiDomainLogicArtifact, String> {
+) -> Result<MultiGroupLogicArtifact, String> {
     let deadline = Instant::now() + timeout;
     loop {
         let snapshot = match read_logic(observer) {
@@ -482,7 +477,7 @@ fn wait_for_logic_incarnation(
     path: &Path,
     old_incarnation: u128,
     timeout: Duration,
-) -> Result<MultiDomainLogicArtifact, String> {
+) -> Result<MultiGroupLogicArtifact, String> {
     let deadline = Instant::now() + timeout;
     loop {
         let snapshot = match read_logic(path) {
@@ -516,7 +511,7 @@ fn wait_for_member_rejoin(
     incarnation: u128,
     minimum_version: MembershipVersionArtifact,
     timeout: Duration,
-) -> Result<Vec<MultiDomainLogicArtifact>, String> {
+) -> Result<Vec<MultiGroupLogicArtifact>, String> {
     let deadline = Instant::now() + timeout;
     loop {
         let snapshots = match paths

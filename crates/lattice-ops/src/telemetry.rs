@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use lattice_model::cluster::PlacementDomainId;
+use lattice_model::cluster::ActorGroupId;
 use lattice_model::trace::{TelemetryResource, TraceContext};
 use serde::Serialize;
 use tokio::sync::Mutex;
@@ -38,9 +38,9 @@ pub struct MetricSample {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PlacementDomainTelemetry {
+pub struct ActorGroupTelemetry {
     pub cluster: String,
-    pub domain: PlacementDomainId,
+    pub group: ActorGroupId,
     pub candidate_state: String,
     pub leader_term: u64,
     pub session_ready: bool,
@@ -57,9 +57,9 @@ pub struct PlacementDomainTelemetry {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CrossDomainDrainTelemetry {
+pub struct CrossGroupDrainTelemetry {
     pub cluster: String,
-    pub domain: PlacementDomainId,
+    pub group: ActorGroupId,
     pub state: String,
     pub remaining_authorities: u64,
 }
@@ -137,21 +137,21 @@ impl TelemetryRecorder {
         Ok(())
     }
 
-    pub async fn record_placement_domain(
+    pub async fn record_placement_group(
         &self,
-        snapshot: &PlacementDomainTelemetry,
+        snapshot: &ActorGroupTelemetry,
     ) -> Result<(), OpsError> {
-        for sample in placement_domain_metrics(snapshot) {
+        for sample in placement_group_metrics(snapshot) {
             self.record_metric(sample).await?;
         }
         Ok(())
     }
 
-    pub async fn record_domain_drain(
+    pub async fn record_group_drain(
         &self,
-        snapshot: &CrossDomainDrainTelemetry,
+        snapshot: &CrossGroupDrainTelemetry,
     ) -> Result<(), OpsError> {
-        for sample in domain_drain_metrics(snapshot) {
+        for sample in group_drain_metrics(snapshot) {
             self.record_metric(sample).await?;
         }
         Ok(())
@@ -163,7 +163,7 @@ impl TelemetryRecorder {
         maximum_leaders_on_one_host: u64,
     ) -> Result<(), OpsError> {
         self.record_metric(MetricSample {
-            name: "lattice_domain_leader_concentration_max".to_owned(),
+            name: "lattice_group_leader_concentration_max".to_owned(),
             value: maximum_leaders_on_one_host,
             labels: HashMap::from([("cluster".to_owned(), cluster.into())]),
         })
@@ -179,38 +179,38 @@ impl TelemetryRecorder {
     }
 }
 
-fn placement_domain_metrics(snapshot: &PlacementDomainTelemetry) -> Vec<MetricSample> {
+fn placement_group_metrics(snapshot: &ActorGroupTelemetry) -> Vec<MetricSample> {
     let labels = HashMap::from([
         ("cluster".to_owned(), snapshot.cluster.clone()),
-        ("domain".to_owned(), snapshot.domain.as_str().to_owned()),
+        ("group".to_owned(), snapshot.group.as_str().to_owned()),
         ("state".to_owned(), snapshot.candidate_state.clone()),
     ]);
     [
-        ("lattice_domain_leader_term", snapshot.leader_term),
+        ("lattice_group_leader_term", snapshot.leader_term),
         (
-            "lattice_domain_session_ready",
+            "lattice_group_session_ready",
             u64::from(snapshot.session_ready),
         ),
         (
-            "lattice_domain_route_available",
+            "lattice_group_route_available",
             u64::from(snapshot.route_available),
         ),
         (
-            "lattice_domain_unresolved_requests",
+            "lattice_group_unresolved_requests",
             snapshot.unresolved_requests,
         ),
-        ("lattice_domain_members", snapshot.members),
-        ("lattice_domain_capacity_units", snapshot.capacity_units),
-        ("lattice_domain_load_units", snapshot.load_units),
-        ("lattice_domain_slots", snapshot.slots),
-        ("lattice_domain_claims", snapshot.claims),
-        ("lattice_domain_plans", snapshot.plans),
+        ("lattice_group_members", snapshot.members),
+        ("lattice_group_capacity_units", snapshot.capacity_units),
+        ("lattice_group_load_units", snapshot.load_units),
+        ("lattice_group_slots", snapshot.slots),
+        ("lattice_group_claims", snapshot.claims),
+        ("lattice_group_plans", snapshot.plans),
         (
-            "lattice_domain_reconciliation_backlog",
+            "lattice_group_reconciliation_backlog",
             snapshot.reconciliation_backlog,
         ),
         (
-            "lattice_domain_reconciliation_oldest_millis",
+            "lattice_group_reconciliation_oldest_millis",
             snapshot.oldest_reconciliation_millis,
         ),
     ]
@@ -223,14 +223,14 @@ fn placement_domain_metrics(snapshot: &PlacementDomainTelemetry) -> Vec<MetricSa
     .collect()
 }
 
-fn domain_drain_metrics(snapshot: &CrossDomainDrainTelemetry) -> Vec<MetricSample> {
+fn group_drain_metrics(snapshot: &CrossGroupDrainTelemetry) -> Vec<MetricSample> {
     let labels = HashMap::from([
         ("cluster".to_owned(), snapshot.cluster.clone()),
-        ("domain".to_owned(), snapshot.domain.as_str().to_owned()),
+        ("group".to_owned(), snapshot.group.as_str().to_owned()),
         ("state".to_owned(), snapshot.state.clone()),
     ]);
     vec![MetricSample {
-        name: "lattice_domain_drain_remaining_authorities".to_owned(),
+        name: "lattice_group_drain_remaining_authorities".to_owned(),
         value: snapshot.remaining_authorities,
         labels,
     }]
@@ -253,12 +253,12 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn domain_metrics_are_scoped_and_never_label_exact_node_identity() {
+    async fn group_metrics_are_scoped_and_never_label_exact_node_identity() {
         let recorder = TelemetryRecorder::default();
         recorder
-            .record_placement_domain(&PlacementDomainTelemetry {
+            .record_placement_group(&ActorGroupTelemetry {
                 cluster: "telemetry-cluster".to_owned(),
-                domain: PlacementDomainId::new("battle").unwrap(),
+                group: ActorGroupId::new("battle").unwrap(),
                 candidate_state: "active".to_owned(),
                 leader_term: 7,
                 session_ready: true,
@@ -276,9 +276,9 @@ mod tests {
             .await
             .unwrap();
         recorder
-            .record_domain_drain(&CrossDomainDrainTelemetry {
+            .record_group_drain(&CrossGroupDrainTelemetry {
                 cluster: "telemetry-cluster".to_owned(),
-                domain: PlacementDomainId::new("battle").unwrap(),
+                group: ActorGroupId::new("battle").unwrap(),
                 state: "draining".to_owned(),
                 remaining_authorities: 2,
             })
@@ -296,8 +296,8 @@ mod tests {
                 && metric.labels.contains_key("cluster")
         }));
         assert!(metrics.iter().any(|metric| {
-            metric.name == "lattice_domain_route_available"
-                && metric.labels.get("domain").map(String::as_str) == Some("battle")
+            metric.name == "lattice_group_route_available"
+                && metric.labels.get("group").map(String::as_str) == Some("battle")
         }));
     }
 }

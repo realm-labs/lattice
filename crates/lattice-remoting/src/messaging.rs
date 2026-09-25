@@ -10,7 +10,7 @@ use lattice_model::actor::{
     ActivationId, ActorAddress, ActorPath, EntityAddress, ProtocolId, ProtocolTag, SingletonAddress,
 };
 use lattice_model::cluster::{
-    ClusterId, ConfigFingerprint, EntityType, NodeEndpoint, NodeIncarnation, PlacementDomainId,
+    ActorGroupId, ClusterId, ConfigFingerprint, EntityType, NodeEndpoint, NodeIncarnation,
     SingletonKind,
 };
 use prost::Message;

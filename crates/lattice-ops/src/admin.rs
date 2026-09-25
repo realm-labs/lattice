@@ -8,13 +8,13 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use lattice_model::cluster::{EntityType, PlacementDomainId};
-use lattice_placement::{
+use lattice_coordination::{
     allocation::RebalanceTrigger,
     plan::RebalancePlan,
-    runtime::{CoordinatorHandle, CoordinatorRuntimeError, ManualRelocationRequest},
+    runtime::{CoordinatorRuntimeError, GroupCoordinatorHandle, ManualRelocationRequest},
     types::{AssignmentGeneration, PlacementSlot, ShardId},
 };
+use lattice_model::cluster::{ActorGroupId, EntityType};
 use serde::{Deserialize, Serialize};
 
 /// Header that carries the admin bearer token.
@@ -189,7 +189,7 @@ fn constant_time_eq(actual: &[u8], expected: &[u8]) -> bool {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ManualRelocation {
-    pub domain: String,
+    pub group: String,
     pub operation_id: String,
     pub entity_type: String,
     pub shard_id: u32,
@@ -199,7 +199,7 @@ pub struct ManualRelocation {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct PlanCommand {
-    pub domain: String,
+    pub group: String,
     pub operation_id: String,
     pub entity_type: Option<String>,
     pub plan_id: Option<String>,
@@ -217,11 +217,11 @@ pub trait AdminMutationHandler: Send + Sync + 'static {
 
 #[derive(Clone)]
 pub struct CoordinatorAdminHandler {
-    coordinator: CoordinatorHandle,
+    coordinator: GroupCoordinatorHandle,
 }
 
 impl CoordinatorAdminHandler {
-    pub fn new(coordinator: CoordinatorHandle) -> Self {
+    pub fn new(coordinator: GroupCoordinatorHandle) -> Self {
         Self { coordinator }
     }
 }
@@ -231,7 +231,7 @@ impl AdminMutationHandler for CoordinatorAdminHandler {
     async fn pause_automatic_rebalance(&self, command: PlanCommand) -> Result<(), AdminApiError> {
         self.coordinator
             .set_automatic_paused(
-                parse_domain(command.domain)?,
+                parse_group(command.group)?,
                 command.operation_id,
                 parse_entity_type(command.entity_type)?,
                 true,
@@ -243,7 +243,7 @@ impl AdminMutationHandler for CoordinatorAdminHandler {
     async fn resume_automatic_rebalance(&self, command: PlanCommand) -> Result<(), AdminApiError> {
         self.coordinator
             .set_automatic_paused(
-                parse_domain(command.domain)?,
+                parse_group(command.group)?,
                 command.operation_id,
                 parse_entity_type(command.entity_type)?,
                 false,
@@ -256,7 +256,7 @@ impl AdminMutationHandler for CoordinatorAdminHandler {
         let entity_type = parse_entity_type(command.entity_type)?.ok_or(AdminApiError::Invalid)?;
         self.coordinator
             .evaluate_rebalance(
-                parse_domain(command.domain)?,
+                parse_group(command.group)?,
                 command.operation_id,
                 entity_type,
                 operator_trigger(),
@@ -269,7 +269,7 @@ impl AdminMutationHandler for CoordinatorAdminHandler {
     async fn relocate_shard(&self, command: ManualRelocation) -> Result<(), AdminApiError> {
         self.coordinator
             .relocate_shard(ManualRelocationRequest {
-                domain: parse_domain(command.domain)?,
+                group: parse_group(command.group)?,
                 operation_id: command.operation_id,
                 entity_type: EntityType::new(command.entity_type)
                     .map_err(|_| AdminApiError::Invalid)?,
@@ -292,7 +292,7 @@ impl AdminMutationHandler for CoordinatorAdminHandler {
         let shard_id = command.shard_id.ok_or(AdminApiError::Invalid)?;
         self.coordinator
             .cancel_pending(
-                parse_domain(command.domain)?,
+                parse_group(command.group)?,
                 command.operation_id,
                 plan_id,
                 ShardId::new(shard_id),
@@ -310,8 +310,8 @@ fn operator_trigger() -> RebalanceTrigger {
     }
 }
 
-fn parse_domain(value: String) -> Result<PlacementDomainId, AdminApiError> {
-    PlacementDomainId::new(value).map_err(|_| AdminApiError::Invalid)
+fn parse_group(value: String) -> Result<ActorGroupId, AdminApiError> {
+    ActorGroupId::new(value).map_err(|_| AdminApiError::Invalid)
 }
 
 fn parse_entity_type(value: Option<String>) -> Result<Option<EntityType>, AdminApiError> {
@@ -477,7 +477,7 @@ fn audit_plan_command(
             operation,
             principal = caller.principal(),
             peer = caller.peer.as_str(),
-            domain = command.domain.as_str(),
+            group = command.group.as_str(),
             operation_id = command.operation_id.as_str(),
             entity_type = ?command.entity_type,
             plan_id = ?command.plan_id,
@@ -489,7 +489,7 @@ fn audit_plan_command(
             operation,
             principal = caller.principal(),
             peer = caller.peer.as_str(),
-            domain = command.domain.as_str(),
+            group = command.group.as_str(),
             operation_id = command.operation_id.as_str(),
             entity_type = ?command.entity_type,
             plan_id = ?command.plan_id,
@@ -511,7 +511,7 @@ fn audit_relocation(
             operation = "rebalance.relocate",
             principal = caller.principal(),
             peer = caller.peer.as_str(),
-            domain = command.domain.as_str(),
+            group = command.group.as_str(),
             operation_id = command.operation_id.as_str(),
             entity_type = command.entity_type.as_str(),
             shard_id = command.shard_id,
@@ -524,7 +524,7 @@ fn audit_relocation(
             operation = "rebalance.relocate",
             principal = caller.principal(),
             peer = caller.peer.as_str(),
-            domain = command.domain.as_str(),
+            group = command.group.as_str(),
             operation_id = command.operation_id.as_str(),
             entity_type = command.entity_type.as_str(),
             shard_id = command.shard_id,
@@ -695,7 +695,7 @@ mod tests {
 
     fn plan_request(uri: &str, token: Option<&str>) -> Request<Body> {
         let body = json!({
-            "domain": "world",
+            "group": "world",
             "operation_id": "op-1",
             "entity_type": "player",
             "plan_id": null,
@@ -715,7 +715,7 @@ mod tests {
 
     fn relocate_request(token: Option<&str>) -> Request<Body> {
         let body = json!({
-            "domain": "world",
+            "group": "world",
             "operation_id": "op-2",
             "entity_type": "player",
             "shard_id": 7,

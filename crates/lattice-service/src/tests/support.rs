@@ -13,34 +13,32 @@ use lattice_actor_distributed::{
     reply::ReplyTo,
     traits::{Actor, Responder},
 };
-use lattice_model::cluster::{
-    ClusterId, EntityType, NodeEndpoint, NodeIncarnation, PlacementDomainId,
-};
-use lattice_placement::{
+use lattice_coordination::{
     control::{DEFAULT_MAX_CONTROL_PAYLOAD, PlacementControlRouter},
     runtime::{
-        PlacementDomainLeaderConfig,
+        GroupCoordinatorConfig,
         host::{CoordinatorHost, CoordinatorHostConfig},
     },
-    storage::InMemoryPlacementStore,
+    storage::InMemoryCoordinationStore,
     types::NodeKey,
 };
+use lattice_model::cluster::{ActorGroupId, ClusterId, EntityType, NodeEndpoint, NodeIncarnation};
 use lattice_remoting::config::RemotingConfig;
 
 use crate::{builder::LatticeService, config::NodeConfig, registration::EntityOptions};
 
 pub(super) const PROTOCOL_ID: u64 = 0x7465_7374_0000_0001;
 
-pub(super) fn placement_domain() -> PlacementDomainId {
-    PlacementDomainId::new("service-test").unwrap()
+pub(super) fn actor_group() -> ActorGroupId {
+    ActorGroupId::new("service-test").unwrap()
 }
 
-pub(super) fn secondary_domain() -> PlacementDomainId {
-    PlacementDomainId::new("service-secondary").unwrap()
+pub(super) fn secondary_group() -> ActorGroupId {
+    ActorGroupId::new("service-secondary").unwrap()
 }
 
-pub(super) fn proxy_options(domain: PlacementDomainId, name: &str) -> EntityOptions {
-    EntityOptions::new(domain, EntityType::new(name).unwrap(), 1)
+pub(super) fn proxy_options(group: ActorGroupId, name: &str) -> EntityOptions {
+    EntityOptions::new(group, EntityType::new(name).unwrap(), 1)
 }
 
 #[derive(Debug, Clone, lattice_actor::Request)]
@@ -166,31 +164,31 @@ pub(super) fn node_config(
 }
 
 pub(super) async fn coordinator_service(
-    store: Arc<InMemoryPlacementStore>,
+    store: Arc<InMemoryCoordinationStore>,
     cluster_id: ClusterId,
     node_id: &str,
     address: NodeEndpoint,
     incarnation: NodeIncarnation,
     _term: u64,
 ) -> LatticeService {
-    coordinator_service_for_domains(
+    coordinator_service_for_groups(
         store,
         cluster_id,
         node_id,
         address,
         incarnation,
-        BTreeSet::from([placement_domain()]),
+        BTreeSet::from([actor_group()]),
     )
     .await
 }
 
-pub(super) async fn coordinator_service_for_domains(
-    store: Arc<InMemoryPlacementStore>,
+pub(super) async fn coordinator_service_for_groups(
+    store: Arc<InMemoryCoordinationStore>,
     cluster_id: ClusterId,
     node_id: &str,
     address: NodeEndpoint,
     incarnation: NodeIncarnation,
-    domains: BTreeSet<PlacementDomainId>,
+    groups: BTreeSet<ActorGroupId>,
 ) -> LatticeService {
     let builder = LatticeService::builder(node_config(
         cluster_id,
@@ -207,11 +205,11 @@ pub(super) async fn coordinator_service_for_domains(
             address,
             incarnation,
         },
-        domains,
+        groups,
         CoordinatorHostConfig {
-            placement: PlacementDomainLeaderConfig {
+            group: GroupCoordinatorConfig {
                 renewal_interval: Duration::from_millis(100),
-                ..PlacementDomainLeaderConfig::default()
+                ..GroupCoordinatorConfig::default()
             },
             ..CoordinatorHostConfig::default()
         },

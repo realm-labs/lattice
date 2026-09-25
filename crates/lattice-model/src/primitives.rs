@@ -16,7 +16,7 @@ pub const MAX_ACTOR_PATH_BYTES: usize = 1024;
 pub const MAX_ACTOR_PATH_SEGMENT_BYTES: usize = 128;
 pub const MAX_ACTOR_ID_BYTES: usize = 256;
 pub const MAX_LOGICAL_KIND_BYTES: usize = 128;
-pub const MAX_PLACEMENT_DOMAIN_ID_BYTES: usize = 128;
+pub const MAX_ACTOR_GROUP_ID_BYTES: usize = 128;
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum ModelError {
@@ -316,7 +316,7 @@ impl ProtocolTag for ErasedProtocol {
 /// the backing storage. Routing borrows these bytes and registries retain the same identity.
 ///
 /// This value is nonempty and at most 256 bytes. It does not by itself identify a category,
-/// cluster or placement domain; use an Actor address to supply that context.
+/// cluster or placement group; use an Actor address to supply that context.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(try_from = "Bytes", into = "Bytes")]
 pub struct ActorId(Bytes);
@@ -387,16 +387,20 @@ macro_rules! bounded_kind {
 bounded_kind!(EntityType, "entity type");
 bounded_kind!(SingletonKind, "singleton kind");
 
+/// Stable coordination boundary for actor types, such as `gameplay` or `social`.
+///
+/// A group is not a node role: roles select eligible hosts, while each actor group
+/// has its own allocation, rebalance, and Coordinator leadership scope.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
 #[serde(transparent)]
-pub struct PlacementDomainId(String);
+pub struct ActorGroupId(String);
 
-impl PlacementDomainId {
+impl ActorGroupId {
     pub fn new(value: impl Into<String>) -> Result<Self, ModelError> {
         Ok(Self(validate_token(
             value.into(),
-            "placement domain ID",
-            MAX_PLACEMENT_DOMAIN_ID_BYTES,
+            "actor group ID",
+            MAX_ACTOR_GROUP_ID_BYTES,
         )?))
     }
 
@@ -409,13 +413,13 @@ impl PlacementDomainId {
     }
 }
 
-impl fmt::Display for PlacementDomainId {
+impl fmt::Display for ActorGroupId {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(self.as_str())
     }
 }
 
-impl<'de> Deserialize<'de> for PlacementDomainId {
+impl<'de> Deserialize<'de> for ActorGroupId {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
@@ -512,30 +516,30 @@ mod tests {
     }
 
     #[test]
-    fn placement_domain_id_is_bounded_canonical_and_serialized_explicitly() {
-        let domain = PlacementDomainId::new("player").unwrap();
-        assert_eq!(domain.as_str(), "player");
-        assert_eq!(serde_json::to_string(&domain).unwrap(), "\"player\"");
+    fn actor_group_id_is_bounded_canonical_and_serialized_explicitly() {
+        let group = ActorGroupId::new("player").unwrap();
+        assert_eq!(group.as_str(), "player");
+        assert_eq!(serde_json::to_string(&group).unwrap(), "\"player\"");
         assert_eq!(
-            serde_json::from_str::<PlacementDomainId>("\"player\"").unwrap(),
-            domain
+            serde_json::from_str::<ActorGroupId>("\"player\"").unwrap(),
+            group
         );
-        assert!(PlacementDomainId::new("").is_err());
-        assert!(PlacementDomainId::new("player/world").is_err());
-        assert!(PlacementDomainId::new("player\\world").is_err());
-        assert!(PlacementDomainId::new("player\nworld").is_err());
-        assert!(PlacementDomainId::new("x".repeat(MAX_PLACEMENT_DOMAIN_ID_BYTES + 1)).is_err());
+        assert!(ActorGroupId::new("").is_err());
+        assert!(ActorGroupId::new("player/world").is_err());
+        assert!(ActorGroupId::new("player\\world").is_err());
+        assert!(ActorGroupId::new("player\nworld").is_err());
+        assert!(ActorGroupId::new("x".repeat(MAX_ACTOR_GROUP_ID_BYTES + 1)).is_err());
         for invalid in ["", ".", "..", "a/b", "a\\b", "a\0b", "a\nb"] {
             let encoded = serde_json::to_string(invalid).unwrap();
-            assert!(serde_json::from_str::<PlacementDomainId>(&encoded).is_err());
+            assert!(serde_json::from_str::<ActorGroupId>(&encoded).is_err());
         }
     }
 
     #[test]
-    fn placement_domain_id_round_trips_generated_canonical_tokens() {
+    fn actor_group_id_round_trips_generated_canonical_tokens() {
         let alphabet = b"abcdefghijklmnopqrstuvwxyz0123456789-_";
         let mut state = 0x9e37_79b9_u64;
-        for length in 1..=MAX_PLACEMENT_DOMAIN_ID_BYTES {
+        for length in 1..=MAX_ACTOR_GROUP_ID_BYTES {
             let mut value = String::with_capacity(length);
             for _ in 0..length {
                 state = state
@@ -543,11 +547,11 @@ mod tests {
                     .wrapping_add(1);
                 value.push(alphabet[(state as usize) % alphabet.len()] as char);
             }
-            let domain = PlacementDomainId::new(value).unwrap();
-            let encoded = serde_json::to_vec(&domain).unwrap();
+            let group = ActorGroupId::new(value).unwrap();
+            let encoded = serde_json::to_vec(&group).unwrap();
             assert_eq!(
-                serde_json::from_slice::<PlacementDomainId>(&encoded).unwrap(),
-                domain
+                serde_json::from_slice::<ActorGroupId>(&encoded).unwrap(),
+                group
             );
         }
     }

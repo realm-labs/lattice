@@ -21,13 +21,13 @@ use lattice_actor_distributed::{
     reply::ReplyTo,
     traits::{Actor, ActorLifecycleState, Responder, StopReason},
 };
-use lattice_model::cluster::{ClusterId, NodeEndpoint, NodeIncarnation};
-use lattice_placement::{
+use lattice_coordination::{
     control::{DEFAULT_MAX_CONTROL_PAYLOAD, PlacementControlRouter},
     runtime::host::{CoordinatorHost, CoordinatorHostConfig},
-    storage::InMemoryPlacementStore,
+    storage::InMemoryCoordinationStore,
     types::NodeKey,
 };
+use lattice_model::cluster::{ClusterId, NodeEndpoint, NodeIncarnation};
 
 use super::support::*;
 use crate::{
@@ -421,7 +421,7 @@ async fn repeated_start_is_rejected_without_stopping_a_ready_node() {
 async fn startup_failure_rolls_back_partially_started_components() {
     let _network = network_test_guard().await;
     let address = unused_address().await;
-    let store = Arc::new(InMemoryPlacementStore::new(64, 64).unwrap());
+    let store = Arc::new(InMemoryCoordinationStore::new(64, 64).unwrap());
     let mut config = node_config(
         ClusterId::new("startup-rollback-test").unwrap(),
         "startup-rollback",
@@ -438,7 +438,7 @@ async fn startup_failure_rolls_back_partially_started_components() {
             address: address.clone(),
             incarnation: NodeIncarnation::new(1).unwrap(),
         },
-        BTreeSet::from([placement_domain()]),
+        BTreeSet::from([actor_group()]),
         CoordinatorHostConfig::default(),
     )
     .await

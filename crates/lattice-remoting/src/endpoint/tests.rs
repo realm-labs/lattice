@@ -673,7 +673,6 @@ async fn backlogged_duplicate_dials_do_not_fence_a_same_incarnation_rejoin() {
                     lane: LaneKind::Control,
                     connection_nonce,
                     maximum_frame_size: max_frame_size,
-                    features: FeatureBits::REQUIRED_V3,
                 },
                 &[descriptor],
                 8,

@@ -16,20 +16,20 @@ use lattice_actor_distributed::{
     registry::{ActorAddressConfig, ActorRegistry, ActorRegistryConfig},
     traits::StopReason,
 };
+use lattice_coordination::{region::EntityConfig, storage::InMemoryCoordinationStore};
 use lattice_discovery::static_provider::{StaticDiscovery, StaticEndpoint};
 use lattice_model::{
     actor::{ActorAddress, ProtocolId},
     cluster::CoordinatorScope,
     cluster::{ClusterId, EntityType, NodeEndpoint, NodeIncarnation},
 };
-use lattice_placement::{region::EntityConfig, storage::InMemoryPlacementStore};
 use lattice_remoting::handshake::NodeIdentity;
 
 use super::support::*;
 use crate::{
     builder::LatticeService,
     config::ClusterJoinConfig,
-    lifecycle::{NodeLifecycleState, PlacementDomainState},
+    lifecycle::{ActorGroupState, NodeLifecycleState},
     test_support::{network_test_guard, unused_address},
 };
 
@@ -105,9 +105,9 @@ async fn membership_loss_sheds_the_edge_while_local_and_exact_traffic_keep_servi
     let member_address = unused_address().await;
     let client_address = unused_address().await;
     let member_incarnation = NodeIncarnation::new(901).unwrap();
-    let store = Arc::new(InMemoryPlacementStore::new(32, 32).unwrap());
+    let store = Arc::new(InMemoryCoordinationStore::new(32, 32).unwrap());
 
-    let first_coordinator = coordinator_service_for_domains(
+    let first_coordinator = coordinator_service_for_groups(
         store.clone(),
         cluster_id.clone(),
         "coordinator-a",
@@ -122,7 +122,7 @@ async fn membership_loss_sheds_the_edge_while_local_and_exact_traffic_keep_servi
     // retry loop rather than by a test-only discovery push.
     let discovery = Arc::new(
         StaticDiscovery::new(
-            CoordinatorScope::Membership,
+            CoordinatorScope::Cluster,
             "admission-scope",
             vec![
                 StaticEndpoint {
@@ -258,7 +258,7 @@ async fn membership_loss_sheds_the_edge_while_local_and_exact_traffic_keep_servi
         "an exact remote ActorAddress must survive the membership gap"
     );
 
-    let second_coordinator = coordinator_service_for_domains(
+    let second_coordinator = coordinator_service_for_groups(
         store,
         cluster_id,
         "coordinator-b",
@@ -289,22 +289,22 @@ async fn membership_loss_sheds_the_edge_while_local_and_exact_traffic_keep_servi
     second_coordinator.force_shutdown().await.unwrap();
 }
 
-/// Logical routing is governed by the placement domain session and its claim deadline, which the
+/// Logical routing is governed by the placement group session and its claim deadline, which the
 /// membership session never participates in. With the two coordinators in separate processes,
-/// killing the membership one must leave the domain Ready and its entity traffic flowing — the
+/// killing the membership one must leave the group Ready and its entity traffic flowing — the
 /// claim is what says the shard is still this node's, and it is still installed and renewing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn membership_loss_leaves_placement_governed_entity_traffic_serving() {
     let _network = network_test_guard().await;
     let cluster_id = ClusterId::new("service-admission-logical").unwrap();
     let membership_address = unused_address().await;
-    let domain_address = unused_address().await;
+    let group_address = unused_address().await;
     let member_address = unused_address().await;
     let member_incarnation = NodeIncarnation::new(905).unwrap();
-    let domain = placement_domain();
-    let store = Arc::new(InMemoryPlacementStore::new(64, 64).unwrap());
+    let group = actor_group();
+    let store = Arc::new(InMemoryCoordinationStore::new(64, 64).unwrap());
 
-    let membership_coordinator = coordinator_service_for_domains(
+    let membership_coordinator = coordinator_service_for_groups(
         store.clone(),
         cluster_id.clone(),
         "membership-coordinator",
@@ -313,17 +313,17 @@ async fn membership_loss_leaves_placement_governed_entity_traffic_serving() {
         BTreeSet::new(),
     )
     .await;
-    let domain_coordinator = coordinator_service_for_domains(
+    let group_coordinator = coordinator_service_for_groups(
         store,
         cluster_id.clone(),
-        "domain-coordinator",
-        domain_address.clone(),
+        "group-coordinator",
+        group_address.clone(),
         NodeIncarnation::new(812).unwrap(),
-        BTreeSet::from([domain.clone()]),
+        BTreeSet::from([group.clone()]),
     )
     .await;
     membership_coordinator.start().await.unwrap();
-    domain_coordinator.start().await.unwrap();
+    group_coordinator.start().await.unwrap();
 
     let discovery = |scope, name: &'static str, node_id: &'static str, address| {
         Arc::new(
@@ -340,7 +340,7 @@ async fn membership_loss_leaves_placement_governed_entity_traffic_serving() {
         )
     };
     let entity_config = EntityConfig::new(
-        domain.clone(),
+        group.clone(),
         EntityType::new("admission-ping").unwrap(),
         ProtocolId::new(PROTOCOL_ID).unwrap(),
         1,
@@ -365,20 +365,20 @@ async fn membership_loss_leaves_placement_governed_entity_traffic_serving() {
     .unwrap()
     .host_entity_with_registry(entity_config.clone(), registry, binding, PingLoader)
     .unwrap()
-    .domain_capacity(domain.clone(), 1)
+    .group_capacity(group.clone(), 1)
     .unwrap()
     .coordinator_discovery(discovery(
-        CoordinatorScope::Membership,
+        CoordinatorScope::Cluster,
         "membership",
         "membership-coordinator",
         membership_address,
     ))
     .unwrap()
     .coordinator_discovery(discovery(
-        CoordinatorScope::Placement(domain.clone()),
-        "domain",
-        "domain-coordinator",
-        domain_address,
+        CoordinatorScope::Group(group.clone()),
+        "group",
+        "group-coordinator",
+        group_address,
     ))
     .unwrap()
     .join_config(join_config())
@@ -407,9 +407,9 @@ async fn membership_loss_leaves_placement_governed_entity_traffic_serving() {
     membership_coordinator.force_shutdown().await.unwrap();
     await_lifecycle(&member, NodeLifecycleState::JoiningMembership).await;
     assert_eq!(
-        member.health_snapshot().domains.get(&domain),
-        Some(&PlacementDomainState::Ready),
-        "losing membership must not degrade a placement domain with its own live session"
+        member.health_snapshot().groups.get(&group),
+        Some(&ActorGroupState::Ready),
+        "losing membership must not degrade a placement group with its own live session"
     );
     assert!(member.admission_snapshot().logical);
     assert_eq!(
@@ -423,7 +423,7 @@ async fn membership_loss_leaves_placement_governed_entity_traffic_serving() {
     );
 
     member.force_shutdown().await.unwrap();
-    domain_coordinator.force_shutdown().await.unwrap();
+    group_coordinator.force_shutdown().await.unwrap();
 }
 
 /// Splitting the gate must not make giving up cluster authority any softer. A cordoned node

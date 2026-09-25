@@ -51,7 +51,7 @@ async fn spawn_endpoint_slice_watch(
 ) -> Result<(), Box<dyn StdError>> {
     let namespace = std::env::var("POD_NAMESPACE").unwrap_or_else(|_| "default".to_owned());
     let discovery = KubernetesEndpointSliceDiscovery::connect(KubernetesEndpointSliceConfig {
-        scope: CoordinatorScope::Membership,
+        scope: CoordinatorScope::Cluster,
         namespace,
         service: "lattice-probe".to_owned(),
         label_selector: None,

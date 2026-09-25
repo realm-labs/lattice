@@ -16,42 +16,42 @@ use axum::{
     response::{IntoResponse, Response},
     routing::get,
 };
-use lattice_model::{cluster::CoordinatorScope, cluster::PlacementDomainId};
+use lattice_model::{cluster::ActorGroupId, cluster::CoordinatorScope};
 use lattice_service::{
     builder::LatticeService,
     deployment::LatticeApplication,
     lifecycle::{
-        CoordinatorScopeState, NodeLifecycleState, PlacementDomainState, ServiceHealthSnapshot,
+        ActorGroupState, CoordinatorScopeState, NodeLifecycleState, ServiceHealthSnapshot,
     },
 };
 use serde::Serialize;
 use tokio::net::TcpListener;
 
-/// Selects the placement domains that must be ready before the logic component accepts traffic.
+/// Selects the placement groups that must be ready before the logic component accepts traffic.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct HealthReadinessPolicy {
-    required_logic_domains: Option<BTreeSet<PlacementDomainId>>,
+    required_logic_groups: Option<BTreeSet<ActorGroupId>>,
 }
 
 impl HealthReadinessPolicy {
-    /// Requires every placement domain configured on the logic component.
-    pub fn all_domains() -> Self {
+    /// Requires every placement group configured on the logic component.
+    pub fn all_groups() -> Self {
         Self::default()
     }
 
-    /// Requires only the supplied placement domains.
-    pub fn required_domains(domains: impl IntoIterator<Item = PlacementDomainId>) -> Self {
+    /// Requires only the supplied placement groups.
+    pub fn required_groups(groups: impl IntoIterator<Item = ActorGroupId>) -> Self {
         Self {
-            required_logic_domains: Some(domains.into_iter().collect()),
+            required_logic_groups: Some(groups.into_iter().collect()),
         }
     }
 }
 
 #[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
 pub enum HealthConfigError {
-    #[error("required logic domain {domain} is not configured")]
-    UnknownRequiredDomain { domain: PlacementDomainId },
-    #[error("required logic domains were configured for an application without a logic component")]
+    #[error("required logic group {group} is not configured")]
+    UnknownRequiredGroup { group: ActorGroupId },
+    #[error("required logic groups were configured for an application without a logic component")]
     LogicComponentUnavailable,
 }
 
@@ -83,8 +83,8 @@ pub enum ProbeReasonCode {
     ComponentBooting,
     ComponentTerminated,
     NodeNotReady,
-    RequiredDomainMissing,
-    RequiredDomainNotReady,
+    RequiredGroupMissing,
+    RequiredGroupNotReady,
     CoordinatorScopesEmpty,
     CoordinatorScopeFailed,
 }
@@ -103,7 +103,7 @@ pub struct ComponentHealthView {
     pub component: HealthComponentKind,
     pub node: String,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
-    pub required_domains: BTreeMap<String, String>,
+    pub required_groups: BTreeMap<String, String>,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub coordinator_scopes: BTreeMap<String, String>,
 }
@@ -136,7 +136,7 @@ impl ManagedComponent {
 #[derive(Clone)]
 struct HealthState {
     components: Vec<ManagedComponent>,
-    required_logic_domains: BTreeSet<PlacementDomainId>,
+    required_logic_groups: BTreeSet<ActorGroupId>,
 }
 
 #[derive(Clone)]
@@ -151,11 +151,10 @@ impl HealthHttpAdapter {
     ) -> Result<Self, HealthConfigError> {
         let logic = application.logic().cloned();
         let coordinator = application.coordinator_service().cloned();
-        let configured_logic_domains = logic
+        let configured_logic_groups = logic
             .as_ref()
-            .map(|logic| logic.health_snapshot().domains.into_keys().collect());
-        let required_logic_domains =
-            resolve_required_logic_domains(configured_logic_domains, policy)?;
+            .map(|logic| logic.health_snapshot().groups.into_keys().collect());
+        let required_logic_groups = resolve_required_logic_groups(configured_logic_groups, policy)?;
 
         let mut components = Vec::with_capacity(2);
         if let Some(logic) = logic {
@@ -170,7 +169,7 @@ impl HealthHttpAdapter {
         Ok(Self {
             state: HealthState {
                 components,
-                required_logic_domains,
+                required_logic_groups,
             },
         })
     }
@@ -185,16 +184,16 @@ impl HealthHttpAdapter {
     }
 }
 
-fn resolve_required_logic_domains(
-    configured: Option<BTreeSet<PlacementDomainId>>,
+fn resolve_required_logic_groups(
+    configured: Option<BTreeSet<ActorGroupId>>,
     policy: HealthReadinessPolicy,
-) -> Result<BTreeSet<PlacementDomainId>, HealthConfigError> {
-    match (configured, policy.required_logic_domains) {
+) -> Result<BTreeSet<ActorGroupId>, HealthConfigError> {
+    match (configured, policy.required_logic_groups) {
         (Some(configured), None) => Ok(configured),
         (Some(configured), Some(required)) => {
-            if let Some(domain) = required.difference(&configured).next() {
-                return Err(HealthConfigError::UnknownRequiredDomain {
-                    domain: domain.clone(),
+            if let Some(group) = required.difference(&configured).next() {
+                return Err(HealthConfigError::UnknownRequiredGroup {
+                    group: group.clone(),
                 });
             }
             Ok(required)
@@ -278,13 +277,13 @@ fn evaluate(state: &HealthState, probe: ProbeKind) -> ProbeResponse {
             ProbeKind::Startup => evaluate_startup(*kind, snapshot, &mut reasons),
             ProbeKind::Liveness => evaluate_liveness(*kind, snapshot, &mut reasons),
             ProbeKind::Readiness => {
-                evaluate_readiness(*kind, snapshot, &state.required_logic_domains, &mut reasons);
+                evaluate_readiness(*kind, snapshot, &state.required_logic_groups, &mut reasons);
             }
         }
     }
     let components = snapshots
         .into_iter()
-        .map(|(kind, snapshot)| component_view(kind, &snapshot, &state.required_logic_domains))
+        .map(|(kind, snapshot)| component_view(kind, &snapshot, &state.required_logic_groups))
         .collect();
     ProbeResponse {
         probe,
@@ -334,7 +333,7 @@ fn evaluate_liveness(
 fn evaluate_readiness(
     component: HealthComponentKind,
     snapshot: &ServiceHealthSnapshot,
-    required_logic_domains: &BTreeSet<PlacementDomainId>,
+    required_logic_groups: &BTreeSet<ActorGroupId>,
     reasons: &mut Vec<ProbeReason>,
 ) {
     if snapshot.node != NodeLifecycleState::Ready {
@@ -347,19 +346,19 @@ fn evaluate_readiness(
     }
     match component {
         HealthComponentKind::Logic => {
-            for domain in required_logic_domains {
-                match snapshot.domains.get(domain) {
-                    Some(PlacementDomainState::Ready) => {}
+            for group in required_logic_groups {
+                match snapshot.groups.get(group) {
+                    Some(ActorGroupState::Ready) => {}
                     Some(state) => reasons.push(reason(
-                        ProbeReasonCode::RequiredDomainNotReady,
+                        ProbeReasonCode::RequiredGroupNotReady,
                         component,
-                        Some(domain.as_str().to_owned()),
-                        domain_state(*state),
+                        Some(group.as_str().to_owned()),
+                        group_state(*state),
                     )),
                     None => reasons.push(reason(
-                        ProbeReasonCode::RequiredDomainMissing,
+                        ProbeReasonCode::RequiredGroupMissing,
                         component,
-                        Some(domain.as_str().to_owned()),
+                        Some(group.as_str().to_owned()),
                         "missing",
                     )),
                 }
@@ -391,17 +390,17 @@ fn evaluate_readiness(
 fn component_view(
     component: HealthComponentKind,
     snapshot: &ServiceHealthSnapshot,
-    required_logic_domains: &BTreeSet<PlacementDomainId>,
+    required_logic_groups: &BTreeSet<ActorGroupId>,
 ) -> ComponentHealthView {
-    let required_domains = if component == HealthComponentKind::Logic {
-        required_logic_domains
+    let required_groups = if component == HealthComponentKind::Logic {
+        required_logic_groups
             .iter()
-            .map(|domain| {
+            .map(|group| {
                 let state = snapshot
-                    .domains
-                    .get(domain)
-                    .map_or("missing", |state| domain_state(*state));
-                (domain.as_str().to_owned(), state.to_owned())
+                    .groups
+                    .get(group)
+                    .map_or("missing", |state| group_state(*state));
+                (group.as_str().to_owned(), state.to_owned())
             })
             .collect()
     } else {
@@ -419,7 +418,7 @@ fn component_view(
     ComponentHealthView {
         component,
         node: node_state(snapshot.node).to_owned(),
-        required_domains,
+        required_groups,
         coordinator_scopes,
     }
 }
@@ -449,13 +448,13 @@ fn node_state(state: NodeLifecycleState) -> &'static str {
     }
 }
 
-fn domain_state(state: PlacementDomainState) -> &'static str {
+fn group_state(state: ActorGroupState) -> &'static str {
     match state {
-        PlacementDomainState::Joining => "joining",
-        PlacementDomainState::Ready => "ready",
-        PlacementDomainState::Degraded => "degraded",
-        PlacementDomainState::Draining => "draining",
-        PlacementDomainState::Terminated => "terminated",
+        ActorGroupState::Joining => "joining",
+        ActorGroupState::Ready => "ready",
+        ActorGroupState::Degraded => "degraded",
+        ActorGroupState::Draining => "draining",
+        ActorGroupState::Terminated => "terminated",
     }
 }
 
@@ -469,8 +468,8 @@ fn coordinator_state(state: CoordinatorScopeState) -> &'static str {
 
 fn scope_name(scope: &CoordinatorScope) -> String {
     match scope {
-        CoordinatorScope::Membership => "membership".to_owned(),
-        CoordinatorScope::Placement(domain) => format!("placement/{}", domain.as_str()),
+        CoordinatorScope::Cluster => "membership".to_owned(),
+        CoordinatorScope::Group(group) => format!("placement/{}", group.as_str()),
     }
 }
 
@@ -493,14 +492,14 @@ mod tests {
 
     type MutableSnapshot = Arc<Mutex<ServiceHealthSnapshot>>;
 
-    fn domain(name: &str) -> PlacementDomainId {
-        PlacementDomainId::new(name).unwrap()
+    fn group(name: &str) -> ActorGroupId {
+        ActorGroupId::new(name).unwrap()
     }
 
     fn snapshot(node: NodeLifecycleState) -> ServiceHealthSnapshot {
         ServiceHealthSnapshot {
             node,
-            domains: BTreeMap::new(),
+            groups: BTreeMap::new(),
             coordinator_scopes: BTreeMap::new(),
         }
     }
@@ -522,19 +521,19 @@ mod tests {
 
     fn adapter(
         components: Vec<ManagedComponent>,
-        required_logic_domains: impl IntoIterator<Item = PlacementDomainId>,
+        required_logic_groups: impl IntoIterator<Item = ActorGroupId>,
     ) -> HealthHttpAdapter {
         HealthHttpAdapter {
             state: HealthState {
                 components,
-                required_logic_domains: required_logic_domains.into_iter().collect(),
+                required_logic_groups: required_logic_groups.into_iter().collect(),
             },
         }
     }
 
     #[test]
     fn lifecycle_state_matrix_matches_kubernetes_probe_semantics() {
-        let alpha = domain("alpha");
+        let alpha = group("alpha");
         let cases = [
             (NodeLifecycleState::Booting, false, true, false),
             (NodeLifecycleState::JoiningMembership, true, true, false),
@@ -545,9 +544,7 @@ mod tests {
         ];
         for (node, startup_ok, live_ok, ready_ok) in cases {
             let mut health = snapshot(node);
-            health
-                .domains
-                .insert(alpha.clone(), PlacementDomainState::Ready);
+            health.groups.insert(alpha.clone(), ActorGroupState::Ready);
             let (logic, _) = mutable_component(HealthComponentKind::Logic, health);
             let state = adapter(vec![logic], [alpha.clone()]).state;
 
@@ -570,14 +567,12 @@ mod tests {
     }
 
     #[test]
-    fn readiness_ignores_optional_domain_degradation_but_requires_selected_domains() {
-        let alpha = domain("alpha");
-        let beta = domain("beta");
+    fn readiness_ignores_optional_group_degradation_but_requires_selected_groups() {
+        let alpha = group("alpha");
+        let beta = group("beta");
         let mut health = snapshot(NodeLifecycleState::Ready);
-        health
-            .domains
-            .insert(alpha.clone(), PlacementDomainState::Ready);
-        health.domains.insert(beta, PlacementDomainState::Degraded);
+        health.groups.insert(alpha.clone(), ActorGroupState::Ready);
+        health.groups.insert(beta, ActorGroupState::Degraded);
         let (logic, current) = mutable_component(HealthComponentKind::Logic, health);
         let state = adapter(vec![logic], [alpha.clone()]).state;
 
@@ -589,28 +584,28 @@ mod tests {
         current
             .lock()
             .unwrap()
-            .domains
-            .insert(alpha, PlacementDomainState::Degraded);
+            .groups
+            .insert(alpha, ActorGroupState::Degraded);
         let response = evaluate(&state, ProbeKind::Readiness);
         assert_eq!(response.status, ProbeStatus::Failed);
         assert!(response.reasons.iter().any(|reason| {
-            reason.code == ProbeReasonCode::RequiredDomainNotReady && reason.state == "degraded"
+            reason.code == ProbeReasonCode::RequiredGroupNotReady && reason.state == "degraded"
         }));
     }
 
     #[test]
     fn embedded_readiness_requires_healthy_logic_and_coordinator_scopes() {
-        let alpha = domain("alpha");
+        let alpha = group("alpha");
         let mut logic_health = snapshot(NodeLifecycleState::Ready);
         logic_health
-            .domains
-            .insert(alpha.clone(), PlacementDomainState::Ready);
+            .groups
+            .insert(alpha.clone(), ActorGroupState::Ready);
         let mut coordinator_health = snapshot(NodeLifecycleState::Ready);
         coordinator_health
             .coordinator_scopes
-            .insert(CoordinatorScope::Membership, CoordinatorScopeState::Standby);
+            .insert(CoordinatorScope::Cluster, CoordinatorScopeState::Standby);
         coordinator_health.coordinator_scopes.insert(
-            CoordinatorScope::Placement(alpha.clone()),
+            CoordinatorScope::Group(alpha.clone()),
             CoordinatorScopeState::Active,
         );
         let (logic, _) = mutable_component(HealthComponentKind::Logic, logic_health);
@@ -628,7 +623,7 @@ mod tests {
             .unwrap()
             .coordinator_scopes
             .insert(
-                CoordinatorScope::Placement(alpha),
+                CoordinatorScope::Group(alpha),
                 CoordinatorScopeState::Failed,
             );
         let response = evaluate(&state, ProbeKind::Readiness);
@@ -640,30 +635,30 @@ mod tests {
     }
 
     #[test]
-    fn readiness_policy_validates_required_domains_and_component_shape() {
-        let alpha = domain("alpha");
-        let beta = domain("beta");
+    fn readiness_policy_validates_required_groups_and_component_shape() {
+        let alpha = group("alpha");
+        let beta = group("beta");
         let configured = Some(BTreeSet::from([alpha.clone()]));
         assert_eq!(
-            resolve_required_logic_domains(
+            resolve_required_logic_groups(
                 configured,
-                HealthReadinessPolicy::required_domains([beta.clone()])
+                HealthReadinessPolicy::required_groups([beta.clone()])
             ),
-            Err(HealthConfigError::UnknownRequiredDomain { domain: beta })
+            Err(HealthConfigError::UnknownRequiredGroup { group: beta })
         );
         assert_eq!(
-            resolve_required_logic_domains(None, HealthReadinessPolicy::required_domains([alpha])),
+            resolve_required_logic_groups(None, HealthReadinessPolicy::required_groups([alpha])),
             Err(HealthConfigError::LogicComponentUnavailable)
         );
     }
 
     #[tokio::test]
     async fn http_contract_uses_json_no_store_and_excludes_removed_healthz() {
-        let alpha = domain("alpha");
+        let alpha = group("alpha");
         let mut health = snapshot(NodeLifecycleState::Draining);
         health
-            .domains
-            .insert(alpha.clone(), PlacementDomainState::Draining);
+            .groups
+            .insert(alpha.clone(), ActorGroupState::Draining);
         let (logic, _) = mutable_component(HealthComponentKind::Logic, health);
         let router = adapter(vec![logic], [alpha]).router();
 

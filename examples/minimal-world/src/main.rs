@@ -23,15 +23,14 @@ use lattice_actor_distributed::{
     traits::{Actor, Responder},
 };
 use lattice_config::source::ConfigSource;
+use lattice_coordination::storage::InMemoryCoordinationStore;
 use lattice_eventbus::{
     local::{EventBus, LocalEventBus},
     types::{EventEnvelope, EventId, EventSubscription, Subject, SubjectFilter},
 };
 use lattice_model::{
     actor::{EntityAddress, ProtocolId, RecipientAddress, SingletonAddress},
-    cluster::{
-        ClusterId, EntityType, NodeEndpoint, NodeIncarnation, PlacementDomainId, SingletonKind,
-    },
+    cluster::{ActorGroupId, ClusterId, EntityType, NodeEndpoint, NodeIncarnation, SingletonKind},
     service::ServiceInstanceId,
     service_name,
     trace::{TelemetryResource, TraceContext},
@@ -40,11 +39,9 @@ use lattice_ops::{
     admin::{AdminAuth, AdminHttpAdapter, AdminSnapshot, CoordinatorAdminHandler},
     scheduler::ServiceScheduler,
     telemetry::{
-        InMemoryTelemetryExporter, OpenTelemetryPipeline, PlacementDomainTelemetry,
-        TelemetryRecorder,
+        ActorGroupTelemetry, InMemoryTelemetryExporter, OpenTelemetryPipeline, TelemetryRecorder,
     },
 };
-use lattice_placement::storage::InMemoryPlacementStore;
 use lattice_remoting::config::RemotingConfig;
 use lattice_service::{
     builder::LatticeService,
@@ -169,7 +166,7 @@ actor_protocol! {
 #[derive(Debug, Deserialize)]
 struct WorldConfig {
     mailbox_capacity: usize,
-    placement_domain: String,
+    actor_group: String,
     shard_count: u32,
     capacity_units: u64,
 }
@@ -258,20 +255,17 @@ async fn main() -> Result<(), Box<dyn StdError>> {
             .load()?
             .section("world")?;
     let cluster_id = ClusterId::new("minimal-world")?;
-    let domain = PlacementDomainId::new(config.placement_domain)?;
+    let group = ActorGroupId::new(config.actor_group)?;
     let coordinator_address = reserve_address()?;
     let logic_address = reserve_address()?;
-    let store = Arc::new(InMemoryPlacementStore::new(1024, 128)?);
+    let store = Arc::new(InMemoryCoordinationStore::new(1024, 128)?);
 
     let logic_incarnation = NodeIncarnation::generate();
-    let entity_options = EntityOptions::new(
-        domain.clone(),
-        EntityType::new("world")?,
-        config.shard_count,
-    )
-    .mailbox(MailboxConfig::bounded(config.mailbox_capacity));
+    let entity_options =
+        EntityOptions::new(group.clone(), EntityType::new("world")?, config.shard_count)
+            .mailbox(MailboxConfig::bounded(config.mailbox_capacity));
     let singleton_options =
-        SingletonOptions::new(domain.clone(), SingletonKind::new("world-clock")?)
+        SingletonOptions::new(group.clone(), SingletonKind::new("world-clock")?)
             .mailbox(MailboxConfig::bounded(config.mailbox_capacity));
     let entity_config = entity_options.build(ProtocolId::new(WORLD_PROTOCOL_ID)?)?;
     let singleton_config = singleton_options.build(ProtocolId::new(CLOCK_PROTOCOL_ID)?);
@@ -279,7 +273,7 @@ async fn main() -> Result<(), Box<dyn StdError>> {
         .entity_ref::<WorldProtocol>(cluster_id.clone(), ActorId::new(b"world-1".to_vec())?)?;
     let clock_ref: SingletonAddress<ClockProtocol> = SingletonAddress::new(
         cluster_id.clone(),
-        domain.clone(),
+        group.clone(),
         singleton_config.kind.clone(),
         singleton_config.protocol_id,
         singleton_config.fingerprint(),
@@ -294,7 +288,7 @@ async fn main() -> Result<(), Box<dyn StdError>> {
     ))?
     .host_entity::<WorldDefinition, WorldActor, _>(entity_options, WorldLoader)?
     .host_singleton::<ClockDefinition, ClockActor, _>(singleton_options, ClockLoader)?
-    .domain_capacity(domain.clone(), config.capacity_units)?
+    .group_capacity(group.clone(), config.capacity_units)?
     .join_config(ClusterJoinConfig {
         retry_initial: Duration::from_millis(10),
         retry_max: Duration::from_millis(100),
@@ -366,8 +360,8 @@ async fn main() -> Result<(), Box<dyn StdError>> {
     let coordinator_handle = application
         .coordinator_service()
         .ok_or_else(|| IoError::other("Coordinator service is unavailable"))?
-        .coordinator(&domain)
-        .ok_or_else(|| IoError::other("domain Coordinator handle is unavailable"))?;
+        .coordinator(&group)
+        .ok_or_else(|| IoError::other("group Coordinator handle is unavailable"))?;
     let _admin_router = AdminHttpAdapter::new(
         AdminAuth::disabled(),
         AdminSnapshot::default,
@@ -377,9 +371,9 @@ async fn main() -> Result<(), Box<dyn StdError>> {
 
     let telemetry = TelemetryRecorder::default();
     telemetry
-        .record_placement_domain(&PlacementDomainTelemetry {
+        .record_placement_group(&ActorGroupTelemetry {
             cluster: cluster_id.as_str().to_owned(),
-            domain: domain.clone(),
+            group: group.clone(),
             candidate_state: "active".to_owned(),
             leader_term: 1,
             session_ready: true,
@@ -416,8 +410,8 @@ async fn main() -> Result<(), Box<dyn StdError>> {
     application.shutdown().await?;
 
     println!(
-        "domain={} players={} singleton_tick={} event={} task={} metrics={}",
-        domain, direct_reply.player_count, clock_reply.tick, event_type, scheduled, metric_count,
+        "group={} players={} singleton_tick={} event={} task={} metrics={}",
+        group, direct_reply.player_count, clock_reply.tick, event_type, scheduled, metric_count,
     );
     Ok(())
 }

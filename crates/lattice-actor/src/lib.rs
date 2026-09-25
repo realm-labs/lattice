@@ -6,6 +6,10 @@
 
 #![cfg_attr(not(test), deny(clippy::wildcard_imports))]
 
+use lattice_model::framework::assert_release;
+
+const _: () = assert_release(env!("CARGO_PKG_VERSION"));
+
 extern crate self as lattice_actor;
 
 pub use lattice_actor_macros::{Message, Request, actor_behavior};

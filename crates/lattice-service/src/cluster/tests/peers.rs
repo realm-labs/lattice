@@ -4,11 +4,11 @@ use std::{
 };
 
 use lattice_actor_distributed::host::ProtocolHostRegistry;
-use lattice_model::cluster::{ClusterId, NodeIncarnation};
-use lattice_placement::{
+use lattice_coordination::{
     coordinator::{MemberChange, MemberEvent, MemberHello, MemberRecord, MemberStatus},
     types::{CoordinatorTerm, MembershipVersion, NodeKey, Revision},
 };
+use lattice_model::cluster::{ClusterId, NodeIncarnation};
 use lattice_remoting::{
     association::AssociationManager, config::RemotingConfig, endpoint::RemotingEndpoint,
     handshake::NodeIdentity, messaging::outbound::OutboundMessaging,

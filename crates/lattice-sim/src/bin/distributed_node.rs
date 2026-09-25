@@ -31,6 +31,31 @@ use lattice_actor_distributed::{
 };
 use lattice_config::store::ConfigStore;
 use lattice_config_etcd::{config::EtcdConfigStoreConfig, store::EtcdConfigStore};
+use lattice_coordination::{
+    control::{
+        DEFAULT_MAX_CONTROL_PAYLOAD, PlacementControlCommand, PlacementControlRouter,
+        control_stream_id, encode_control_command_for_term,
+    },
+    coordinator::{
+        ActorGroupHello, MemberHello, MemberRecord, MemberStatus, SnapshotLimits, SnapshotRecord,
+        SnapshotVersion, build_snapshot,
+    },
+    region::EntityConfig,
+    runtime::{
+        CoordinatorRuntimeError, GroupCoordinator, GroupCoordinatorConfig,
+        host::{CoordinatorHost, CoordinatorHostConfig},
+    },
+    session::{GroupSession, GroupSessionConfig},
+    storage::{
+        InMemoryCoordinationStore, ScopedElectionStore, StorageError,
+        etcd::{EtcdCoordinationConfig, EtcdCoordinationStore},
+        records::DurableStorageLimits,
+    },
+    types::{
+        AssignmentGeneration, ClaimGrant, CoordinatorTerm, GrantSequence, MembershipVersion,
+        NodeKey, PlacementSlot, PlacementSlotKey, PlacementSlotState, PlacementVersion, Revision,
+    },
+};
 use lattice_discovery::{
     config_store::ConfigStoreDiscovery,
     provider::CoordinatorDiscovery,
@@ -39,32 +64,7 @@ use lattice_discovery::{
 use lattice_model::{
     actor::{ActorAddress, EntityAddress, ProtocolId},
     cluster::CoordinatorScope,
-    cluster::{ClusterId, EntityType, NodeEndpoint, NodeIncarnation, PlacementDomainId},
-};
-use lattice_placement::{
-    control::{
-        DEFAULT_MAX_CONTROL_PAYLOAD, PlacementControlCommand, PlacementControlRouter,
-        control_stream_id, encode_control_command_for_term,
-    },
-    coordinator::{
-        MemberHello, MemberRecord, MemberStatus, PlacementDomainHello, SnapshotLimits,
-        SnapshotRecord, SnapshotVersion, build_snapshot,
-    },
-    region::EntityConfig,
-    runtime::{
-        CoordinatorRuntimeError, PlacementDomainLeader, PlacementDomainLeaderConfig,
-        host::{CoordinatorHost, CoordinatorHostConfig},
-    },
-    session::{LogicCoordinatorConfig, PlacementDomainSession},
-    storage::{
-        InMemoryPlacementStore, ScopedElectionStore, StorageError,
-        domain::DurableStorageLimits,
-        etcd::{EtcdPlacementConfig, EtcdPlacementStore},
-    },
-    types::{
-        AssignmentGeneration, ClaimGrant, CoordinatorTerm, GrantSequence, MembershipVersion,
-        NodeKey, PlacementSlot, PlacementSlotKey, PlacementSlotState, PlacementVersion, Revision,
-    },
+    cluster::{ActorGroupId, ClusterId, EntityType, NodeEndpoint, NodeIncarnation},
 };
 use lattice_remoting::{
     association::{AssociationKey, AssociationManager, LaneAttachment, LaneKind},
@@ -74,7 +74,7 @@ use lattice_remoting::{
 };
 use lattice_service::{
     builder::{LatticeService, LatticeServiceBuilder},
-    cluster::{DomainLogicalRouter, LogicalBufferConfig, members::MemberSnapshot},
+    cluster::{GroupLogicalRouter, LogicalBufferConfig, members::MemberSnapshot},
     config::{ClusterJoinConfig, NodeConfig},
     lifecycle::NodeLifecycleState,
 };
@@ -96,7 +96,7 @@ struct Cli {
     #[arg(long, default_value_t = 29101)]
     port: u16,
     #[arg(long, default_value = "")]
-    domains: String,
+    groups: String,
     #[arg(long)]
     address_host: Option<String>,
     #[arg(long)]
@@ -116,8 +116,8 @@ enum Role {
     DiscoveryCoordinator,
     StaticMember,
     ConfigMember,
-    DomainHost,
-    DomainLogic,
+    GroupHost,
+    GroupLogic,
     SplitEntityHost,
 }
 
@@ -139,7 +139,7 @@ struct DiscoveryLifecycleArtifact {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct MultiDomainHostArtifact {
+struct MultiGroupHostArtifact {
     node_id: String,
     #[serde(with = "lattice_sim::serde_u128")]
     incarnation: u128,
@@ -147,12 +147,12 @@ struct MultiDomainHostArtifact {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct MultiDomainLogicArtifact {
+struct MultiGroupLogicArtifact {
     node_id: String,
     #[serde(with = "lattice_sim::serde_u128")]
     incarnation: u128,
     lifecycle: String,
-    domains: BTreeMap<String, String>,
+    groups: BTreeMap<String, String>,
     membership_version: Option<MembershipVersionArtifact>,
     members: Vec<MemberArtifact>,
     join_millis: Option<u128>,
@@ -378,10 +378,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
         Role::StaticMember => discovery_member(cli.reference, cli.node_id, cli.port, false).await,
         Role::ConfigMember => discovery_member(cli.reference, cli.node_id, cli.port, true).await,
-        Role::DomainHost => domain_host(cli.reference, cli.node_id, cli.port, cli.domains).await,
-        Role::DomainLogic => {
+        Role::GroupHost => group_host(cli.reference, cli.node_id, cli.port, cli.groups).await,
+        Role::GroupLogic => {
             let address_host = cli.address_host.unwrap_or_else(|| cli.node_id.clone());
-            domain_logic(
+            group_logic(
                 cli.reference,
                 cli.node_id,
                 address_host,
@@ -392,7 +392,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             .await
         }
         Role::SplitEntityHost => {
-            split_entity_host(cli.reference, cli.node_id, cli.port, cli.domains).await
+            split_entity_host(cli.reference, cli.node_id, cli.port, cli.groups).await
         }
     }
 }
@@ -407,7 +407,7 @@ async fn discovery_coordinator(
     let incarnation = NodeIncarnation::generate();
     let builder =
         LatticeService::builder(node_config(cluster, &node_id, address.clone(), incarnation))?;
-    let store = Arc::new(InMemoryPlacementStore::new(64, 64)?);
+    let store = Arc::new(InMemoryCoordinationStore::new(64, 64)?);
     let host = CoordinatorHost::elect(
         store,
         builder.association_manager(),
@@ -416,11 +416,11 @@ async fn discovery_coordinator(
             address,
             incarnation,
         },
-        BTreeSet::from([placement_domain()]),
+        BTreeSet::from([actor_group()]),
         CoordinatorHostConfig {
-            placement: PlacementDomainLeaderConfig {
+            group: GroupCoordinatorConfig {
                 renewal_interval: Duration::from_millis(100),
-                ..PlacementDomainLeaderConfig::default()
+                ..GroupCoordinatorConfig::default()
             },
             ..CoordinatorHostConfig::default()
         },
@@ -453,7 +453,7 @@ async fn discovery_member(
     config_store: bool,
 ) -> Result<(), Box<dyn Error>> {
     let coordinator = NodeEndpoint::new("discovery-coordinator", 29200)?;
-    let scope = CoordinatorScope::Membership;
+    let scope = CoordinatorScope::Cluster;
     let discovery: Arc<dyn CoordinatorDiscovery> = if config_store {
         let run_id = std::env::var("LATTICE_RUN_ID")?;
         let endpoints = std::env::var("LATTICE_ETCD_ENDPOINTS")?
@@ -1010,7 +1010,7 @@ fn entity_service(
         version: MembershipVersion::new(slot.version.term, slot.version.revision),
         lease_id: 1,
     };
-    let domain_hello = PlacementDomainHello::builder(node.clone(), placement_domain(), 1)
+    let group_hello = ActorGroupHello::builder(node.clone(), actor_group(), 1)
         .hosted_entity_types(if owns_slot {
             BTreeSet::from([entity_config.entity_type.clone()])
         } else {
@@ -1022,11 +1022,11 @@ fn entity_service(
             BTreeSet::from([entity_config.entity_type.clone()])
         })
         .build();
-    let (logic, effects) = PlacementDomainSession::new(
-        domain_hello,
+    let (logic, effects) = GroupSession::new(
+        group_hello,
         coordinator.clone(),
         associations.clone(),
-        LogicCoordinatorConfig::default(),
+        GroupSessionConfig::default(),
         64,
         slot.version.term.get(),
     )?;
@@ -1036,7 +1036,7 @@ fn entity_service(
     let state = logic.state();
     let (control, controls) = PlacementControlRouter::bounded(64, DEFAULT_MAX_CONTROL_PAYLOAD)?;
     let control = Arc::new(control);
-    let mut router = DomainLogicalRouter::new(
+    let mut router = GroupLogicalRouter::new(
         node,
         state,
         associations,
@@ -1074,22 +1074,22 @@ async fn install_fixture_snapshot(
     let record = SnapshotRecord {
         key: match &slot.key {
             PlacementSlotKey::Shard {
-                domain,
+                group,
                 entity_type,
                 shard_id,
             } => format!(
-                "domain/{}/shard/{}/{}",
-                domain.as_str(),
+                "group/{}/shard/{}/{}",
+                group.as_str(),
                 entity_type.as_str(),
                 shard_id.get()
             ),
-            PlacementSlotKey::Singleton { domain, kind } => {
-                format!("domain/{}/singleton/{}", domain.as_str(), kind.as_str())
+            PlacementSlotKey::Singleton { group, kind } => {
+                format!("group/{}/singleton/{}", group.as_str(), kind.as_str())
             }
         },
         value: serde_json::to_vec(slot)?.into(),
     };
-    let scope = CoordinatorScope::Placement(slot.key.domain().clone());
+    let scope = CoordinatorScope::Group(slot.key.group().clone());
     let (begin, chunks, end) = build_snapshot(
         &scope,
         slot.version.term.get(),
@@ -1108,7 +1108,7 @@ async fn install_fixture_snapshot(
     commands.push(PlacementControlCommand::MemberUp(member));
     if owns_slot {
         commands.push(PlacementControlCommand::ClaimGranted(ClaimGrant {
-            domain: slot.key.domain().clone(),
+            group: slot.key.group().clone(),
             slot: slot.key.clone(),
             owner: slot.owner.clone().ok_or("fixture slot has no owner")?,
             coordinator_term: slot.version.term,

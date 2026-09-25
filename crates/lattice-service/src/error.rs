@@ -3,10 +3,10 @@ use lattice_actor_distributed::{
     protocol::ProtocolBuildError,
     recipient::ProtocolRegistrationError,
 };
-use lattice_discovery::provider::DiscoveryError;
-use lattice_placement::{
+use lattice_coordination::{
     control::PlacementControlError, region::RegionError, runtime::CoordinatorRuntimeError,
 };
+use lattice_discovery::provider::DiscoveryError;
 use lattice_remoting::{
     association::AssociationError, control::ControlDispatchError, endpoint::EndpointError,
     messaging::error::RemoteMessageError, watch::WatchError,
@@ -73,8 +73,8 @@ pub enum ServiceError {
     CoordinatorUnavailable,
     #[error("node placement capacity must be nonzero")]
     InvalidCapacity,
-    #[error("discovery logic runtime requires exactly one explicit placement domain")]
-    InvalidPlacementDomains,
+    #[error("discovery logic runtime requires exactly one explicit placement group")]
+    InvalidActorGroups,
     #[error("graceful member leave exceeded its deadline")]
     LeaveTimeout,
     #[error("graceful shutdown requires operator intervention: {0:?}")]

@@ -2,7 +2,11 @@ use std::path::{Path, PathBuf};
 
 use lattice_sim::failpoints::Failpoint;
 
-const PRODUCTION_CRATES: [&str; 3] = ["lattice-remoting", "lattice-placement", "lattice-service"];
+const PRODUCTION_CRATES: [&str; 3] = [
+    "lattice-remoting",
+    "lattice-coordination",
+    "lattice-service",
+];
 
 /// Every entry is a production call site that turns an injected decision into an outcome the
 /// caller can observe: a refused commit, an unknown outcome after the commit landed, or a control

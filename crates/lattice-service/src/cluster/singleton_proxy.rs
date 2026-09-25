@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
+use lattice_coordination::control::PlacementControlCommand;
 use lattice_model::cluster::CoordinatorScope;
-use lattice_placement::control::PlacementControlCommand;
 use lattice_remoting::{association::Association, messaging::error::RemoteFailureCode};
 
 use super::{
@@ -28,7 +28,7 @@ pub(super) struct SingletonProxyRoute {
 impl SingletonProxyRoute {
     fn slot(&self, target: &SingletonAddress) -> Result<PlacementSlot, RemoteMessageError> {
         if target.protocol_id() != self.config.protocol_id
-            || target.domain() != &self.config.domain
+            || target.group() != &self.config.group
             || target.config_fingerprint() != self.config.fingerprint()
         {
             return Err(RemoteMessageError::ProtocolFingerprintMismatch);
@@ -37,7 +37,7 @@ impl SingletonProxyRoute {
             .lock()
             .expect("logic placement state poisoned")
             .slot(&PlacementSlotKey::Singleton {
-                domain: self.config.domain.clone(),
+                group: self.config.group.clone(),
                 kind: self.config.kind.clone(),
             })
             .cloned()
@@ -66,12 +66,12 @@ impl SingletonProxyRoute {
             .expect("logic placement state poisoned")
             .coordinator_term()
             .ok_or(RemoteMessageError::ShardUnavailable)?;
-        let payload = lattice_placement::control::encode_control_command_for_term(
-            &CoordinatorScope::Placement(self.config.domain.clone()),
+        let payload = lattice_coordination::control::encode_control_command_for_term(
+            &CoordinatorScope::Group(self.config.group.clone()),
             coordinator_term,
             &PlacementControlCommand::ResolveSingleton {
                 request_id,
-                domain: self.config.domain.clone(),
+                group: self.config.group.clone(),
                 kind: self.config.kind.clone(),
             },
             self.buffer.config.maximum_control_payload,
@@ -79,8 +79,8 @@ impl SingletonProxyRoute {
         .map_err(|_| RemoteMessageError::InvalidPayload)?;
         association
             .admit_control_command_in(
-                lattice_placement::control::control_stream_id(&CoordinatorScope::Placement(
-                    self.config.domain.clone(),
+                lattice_coordination::control::control_stream_id(&CoordinatorScope::Group(
+                    self.config.group.clone(),
                 )),
                 payload,
             )
@@ -98,7 +98,7 @@ impl SingletonProxyRoute {
             return Ok(slot);
         }
         let key = PlacementSlotKey::Singleton {
-            domain: self.config.domain.clone(),
+            group: self.config.group.clone(),
             kind: self.config.kind.clone(),
         };
         let candidate_request_id = next_logical_resolution(self.local_node.incarnation);

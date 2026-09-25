@@ -24,7 +24,7 @@ use crate::{
     bootstrap::{BootstrapError, BootstrapHandler},
     config::RemotingConfig,
     control::ControlDispatch,
-    handshake::{FeatureBits, Handshake, HandshakeError, HandshakeValidator, NodeIdentity},
+    handshake::{Handshake, HandshakeError, HandshakeValidator, NodeIdentity},
     lane::{BidirectionalLane, LaneError, LaneExit, LaneServices},
     messaging::{inbound::InboundDispatch, outbound::OutboundMessaging},
     protocol::ProtocolDescriptor,
@@ -422,7 +422,6 @@ impl RemotingEndpoint {
             lane,
             connection_nonce: nonce,
             maximum_frame_size: self.config.max_frame_size,
-            features: FeatureBits::REQUIRED_V3,
         };
         let peer_catalogue = negotiate_outbound(
             &mut connection,

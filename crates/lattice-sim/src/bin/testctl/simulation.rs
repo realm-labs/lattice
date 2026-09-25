@@ -4,7 +4,7 @@ use std::{
 };
 
 use lattice_sim::{
-    domains::{MultiDomainScenario, MultiDomainScenarioConfig},
+    groups::{MultiGroupScenario, MultiGroupScenarioConfig},
     lifecycle::{LifecycleScenario, LifecycleScenarioConfig},
     scenario::{Scenario, ScenarioConfig},
     trace::TraceJournal,
@@ -46,7 +46,7 @@ fn simulate_to(seed: u64, trace_path: &Path, retain_companion_traces: bool) -> R
             .write_json(&trace_path.with_file_name(format!("lifecycle-trace-{seed}.json")))
             .map_err(|error| error.to_string())?;
     }
-    let mut domains = MultiDomainScenario::standard(MultiDomainScenarioConfig {
+    let mut domains = MultiGroupScenario::standard(MultiGroupScenarioConfig {
         seed,
         maximum_events: 64,
     })
@@ -56,7 +56,7 @@ fn simulate_to(seed: u64, trace_path: &Path, retain_companion_traces: bool) -> R
     if retain_companion_traces {
         domains
             .trace
-            .write_json(&trace_path.with_file_name(format!("domain-trace-{seed}.json")))
+            .write_json(&trace_path.with_file_name(format!("group-trace-{seed}.json")))
             .map_err(|error| error.to_string())?;
     }
     result
@@ -111,8 +111,8 @@ pub(super) fn replay(path: &Path) -> Result<(), String> {
             scenario.run().map_err(|error| error.to_string())?;
             scenario.trace
         }
-        "multi-domain-isolation" => {
-            let mut scenario = MultiDomainScenario::standard(MultiDomainScenarioConfig {
+        "multi-group-isolation" => {
+            let mut scenario = MultiGroupScenario::standard(MultiGroupScenarioConfig {
                 seed: expected.seed,
                 maximum_events: 64,
             })

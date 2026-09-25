@@ -1,19 +1,19 @@
 use std::{collections::BTreeSet, sync::Arc, time::Duration};
 
-use lattice_discovery::static_provider::{StaticDiscovery, StaticEndpoint};
-use lattice_model::{cluster::CoordinatorScope, cluster::PlacementDomainId};
-use lattice_placement::{
+use lattice_coordination::{
     control::{DEFAULT_MAX_CONTROL_PAYLOAD, PlacementControlRouter},
     runtime::host::{CoordinatorHost, CoordinatorHostConfig},
-    storage::{CoordinatorLeaseStore, MembershipStore, PlacementDomainStore, ScopedElectionStore},
+    storage::{ActorGroupStore, CoordinatorLeaseStore, MembershipStore, ScopedElectionStore},
     types::NodeKey,
 };
+use lattice_discovery::static_provider::{StaticDiscovery, StaticEndpoint};
+use lattice_model::{cluster::ActorGroupId, cluster::CoordinatorScope};
 
 use crate::{
     builder::{LatticeService, LatticeServiceBuilder},
     config::NodeConfig,
     error::ServiceError,
-    lifecycle::{CoordinatorScopeState, NodeLifecycleState, PlacementDomainState},
+    lifecycle::{ActorGroupState, CoordinatorScopeState, NodeLifecycleState},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -117,9 +117,9 @@ impl LatticeApplication {
                     let ready = health.borrow().node == NodeLifecycleState::Ready
                         && health
                             .borrow()
-                            .domains
+                            .groups
                             .values()
-                            .all(|state| *state == PlacementDomainState::Ready);
+                            .all(|state| *state == ActorGroupState::Ready);
                     if ready {
                         break;
                     }
@@ -225,13 +225,13 @@ impl LatticeApplication {
     pub async fn dedicated_candidate<S>(
         node: NodeConfig,
         store: Arc<S>,
-        domains: BTreeSet<PlacementDomainId>,
+        groups: BTreeSet<ActorGroupId>,
         host_config: CoordinatorHostConfig,
     ) -> Result<Self, ServiceError>
     where
-        S: CoordinatorLeaseStore + ScopedElectionStore + MembershipStore + PlacementDomainStore,
+        S: CoordinatorLeaseStore + ScopedElectionStore + MembershipStore + ActorGroupStore,
     {
-        let coordinator = assemble_coordinator(node, store, domains, host_config).await?;
+        let coordinator = assemble_coordinator(node, store, groups, host_config).await?;
         Ok(Self {
             mode: CoordinatorDeploymentMode::DedicatedCandidate,
             logic: None,
@@ -251,7 +251,7 @@ impl LatticeServiceBuilder {
         config: EmbeddedCoordinatorConfig,
     ) -> Result<LatticeApplication, ServiceError>
     where
-        S: CoordinatorLeaseStore + ScopedElectionStore + MembershipStore + PlacementDomainStore,
+        S: CoordinatorLeaseStore + ScopedElectionStore + MembershipStore + ActorGroupStore,
     {
         if self.node_config().cluster_id != config.node.cluster_id
             || self.node_config().address == config.node.address
@@ -269,11 +269,11 @@ impl LatticeServiceBuilder {
                 priority: 1,
             });
         }
-        let candidate_domains = self.hosted_domains();
-        let joined_domains = self.placement_domains();
-        self = install_static_discovery(self, &joined_domains, &candidates)?;
+        let candidate_groups = self.hosted_groups();
+        let joined_groups = self.actor_groups();
+        self = install_static_discovery(self, &joined_groups, &candidates)?;
         let coordinator =
-            assemble_coordinator(config.node, store, candidate_domains, config.host).await?;
+            assemble_coordinator(config.node, store, candidate_groups, config.host).await?;
         let logic = self.build()?;
         Ok(LatticeApplication::embedded(logic, coordinator))
     }
@@ -281,18 +281,18 @@ impl LatticeServiceBuilder {
 
 fn install_static_discovery(
     mut builder: LatticeServiceBuilder,
-    domains: &BTreeSet<PlacementDomainId>,
+    groups: &BTreeSet<ActorGroupId>,
     candidates: &[StaticEndpoint],
 ) -> Result<LatticeServiceBuilder, ServiceError> {
     builder = builder.coordinator_discovery(Arc::new(StaticDiscovery::new(
-        CoordinatorScope::Membership,
+        CoordinatorScope::Cluster,
         "application-coordinator-membership",
         candidates.to_vec(),
     )?))?;
-    for domain in domains {
+    for group in groups {
         builder = builder.coordinator_discovery(Arc::new(StaticDiscovery::new(
-            CoordinatorScope::Placement(domain.clone()),
-            format!("application-coordinator-{}", domain.as_str()),
+            CoordinatorScope::Group(group.clone()),
+            format!("application-coordinator-{}", group.as_str()),
             candidates.to_vec(),
         )?))?;
     }
@@ -302,11 +302,11 @@ fn install_static_discovery(
 async fn assemble_coordinator<S>(
     node: NodeConfig,
     store: Arc<S>,
-    domains: BTreeSet<PlacementDomainId>,
+    groups: BTreeSet<ActorGroupId>,
     host_config: CoordinatorHostConfig,
 ) -> Result<LatticeService, ServiceError>
 where
-    S: CoordinatorLeaseStore + ScopedElectionStore + MembershipStore + PlacementDomainStore,
+    S: CoordinatorLeaseStore + ScopedElectionStore + MembershipStore + ActorGroupStore,
 {
     let address = node.address.clone();
     let node_key = NodeKey {
@@ -319,7 +319,7 @@ where
         store,
         builder.association_manager(),
         node_key,
-        domains,
+        groups,
         host_config,
     )
     .await?;
@@ -334,10 +334,10 @@ where
 mod tests {
     use std::{collections::BTreeSet, net::TcpListener, sync::Arc, time::Duration};
 
-    use lattice_model::cluster::{ClusterId, NodeEndpoint, NodeIncarnation};
-    use lattice_placement::{
-        runtime::host::CoordinatorHostConfig, storage::InMemoryPlacementStore,
+    use lattice_coordination::{
+        runtime::host::CoordinatorHostConfig, storage::InMemoryCoordinationStore,
     };
+    use lattice_model::cluster::{ClusterId, NodeEndpoint, NodeIncarnation};
     use lattice_remoting::config::RemotingConfig;
 
     use super::{CoordinatorDeploymentMode, EmbeddedCoordinatorConfig, LatticeApplication};
@@ -418,7 +418,7 @@ mod tests {
         let cluster = ClusterId::new("dedicated-mode-test").unwrap();
         let application = LatticeApplication::dedicated_candidate(
             node(&cluster, "coordinator"),
-            Arc::new(InMemoryPlacementStore::new(16, 16).unwrap()),
+            Arc::new(InMemoryCoordinationStore::new(16, 16).unwrap()),
             BTreeSet::new(),
             CoordinatorHostConfig::default(),
         )
@@ -458,7 +458,7 @@ mod tests {
         let application = LatticeService::builder(node(&cluster, "logic"))
             .unwrap()
             .build_embedded(
-                Arc::new(InMemoryPlacementStore::new(16, 16).unwrap()),
+                Arc::new(InMemoryCoordinationStore::new(16, 16).unwrap()),
                 EmbeddedCoordinatorConfig::new(node(&cluster, "coordinator")),
             )
             .await

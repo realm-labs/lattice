@@ -1,10 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use lattice_model::cluster::{NodeEndpoint, NodeIncarnation};
-use lattice_placement::coordinator::{
+use lattice_coordination::coordinator::{
     MemberChange, MemberEvent, MemberHello, MemberRecord, MemberRemovalReason, MemberStatus,
 };
-use lattice_placement::types::{CoordinatorTerm, MembershipVersion, NodeKey, Revision};
+use lattice_coordination::types::{CoordinatorTerm, MembershipVersion, NodeKey, Revision};
+use lattice_model::cluster::{NodeEndpoint, NodeIncarnation};
 use lattice_service::cluster::members::{MemberDirectory, MemberDirectoryError};
 use lattice_service::lifecycle::{
     NodeLifecycle, NodeLifecycleState, ServiceLifecycleEffect, ServiceLifecycleError,

@@ -4,17 +4,14 @@ use std::{
     time::{Duration, Instant},
 };
 
-use lattice_model::cluster::{NodeIncarnation, PlacementDomainId};
-use lattice_placement::{
+use lattice_coordination::{
     authority::AuthorityEffect,
     control::PlacementControlEvent,
-    coordinator::{MemberChange, MemberEvent, PlacementDomainHello},
-    session::{
-        LogicCoordinatorConfig, LogicCoordinatorHandle, LogicPlacementEffect,
-        PlacementDomainSession,
-    },
+    coordinator::{ActorGroupHello, MemberChange, MemberEvent},
+    session::{GroupSession, GroupSessionConfig, GroupSessionHandle, LogicPlacementEffect},
     types::PlacementSlotKey,
 };
+use lattice_model::cluster::{ActorGroupId, NodeIncarnation};
 use lattice_remoting::{
     association::AssociationManager, bootstrap::BootstrapLeader,
     messaging::outbound::OutboundMessaging, watch::WatchRegistry,
@@ -22,15 +19,15 @@ use lattice_remoting::{
 use tokio::sync::{mpsc, watch};
 
 use super::{
-    DomainLogicalRouter, LogicalBufferConfig,
+    GroupLogicalRouter, LogicalBufferConfig,
     join::{BootstrapView, JoinController, JoinEvent},
     peers::PeerReconciler,
 };
 use crate::{
-    backend::{DomainRouterDirectory, LogicalRouter},
+    backend::{GroupRouterDirectory, LogicalRouter},
     builder::LogicalEntityInstaller,
     lifecycle::{
-        NodeLifecycle, NodeLifecycleState, PlacementDomainState, ProductionLifecycleDriver,
+        ActorGroupState, NodeLifecycle, NodeLifecycleState, ProductionLifecycleDriver,
         ServiceHealthSnapshot, ServiceLifecycleEvent,
     },
     supervisor::TaskSupervisor,
@@ -38,12 +35,12 @@ use crate::{
 
 pub(crate) struct LogicJoinRuntime {
     pub controller: Arc<JoinController>,
-    pub domain_hello: PlacementDomainHello,
+    pub group_hello: ActorGroupHello,
     pub associations: Arc<AssociationManager>,
     pub controls: Option<mpsc::Receiver<PlacementControlEvent>>,
-    pub config: LogicCoordinatorConfig,
+    pub config: GroupSessionConfig,
     pub effect_capacity: usize,
-    pub router: Arc<DomainRouterDirectory>,
+    pub router: Arc<GroupRouterDirectory>,
     pub entity_installers: Vec<LogicalEntityInstaller>,
     pub messaging: Arc<OutboundMessaging>,
     pub buffer_config: LogicalBufferConfig,
@@ -53,26 +50,26 @@ pub(crate) struct LogicJoinRuntime {
     pub lifecycle: Arc<Mutex<NodeLifecycle>>,
     pub lifecycle_driver: ProductionLifecycleDriver,
     pub health: Arc<Mutex<ServiceHealthSnapshot>>,
-    pub logic_handles: Arc<Mutex<BTreeMap<PlacementDomainId, LogicCoordinatorHandle>>>,
-    pub drain_ready: watch::Sender<BTreeMap<PlacementDomainId, String>>,
-    pub drain_blockers: watch::Sender<BTreeMap<PlacementDomainId, BTreeSet<PlacementSlotKey>>>,
+    pub logic_handles: Arc<Mutex<BTreeMap<ActorGroupId, GroupSessionHandle>>>,
+    pub drain_ready: watch::Sender<BTreeMap<ActorGroupId, String>>,
+    pub drain_blockers: watch::Sender<BTreeMap<ActorGroupId, BTreeSet<PlacementSlotKey>>>,
     pub bootstrap_view: Arc<BootstrapView>,
     pub membership_ready: watch::Receiver<bool>,
     pub supervisor: Arc<TaskSupervisor>,
 }
 
-/// Applies the placement effects produced by one logic domain session.
+/// Applies the placement effects produced by one logic group session.
 ///
 /// Both the discovery-driven join runtime and the pre-assembled cluster runtime share this
 /// applier so authority effects cannot diverge between the two assembly paths.
 pub(crate) struct LogicEffectApplier {
-    pub domain: PlacementDomainId,
+    pub group: ActorGroupId,
     pub incarnation: NodeIncarnation,
     pub router: Arc<dyn LogicalRouter>,
     pub peers: Arc<PeerReconciler>,
     pub watches: Arc<Mutex<WatchRegistry>>,
-    pub drain_ready: watch::Sender<BTreeMap<PlacementDomainId, String>>,
-    pub drain_blockers: watch::Sender<BTreeMap<PlacementDomainId, BTreeSet<PlacementSlotKey>>>,
+    pub drain_ready: watch::Sender<BTreeMap<ActorGroupId, String>>,
+    pub drain_blockers: watch::Sender<BTreeMap<ActorGroupId, BTreeSet<PlacementSlotKey>>>,
     pub supervisor: Arc<TaskSupervisor>,
 }
 
@@ -80,7 +77,7 @@ impl LogicEffectApplier {
     pub async fn apply(
         &self,
         effect: LogicPlacementEffect,
-        handle: &LogicCoordinatorHandle,
+        handle: &GroupSessionHandle,
     ) -> Result<(), ()> {
         match effect {
             LogicPlacementEffect::MemberSnapshot { version, members } => self
@@ -139,7 +136,7 @@ impl LogicEffectApplier {
                     return Err(());
                 }
                 self.drain_ready.send_modify(|ready| {
-                    ready.insert(self.domain.clone(), operation_id);
+                    ready.insert(self.group.clone(), operation_id);
                 });
                 Ok(())
             }
@@ -153,7 +150,7 @@ impl LogicEffectApplier {
         &self,
         slot: PlacementSlotKey,
         effect: AuthorityEffect,
-        handle: &LogicCoordinatorHandle,
+        handle: &GroupSessionHandle,
     ) -> Result<(), ()> {
         match effect {
             AuthorityEffect::DrainSlot => {
@@ -171,7 +168,7 @@ impl LogicEffectApplier {
                 let mut inserted = false;
                 self.drain_blockers.send_modify(|blockers| {
                     inserted = blockers
-                        .entry(self.domain.clone())
+                        .entry(self.group.clone())
                         .or_default()
                         .insert(slot.clone());
                 });
@@ -198,7 +195,7 @@ impl LogicEffectApplier {
 
     fn release_blocker(&self, slot: &PlacementSlotKey) {
         self.drain_blockers.send_modify(|blockers| {
-            if let Some(slots) = blockers.get_mut(&self.domain) {
+            if let Some(slots) = blockers.get_mut(&self.group) {
                 slots.remove(slot);
             }
         });
@@ -207,7 +204,7 @@ impl LogicEffectApplier {
     pub(super) fn watch_stop_failed_slot(
         &self,
         slot: PlacementSlotKey,
-        handle: &LogicCoordinatorHandle,
+        handle: &GroupSessionHandle,
     ) {
         let router = self.router.clone();
         let handle = handle.clone();
@@ -223,7 +220,7 @@ impl LogicEffectApplier {
         {
             tracing::warn!(
                 target: "lattice.cluster.logic",
-                domain = %self.domain.as_str(),
+                group = %self.group.as_str(),
                 ?slot,
                 "stop-failed slot keeps blocking the drain because no supervised task was available"
             );
@@ -231,15 +228,15 @@ impl LogicEffectApplier {
     }
 }
 
-struct LogicSessionRun {
+struct GroupSessionRun {
     leader: BootstrapLeader,
-    session: PlacementDomainSession,
+    session: GroupSession,
     controls: mpsc::Receiver<PlacementControlEvent>,
     effects: mpsc::Receiver<LogicPlacementEffect>,
-    handle: LogicCoordinatorHandle,
+    handle: GroupSessionHandle,
 }
 
-struct LogicSessionReturn {
+struct GroupSessionReturn {
     controls: mpsc::Receiver<PlacementControlEvent>,
     retry: bool,
 }
@@ -260,13 +257,13 @@ impl LogicJoinRuntime {
                     leader,
                     association,
                 } => {
-                    // Once this domain's durable removal is confirmed, coordinator replacement
+                    // Once this group's durable removal is confirmed, coordinator replacement
                     // must not register it again while the remaining domains/membership leave.
                     if self.lifecycle_driver.state() == NodeLifecycleState::Draining
                         && self
                             .drain_ready
                             .borrow()
-                            .contains_key(&self.domain_hello.domain)
+                            .contains_key(&self.group_hello.group)
                     {
                         continue;
                     }
@@ -282,7 +279,7 @@ impl LogicJoinRuntime {
                     {
                         break;
                     }
-                    self.set_domain_state(PlacementDomainState::Joining);
+                    self.set_group_state(ActorGroupState::Joining);
                     self.bootstrap_view.install(leader.clone());
                     let Some(mut receiver) = controls.take() else {
                         continue;
@@ -296,8 +293,8 @@ impl LogicJoinRuntime {
                             break;
                         }
                         let key = association.key().clone();
-                        let Ok((session, effects)) = PlacementDomainSession::new(
-                            self.domain_hello.clone(),
+                        let Ok((session, effects)) = GroupSession::new(
+                            self.group_hello.clone(),
                             key,
                             self.associations.clone(),
                             self.config.clone(),
@@ -307,8 +304,8 @@ impl LogicJoinRuntime {
                             controls = Some(receiver);
                             break;
                         };
-                        let Ok(mut router) = DomainLogicalRouter::new(
-                            self.domain_hello.node.clone(),
+                        let Ok(mut router) = GroupLogicalRouter::new(
+                            self.group_hello.node.clone(),
                             session.state(),
                             self.associations.clone(),
                             self.messaging.clone(),
@@ -320,29 +317,29 @@ impl LogicJoinRuntime {
                             let _ = self
                                 .lifecycle_driver
                                 .transition(ServiceLifecycleEvent::CoordinatorLost);
-                            self.set_domain_state(PlacementDomainState::Degraded);
+                            self.set_group_state(ActorGroupState::Degraded);
                             controls = Some(receiver);
                             break;
                         };
                         if self
                             .entity_installers
                             .iter()
-                            .filter(|install| install.domain == self.domain_hello.domain)
+                            .filter(|install| install.group == self.group_hello.group)
                             .any(|install| (install.install)(&mut router).is_err())
                         {
                             let _ = self
                                 .lifecycle_driver
                                 .transition(ServiceLifecycleEvent::CoordinatorLost);
-                            self.set_domain_state(PlacementDomainState::Degraded);
+                            self.set_group_state(ActorGroupState::Degraded);
                             controls = Some(receiver);
                             break;
                         }
-                        let domain = self.domain_hello.domain.clone();
-                        if self.router.install(&domain, Arc::new(router)).is_err() {
+                        let group = self.group_hello.group.clone();
+                        if self.router.install(&group, Arc::new(router)).is_err() {
                             let _ = self
                                 .lifecycle_driver
                                 .transition(ServiceLifecycleEvent::CoordinatorLost);
-                            self.set_domain_state(PlacementDomainState::Degraded);
+                            self.set_group_state(ActorGroupState::Degraded);
                             controls = Some(receiver);
                             break;
                         }
@@ -350,11 +347,11 @@ impl LogicJoinRuntime {
                         self.logic_handles
                             .lock()
                             .expect("logic handles poisoned")
-                            .insert(self.domain_hello.domain.clone(), handle.clone());
+                            .insert(self.group_hello.group.clone(), handle.clone());
                         let session_started = Instant::now();
                         let returned = self
                             .run_session(
-                                LogicSessionRun {
+                                GroupSessionRun {
                                     leader: leader.clone(),
                                     session,
                                     controls: receiver,
@@ -368,14 +365,14 @@ impl LogicJoinRuntime {
                         self.logic_handles
                             .lock()
                             .expect("logic handles poisoned")
-                            .remove(&self.domain_hello.domain);
-                        self.router.clear(&self.domain_hello.domain);
+                            .remove(&self.group_hello.group);
+                        self.router.clear(&self.group_hello.group);
                         receiver = returned.controls;
                         if self.lifecycle_driver.state() == NodeLifecycleState::Draining
                             && let Some(operation_id) = handle.committed_member_drain()
                         {
                             self.drain_ready.send_modify(|ready| {
-                                ready.insert(self.domain_hello.domain.clone(), operation_id);
+                                ready.insert(self.group_hello.group.clone(), operation_id);
                             });
                             controls = Some(receiver);
                             break;
@@ -400,14 +397,14 @@ impl LogicJoinRuntime {
                     }
                 }
                 JoinEvent::CoordinatorLost { .. } => {
-                    self.router.clear(&self.domain_hello.domain);
-                    self.set_domain_state(PlacementDomainState::Degraded);
+                    self.router.clear(&self.group_hello.group);
+                    self.set_group_state(ActorGroupState::Degraded);
                     let _ = self
                         .lifecycle_driver
                         .transition(ServiceLifecycleEvent::CoordinatorLost);
                 }
                 JoinEvent::TerminalFailure(_) => {
-                    self.set_domain_state(PlacementDomainState::Terminated);
+                    self.set_group_state(ActorGroupState::Terminated);
                     let event = if self
                         .lifecycle
                         .lock()
@@ -430,11 +427,11 @@ impl LogicJoinRuntime {
 
     async fn run_session(
         &self,
-        run: LogicSessionRun,
+        run: GroupSessionRun,
         join_events: &mut mpsc::Receiver<JoinEvent>,
         shutdown: &mut watch::Receiver<bool>,
-    ) -> LogicSessionReturn {
-        let LogicSessionRun {
+    ) -> GroupSessionReturn {
+        let GroupSessionRun {
             leader,
             session,
             controls,
@@ -449,7 +446,7 @@ impl LogicJoinRuntime {
         membership_ready.borrow_and_update();
         loop {
             // The placement state can become ready while authority effects produced by the
-            // snapshot are still queued. Publishing domain readiness before those effects are
+            // snapshot are still queued. Publishing group readiness before those effects are
             // applied exposes a transient Ready state in which logical messages are rejected as
             // stale authority.
             if !membership_ready.has_changed().unwrap_or(true)
@@ -457,14 +454,14 @@ impl LogicJoinRuntime {
                 && effects.is_empty()
                 && *membership_ready.borrow()
             {
-                self.set_domain_state(PlacementDomainState::Ready);
+                self.set_group_state(ActorGroupState::Ready);
                 let state = self
                     .lifecycle
                     .lock()
                     .expect("service lifecycle poisoned")
                     .state();
                 let event = match state {
-                    NodeLifecycleState::JoiningMembership if self.all_domains_ready() => {
+                    NodeLifecycleState::JoiningMembership if self.all_groups_ready() => {
                         Some(ServiceLifecycleEvent::SnapshotInstalled)
                     }
                     NodeLifecycleState::Ready => None,
@@ -476,12 +473,12 @@ impl LogicJoinRuntime {
             }
             tokio::select! {
                 result = &mut task => {
-                    self.set_domain_state(PlacementDomainState::Degraded);
+                    self.set_group_state(ActorGroupState::Degraded);
                     let _ = self
                         .lifecycle_driver
                         .transition(ServiceLifecycleEvent::CoordinatorLost);
                     return match result {
-                        Ok((Ok(()), controls)) => LogicSessionReturn {
+                        Ok((Ok(()), controls)) => GroupSessionReturn {
                             controls,
                             retry: false,
                         },
@@ -490,10 +487,10 @@ impl LogicJoinRuntime {
                             tracing::warn!(
                                 target: "lattice.cluster.logic",
                                 %error,
-                                domain = %self.domain_hello.domain.as_str(),
+                                group = %self.group_hello.group.as_str(),
                                 "logic session stopped; reconciliation required"
                             );
-                            LogicSessionReturn {
+                            GroupSessionReturn {
                                 controls,
                                 retry,
                             }
@@ -502,10 +499,10 @@ impl LogicJoinRuntime {
                             tracing::warn!(
                                 target: "lattice.cluster.logic",
                                 %error,
-                                domain = %self.domain_hello.domain.as_str(),
+                                group = %self.group_hello.group.as_str(),
                                 "logic session task failed; reconciliation required"
                             );
-                            LogicSessionReturn {
+                            GroupSessionReturn {
                                 controls: closed_controls(),
                                 retry: false,
                             }
@@ -517,12 +514,12 @@ impl LogicJoinRuntime {
                         Some(JoinEvent::CoordinatorLost { leader: lost })
                             if lost.identity == leader.identity && lost.term == leader.term =>
                         {
-                            self.set_domain_state(PlacementDomainState::Degraded);
+                            self.set_group_state(ActorGroupState::Degraded);
                             let _ = self
                                 .lifecycle_driver
                                 .transition(ServiceLifecycleEvent::CoordinatorLost);
                             let _ = session_shutdown.send(true);
-                            return LogicSessionReturn {
+                            return GroupSessionReturn {
                                 controls: task
                                     .await
                                     .map(|(_, controls)| controls)
@@ -532,7 +529,7 @@ impl LogicJoinRuntime {
                         }
                         Some(JoinEvent::TerminalFailure(_)) | None => {
                             let _ = session_shutdown.send(true);
-                            return LogicSessionReturn {
+                            return GroupSessionReturn {
                                 controls: task.await
                                 .map(|(_, controls)| controls)
                                 .unwrap_or_else(|_| closed_controls()),
@@ -545,7 +542,7 @@ impl LogicJoinRuntime {
                 }
                 effect = effects.recv() => {
                     let Some(effect) = effect else {
-                        self.set_domain_state(PlacementDomainState::Degraded);
+                        self.set_group_state(ActorGroupState::Degraded);
                         let _ = self
                             .lifecycle_driver
                             .transition(ServiceLifecycleEvent::CoordinatorLost);
@@ -554,13 +551,13 @@ impl LogicJoinRuntime {
                             .map(|(_, controls)| controls)
                             .unwrap_or_else(|_| closed_controls());
                         let retry = !controls.is_closed();
-                        return LogicSessionReturn {
+                        return GroupSessionReturn {
                             controls,
                             retry,
                         };
                     };
                     if applier.apply(effect, &handle).await.is_err() {
-                        self.set_domain_state(PlacementDomainState::Degraded);
+                        self.set_group_state(ActorGroupState::Degraded);
                         let _ = self
                             .lifecycle_driver
                             .transition(ServiceLifecycleEvent::CoordinatorLost);
@@ -571,11 +568,11 @@ impl LogicJoinRuntime {
                         let retry = !controls.is_closed();
                         tracing::warn!(
                             target: "lattice.cluster.logic",
-                            domain = %self.domain_hello.domain.as_str(),
+                            group = %self.group_hello.group.as_str(),
                             retry,
                             "logic session effect failed; reconciliation required"
                         );
-                        return LogicSessionReturn {
+                        return GroupSessionReturn {
                             controls,
                             retry,
                         };
@@ -585,20 +582,20 @@ impl LogicJoinRuntime {
                 changed = membership_ready.changed() => {
                     if changed.is_err() {
                         let _ = session_shutdown.send(true);
-                        return LogicSessionReturn {
+                        return GroupSessionReturn {
                             controls: task.await
                             .map(|(_, controls)| controls)
                             .unwrap_or_else(|_| closed_controls()),
                             retry: false,
                         };
                     }
-                    self.set_domain_state(PlacementDomainState::Degraded);
+                    self.set_group_state(ActorGroupState::Degraded);
                     if *membership_ready.borrow_and_update() {
                         // A membership recovery can outlive the Coordinator's placement session
                         // while its TCP association stays active (for example after a process
                         // pause). Re-register and install a fresh snapshot before routing again.
                         let _ = session_shutdown.send(true);
-                        return LogicSessionReturn {
+                        return GroupSessionReturn {
                             controls: task.await
                                 .map(|(_, controls)| controls)
                                 .unwrap_or_else(|_| closed_controls()),
@@ -609,7 +606,7 @@ impl LogicJoinRuntime {
                 changed = shutdown.changed() => {
                     if changed.is_err() || *shutdown.borrow() {
                         let _ = session_shutdown.send(true);
-                        return LogicSessionReturn {
+                        return GroupSessionReturn {
                             controls: task.await
                             .map(|(_, controls)| controls)
                             .unwrap_or_else(|_| closed_controls()),
@@ -623,8 +620,8 @@ impl LogicJoinRuntime {
 
     fn effect_applier(&self) -> LogicEffectApplier {
         LogicEffectApplier {
-            domain: self.domain_hello.domain.clone(),
-            incarnation: self.domain_hello.node.incarnation,
+            group: self.group_hello.group.clone(),
+            incarnation: self.group_hello.node.incarnation,
             router: self.router.clone(),
             peers: self.peers.clone(),
             watches: self.watches.clone(),
@@ -634,18 +631,18 @@ impl LogicJoinRuntime {
         }
     }
 
-    fn set_domain_state(&self, state: PlacementDomainState) {
+    fn set_group_state(&self, state: ActorGroupState) {
         self.lifecycle_driver
-            .set_domain_state(self.domain_hello.domain.clone(), state);
+            .set_group_state(self.group_hello.group.clone(), state);
     }
 
-    fn all_domains_ready(&self) -> bool {
+    fn all_groups_ready(&self) -> bool {
         self.health
             .lock()
             .expect("service health poisoned")
-            .domains
+            .groups
             .values()
-            .all(|state| *state == PlacementDomainState::Ready)
+            .all(|state| *state == ActorGroupState::Ready)
     }
 }
 

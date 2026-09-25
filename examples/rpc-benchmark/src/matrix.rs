@@ -17,11 +17,7 @@ use lattice_actor_distributed::{
     registry::{ActorRegistry, ActorRegistryConfig},
     traits::{Actor, Handler, StopReason},
 };
-use lattice_model::{
-    actor::ProtocolId,
-    cluster::{EntityType, NodeEndpoint, NodeIncarnation, PlacementDomainId},
-};
-use lattice_placement::{
+use lattice_coordination::{
     allocation::{
         AllocationRequest, LoadSample, PlacedShard, PlacementNode, PlacementView, RebalanceLimits,
         RebalanceTrigger, ShardAllocationStrategy, WeightedLeastLoad,
@@ -32,6 +28,10 @@ use lattice_placement::{
         AssignmentGeneration, CoordinatorTerm, MonotonicTime, NodeKey, PlacementSlotKey,
         PlacementSlotState, PlacementVersion, Revision, ShardId,
     },
+};
+use lattice_model::{
+    actor::ProtocolId,
+    cluster::{ActorGroupId, EntityType, NodeEndpoint, NodeIncarnation},
 };
 use lattice_remoting::{
     association::AssociationId,
@@ -117,7 +117,7 @@ pub fn placement_matrix(
     let entity_type = EntityType::new("benchmark-entity")?;
     let protocol = ProtocolId::new(0x6265_6e63_6800_0002)?;
     let config = EntityConfig::new(
-        placement_domain(),
+        actor_group(),
         entity_type.clone(),
         protocol,
         1,
@@ -267,15 +267,15 @@ fn allocation_fixture(
     };
     Ok((
         AllocationRequest {
-            domain: placement_domain(),
+            group: actor_group(),
             entity_type: entity_type.clone(),
             shard_id: ShardId::new(1),
             required_protocol: protocol,
         },
         PlacementView {
-            domain: placement_domain(),
+            group: actor_group(),
             version: PlacementVersion::new(
-                placement_domain(),
+                actor_group(),
                 CoordinatorTerm::new(1)?,
                 Revision::new(1)?,
             ),
@@ -287,7 +287,7 @@ fn allocation_fixture(
                 placement_node(target, 0),
             ],
             shards: vec![PlacedShard {
-                domain: placement_domain(),
+                group: actor_group(),
                 entity_type,
                 shard_id: ShardId::new(1),
                 owner: source,
@@ -314,7 +314,7 @@ fn reduce_handoff(
     let generation = AssignmentGeneration::new(1)?;
     let mut machine = HandoffMachine::begin(
         PlacementSlotKey::Shard {
-            domain: placement_domain(),
+            group: actor_group(),
             entity_type: entity_type.clone(),
             shard_id: ShardId::new(1),
         },
@@ -322,11 +322,7 @@ fn reduce_handoff(
         source.clone(),
         target.clone(),
         generation,
-        PlacementVersion::new(
-            placement_domain(),
-            CoordinatorTerm::new(1)?,
-            Revision::new(1)?,
-        ),
+        PlacementVersion::new(actor_group(), CoordinatorTerm::new(1)?, Revision::new(1)?),
         BTreeSet::new(),
     )?;
     machine.start();
@@ -345,8 +341,8 @@ fn reduce_handoff(
     Ok(())
 }
 
-fn placement_domain() -> PlacementDomainId {
-    PlacementDomainId::new("benchmark").expect("static placement domain is valid")
+fn actor_group() -> ActorGroupId {
+    ActorGroupId::new("benchmark").expect("static placement group is valid")
 }
 
 fn reduce_reconnect(command: u128) -> Result<(), Box<dyn Error>> {

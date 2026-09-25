@@ -281,17 +281,17 @@ session. Member registration resends pending effects but is not the only repair 
 
 | Area | Primary files | Required responsibility |
 |---|---|---|
-| Domain types | `crates/lattice-placement/src/types.rs`, `plan.rs`, `coordinator.rs` | `StateVersion`, `PlanRevision`, record validation, term-aware snapshot/barrier types |
-| Control wire | `crates/lattice-placement/src/control.rs`, `session.rs` | generation 4 encoding, new-term snapshot requirement, term-aware acks |
-| Store contract | `crates/lattice-placement/src/storage.rs` | read APIs, named commit requests/results, in-memory atomic implementation |
-| etcd backend | `crates/lattice-placement/src/storage/etcd/` | exact leader predicates, multi-key transactions, pagination, counters, migration primitives |
-| Coordinator runtime | `crates/lattice-placement/src/runtime/*.rs` | use only guarded domain commits, lease cleanup, recovery, durable admin state |
+| Domain types | `crates/lattice-coordination/src/types.rs`, `plan.rs`, `coordinator.rs` | `StateVersion`, `PlanRevision`, record validation, term-aware snapshot/barrier types |
+| Control wire | `crates/lattice-coordination/src/control.rs`, `session.rs` | generation 4 encoding, new-term snapshot requirement, term-aware acks |
+| Store contract | `crates/lattice-coordination/src/storage.rs` | read APIs, named commit requests/results, in-memory atomic implementation |
+| etcd backend | `crates/lattice-coordination/src/storage/etcd/` | exact leader predicates, multi-key transactions, pagination, counters, migration primitives |
+| Coordinator runtime | `crates/lattice-coordination/src/runtime/*.rs` | use only guarded domain commits, lease cleanup, recovery, durable admin state |
 | Authority/handoff reducers | `authority.rs`, `handoff.rs` | `StateVersion` checks and forward-only recovery effects |
 | Service lifecycle | `crates/lattice-service/src/cluster/*.rs`, `builder.rs` | new-term fresh sessions, generation hard switch, retryable incarnation state |
 | Operations | `crates/lattice-ops/src/admin.rs`, new offline migration binary | durable operation semantics and explicit migration command |
 | Failpoints | `crates/lattice-model/src/failpoint.rs` | post-atomic-commit/pre-effect and leadership-loss boundaries |
 | Simulation | `crates/lattice-sim/src/{store,scenario,explorer}.rs` | atomic transaction model, invariants, liveness, replay |
-| Real acceptance | `crates/lattice-placement/tests/etcd_acceptance.rs`, `tests/distributed/`, `lattice-sim testctl` | real etcd, process failover, chaos, artifacts |
+| Real acceptance | `crates/lattice-coordination/tests/etcd_acceptance.rs`, `tests/distributed/`, `lattice-sim testctl` | real etcd, process failover, chaos, artifacts |
 
 Split `storage/etcd.rs` before it exceeds the repository file limit. Prefer a small `etcd.rs` plus
 focused transaction, pagination/codec, and migration modules. Do not create a generic abstraction
@@ -436,7 +436,7 @@ Batch B converts every Coordinator writer and completes the first coherent hard-
 - [x] Unit-test stale leader writes through membership, allocation, rebalance, and admin entry points.
 - [x] Unit-test a saturated control queue while renewal is due; the leader must renew or terminate,
   never continue mutating after lease loss.
-- [x] Run `cargo test -p lattice-placement`.
+- [x] Run `cargo test -p lattice-coordination`.
 - [x] Run `cargo test -p lattice-service -p lattice-ops`.
 - [x] Run focused clippy with `-D warnings`.
 - [x] Run the real-etcd contract suite through the Docker quality/HA environment.
@@ -551,8 +551,8 @@ feat(placement): reconcile term-qualified coordinator state
 ### 7.3 Offline generation-3-to-4 migration
 
 Add an explicit command, preferably
-`crates/lattice-ops/src/bin/lattice-placement-migrate.rs`, backed by migration primitives in
-`lattice-placement`.
+`crates/lattice-ops/src/bin/lattice-coordination-migrate.rs`, backed by migration primitives in
+`lattice-coordination`.
 
 - [x] Support `inspect`, `dry-run`, `apply`, and `resume` modes with endpoints/prefix supplied through
   validated arguments/config; never log credentials.

@@ -1,9 +1,9 @@
 # Placement-domain deployment
 
-Generation 5 separates global membership from placement authority. Deploy at least two candidates
-for the membership scope and for every placement domain required by an application. One
+Cluster membership and group allocation have independent Coordinators. Deploy at least two candidates
+for the membership scope and for every actor group required by an application. One
 CoordinatorHost process may campaign for several scopes; dedicated membership-only hosts are
-supported by configuring zero placement domains.
+supported by configuring zero actor groups.
 
 Applications select one explicit assembly mode. `EmbeddedCandidate` supervises a Coordinator
 candidate and Logic Service in the same operating-system process while retaining separate remoting
@@ -32,10 +32,10 @@ scoped candidate reachability; they never publish placement truth.
 
 ## Required configuration
 
-- Give CoordinatorHosts generation-5 etcd credentials scoped to the cluster prefix. Logic and
+- Give CoordinatorHosts etcd credentials scoped to the cluster prefix. Logic and
   gateway processes receive no general placement-store credentials.
-- Configure membership discovery separately from every `CoordinatorScope::Placement(domain)`.
-- Declare every entity and singleton with an explicit `PlacementDomainId`. Configure a positive
+- Configure membership discovery separately from every `CoordinatorScope::Group(domain)`.
+- Declare every entity and singleton with an explicit `ActorGroupId`. Configure a positive
   capacity quota on each node/domain pair that may host authority.
 - Bound domains per host, snapshot/session/control queues per domain, total service buffering, and
   host-wide movement concurrency.
@@ -66,14 +66,14 @@ The former code-only rolling-upgrade mechanism is no longer supported. Deploy on
 application version at a time using the [full-stop procedure](code-only-rolling-upgrade.md).
 Placement has no application-release preference.
 
-## Full-stop generation-5 rollout
+## Full-stop framework rollout
 
-Mixed generation 4/5 rollout is unsupported:
+Mixed framework versions are unsupported:
 
-1. close application admission and stop all generation-4 processes;
+1. close application admission and stop all old framework processes;
 2. wait for every old leader/member/claim lease and active handoff to disappear;
-3. run the explicit generation-4-to-5 migration and verify scoped inventory;
-4. deploy membership and placement-domain CoordinatorHosts;
+3. prepare a fresh coordination namespace under the [full-stop procedure](code-only-rolling-upgrade.md); do not stamp a new version onto old records;
+4. deploy membership and Group CoordinatorHosts;
 5. wait for one leader per required scope;
 6. deploy logic/gateway processes and wait for selected domain readiness;
 7. reopen admission.

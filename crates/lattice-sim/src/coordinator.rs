@@ -1,14 +1,14 @@
-//! Fault injection against a real placement domain leader.
+//! Fault injection against a real placement group leader.
 //!
 //! [`Scenario`](crate::scenario::Scenario) drives production reducers under a simulated executor,
 //! which can only prove that a boundary exists, never that the coordinator honours a decision at
 //! it. This harness closes that gap: it installs the injector over a genuine
-//! `PlacementDomainLeader` — durable store, association manager, member sessions and all — and
+//! `GroupCoordinator` — durable store, association manager, member sessions and all — and
 //! walks it through allocation, handoff, reconciliation and admin work so an armed failpoint has
 //! to change what the leader persists or sends.
 
 use crate::failpoints::Failpoint;
-use lattice_placement::runtime::{CoordinatorRuntimeError, harness::DomainHarness};
+use lattice_coordination::runtime::{CoordinatorRuntimeError, harness::GroupHarness};
 
 use crate::fault::{
     FailAction, FaultEvidence, FaultOrigin, FaultOutcome, FaultTarget, InstalledFaultInjector,
@@ -35,7 +35,7 @@ pub enum LeaderStep {
 }
 
 pub struct LeaderHarness {
-    leader: DomainHarness,
+    leader: GroupHarness,
     faults: SharedFaultInjector,
     plan_id: Option<u128>,
     /// Field order is load bearing: the hook has to outlive every leader operation this harness
@@ -53,7 +53,7 @@ impl LeaderHarness {
         let faults = SharedFaultInjector::default();
         let installed = faults.install();
         let leader =
-            DomainHarness::start(cluster, HARNESS_DOMAIN, port_base, incarnation_base).await?;
+            GroupHarness::start(cluster, HARNESS_DOMAIN, port_base, incarnation_base).await?;
         Ok(Self {
             leader,
             faults,
@@ -66,11 +66,11 @@ impl LeaderHarness {
         self.faults.arm(point, action);
     }
 
-    pub fn leader(&self) -> &DomainHarness {
+    pub fn leader(&self) -> &GroupHarness {
         &self.leader
     }
 
-    pub fn leader_mut(&mut self) -> &mut DomainHarness {
+    pub fn leader_mut(&mut self) -> &mut GroupHarness {
         &mut self.leader
     }
 

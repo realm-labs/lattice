@@ -187,7 +187,7 @@ their own domain participation state and capacity.
 
 ### 3.1 Placement-domain identity
 
-Add a bounded canonical `PlacementDomainId`. It rejects empty values, path separators, control
+Add a bounded canonical `ActorGroupId`. It rejects empty values, path separators, control
 characters and values longer than the framework limit. It is serialized explicitly and is not
 derived from a Rust type name.
 
@@ -222,7 +222,7 @@ MemberHello
   protocol catalogue
   remoting capabilities
 
-PlacementDomainHello
+ActorGroupHello
   domain ID and domain config fingerprint
   hosted entity/singleton configs
   proxied entity/singleton subscriptions
@@ -232,7 +232,7 @@ PlacementDomainHello
 
 The membership leader persists global node lifecycle and emits a term-qualified member directory.
 It performs no shard or singleton placement. Each placement-domain leader validates
-`PlacementDomainHello`, persists `DomainMemberRecord { node, status, version, capacity }`, and
+`ActorGroupHello`, persists `GroupMemberRecord { node, status, version, capacity }`, and
 allocates only to nodes that are both globally Up and domain Up.
 
 A mismatch in one domain rejects only that domain admission. It does not evict the process from the
@@ -269,8 +269,8 @@ and multiple domain leaders in one process through the same API.
 Replace single-leader discovery with a scoped directory:
 
 ```text
-CoordinatorScope::Membership
-CoordinatorScope::Placement(PlacementDomainId)
+CoordinatorScope::Cluster
+CoordinatorScope::Group(ActorGroupId)
 
 CoordinatorDirectorySnapshot {
   scope,
@@ -338,8 +338,8 @@ generation and claim before activating an entity or delivering a handler message
 Replace one switchable cluster router with a bounded router directory:
 
 ```text
-DomainRouterDirectory
-  PlacementDomainId -> SwitchableDomainRouter
+GroupRouterDirectory
+  ActorGroupId -> SwitchableDomainRouter
 ```
 
 Known Running routes remain usable during a domain Coordinator outage only under existing claim and
@@ -357,7 +357,7 @@ Separate node lifecycle from domain lifecycle:
 NodeLifecycleState
   Booting | JoiningMembership | Ready | Draining | Terminated
 
-PlacementDomainState
+ActorGroupState
   Joining | Ready | Degraded | Draining | Terminated
 ```
 
@@ -423,14 +423,14 @@ deprecated:
 
 | Remove | Replace with |
 |---|---|
-| unscoped `EntityConfig::new(...)` | constructor requiring `PlacementDomainId` |
+| unscoped `EntityConfig::new(...)` | constructor requiring `ActorGroupId` |
 | unscoped `SingletonConfig` | domain-scoped singleton config |
 | logical refs without domain identity | domain-scoped `EntityRef` / `SingletonRef` |
-| `CoordinatorLeader` as cluster placement leader | membership leader plus `PlacementDomainLeader` |
-| monolithic `CoordinatorStore` | `MembershipStore` and named `PlacementDomainStore` contracts |
+| `CoordinatorLeader` as cluster placement leader | membership leader plus `GroupCoordinator` |
+| monolithic `CoordinatorStore` | `MembershipStore` and named `ActorGroupStore` contracts |
 | `cluster_coordinator_runtime(...)` | `coordinator_host(...)` with registered scopes/domains |
-| `ClusterLogicalRouter` | `DomainRouterDirectory` and `DomainLogicalRouter` |
-| `LogicCoordinatorSession` | membership session and `PlacementDomainSession` |
+| `ClusterLogicalRouter` | `GroupRouterDirectory` and `GroupLogicalRouter` |
+| `LogicCoordinatorSession` | membership session and `GroupSession` |
 | one global placement snapshot | membership snapshot plus per-domain snapshots |
 | global placement `StateVersion` | membership version and domain-qualified placement version |
 | global placement capacity | explicit per-domain capacity quota |
@@ -445,7 +445,7 @@ Structure and compile-fail tests must prove these old APIs are absent.
 
 ### Batch A — Scoped identity, configuration and durable schema
 
-- [x] Add and validate `PlacementDomainId` and Coordinator scope identity.
+- [x] Add and validate `ActorGroupId` and Coordinator scope identity.
 - [x] Require domain identity in entity, singleton, slot, claim, plan and logical-reference types.
 - [x] Include domain identity in configuration fingerprints and golden vectors.
 - [x] Split membership and domain placement versions, leader guards and errors.
@@ -460,7 +460,7 @@ memory/etcd backends pass the same scoped contract suite.
 ### Batch B — Membership plane and multi-domain CoordinatorHost
 
 - [x] Separate global member lifecycle from domain participation and placement decisions.
-- [x] Implement `MemberHello` and bounded `PlacementDomainHello` validation.
+- [x] Implement `MemberHello` and bounded `ActorGroupHello` validation.
 - [x] Implement a supervised CoordinatorHost with independent scope elections and leader tasks.
 - [x] Allow one process to lead, stand by for and lose multiple domains independently.
 - [x] Implement scoped discovery publication, candidate selection and leader rollover.
