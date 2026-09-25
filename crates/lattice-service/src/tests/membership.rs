@@ -67,14 +67,18 @@ impl CoordinatorDiscovery for WatchDiscovery {
     ) -> Pin<Box<dyn Stream<Item = Result<CoordinatorDirectorySnapshot, DiscoveryError>> + Send + '_>>
     {
         let receiver = self.snapshots.clone();
+        let scope = self.scope.clone();
         Box::pin(futures_util::stream::unfold(
-            (receiver, true),
-            |(mut receiver, first)| async move {
+            (receiver, true, scope),
+            |(mut receiver, first, scope)| async move {
                 if !first && receiver.changed().await.is_err() {
                     return None;
                 }
-                let snapshot = receiver.borrow_and_update().clone();
-                Some((Ok(snapshot), (receiver, false)))
+                // This test shares endpoint updates, not an unscoped directory:
+                // each provider must emit the scope it advertises to its client.
+                let mut snapshot = receiver.borrow_and_update().clone();
+                snapshot.scope = scope.clone();
+                Some((Ok(snapshot), (receiver, false, scope)))
             },
         ))
     }
@@ -86,6 +90,7 @@ fn discovery_snapshot(
     address: NodeEndpoint,
 ) -> CoordinatorDirectorySnapshot {
     CoordinatorDirectorySnapshot {
+        leader_hint: None,
         scope: CoordinatorScope::Group(actor_group()),
         generation,
         targets: vec![DiscoveryTarget {

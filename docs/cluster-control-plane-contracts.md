@@ -1,10 +1,10 @@
 # Cluster Control-Plane Implementation Contracts
 
-> Status: proposed implementation contracts for work packages 2/3; no runtime changes are implemented by this document.
+> Status: implementation contracts for work packages 2/3; the three business-behavior choices were approved on 2026-09-25. Protocol validation gates remain open; no runtime changes are implemented by this document.
 > Parent plan and completion tracking: [control-plane memo](cluster-control-plane-memo.md), sections 9.1-9.6.
 > Evidence: [preparation inventory](cluster-control-plane-preparation.md). W1 is complete; these contracts do not mark P0 or W2/W3 complete.
 
-This document makes the next delivery slices reviewable in terms of state transitions, transaction predicates, and failure tests. It supplements the memo rather than introducing another implementation backlog. Items explicitly marked **behavior approval** or **validation gate** must be resolved before the affected serving path is enabled. Examples are conceptual contracts, not finalized Rust signatures.
+This document makes the next delivery slices reviewable in terms of state transitions, transaction predicates, and failure tests. It supplements the memo rather than introducing another implementation backlog. Items marked **approved behavior** are agreed requirements, not implemented guarantees. Items marked **validation gate** must be resolved before the affected serving path is enabled. Examples are conceptual contracts, not finalized Rust signatures.
 
 ## 1. Shared transaction and run boundary
 
@@ -60,7 +60,7 @@ The holdoff is deliberately conservative. Reducing it requires validated durable
 
 Use one distributed authority cell per exact slot generation, shared by entity and singleton integration. Loading occurs outside its synchronization boundary; final publication checks and authority revocation serialize against that same cell. Revocation closes the shared gate before enumerating Actors for asynchronous cleanup. Cached references and queued messages recheck the gate at execution admission.
 
-**Behavior approval — recommended:** once an instance enters retirement after expiry or revocation, it never reopens. Reconnection may authorize fresh activation, but does not revive the retired instance. Transient loss repaired before expiry need not retire it. A new local activation waits for old-instance retirement or remains explicitly blocked/quarantined; stop failure is not permission to overlap local instances.
+**Approved behavior — no revival:** once an instance enters retirement after expiry or revocation, it never reopens. Reconnection may authorize fresh activation, but does not revive the retired instance. Transient loss repaired before expiry need not retire it. A new local activation waits for old-instance retirement or remains explicitly blocked/quarantined; stop failure is not permission to overlap local instances.
 
 Do not promise preemption of an already-running handler. On unexpected authority loss, close new execution immediately and drive the defined cancellation/retirement path; retain incomplete stop diagnostics. Stop callbacks may themselves issue external writes and must not be presented as safe solely because the mailbox is closed.
 
@@ -153,7 +153,7 @@ Construct and seal shutdown manifests using the fixed-revision/build protocol in
 
 Reject late business joins and new assignments. Allow authenticated recovery/control participants that can advance the same close operation. An already-leaving node switches to cluster-stop handling rather than starting more migrations. Classify each in-flight transfer: close any already-authorized target as a participant; abandon an unstarted target only through a guarded transition; never promote a new owner merely to finish a rebalance during shutdown.
 
-**Behavior approval — recommended initial drain contract:**
+**Approved behavior — initial drain contract:**
 
 - Close library execution admission and activation publication; withdraw readiness and notify application ingress integration.
 - Do not begin queued business messages or deferred business continuations. Pending requests complete with a shutdown/closed error where their reply channel remains available; tell acceptance does not imply processing.
@@ -171,7 +171,7 @@ Retain leadership guards, cleanup cursors and completion evidence until their la
 
 A retained result outside the reclaimed run supports query after initiator loss. Remote control tasks may observe `Closed` and tear down asynchronously; cluster shutdown success does not prove every host process has exited. The initiating convenience API waits for its own managed teardown before returning. A combined single-process deployment must perform this wait outside the runtime it is destroying.
 
-**Behavior approval:** graceful success requires the specified application stop evidence, invalid ownership, completed runtime cleanup and confirmable result. It does not require operating-system process termination or remote control-task acknowledgements after `Closed`. A missing graceful stop report remains a blocker, even if failure recovery could otherwise reassign that shard.
+**Approved behavior — graceful completion:** graceful success requires the specified application stop evidence, invalid ownership, completed runtime cleanup and confirmable result. It does not require operating-system process termination or remote control-task acknowledgements after `Closed`. A missing graceful stop report remains a blocker, even if failure recovery could otherwise reassign that shard.
 
 ### 5.4 Abnormal reset and restart exclusion
 
@@ -189,10 +189,9 @@ Start with W3.1 plus W2.1: lifecycle/epoch and operation guard types, namespace 
 
 Before migrating each writer, extend the inventory with its exact predicates and retained/deleted fields. Keep all dependent producers and consumers aligned; do not claim a deployable intermediate protocol. Then implement candidate/grant/retirement, transfer/rebalance, and shutdown/reset in the memo's coupled order.
 
-The following remain gates, not silently completed decisions:
+The three business-behavior choices above (no revival, queued/in-flight drain treatment, and graceful completion semantics) are approved. The following remain gates, not silently completed decisions:
 
-1. Approval of the three business-behavior choices above: no revival, queued/in-flight drain treatment, and graceful completion semantics.
-2. Timing/lease proof and platform suspension support; candidate credential-to-principal policy; concrete public API/error types.
-3. Final inventory/byte budgets, fixed-revision and guarded-transaction acceptance tests, and representative grant/transfer workload measurements.
+1. Timing/lease proof and platform suspension support; candidate credential-to-principal policy; concrete public API/error types.
+2. Final inventory/byte budgets, fixed-revision and guarded-transaction acceptance tests, and representative grant/transfer workload measurements.
 
 Do not rerun the full workspace test suite merely to begin this work. Use focused deterministic race tests, isolated real-etcd acceptance, touched-crate checks, and structure checks as applicable. The new protocols are not validated by W1's passing tests.

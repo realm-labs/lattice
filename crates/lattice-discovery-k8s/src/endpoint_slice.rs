@@ -152,7 +152,7 @@ impl CoordinatorDiscovery for KubernetesEndpointSliceDiscovery {
                             if !emitted_initial {
                                 generation += 1;
                                 emitted_initial = true;
-                                yield Ok(CoordinatorDirectorySnapshot { scope: scope.clone(), generation, targets: Vec::new() });
+                                yield Ok(CoordinatorDirectorySnapshot { leader_hint: None, scope: scope.clone(), generation, targets: Vec::new() });
                             }
                             yield Err(DiscoveryError::Provider {
                                 provider: "kubernetes_endpoint_slice",
@@ -172,7 +172,7 @@ impl CoordinatorDiscovery for KubernetesEndpointSliceDiscovery {
                                 } else {
                                     generation += 1;
                                     emitted_initial = true;
-                                    yield Ok(CoordinatorDirectorySnapshot { scope: scope.clone(), generation, targets });
+                                    yield Ok(CoordinatorDirectorySnapshot { leader_hint: None, scope: scope.clone(), generation, targets });
                                 }
                             }
                         },

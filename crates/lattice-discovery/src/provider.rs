@@ -91,7 +91,13 @@ impl DiscoveryTarget {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CoordinatorDirectorySnapshot {
     pub scope: CoordinatorScope,
+    /// Monotonically increasing within this provider stream, not a leader term.
     pub generation: u64,
+    /// Preferred bootstrap endpoint, never proof of leadership or serving authority.
+    /// If unavailable, clients fall back to `targets`. The same address may appear
+    /// in both lists only with identical identity and TLS expectations.
+    pub leader_hint: Option<DiscoveryTarget>,
+    /// Candidate or seed endpoints used when no usable leader hint is available.
     pub targets: Vec<DiscoveryTarget>,
 }
 
@@ -151,13 +157,26 @@ pub(crate) fn validate_target(target: &DiscoveryTarget) -> Result<(), DiscoveryE
     Ok(())
 }
 
-pub(crate) fn validate_snapshot(
-    snapshot: &CoordinatorDirectorySnapshot,
-) -> Result<(), DiscoveryError> {
+/// Validates one replacement directory, including hint/candidate identity
+/// consistency. Stream consumers must additionally check scope and generation
+/// ordering against their previous accepted snapshot.
+pub fn validate_snapshot(snapshot: &CoordinatorDirectorySnapshot) -> Result<(), DiscoveryError> {
     if snapshot.generation == 0 {
         return Err(DiscoveryError::InvalidSnapshot {
             message: "generation zero is reserved".to_string(),
         });
+    }
+    if let Some(leader) = &snapshot.leader_hint {
+        validate_target(leader)?;
+        if snapshot.targets.iter().any(|target| {
+            target.address == leader.address
+                && (target.expected_node_id != leader.expected_node_id
+                    || target.tls_server_name() != leader.tls_server_name())
+        }) {
+            return Err(DiscoveryError::InvalidSnapshot {
+                message: "leader hint conflicts with candidate identity or TLS expectations".into(),
+            });
+        }
     }
     let mut addresses = BTreeSet::new();
     for target in &snapshot.targets {

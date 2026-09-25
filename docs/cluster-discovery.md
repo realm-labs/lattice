@@ -1,6 +1,7 @@
 # Cluster Discovery Providers
 
-Discovery publishes bootstrap candidates only. A discovered address is not a member, is not
+Discovery publishes an optional preferred leader endpoint and fallback bootstrap candidates.
+Both are connection hints only. A discovered address is not a member, is not
 eligible for business routing, and does not become authoritative until the `ClusterCoordinator`
 admits the exact probed `NodeIncarnation`. Provider updates never add or remove members.
 
@@ -13,6 +14,44 @@ Applications construct providers through their defining module paths and may com
 `lattice_discovery::aggregate::AggregateDiscovery`. Aggregation deduplicates by canonical
 `NodeEndpoint`, retains every source origin, selects the lowest numeric priority, rejects conflicting
 expected node IDs, and rotates candidates within one priority.
+
+`CoordinatorDirectorySnapshot::leader_hint` is probed before fallback candidates. An unavailable
+hint falls back to candidates; duplicate hint addresses are not probed again in that attempt.
+If bootstrap succeeds but association establishment fails, the next paced retry uses candidates
+until the provider publishes a new hint. Aggregation preserves an agreed hint; different hinted
+addresses are retained as candidates rather than selecting a leader from provider priority.
+Conflicting TLS expectations for the same address are rejected, not silently weakened.
+
+## Sharing a provider within a process
+
+Wrap a provider once in `lattice_discovery::shared::SharedDiscovery` and pass clones to services
+or observers that use the same scope, cluster and credentials:
+
+```rust,ignore
+let shared = Arc::new(SharedDiscovery::new(provider));
+let first = first.coordinator_discovery(shared.clone())?;
+let second = second.coordinator_discovery(shared.clone())?;
+```
+
+Construction is synchronous and does not start a task. The first polled subscription starts one
+upstream subscription on the current Tokio runtime. Consumers receive the latest validated
+snapshot; slow consumers may skip intermediate replacements. Errors retain the last valid
+directory, and a finite provider's final snapshot is available to later subscribers. Dropping
+the last shared owner/subscription aborts its worker. Keep that runtime alive while using the
+shared provider; this wrapper does not restart a worker on another runtime.
+
+There is no global cache keyed solely by scope. Constructing separate wrappers does not coalesce
+their watches. JoinController uses a validating shared wrapper internally, and can consume an
+already-shared provider without opening additional backend subscriptions. Backend reconnect and
+compaction recovery remain the underlying provider's responsibility.
+
+Join timeout and shutdown cancellation cover the initial snapshot, bootstrap and association
+establishment waits. Discovery updates do not bypass retry backoff; jitter is independently seeded
+and delays are capped by `retry_max`.
+
+This first W2.1 slice does not yet replace periodic leadership probes with control-session health
+signals. Existing leadership refresh remains necessary until that integration is implemented.
+It also does not introduce run-aware etcd election-record discovery or new readiness semantics.
 
 ## Configuration
 
@@ -57,6 +96,7 @@ get/watch race. The configured key contains one complete JSON document:
 {
   "schema_version": 1,
   "generation": 42,
+  "leader": { "host": "node-a", "port": 7447, "node_id": "node-a" },
   "endpoints": [
     { "host": "node-a", "port": 7447, "node_id": "node-a", "priority": 10 }
   ]
@@ -66,6 +106,11 @@ get/watch race. The configured key contains one complete JSON document:
 Document generations are nonzero and strictly increasing. Malformed, rolled-back, duplicate, or
 temporarily empty updates report an error and retain the last valid targets. An absent initial key
 produces an empty initial snapshot.
+
+`leader` is optional and uses the same endpoint shape as each `endpoints` entry. Omitting it in
+a later document withdraws the hint while keeping the supplied candidates. A leader-only document
+is valid but has no candidate fallback. This remains an application-managed discovery document,
+not a direct view of Coordinator election records or a new source of authority.
 
 `DnsDiscovery` supports either an SRV service or a hostname plus fixed port. It resolves A and AAAA
 records, refreshes at the returned TTL clamped to configured bounds, and retains the previous valid

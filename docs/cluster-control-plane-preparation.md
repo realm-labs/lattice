@@ -176,7 +176,7 @@ No new failing test or pass rate is established by this source audit. Representa
 
 ## 6. Preparation outcome
 
-The next design step is recorded in [W2/W3 implementation contracts](cluster-control-plane-contracts.md): proposed state transitions, guarded writes, failure recovery, and focused acceptance cases. Its timing/platform validation and explicitly marked behavior choices remain prerequisites for the affected slices; the source-audit findings below are not retroactively treated as resolved.
+The next design step is recorded in [W2/W3 implementation contracts](cluster-control-plane-contracts.md): proposed state transitions, guarded writes, failure recovery, and focused acceptance cases. The three business-behavior choices were approved on 2026-09-25; timing/platform and other protocol validation gates remain prerequisites for the affected slices. The historical source-audit findings below are not retroactively treated as resolved.
 
 - The current key families, lease attachments, major readers/writers, growth sources, and transaction invariants are identified. No key deletion is authorized by this inventory.
 - Primary reduction candidates are duplicated member descriptions, embedded participant sets, and whole persisted rebalance proposals. Required assignment/claim/transfer evidence is not disposable.

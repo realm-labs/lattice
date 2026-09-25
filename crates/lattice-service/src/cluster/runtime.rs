@@ -589,8 +589,8 @@ impl LogicJoinRuntime {
                             retry: false,
                         };
                     }
-                    self.set_group_state(ActorGroupState::Degraded);
                     if *membership_ready.borrow_and_update() {
+                        self.set_group_state(ActorGroupState::Degraded);
                         // A membership recovery can outlive the Coordinator's placement session
                         // while its TCP association stays active (for example after a process
                         // pause). Re-register and install a fresh snapshot before routing again.
@@ -602,6 +602,9 @@ impl LogicJoinRuntime {
                             retry: true,
                         };
                     }
+                    // Membership loss alone does not revoke this group's live
+                    // session or claims. Its own session/authority paths decide
+                    // degradation; recovery above still requires reconciliation.
                 }
                 changed = shutdown.changed() => {
                     if changed.is_err() || *shutdown.borrow() {

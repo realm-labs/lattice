@@ -614,6 +614,10 @@ impl LatticeServiceBuilder {
         self
     }
 
+    /// Configures discovery for one Coordinator scope. To share a backend watch
+    /// across several services in a process, wrap the provider once in
+    /// [`lattice_discovery::shared::SharedDiscovery`] and pass clones of that
+    /// wrapper. Scope equality alone does not identify a cluster or credentials.
     pub fn coordinator_discovery(
         mut self,
         discovery: Arc<dyn CoordinatorDiscovery>,

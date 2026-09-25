@@ -44,6 +44,7 @@ impl StaticDiscovery {
             })
             .collect();
         let snapshot = CoordinatorDirectorySnapshot {
+            leader_hint: None,
             scope,
             generation: 1,
             targets,

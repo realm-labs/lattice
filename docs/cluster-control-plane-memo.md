@@ -252,7 +252,7 @@ A healthy partition may authorize a replacement only after validating current le
 
 Admission closure does not complete already-running handlers or retract external requests. Cancellation and stop callbacks follow an explicit retirement contract, and neither proves that external writes have ended. Where exclusive external writes are required, the destination must enforce the appropriate fencing boundary before replacement-owner writes; see section 7.11.
 
-On reconnection, reconcile the current epoch, owner incarnation, assignment generation, and grant. A late renewal for a revoked generation must not reopen admission. **Proposed lifecycle rule, pending final confirmation:** once authority loss has put an instance into retirement, do not revive that instance; obtain fresh authorization and activate a new instance through the normal safety checks. A transient connection failure repaired by valid renewal before expiration need not retire the Actor.
+On reconnection, reconcile the current epoch, owner incarnation, assignment generation, and grant. A late renewal for a revoked generation must not reopen admission. **Approved lifecycle rule:** once authority loss has put an instance into retirement, do not revive that instance; obtain fresh authorization and activate a new instance through the normal safety checks. A transient connection failure repaired by valid renewal before expiration need not retire the Actor. Failed old-instance retirement blocks replacement local activation rather than permitting overlapping instances.
 
 ## 6. etcd lifecycle and reset after abnormal termination
 
@@ -631,7 +631,7 @@ Key findings:
 - Full member descriptions and per-move/slot participant sets are major structural growth sources. Stored type definitions duplicate parts of group-member descriptions.
 - Leader/term guards and exact global/group member revisions are compared inside authority transactions. Payload minimization must retain those safety boundaries.
 - Config-store data and worker-ID history use separate configured prefixes and are not generic runtime cleanup targets.
-- The current grant path installs a receipt-time TTL deadline and avoids reliable-outbox replay. The end-to-end delay/suspension contract and retired-instance behavior still need explicit decisions before W2.3/W2.4.
+- The current grant path installs a receipt-time TTL deadline and avoids reliable-outbox replay. The end-to-end delay/suspension contract still needs validation before W2.3/W2.4; the approved no-revival behavior requires implementation and race tests.
 
 For each entry, identify the safety invariants requiring etcd storage, whether it must survive a whole-cluster restart, whether it can become a versioned in-memory leader view, how a new leader would reconstruct it and verify previous ownership loss, which operations must pause during recovery, and whether reclamation would remove deduplication evidence needed for old requests or retries.
 
@@ -641,7 +641,9 @@ Shutdown cleanup and reducing persistence during operation are related but separ
 
 ## 9. Pre-implementation decisions and acceptance criteria
 
-The [W2/W3 implementation contracts](cluster-control-plane-contracts.md) propose concrete transaction boundaries, renewal freshness, candidate revocation, sealed transfer sets, and shutdown/reset semantics. They refine the questions below without marking them implemented. Explicit behavior-approval and validation gates remain open; use section 9 here as the sole completion checklist.
+The [W2/W3 implementation contracts](cluster-control-plane-contracts.md) propose concrete transaction boundaries, renewal freshness, candidate revocation, sealed transfer sets, and shutdown/reset semantics. They refine the questions below without marking them implemented. On 2026-09-25, the no-revival rule, queued/in-flight drain contract, and graceful completion semantics were approved. Validation gates remain open; use section 9 here as the sole completion checklist.
+
+Approved shutdown behavior: stop starting queued business work, allow the current handler to finish within the drain deadline, and report timeout/stop failure as a blocker without automatic forced termination. Graceful success requires application stop evidence, invalidated ownership, completed runtime cleanup and a confirmable result, not host-process exit. An unreachable node's expired lease is not a graceful-stop acknowledgement. The detailed contract covers pending replies and managed background work; these decisions are requirements for W2/W3, not claims about the current implementation.
 
 This section is the single active list of remaining decisions and validation requirements. The historical analysis in section 10 is not a second backlog. Sections 3.4, 3.5, and 5.1 establish discovery through replaceable providers (including etcd), runtime candidate changes, and recovery/degraded-operation boundaries. Section 4 assigns global shutdown orchestration to the Cluster Coordinator and group execution to Group Coordinators.
 
@@ -655,7 +657,7 @@ For dynamic candidacy, finalize authenticated identity binding, configuration ad
 
 For failover and partitions, specify dependency-based recovery readiness, conservative grant deadlines, and the boundary between stopping new authority operations and retiring existing owners. Missing information blocks dependent operations; discovery cache freshness is not a serving-authority guarantee.
 
-For section 5.2, prove the deadline/renewal rules under the chosen delay, clock, and suspension assumptions, including early revocation and replacement. Confirm the proposed rule against reviving instances already in retirement and define fresh activation when old work or quarantine has not yet completed.
+For section 5.2, prove the deadline/renewal rules under the chosen delay, clock, and suspension assumptions, including early revocation and replacement. Implement the approved no-revival rule and define the synchronization that blocks fresh local activation while old-instance retirement or quarantine remains incomplete.
 
 For the target data model, also finalize session-lease binding for domain members, the minimal transfer barrier and blocked states, epoch-aware fencing, persistent configuration ownership, and the replacement of existing transaction predicates. The logical record sketches do not settle those protocol obligations.
 
@@ -710,7 +712,7 @@ Acceptance coverage must include at least:
 Status: work package 1 is complete; the remaining P0 authority/storage preparation applies to packages 2/3. The [preparation evidence](cluster-control-plane-preparation.md) records the first key-family audit, protocol findings, and test map. P0.1 still needs finalized field-removal/cleanup contracts; P0.4 has no executed baseline or scale measurements. Only work items with completed deliverables and recorded validation are checked. This plan groups responsibilities, not independent crate rewrites or separate production rollouts. Keep one final target protocol/schema; do not build old/new dual-read, dual-write, or mixed-framework compatibility paths merely to stage development.
 
 - [ ] **P0.1 Inventory:** complete section 8 with actual keys, readers, writers, leases, transaction predicates, and retention rules. Include configuration and worker-ID safety history so runtime cleanup cannot erase unrelated persistent state. Record each removed field's replacement or why it is no longer needed.
-- [ ] **P0.2 Contract decisions:** resolve the relevant section 9 questions before implementing each affected boundary. First settle candidate eligibility/revocation guards, grant deadline and renewal assumptions, transfer/barrier completion evidence, and cluster shutdown success/cleanup conditions. Confirm the proposed no-revival lifecycle rule rather than implementing it as an unstated assumption.
+- [ ] **P0.2 Contract decisions:** resolve the relevant section 9 questions before implementing each affected boundary. Finalize candidate eligibility/revocation guards, grant deadline and renewal assumptions, transfer/barrier completion evidence, and cleanup predicates. No revival, queued/in-flight drain treatment, and graceful completion semantics are approved; this does not close the remaining protocol validation gates.
 - [ ] **P0.3 Public contract:** the crate rename and Cargo package version as the sole framework identity are confirmed; finalize public administration/lifecycle entry points. API examples must distinguish configuration, candidate eligibility, discovery hints, and serving authority. Application rolling-release design is deferred, not a prerequisite for this work.
 - [ ] **P0.4 Evidence baseline:** map existing focused tests and failpoints to the acceptance requirements above. Record known failures and representative workload sizes; preserve unrelated worktree changes. Do not run the full suite solely to begin the inventory.
 
@@ -832,6 +834,42 @@ Within each slice, migrate every producer and consumer of a changed contract and
   and load tests were not run; those remain part of the coupled final W2/W3
   acceptance. Cluster shutdown, run epochs, reset/cleanup, dynamic candidacy,
   new grant timing, and application rolling releases are not claimed here.
+
+#### W2.1 discovery foundation (partial, 2026-09-25)
+
+- Added an optional `leader_hint` to directory snapshots, with candidate fallback
+  after failed hint probing and after failed association establishment. A hint
+  remains untrusted connection information; normal bootstrap and control-session
+  admission still apply. Static, DNS and Kubernetes providers remain seed-only.
+- Config-store discovery can publish/withdraw the optional hint. This is still an
+  application-managed document, not direct discovery of etcd election records.
+- Added `SharedDiscovery`: clones share one lazy upstream subscription and a
+  latest-value cache. Invalid scope/generation/identity updates cannot replace the
+  last valid snapshot. Separate wrappers are not globally deduplicated. Errors,
+  finite streams, late subscribers and worker teardown have dedicated tests.
+- Aggregation preserves agreed hints, demotes conflicting hints to candidates,
+  and rejects conflicting TLS expectations. Service join validates provider
+  snapshots, bounds the initial wait through connection establishment, responds
+  to shutdown during pending work, and does not let updates bypass retry pacing.
+  Retry jitter is independently seeded and capped at the configured maximum.
+- Scope validation exposed a test provider emitting Group snapshots for its
+  Cluster subscription; the fixture now binds each output to its declared scope.
+  Service regression tests also exposed unconditional Group degradation on
+  membership loss. A still-valid independent Group session now retains readiness;
+  membership recovery continues to require re-registration/reconciliation.
+- The existing active-association leadership refresh remains in place until a
+  control-session replacement supplies its leadership-loss signal. Run epochs,
+  run-scoped storage/guards, election-record discovery, and the remaining W2.1
+  readiness/session changes are not implemented by this slice. W2.1 and W3.1
+  remain unchecked; no live etcd data or schema was changed.
+- Validation: discovery library tests passed (23), Kubernetes discovery library
+  tests passed (4), and service library tests passed (78), including the corrected
+  rollover fixture and independent Group readiness regression. Workspace
+  all-target compilation, formatting, diff and structure checks passed. No full
+  workspace test suite, real-etcd acceptance or load benchmark was run for this
+  discovery-only slice; no etcd implementation changed.
+
+#### Validation policy
 
 - Use focused unit, integration, UI/API, and doctests for the slice being changed, plus compilation of affected reverse dependencies. Consolidate expensive workspace runs rather than repeating the full suite after every naming or documentation edit.
 - Run formatting checks and `bash scripts/check-structure.sh` after structural changes. Preserve `foo.rs` plus `foo/`, explicit imports, and the effective-LOC limit without shrinking useful documentation.

@@ -27,6 +27,8 @@ use crate::{
     static_provider::{StaticDiscovery, StaticEndpoint},
 };
 
+mod directory;
+
 #[tokio::test]
 async fn static_discovery_emits_one_validated_snapshot() {
     let discovery = StaticDiscovery::new(
@@ -331,6 +333,7 @@ async fn dns_srv_publishes_healthy_targets_when_one_record_fails_to_resolve() {
 async fn aggregate_deduplicates_merges_sources_and_rotates_equal_priority() {
     let first = Arc::new(SequenceDiscovery::new(vec![Ok(
         CoordinatorDirectorySnapshot {
+            leader_hint: None,
             scope: scope(),
             generation: 1,
             targets: vec![target("a", 7447, None, 10), target("b", 7447, None, 10)],
@@ -338,11 +341,13 @@ async fn aggregate_deduplicates_merges_sources_and_rotates_equal_priority() {
     )]));
     let second = Arc::new(SequenceDiscovery::new(vec![
         Ok(CoordinatorDirectorySnapshot {
+            leader_hint: None,
             scope: scope(),
             generation: 1,
             targets: vec![config_target("a", 7447, Some("node-a"), 5)],
         }),
         Ok(CoordinatorDirectorySnapshot {
+            leader_hint: None,
             scope: scope(),
             generation: 2,
             targets: vec![
@@ -386,6 +391,7 @@ async fn aggregate_deduplicates_merges_sources_and_rotates_equal_priority() {
 async fn aggregate_bootstraps_from_answering_providers_after_the_grace() {
     let ready = Arc::new(SequenceDiscovery::new(vec![Ok(
         CoordinatorDirectorySnapshot {
+            leader_hint: None,
             scope: scope(),
             generation: 1,
             targets: vec![target("a", 7447, Some("node-a"), 10)],
@@ -411,11 +417,13 @@ async fn aggregate_bootstraps_from_answering_providers_after_the_grace() {
 async fn aggregate_suppresses_snapshots_that_do_not_change_the_targets() {
     let repeating = Arc::new(SequenceDiscovery::new(vec![
         Ok(CoordinatorDirectorySnapshot {
+            leader_hint: None,
             scope: scope(),
             generation: 1,
             targets: vec![target("a", 7447, None, 10), target("b", 7447, None, 10)],
         }),
         Ok(CoordinatorDirectorySnapshot {
+            leader_hint: None,
             scope: scope(),
             generation: 2,
             targets: vec![target("b", 7447, None, 10), target("a", 7447, None, 10)],

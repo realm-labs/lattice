@@ -4,6 +4,7 @@ pub mod aggregate;
 pub mod config_store;
 pub mod dns;
 pub mod provider;
+pub mod shared;
 pub mod static_provider;
 
 #[cfg(test)]

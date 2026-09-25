@@ -115,7 +115,7 @@ impl CoordinatorDiscovery for DnsDiscovery {
                     Ok(resolution) if !resolution.targets.is_empty() => {
                         generation += 1;
                         emitted_initial = true;
-                        yield Ok(CoordinatorDirectorySnapshot { scope: scope.clone(), generation, targets: resolution.targets });
+                        yield Ok(CoordinatorDirectorySnapshot { leader_hint: None, scope: scope.clone(), generation, targets: resolution.targets });
                         for failure in resolution.failures {
                             yield Err(failure);
                         }
@@ -125,7 +125,7 @@ impl CoordinatorDiscovery for DnsDiscovery {
                         if !emitted_initial {
                             generation += 1;
                             emitted_initial = true;
-                            yield Ok(CoordinatorDirectorySnapshot { scope: scope.clone(), generation, targets: Vec::new() });
+                            yield Ok(CoordinatorDirectorySnapshot { leader_hint: None, scope: scope.clone(), generation, targets: Vec::new() });
                         }
                         for failure in resolution.failures {
                             yield Err(failure);
@@ -137,7 +137,7 @@ impl CoordinatorDiscovery for DnsDiscovery {
                         if !emitted_initial {
                             generation += 1;
                             emitted_initial = true;
-                            yield Ok(CoordinatorDirectorySnapshot { scope: scope.clone(), generation, targets: Vec::new() });
+                            yield Ok(CoordinatorDirectorySnapshot { leader_hint: None, scope: scope.clone(), generation, targets: Vec::new() });
                         }
                         yield Err(error);
                         tokio::time::sleep(self.config.retry_delay).await;

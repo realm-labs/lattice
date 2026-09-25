@@ -95,7 +95,7 @@ impl CoordinatorDiscovery for AggregateDiscovery {
             let mut output_generation = 0_u64;
             let mut emitted = false;
             let mut grace_expired = false;
-            let mut last_merged: Option<Vec<DiscoveryTarget>> = None;
+            let mut last_merged = None;
             let grace = tokio::time::sleep(self.first_snapshot_grace);
             tokio::pin!(grace);
 
@@ -119,6 +119,10 @@ impl CoordinatorDiscovery for AggregateDiscovery {
                             Ok(snapshot) => {
                                 if let Err(error) = validate_snapshot(&snapshot) {
                                     yield Err(error);
+                                } else if snapshot.scope != self.scope {
+                                    yield Err(DiscoveryError::InvalidSnapshot {
+                                        message: format!("provider {index} returned a different scope"),
+                                    });
                                 } else if snapshot.generation <= provider_generations[index] {
                                     yield Err(DiscoveryError::InvalidSnapshot {
                                         message: format!(
@@ -143,15 +147,29 @@ impl CoordinatorDiscovery for AggregateDiscovery {
                 }
                 match merge_targets(&provider_snapshots) {
                     Ok(targets) => {
-                        if last_merged.as_ref() == Some(&targets) {
+                        let hint_addresses = provider_snapshots.iter()
+                            .filter_map(Option::as_ref)
+                            .filter_map(|snapshot| snapshot.leader_hint.as_ref())
+                            .map(|target| &target.address)
+                            .collect::<BTreeSet<_>>();
+                        // Conflicting hints are merely seeds. Probe all of them
+                        // rather than inventing an authoritative winner here.
+                        let leader_hint = if hint_addresses.len() == 1 {
+                            targets.iter().find(|target| hint_addresses.contains(&target.address)).cloned()
+                        } else {
+                            None
+                        };
+                        let merged = (targets.clone(), leader_hint.clone());
+                        if last_merged.as_ref() == Some(&merged) {
                             continue;
                         }
-                        last_merged = Some(targets.clone());
+                        last_merged = Some(merged);
                         output_generation += 1;
                         emitted = true;
                         yield Ok(CoordinatorDirectorySnapshot {
                             scope: self.scope.clone(),
                             generation: output_generation,
+                            leader_hint,
                             targets: rotate_targets(targets, &mut rotations),
                         });
                     }
@@ -175,13 +193,21 @@ fn merge_targets(
     for target in snapshots
         .iter()
         .filter_map(Option::as_ref)
-        .flat_map(|snapshot| &snapshot.targets)
+        .flat_map(|snapshot| snapshot.targets.iter().chain(snapshot.leader_hint.iter()))
     {
         match merged.get_mut(&target.address) {
             None => {
                 merged.insert(target.address.clone(), target.clone());
             }
             Some(current) => {
+                if current.tls_server_name() != target.tls_server_name() {
+                    return Err(DiscoveryError::InvalidSnapshot {
+                        message: format!(
+                            "target {} has conflicting TLS expectations",
+                            target.address
+                        ),
+                    });
+                }
                 if let (Some(left), Some(right)) =
                     (&current.expected_node_id, &target.expected_node_id)
                     && left != right

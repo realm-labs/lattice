@@ -1,13 +1,17 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, hash_map::RandomState},
+    future::pending,
+    hash::BuildHasher,
     sync::{Arc, RwLock},
     time::Duration,
 };
 
-use futures_util::{StreamExt, stream};
+use futures_util::{Stream, StreamExt, stream};
 use lattice_discovery::provider::{
-    CoordinatorDirectorySnapshot, CoordinatorDiscovery, DiscoveryTarget,
+    CoordinatorDirectorySnapshot, CoordinatorDiscovery, DiscoveryError, DiscoveryTarget,
+    validate_snapshot,
 };
+use lattice_discovery::shared::SharedDiscovery;
 use lattice_model::cluster::CoordinatorScope;
 use lattice_remoting::{
     association::{Association, AssociationManager, AssociationState},
@@ -20,7 +24,7 @@ use lattice_remoting::{
 };
 use thiserror::Error;
 use tokio::{
-    sync::{mpsc, watch},
+    sync::{mpsc, oneshot, watch},
     time::{Instant, MissedTickBehavior},
 };
 
@@ -54,7 +58,7 @@ impl JoinController {
     ) -> Result<Self, JoinError> {
         config.validate().map_err(JoinError::Config)?;
         Ok(Self {
-            discovery,
+            discovery: Arc::new(SharedDiscovery::new(discovery)),
             endpoint,
             associations,
             config,
@@ -66,25 +70,48 @@ impl JoinController {
         events: mpsc::Sender<JoinEvent>,
         mut shutdown: watch::Receiver<bool>,
     ) {
-        let started = Instant::now();
+        if *shutdown.borrow() {
+            return;
+        }
+        let (joined_tx, mut joined_rx) = oneshot::channel();
+        let timeout = self.config.join_timeout;
+        let deadline = async move {
+            match timeout {
+                Some(timeout) => tokio::time::sleep(timeout).await,
+                None => pending::<()>().await,
+            }
+        };
+        let run = self.run_inner(events.clone(), shutdown.clone(), Some(joined_tx));
+        tokio::pin!(run, deadline);
+        let mut joining = true;
+        loop {
+            tokio::select! {
+                biased;
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() { return; }
+                }
+                () = &mut run => return,
+                _ = &mut joined_rx, if joining => joining = false,
+                () = &mut deadline, if joining => {
+                    let _ = events.send(JoinEvent::TerminalFailure(JoinError::JoinTimeout)).await;
+                    return;
+                }
+            }
+        }
+    }
+
+    async fn run_inner(
+        self: Arc<Self>,
+        events: mpsc::Sender<JoinEvent>,
+        mut shutdown: watch::Receiver<bool>,
+        mut joined: Option<oneshot::Sender<()>>,
+    ) {
         let mut snapshots = self.discovery.snapshots();
         let mut latest = None;
         let mut discovery_closed = false;
-        let mut initial_join = true;
         let mut backoff = RetryBackoff::new(self.config.clone());
         let mut attempt = 0_u64;
         loop {
-            if initial_join
-                && self
-                    .config
-                    .join_timeout
-                    .is_some_and(|timeout| started.elapsed() >= timeout)
-            {
-                let _ = events
-                    .send(JoinEvent::TerminalFailure(JoinError::JoinTimeout))
-                    .await;
-                return;
-            }
             if latest.is_none() {
                 if discovery_closed {
                     let _ = events
@@ -139,7 +166,9 @@ impl JoinController {
                     if let Ok(association) =
                         establish_coordinator(&self.endpoint, &self.associations, &leader).await
                     {
-                        initial_join = false;
+                        if let Some(joined) = joined.take() {
+                            let _ = joined.send(());
+                        }
                         backoff.reset();
                         if events
                             .send(JoinEvent::Coordinator {
@@ -244,6 +273,11 @@ impl JoinController {
                                 () = tokio::time::sleep(Duration::from_millis(100)) => {}
                             }
                         }
+                    } else if let Some(snapshot) = latest.as_mut() {
+                        // A hint may bootstrap successfully but name an
+                        // unreachable leader. Retry through the candidate set
+                        // until the provider supplies a fresh hint.
+                        snapshot.leader_hint = None;
                     }
                 }
                 Err(JoinError::ConflictingLeaders) => {
@@ -262,19 +296,45 @@ impl JoinController {
                     );
                 }
             }
-            let delay = backoff.next_delay();
-            tokio::select! {
-                changed = shutdown.changed() => {
-                    if changed.is_err() || *shutdown.borrow() { return; }
+            let retry_at = Instant::now() + backoff.next_delay();
+            if !wait_for_retry(
+                retry_at,
+                &mut snapshots,
+                &mut latest,
+                &mut discovery_closed,
+                &mut shutdown,
+            )
+            .await
+            {
+                return;
+            }
+        }
+    }
+}
+
+async fn wait_for_retry<S>(
+    retry_at: Instant,
+    snapshots: &mut S,
+    latest: &mut Option<CoordinatorDirectorySnapshot>,
+    discovery_closed: &mut bool,
+    shutdown: &mut watch::Receiver<bool>,
+) -> bool
+where
+    S: Stream<Item = Result<CoordinatorDirectorySnapshot, DiscoveryError>> + Unpin,
+{
+    loop {
+        tokio::select! {
+            biased;
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() { return false; }
+            }
+            () = tokio::time::sleep_until(retry_at) => return true,
+            snapshot = snapshots.next(), if !*discovery_closed => {
+                match snapshot {
+                    Some(Ok(snapshot)) => *latest = Some(snapshot),
+                    Some(Err(_)) => {}
+                    None => *discovery_closed = true,
                 }
-                snapshot = snapshots.next(), if !discovery_closed => {
-                    match snapshot {
-                        Some(Ok(snapshot)) => latest = Some(snapshot),
-                        Some(Err(_)) => {}
-                        None => discovery_closed = true,
-                    }
-                }
-                () = tokio::time::sleep(delay) => {}
             }
         }
     }
@@ -297,6 +357,15 @@ async fn refresh_leadership(
     concurrency: usize,
 ) -> Result<LeadershipRefresh, JoinError> {
     let mut current_target = snapshot.clone();
+    current_target.leader_hint = None;
+    if let Some(hint) = &snapshot.leader_hint
+        && !current_target
+            .targets
+            .iter()
+            .any(|target| target.address == hint.address)
+    {
+        current_target.targets.push(hint.clone());
+    }
     current_target.targets.retain(|target| {
         target.address == current.identity.address
             && target
@@ -332,11 +401,33 @@ async fn probe_snapshot(
     snapshot: CoordinatorDirectorySnapshot,
     concurrency: usize,
 ) -> Result<BootstrapLeader, JoinError> {
-    if snapshot.targets.is_empty() {
+    validate_snapshot(&snapshot).map_err(JoinError::Discovery)?;
+    if let Some(hint) = snapshot.leader_hint {
+        match probe_targets(endpoint, snapshot.scope.clone(), vec![hint.clone()], 1).await {
+            Ok(leader) => return Ok(leader),
+            Err(JoinError::ConflictingLeaders) => return Err(JoinError::ConflictingLeaders),
+            Err(_) => {}
+        }
+        let targets = snapshot
+            .targets
+            .into_iter()
+            .filter(|target| target.address != hint.address)
+            .collect();
+        return probe_targets(endpoint, snapshot.scope, targets, concurrency).await;
+    }
+    probe_targets(endpoint, snapshot.scope, snapshot.targets, concurrency).await
+}
+
+async fn probe_targets(
+    endpoint: &Arc<RemotingEndpoint>,
+    scope: CoordinatorScope,
+    targets: Vec<DiscoveryTarget>,
+    concurrency: usize,
+) -> Result<BootstrapLeader, JoinError> {
+    if targets.is_empty() {
         return Err(JoinError::NoCandidates);
     }
-    let scope = snapshot.scope;
-    let results = stream::iter(snapshot.targets.into_iter().map(|target| {
+    let results = stream::iter(targets.into_iter().map(|target| {
         let endpoint = endpoint.clone();
         let scope = scope.clone();
         async move { endpoint.probe_candidate(probe_target(scope, target)).await }
@@ -497,13 +588,12 @@ impl RetryBackoff {
         Self {
             current: config.retry_initial,
             config,
-            sequence: 0,
+            sequence: RandomState::new().hash_one("coordinator-retry"),
         }
     }
 
     fn reset(&mut self) {
         self.current = self.config.retry_initial;
-        self.sequence = 0;
     }
 
     fn next_delay(&mut self) -> Duration {
@@ -511,17 +601,21 @@ impl RetryBackoff {
         let unit = (self.sequence.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 11) as f64
             / ((1_u64 << 53) as f64);
         let factor = 1.0 + ((unit * 2.0) - 1.0) * self.config.retry_jitter;
-        let delay = self.current.mul_f64(factor);
-        self.current = self
-            .current
-            .mul_f64(self.config.retry_multiplier)
+        let delay = Duration::try_from_secs_f64(self.current.as_secs_f64() * factor)
+            .unwrap_or(self.config.retry_max)
             .min(self.config.retry_max);
+        self.current =
+            Duration::try_from_secs_f64(self.current.as_secs_f64() * self.config.retry_multiplier)
+                .unwrap_or(self.config.retry_max)
+                .min(self.config.retry_max);
         delay
     }
 }
 
 #[derive(Debug, Error)]
 pub enum JoinError {
+    #[error("cluster discovery snapshot is invalid")]
+    Discovery(#[source] DiscoveryError),
     #[error("cluster join configuration is invalid")]
     Config(#[source] ClusterJoinConfigError),
     #[error("cluster discovery stream ended")]
@@ -541,245 +635,4 @@ pub enum JoinError {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::{sync::Arc, time::Duration};
-
-    use async_trait::async_trait;
-    use bytes::Bytes;
-    use lattice_discovery::static_provider::{StaticDiscovery, StaticEndpoint};
-    use lattice_model::{
-        cluster::CoordinatorScope,
-        cluster::{ClusterId, NodeEndpoint, NodeIncarnation},
-    };
-    use lattice_remoting::{
-        association::{AssociationManager, AssociationState},
-        bootstrap::BootstrapLeader,
-        config::RemotingConfig,
-        endpoint::RemotingEndpoint,
-        handshake::NodeIdentity,
-        messaging::{
-            error::RemoteMessageError, inbound::InboundDispatch, outbound::OutboundMessaging,
-            target::ExactActorTarget,
-        },
-    };
-    use tokio::sync::watch;
-
-    use super::{
-        BootstrapView, JoinController, JoinError, JoinEvent, leadership_replaced, select_leader,
-    };
-    use crate::{
-        config::ClusterJoinConfig,
-        test_support::{network_test_guard, unused_address},
-    };
-
-    fn leader(node: &str, term: u64, incarnation: u64) -> BootstrapLeader {
-        BootstrapLeader {
-            scope: CoordinatorScope::Cluster,
-            identity: NodeIdentity {
-                cluster_id: ClusterId::new("cluster").unwrap(),
-                node_id: node.to_string(),
-                address: NodeEndpoint::new(node, 7447).unwrap(),
-                incarnation: NodeIncarnation::new(u128::from(incarnation)).unwrap(),
-            },
-            term,
-        }
-    }
-
-    #[test]
-    fn selects_highest_term() {
-        assert_eq!(
-            select_leader(vec![leader("a", 1, 9), leader("b", 2, 1)])
-                .unwrap()
-                .identity
-                .node_id,
-            "b"
-        );
-    }
-
-    #[test]
-    fn rejects_different_leaders_in_same_term() {
-        assert!(matches!(
-            select_leader(vec![leader("a", 2, 1), leader("b", 2, 2)]),
-            Err(JoinError::ConflictingLeaders)
-        ));
-    }
-
-    #[test]
-    fn active_association_is_reconciled_when_its_leadership_term_changes() {
-        let current = leader("a", 1, 1);
-        assert!(leadership_replaced(&current, &leader("a", 2, 1)));
-        assert!(leadership_replaced(&current, &leader("b", 2, 1)));
-        assert!(!leadership_replaced(&current, &current));
-        assert!(!leadership_replaced(&current, &leader("a", 0, 1)));
-    }
-
-    struct RejectDispatch;
-
-    #[async_trait]
-    impl InboundDispatch for RejectDispatch {
-        async fn tell(
-            &self,
-            _target: ExactActorTarget,
-            _message_id: u64,
-            _payload: Bytes,
-        ) -> Result<(), RemoteMessageError> {
-            Err(RemoteMessageError::Unauthorized)
-        }
-
-        async fn ask(
-            &self,
-            _target: ExactActorTarget,
-            _message_id: u64,
-            _payload: Bytes,
-            _deadline: std::time::Instant,
-        ) -> Result<Bytes, RemoteMessageError> {
-            Err(RemoteMessageError::Unauthorized)
-        }
-    }
-
-    fn endpoint(identity: NodeIdentity) -> (Arc<RemotingEndpoint>, Arc<AssociationManager>) {
-        let config = RemotingConfig {
-            heartbeat_interval: Duration::from_millis(50),
-            ..RemotingConfig::default()
-        };
-        let associations = Arc::new(
-            AssociationManager::new(
-                identity.address.clone(),
-                identity.incarnation,
-                config.clone(),
-            )
-            .unwrap(),
-        );
-        let endpoint = Arc::new(
-            RemotingEndpoint::builder(
-                identity,
-                config,
-                associations.clone(),
-                Arc::new(OutboundMessaging::new(16).unwrap()),
-                Arc::new(RejectDispatch),
-            )
-            .build()
-            .unwrap(),
-        );
-        (endpoint, associations)
-    }
-
-    #[tokio::test]
-    async fn refreshes_leadership_while_the_transport_association_stays_active() {
-        let _network = network_test_guard().await;
-        let first = unused_address().await;
-        let second = unused_address().await;
-        let (client_address, server_address) = if first < second {
-            (first, second)
-        } else {
-            (second, first)
-        };
-        let cluster_id = ClusterId::new("join-refresh-test").unwrap();
-        let client_identity = NodeIdentity {
-            cluster_id: cluster_id.clone(),
-            node_id: "client".to_owned(),
-            address: client_address,
-            incarnation: NodeIncarnation::new(1).unwrap(),
-        };
-        let server_identity = NodeIdentity {
-            cluster_id,
-            node_id: "coordinator".to_owned(),
-            address: server_address.clone(),
-            incarnation: NodeIncarnation::new(2).unwrap(),
-        };
-        let (client, client_associations) = endpoint(client_identity);
-        let (server, _) = endpoint(server_identity.clone());
-        let view = Arc::new(BootstrapView::new(server_identity.clone()));
-        let current = BootstrapLeader {
-            scope: CoordinatorScope::Cluster,
-            identity: server_identity.clone(),
-            term: 1,
-        };
-        view.install(current.clone());
-        server.install_bootstrap_handler(view.clone());
-        client.bind().await.unwrap();
-        server.bind().await.unwrap();
-
-        let discovery = Arc::new(
-            StaticDiscovery::new(
-                CoordinatorScope::Cluster,
-                "join-refresh",
-                vec![StaticEndpoint {
-                    address: server_address,
-                    expected_node_id: Some(server_identity.node_id.clone()),
-                    priority: 1,
-                }],
-            )
-            .unwrap(),
-        );
-        let controller = Arc::new(
-            JoinController::new(
-                discovery,
-                client,
-                client_associations,
-                ClusterJoinConfig {
-                    retry_initial: Duration::from_millis(10),
-                    retry_max: Duration::from_millis(20),
-                    retry_jitter: 0.0,
-                    leadership_refresh_interval: Duration::from_millis(25),
-                    discovery_stale_grace: Duration::from_millis(100),
-                    join_timeout: Some(Duration::from_secs(2)),
-                    ..ClusterJoinConfig::default()
-                },
-            )
-            .unwrap(),
-        );
-        let (events_tx, mut events) = tokio::sync::mpsc::channel(8);
-        let (shutdown, shutdown_rx) = watch::channel(false);
-        let task = tokio::spawn(controller.run(events_tx, shutdown_rx));
-
-        let initial_association = match tokio::time::timeout(Duration::from_secs(2), events.recv())
-            .await
-            .unwrap()
-            .unwrap()
-        {
-            JoinEvent::Coordinator {
-                leader,
-                association,
-            } => {
-                assert_eq!(leader.term, 1);
-                association
-            }
-            event => panic!("unexpected initial join event: {event:?}"),
-        };
-        view.install(BootstrapLeader { term: 2, ..current });
-        assert!(matches!(
-            tokio::time::timeout(Duration::from_secs(2), events.recv())
-                .await
-                .unwrap(),
-            Some(JoinEvent::CoordinatorLost { leader }) if leader.term == 1
-        ));
-        match tokio::time::timeout(Duration::from_secs(2), events.recv())
-            .await
-            .unwrap()
-            .unwrap()
-        {
-            JoinEvent::Coordinator {
-                leader,
-                association,
-            } => {
-                assert_eq!(leader.term, 2);
-                assert!(Arc::ptr_eq(&initial_association, &association));
-            }
-            event => panic!("unexpected refreshed join event: {event:?}"),
-        }
-        view.clear(&CoordinatorScope::Cluster);
-        assert!(matches!(
-            tokio::time::timeout(Duration::from_secs(2), events.recv())
-                .await
-                .unwrap(),
-            Some(JoinEvent::CoordinatorLost { leader }) if leader.term == 2
-        ));
-        assert_eq!(initial_association.state(), AssociationState::Active);
-        shutdown.send_replace(true);
-        tokio::time::timeout(Duration::from_secs(2), task)
-            .await
-            .unwrap()
-            .unwrap();
-    }
-}
+mod tests;
