@@ -851,8 +851,6 @@ pub enum CoordinatorRuntimeError {
     Storage(#[from] StorageError),
     #[error("Coordinator reducer rejected state: {0}")]
     Coordinator(#[source] CoordinatorError),
-    #[error("application release is not eligible for a code-only rolling upgrade: {0}")]
-    Release(#[from] lattice_model::cluster::ReleaseError),
     #[error("Coordinator control codec failed: {0}")]
     Control(#[source] PlacementControlError),
     #[error("Coordinator snapshot record codec failed")]

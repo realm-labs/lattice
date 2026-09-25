@@ -299,8 +299,6 @@ async fn production_membership_commit_fails_under_an_injected_store_failure() {
 fn member_hello() -> MemberHello {
     MemberHello {
         node: node("member", 11, 29301),
-        release: lattice_model::cluster::ReleaseManifest::development(1),
-        rollout_participant: true,
         roles: Default::default(),
         failure_domains: Default::default(),
         protocols: Vec::new(),

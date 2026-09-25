@@ -194,8 +194,6 @@ mod tests {
         MemberRecord {
             node: node.clone(),
             hello: MemberHello {
-                release: lattice_model::cluster::ReleaseManifest::development(1),
-                rollout_participant: true,
                 node,
                 roles: BTreeSet::new(),
                 failure_domains: BTreeMap::new(),

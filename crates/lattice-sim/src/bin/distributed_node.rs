@@ -143,11 +143,6 @@ struct MultiDomainHostArtifact {
     node_id: String,
     #[serde(with = "lattice_sim::serde_u128")]
     incarnation: u128,
-    /// The release this Coordinator host itself runs. A Coordinator is not a rollout participant,
-    /// so it never appears in the cluster's release state; publishing it is what lets a scenario
-    /// prove which release decided an upgrade it was not part of.
-    #[serde(default)]
-    release_id: u64,
     scopes: BTreeMap<String, ScopedLeadershipArtifact>,
 }
 
@@ -1002,8 +997,6 @@ fn entity_service(
         })?;
     }
     let member_hello = MemberHello {
-        release: lattice_model::cluster::ReleaseManifest::development(1),
-        rollout_participant: true,
         node: node.clone(),
         roles: BTreeSet::from([if owns_slot { "entity" } else { "gateway" }.to_owned()]),
         failure_domains: BTreeMap::new(),

@@ -136,7 +136,6 @@ fn write_domain_host_artifact(
         &serde_json::to_vec_pretty(&MultiDomainHostArtifact {
             node_id: node_id.to_owned(),
             incarnation: incarnation.get(),
-            release_id: FIXTURE_RELEASE_ID,
             scopes,
         })?,
     )?;

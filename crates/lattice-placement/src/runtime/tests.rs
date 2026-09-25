@@ -184,8 +184,6 @@ async fn seed_running_slot(
     let member_hello = authority_hello
         .map(|hello| hello.member.clone())
         .unwrap_or_else(|| MemberHello {
-            release: lattice_model::cluster::ReleaseManifest::development(1),
-            rollout_participant: true,
             node: owner.clone(),
             roles: BTreeSet::new(),
             failure_domains: BTreeMap::new(),
@@ -358,8 +356,6 @@ struct TestHelloSpec {
 fn test_hello(node: NodeKey, spec: TestHelloSpec) -> TestHello {
     TestHello {
         member: MemberHello {
-            release: lattice_model::cluster::ReleaseManifest::development(1),
-            rollout_participant: true,
             node: node.clone(),
             roles: spec.roles,
             failure_domains: Default::default(),

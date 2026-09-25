@@ -28,8 +28,6 @@ mod testctl_scenarios;
 mod testctl_simulation;
 #[path = "testctl/split_cluster.rs"]
 mod testctl_split_cluster;
-#[path = "testctl/upgrade.rs"]
-mod testctl_upgrade;
 
 use std::{
     path::{Path, PathBuf},
@@ -314,18 +312,6 @@ fn run_profile(
             });
             runner.run("entity-egress-blackhole-reassignment", || {
                 testctl_partition::egress_blackhole_reassignment(artifacts)
-            });
-            runner.run("entity-code-only-rolling-upgrade", || {
-                testctl_upgrade::code_only_rolling_upgrade(artifacts)
-            });
-            runner.run("entity-third-release-refused", || {
-                testctl_upgrade::third_release_refused(artifacts)
-            });
-            runner.run("entity-incompatible-release-refused", || {
-                testctl_upgrade::incompatible_release_refused(artifacts)
-            });
-            runner.run("entity-upgrade-under-an-older-coordinator", || {
-                testctl_upgrade::upgrade_under_an_older_coordinator(artifacts)
             });
             // The drained host exits, so nothing that needs both split hosts can follow it.
             runner.run("entity-drain-message-conservation", || {

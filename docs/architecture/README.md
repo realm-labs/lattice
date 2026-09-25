@@ -13,7 +13,7 @@
 > Ongoing source review (opened 2026-09-17): [current findings and deferred decisions](../code-review-2026-09-17.md).
 > Review remediation progress and validation: [review-remediation-plan.md](../review-remediation-plan.md).
 > Coordinator correctness hardening execution plan: [../coordinator-correctness-implementation-plan.md](../coordinator-correctness-implementation-plan.md).
-> Undecided control-plane redesign: [minimal etcd state and Coordinator candidacy memo](../cluster-control-plane-memo.md).
+> Proposed cluster lifecycle and control-plane redesign (not implemented): [cluster shutdown, etcd state lifecycle, and Coordinator candidacy](../cluster-control-plane-memo.md).
 
 These documents describe the complete target model, not a disposable minimal v1. Implementation may land in dependency order, but target capabilities are simplified through shared internal mechanisms and narrow fault domains rather than omitted in ways that require later identity, wire, or ownership redesign.
 

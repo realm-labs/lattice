@@ -7,7 +7,6 @@ use bytes::Bytes;
 use lattice_model::{
     actor::ProtocolId,
     cluster::CoordinatorScope,
-    cluster::ReleaseManifest,
     cluster::{ConfigFingerprint, EntityType, NodeIncarnation, PlacementDomainId, SingletonKind},
 };
 use lattice_remoting::protocol::ProtocolDescriptor;
@@ -161,8 +160,6 @@ impl LeaderRecord {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemberHello {
     pub node: NodeKey,
-    pub release: ReleaseManifest,
-    pub rollout_participant: bool,
     pub roles: BTreeSet<String>,
     pub failure_domains: BTreeMap<String, String>,
     pub protocols: Vec<ProtocolDescriptor>,
@@ -260,9 +257,6 @@ pub struct MemberEvent {
 
 impl MemberHello {
     pub fn validate(&self, limits: &SessionLimits) -> Result<(), CoordinatorError> {
-        self.release
-            .validate()
-            .map_err(|_| CoordinatorError::InvalidHello)?;
         self.node
             .validate()
             .map_err(|_| CoordinatorError::InvalidHello)?;

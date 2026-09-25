@@ -188,7 +188,6 @@ fn node_config(
     incarnation: NodeIncarnation,
 ) -> NodeConfig {
     NodeConfig {
-        release: lattice_model::cluster::ReleaseManifest::development(1),
         cluster_id,
         node_id: node_id.to_owned(),
         address,

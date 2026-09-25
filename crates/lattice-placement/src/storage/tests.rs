@@ -42,8 +42,6 @@ fn node(id: &str, incarnation: u128, port: u16) -> NodeKey {
 
 fn hello(node: NodeKey) -> MemberHello {
     MemberHello {
-        release: lattice_model::cluster::ReleaseManifest::development(1),
-        rollout_participant: true,
         node,
         roles: BTreeSet::new(),
         failure_domains: BTreeMap::new(),

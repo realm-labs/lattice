@@ -10,9 +10,7 @@ use super::{labeled_containers, require_label};
 /// rule out a probe that was already in flight.
 pub(super) const QUIET_PERIOD: Duration = Duration::from_millis(1_500);
 
-/// The hosts that keep an independent, timestamped record of which activation served the shared
-/// entity. A spare host exists in the same profile but stays out of the cluster until a scenario
-/// gives it a release, so it is deliberately not one of these observers.
+/// Hosts that independently record which activation served the shared entity.
 pub(super) const NODES: [&str; 2] = ["split-node-a", "split-node-b"];
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
@@ -39,93 +37,6 @@ pub(super) struct ServingWindow {
     pub last_served_millis: u128,
     pub observers: Vec<String>,
     pub samples: usize,
-}
-
-/// The release composition a host observes across the live, lease-backed members, exactly as the
-/// admission guard would derive it. `invalid` can only be published by a host whose cluster has a
-/// combination of releases no guard should ever have admitted.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(tag = "status", rename_all = "snake_case")]
-pub(super) enum ClusterReleaseArtifact {
-    Absent,
-    Empty,
-    Stable { release_id: u64 },
-    Rolling { from: u64, to: u64 },
-    Invalid { error: String },
-}
-
-impl ClusterReleaseArtifact {
-    /// Every release the host can see, which is what a scenario compares against the releases it
-    /// asked for.
-    pub fn releases(&self) -> Vec<u64> {
-        match self {
-            Self::Absent | Self::Empty | Self::Invalid { .. } => Vec::new(),
-            Self::Stable { release_id } => vec![*release_id],
-            Self::Rolling { from, to } => vec![*from, *to],
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
-pub(super) struct RolloutMemberArtifact {
-    pub node_id: String,
-    pub status: String,
-    pub release_id: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-pub(super) struct StartupErrorArtifact {
-    pub kind: String,
-    pub detail: String,
-}
-
-/// The release a host was told to run. A code-only upgrade changes nothing here but `release_id`.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
-pub(super) struct ReleaseIdentity {
-    pub release_id: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub protocol_fingerprint: Option<u8>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub control_generation: Option<u64>,
-}
-
-impl ReleaseIdentity {
-    pub fn code_only(release_id: u64) -> Self {
-        Self {
-            release_id,
-            ..Self::default()
-        }
-    }
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub(super) struct SplitHostArtifact {
-    pub node_id: String,
-    pub unix_millis: u128,
-    pub lifecycle: String,
-    #[serde(default)]
-    pub release: Option<ReleaseIdentity>,
-    #[serde(default)]
-    pub cluster_release: Option<ClusterReleaseArtifact>,
-    #[serde(default)]
-    pub rollout_members: Vec<RolloutMemberArtifact>,
-    #[serde(default)]
-    pub startup_error: Option<StartupErrorArtifact>,
-}
-
-impl SplitHostArtifact {
-    pub fn release_of(&self, node_id: &str) -> Option<u64> {
-        self.rollout_members
-            .iter()
-            .find(|member| member.node_id == node_id)
-            .map(|member| member.release_id)
-    }
-
-    pub fn cluster_release(&self) -> ClusterReleaseArtifact {
-        self.cluster_release
-            .clone()
-            .unwrap_or(ClusterReleaseArtifact::Absent)
-    }
 }
 
 pub(super) struct SplitCluster {
@@ -164,16 +75,6 @@ impl SplitCluster {
 
     pub fn peer(node: &str) -> &'static str {
         if node == NODES[0] { NODES[1] } else { NODES[0] }
-    }
-
-    /// Where a host publishes what it is doing, including the releases it can see.
-    pub fn host_artifact(&self, node: &str) -> PathBuf {
-        self.directory.join(format!("{node}.json"))
-    }
-
-    /// Where a scenario tells a host which release to run. Rewriting it is the upgrade.
-    pub fn release_file(&self, node: &str) -> PathBuf {
-        self.directory.join(format!("{node}-release.json"))
     }
 
     pub fn probes(&self, node: &str, since: u128) -> Result<Vec<ProbeRecord>, String> {

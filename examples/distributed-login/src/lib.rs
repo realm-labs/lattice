@@ -159,7 +159,6 @@ pub async fn run_demo() -> Result<LoginAcceptedReply, Box<dyn StdError>> {
         .ok_or_else(|| IoError::other("missing exact World ActorAddress"))?;
     let service = LatticeServiceBuilder::with_actor_runtime(
         NodeConfig {
-            release: lattice_model::cluster::ReleaseManifest::development(1),
             cluster_id,
             node_id: "world-a".to_owned(),
             address,

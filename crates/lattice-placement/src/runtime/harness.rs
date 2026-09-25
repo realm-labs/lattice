@@ -15,7 +15,6 @@ use std::{
 use lattice_model::{
     actor::ProtocolId,
     cluster::CoordinatorScope,
-    cluster::ReleaseManifest,
     cluster::{ClusterId, EntityType, NodeEndpoint, NodeIncarnation, PlacementDomainId},
 };
 use lattice_remoting::{
@@ -128,8 +127,6 @@ impl DomainHarness {
                 incarnation_base * 100 + (index as u128 + 1) * 10,
             )?;
             let member = MemberHello {
-                release: ReleaseManifest::development(1),
-                rollout_participant: true,
                 node: node.clone(),
                 roles: BTreeSet::new(),
                 failure_domains: BTreeMap::new(),

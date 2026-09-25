@@ -14,7 +14,6 @@ use lattice_actor_distributed::{
 use lattice_model::{
     actor::{ActorAddress, EntityAddress, SingletonAddress},
     cluster::ClusterId,
-    cluster::{ClusterReleaseState, ReleaseError, ReleaseManifest},
 };
 use lattice_placement::{membership_session::MembershipCoordinatorHandle, types::PlacementSlotKey};
 use tokio::{sync::broadcast::Receiver, time::Instant};
@@ -45,7 +44,6 @@ use super::{
 pub struct LatticeService {
     pub(super) actor_runtime: Mutex<Option<ActorRuntime>>,
     pub(super) cluster_id: ClusterId,
-    pub(super) release: ReleaseManifest,
     pub(super) actor_system: ActorSystem,
     pub(super) hosts: Arc<ProtocolHostRegistry>,
     pub(super) associations: Arc<AssociationManager>,
@@ -137,21 +135,6 @@ impl LatticeService {
     /// True while the node is re-joining after losing a membership session it had already used.
     pub fn recovering_membership(&self) -> bool {
         self.lifecycle_driver.recovering_membership()
-    }
-
-    pub fn release_manifest(&self) -> &ReleaseManifest {
-        &self.release
-    }
-
-    pub fn cluster_release_state(&self) -> Result<ClusterReleaseState, ReleaseError> {
-        let snapshot = self.members.snapshot();
-        ClusterReleaseState::from_manifests(
-            snapshot
-                .members
-                .iter()
-                .filter(|member| member.hello.rollout_participant)
-                .map(|member| &member.hello.release),
-        )
     }
 
     pub fn retained_actor_cells(&self) -> Vec<ActorCellDiagnostics> {
@@ -872,7 +855,6 @@ mod drain_deadline_tests {
             node_id: "departing".to_owned(),
             address: NodeEndpoint::new("127.0.0.1", 34801).unwrap(),
             incarnation: NodeIncarnation::new(1).unwrap(),
-            release: ReleaseManifest::development(1),
             roles: BTreeSet::new(),
             remoting: RemotingConfig::default(),
             maximum_actor_protocols: 8,
@@ -945,8 +927,6 @@ mod drain_deadline_tests {
                 address: identity.address.clone(),
                 incarnation: identity.incarnation,
             },
-            release: ReleaseManifest::development(1),
-            rollout_participant: true,
             roles: Default::default(),
             failure_domains: Default::default(),
             protocols: Vec::new(),
@@ -1001,8 +981,6 @@ mod drain_deadline_tests {
                 address: identity.address.clone(),
                 incarnation: identity.incarnation,
             },
-            release: ReleaseManifest::development(1),
-            rollout_participant: true,
             roles: Default::default(),
             failure_domains: Default::default(),
             protocols: Vec::new(),

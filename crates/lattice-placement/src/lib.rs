@@ -208,7 +208,6 @@ mod tests {
         let b = node("b", 2, 1002);
         let placement_node = |key: NodeKey, capacity, weight| PlacementNode {
             key: key.clone(),
-            release_id: lattice_model::cluster::ReleaseId::new(1).unwrap(),
             ready: true,
             eligible_entity_types: BTreeSet::from([entity_type.clone()]),
             protocols: BTreeSet::from([protocol]),

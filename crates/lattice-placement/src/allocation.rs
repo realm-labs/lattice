@@ -5,7 +5,6 @@ use std::{
 
 use lattice_model::{
     actor::ProtocolId,
-    cluster::ReleaseId,
     cluster::{EntityType, NodeIncarnation, PlacementDomainId},
 };
 
@@ -26,7 +25,6 @@ pub struct LoadSample {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlacementNode {
     pub key: NodeKey,
-    pub release_id: ReleaseId,
     pub ready: bool,
     pub eligible_entity_types: BTreeSet<EntityType>,
     pub protocols: BTreeSet<ProtocolId>,
@@ -188,9 +186,6 @@ pub struct WeightedLeastLoad {
     pub cooldown_millis: u64,
     pub minimum_relative_improvement_bps: u32,
     pub minimum_absolute_improvement_micros: u64,
-    /// How far, in basis points, the latest release may hold above its capacity share of the
-    /// entity type's placements before older releases rejoin the candidate set.
-    pub rolling_upgrade_admission_bps: u32,
 }
 
 impl Default for WeightedLeastLoad {
@@ -202,7 +197,6 @@ impl Default for WeightedLeastLoad {
             cooldown_millis: 30_000,
             minimum_relative_improvement_bps: 500,
             minimum_absolute_improvement_micros: 10_000,
-            rolling_upgrade_admission_bps: 20_000,
         }
     }
 }
@@ -223,14 +217,9 @@ impl ShardAllocationStrategy for WeightedLeastLoad {
     ) -> Result<AllocationDecision, AllocationError> {
         require_reconciled(view)?;
         let totals = node_weights(view);
-        let target = eligible_nodes(
-            view,
-            &request.entity_type,
-            request.required_protocol,
-            self.rolling_upgrade_admission_bps,
-        )
-        .min_by(|left, right| compare_normalized(left, right, &totals))
-        .ok_or(AllocationError::NoEligibleNode)?;
+        let target = eligible_nodes(view, &request.entity_type, request.required_protocol)
+            .min_by(|left, right| compare_normalized(left, right, &totals))
+            .ok_or(AllocationError::NoEligibleNode)?;
         Ok(AllocationDecision {
             target: target.key.clone(),
             policy_id: self.policy_id(),
@@ -298,24 +287,19 @@ impl ShardAllocationStrategy for WeightedLeastLoad {
             if source.is_none() && !matches!(trigger, RebalanceTrigger::Recovery { .. }) {
                 return Err(AllocationError::InvalidView);
             }
-            let target = eligible_nodes(
-                view,
-                entity_type,
-                required_protocol,
-                self.rolling_upgrade_admission_bps,
-            )
-            .filter(|node| node.key != shard.owner)
-            .filter(|node| trigger_allows_target(&trigger, &node.key))
-            .filter(|node| {
-                elapsed(view.now, node.joined_at) >= self.node_join_stability_millis
-                    || !matches!(trigger, RebalanceTrigger::Automatic)
-            })
-            .filter(|node| {
-                existing_count(view, &view.active_target_moves, &node.key)
-                    + target_counts.get(&node.key).copied().unwrap_or(0)
-                    < limits.concurrent_target
-            })
-            .min_by(|left, right| compare_normalized(left, right, &totals));
+            let target = eligible_nodes(view, entity_type, required_protocol)
+                .filter(|node| node.key != shard.owner)
+                .filter(|node| trigger_allows_target(&trigger, &node.key))
+                .filter(|node| {
+                    elapsed(view.now, node.joined_at) >= self.node_join_stability_millis
+                        || !matches!(trigger, RebalanceTrigger::Automatic)
+                })
+                .filter(|node| {
+                    existing_count(view, &view.active_target_moves, &node.key)
+                        + target_counts.get(&node.key).copied().unwrap_or(0)
+                        < limits.concurrent_target
+                })
+                .min_by(|left, right| compare_normalized(left, right, &totals));
             let Some(target) = target else {
                 continue;
             };
@@ -326,7 +310,6 @@ impl ShardAllocationStrategy for WeightedLeastLoad {
                 continue;
             }
             if !bypasses_improvement(&trigger)
-                && source.is_some_and(|source| source.release_id == target.release_id)
                 && !self.improves(
                     source.ok_or(AllocationError::InvalidView)?,
                     target,
@@ -438,15 +421,11 @@ fn eligible_nodes<'a>(
     view: &'a PlacementView,
     entity_type: &EntityType,
     protocol: ProtocolId,
-    admission_bps: u32,
 ) -> impl Iterator<Item = &'a PlacementNode> {
     let entity_type = entity_type.clone();
-    let admitted = admits_latest_release_only(view, &entity_type, protocol, admission_bps);
-    let target_release = admitted.then(|| latest_eligible_release(view, &entity_type, protocol));
-    view.nodes.iter().filter(move |node| {
-        target_release.is_none_or(|release| Some(node.release_id) == release)
-            && is_eligible(node, &entity_type, protocol)
-    })
+    view.nodes
+        .iter()
+        .filter(move |node| is_eligible(node, &entity_type, protocol))
 }
 
 fn is_eligible(node: &PlacementNode, entity_type: &EntityType, protocol: ProtocolId) -> bool {
@@ -455,73 +434,6 @@ fn is_eligible(node: &PlacementNode, entity_type: &EntityType, protocol: Protoco
         && node.capacity_units > 0
         && node.eligible_entity_types.contains(entity_type)
         && node.protocols.contains(&protocol)
-}
-
-fn latest_eligible_release(
-    view: &PlacementView,
-    entity_type: &EntityType,
-    protocol: ProtocolId,
-) -> Option<ReleaseId> {
-    view.nodes
-        .iter()
-        .filter(|node| is_eligible(node, entity_type, protocol))
-        .map(|node| node.release_id)
-        .max()
-}
-
-/// New placements prefer the newest release, but a partially upgraded cluster must not funnel every
-/// allocation, recovery reinstall, and rebalance target onto the first upgraded node. The newest
-/// release keeps exclusive candidacy only while it holds no more than the configured multiple of
-/// its capacity share of this entity type's placements; past that, older releases rejoin.
-/// Placements are counted rather than weighed because advisory load never decides eligibility.
-fn admits_latest_release_only(
-    view: &PlacementView,
-    entity_type: &EntityType,
-    protocol: ProtocolId,
-    admission_bps: u32,
-) -> bool {
-    let Some(target_release) = latest_eligible_release(view, entity_type, protocol) else {
-        return true;
-    };
-    let mut latest_capacity = 0_u128;
-    let mut total_capacity = 0_u128;
-    for node in view
-        .nodes
-        .iter()
-        .filter(|node| is_eligible(node, entity_type, protocol))
-    {
-        total_capacity += u128::from(node.capacity_units);
-        if node.release_id == target_release {
-            latest_capacity += u128::from(node.capacity_units);
-        }
-    }
-    if latest_capacity == total_capacity {
-        return true;
-    }
-    let latest_release_nodes = view
-        .nodes
-        .iter()
-        .filter(|node| node.release_id == target_release)
-        .map(|node| node.key.clone())
-        .collect::<BTreeSet<_>>();
-    let mut latest_placements = 0_u128;
-    let mut total_placements = 0_u128;
-    for shard in view
-        .shards
-        .iter()
-        .filter(|shard| &shard.entity_type == entity_type)
-    {
-        total_placements += 1;
-        if latest_release_nodes.contains(&shard.owner) {
-            latest_placements += 1;
-        }
-    }
-    latest_placements
-        .saturating_mul(total_capacity)
-        .saturating_mul(10_000)
-        <= u128::from(admission_bps)
-            .saturating_mul(total_placements)
-            .saturating_mul(latest_capacity)
 }
 
 fn node_weights(view: &PlacementView) -> BTreeMap<NodeKey, u64> {
@@ -661,7 +573,6 @@ mod tests {
         let target = node("target", 2);
         let placement_node = |key: NodeKey, weight| PlacementNode {
             key: key.clone(),
-            release_id: lattice_model::cluster::ReleaseId::new(1).unwrap(),
             ready: true,
             eligible_entity_types: [entity.clone()].into_iter().collect(),
             protocols: [protocol].into_iter().collect(),
@@ -717,6 +628,49 @@ mod tests {
             concurrent_source: 4,
             concurrent_target: 4,
         }
+    }
+
+    #[test]
+    fn allocation_uses_load_and_excludes_ineligible_hosts() {
+        let strategy = WeightedLeastLoad::default();
+        let (entity, protocol, source, target, mut view) = automatic_view();
+        let request = AllocationRequest {
+            domain: view.domain.clone(),
+            entity_type: entity.clone(),
+            shard_id: ShardId::new(9),
+            required_protocol: protocol,
+        };
+        assert_eq!(strategy.allocate(&request, &view).unwrap().target, target);
+
+        let mut proxy = view.nodes[1].clone();
+        proxy.key = node("proxy", 3);
+        proxy.load.as_mut().unwrap().boot_incarnation = proxy.key.incarnation;
+        proxy.eligible_entity_types.clear();
+        view.nodes.push(proxy);
+        view.nodes[1].load.as_mut().unwrap().weight = 1_000;
+        assert_eq!(strategy.allocate(&request, &view).unwrap().target, source);
+        assert!(
+            strategy
+                .rebalance(
+                    &entity,
+                    protocol,
+                    RebalanceTrigger::Automatic,
+                    &view,
+                    limits()
+                )
+                .unwrap()
+                .moves
+                .is_empty()
+        );
+
+        // A low load never makes a draining or protocol-incompatible host eligible.
+        view.nodes[0].draining = true;
+        assert_eq!(strategy.allocate(&request, &view).unwrap().target, target);
+        view.nodes[1].protocols.clear();
+        assert_eq!(
+            strategy.allocate(&request, &view).unwrap_err(),
+            AllocationError::NoEligibleNode
+        );
     }
 
     #[test]
@@ -874,65 +828,22 @@ mod tests {
         );
     }
 
-    #[test]
-    fn rolling_upgrade_allocates_and_rebalances_only_to_the_new_release() {
-        let strategy = WeightedLeastLoad::default();
-        let (entity, protocol, source, target, mut view) = automatic_view();
-        view.nodes[0].load.as_mut().unwrap().weight = 1;
-        view.nodes[1].load.as_mut().unwrap().weight = 100;
-        view.nodes[1].release_id = lattice_model::cluster::ReleaseId::new(2).unwrap();
-        let mut unrelated_proxy = view.nodes[1].clone();
-        unrelated_proxy.key = node("proxy", 3);
-        unrelated_proxy.load.as_mut().unwrap().boot_incarnation = unrelated_proxy.key.incarnation;
-        unrelated_proxy.release_id = lattice_model::cluster::ReleaseId::new(99).unwrap();
-        unrelated_proxy.eligible_entity_types.clear();
-        view.nodes.push(unrelated_proxy);
-
-        let allocation = strategy
-            .allocate(
-                &AllocationRequest {
-                    domain: view.domain.clone(),
-                    entity_type: entity.clone(),
-                    shard_id: ShardId::new(9),
-                    required_protocol: protocol,
-                },
-                &view,
-            )
-            .unwrap();
-        assert_eq!(allocation.target, target);
-
-        let proposal = strategy
-            .rebalance(
-                &entity,
-                protocol,
-                RebalanceTrigger::Automatic,
-                &view,
-                limits(),
-            )
-            .unwrap();
-        assert_eq!(proposal.moves.len(), 1);
-        assert_eq!(proposal.moves[0].source, source);
-        assert_eq!(proposal.moves[0].target, target);
-    }
-
-    fn partially_upgraded_view(
-        upgraded_placements: usize,
+    fn multi_node_view(
+        first_node_placements: usize,
     ) -> (EntityType, ProtocolId, NodeKey, PlacementView) {
-        let entity = EntityType::new("rolling-upgrade").unwrap();
+        let entity = EntityType::new("balanced").unwrap();
         let protocol = ProtocolId::new(93).unwrap();
-        let domain = PlacementDomainId::new("rolling").unwrap();
-        let upgraded = node("upgraded", 1);
+        let domain = PlacementDomainId::new("balanced").unwrap();
+        let first_node = node("first_node", 1);
         let mut nodes = Vec::new();
         for index in 0..10_u128 {
             let key = if index == 0 {
-                upgraded.clone()
+                first_node.clone()
             } else {
-                node(&format!("old-{index}"), index + 1)
+                node(&format!("node-{index}"), index + 1)
             };
             nodes.push(PlacementNode {
                 key: key.clone(),
-                release_id: lattice_model::cluster::ReleaseId::new(if index == 0 { 2 } else { 1 })
-                    .unwrap(),
                 ready: true,
                 eligible_entity_types: [entity.clone()].into_iter().collect(),
                 protocols: [protocol].into_iter().collect(),
@@ -953,8 +864,8 @@ mod tests {
                 domain: domain.clone(),
                 entity_type: entity.clone(),
                 shard_id: ShardId::new(index),
-                owner: if (index as usize) < upgraded_placements {
-                    upgraded.clone()
+                owner: if (index as usize) < first_node_placements {
+                    first_node.clone()
                 } else {
                     nodes[1 + (index as usize % 9)].key.clone()
                 },
@@ -982,62 +893,13 @@ mod tests {
             active_target_moves: BTreeMap::new(),
             last_automatic_move_at: None,
         };
-        (entity, protocol, upgraded, view)
-    }
-
-    #[test]
-    fn a_partial_rolling_upgrade_stops_funnelling_once_the_new_release_holds_its_share() {
-        let strategy = WeightedLeastLoad::default();
-        let request = |entity: &EntityType, protocol| AllocationRequest {
-            domain: PlacementDomainId::new("rolling").unwrap(),
-            entity_type: entity.clone(),
-            shard_id: ShardId::new(99),
-            required_protocol: protocol,
-        };
-
-        let (entity, protocol, upgraded, empty) = partially_upgraded_view(0);
-        assert_eq!(
-            strategy
-                .allocate(&request(&entity, protocol), &empty)
-                .unwrap()
-                .target,
-            upgraded
-        );
-
-        let (entity, protocol, upgraded, saturated) = partially_upgraded_view(5);
-        let target = strategy
-            .allocate(&request(&entity, protocol), &saturated)
-            .unwrap()
-            .target;
-        assert_ne!(
-            target, upgraded,
-            "one upgraded node of ten must not absorb every placement"
-        );
-
-        let proposal = strategy
-            .rebalance(
-                &entity,
-                protocol,
-                RebalanceTrigger::Automatic,
-                &saturated,
-                limits(),
-            )
-            .unwrap();
-        assert!(
-            proposal
-                .moves
-                .iter()
-                .all(|movement| movement.target != upgraded)
-        );
+        (entity, protocol, first_node, view)
     }
 
     #[test]
     fn one_round_spreads_moves_across_targets_instead_of_stacking_them() {
         let strategy = WeightedLeastLoad::default();
-        let (entity, protocol, _upgraded, mut view) = partially_upgraded_view(0);
-        for node in &mut view.nodes {
-            node.release_id = lattice_model::cluster::ReleaseId::new(1).unwrap();
-        }
+        let (entity, protocol, _first_node, mut view) = multi_node_view(0);
         view.nodes.truncate(3);
         let source = view.nodes[0].key.clone();
         view.shards.truncate(2);

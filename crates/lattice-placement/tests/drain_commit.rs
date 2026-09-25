@@ -6,7 +6,6 @@ use std::{
 
 use lattice_model::{
     cluster::CoordinatorScope,
-    cluster::ReleaseManifest,
     cluster::{ClusterId, NodeEndpoint, NodeIncarnation, PlacementDomainId},
 };
 use lattice_placement::{
@@ -53,8 +52,6 @@ fn setup() -> (NodeKey, Arc<AssociationManager>, Arc<Association>) {
 fn hello(node: NodeKey) -> MemberHello {
     MemberHello {
         node,
-        release: ReleaseManifest::development(1),
-        rollout_participant: true,
         roles: BTreeSet::new(),
         failure_domains: BTreeMap::new(),
         protocols: Vec::new(),

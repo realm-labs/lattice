@@ -471,7 +471,7 @@ mod routing_backpressure_tests {
             control::decode_control_command, runtime::host::CoordinatorHostConfig,
             storage::InMemoryPlacementStore,
         };
-        use lattice_model::{cluster::ClusterId, cluster::ReleaseManifest};
+        use lattice_model::cluster::ClusterId;
         use lattice_remoting::{
             association::AssociationManager, config::RemotingConfig,
             control::decode_control_envelope,
@@ -515,8 +515,6 @@ mod routing_backpressure_tests {
         .unwrap();
         let hello = MemberHello {
             node: departing.clone(),
-            release: ReleaseManifest::development(1),
-            rollout_participant: true,
             roles: Default::default(),
             failure_domains: Default::default(),
             protocols: Vec::new(),

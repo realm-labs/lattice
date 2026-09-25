@@ -356,7 +356,6 @@ mod tests {
 
     fn node(cluster: &ClusterId, node_id: &str) -> NodeConfig {
         NodeConfig {
-            release: lattice_model::cluster::ReleaseManifest::development(1),
             cluster_id: cluster.clone(),
             node_id: node_id.to_owned(),
             address: unused_address(),

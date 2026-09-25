@@ -504,10 +504,7 @@ mod tests {
         coordinator::build_snapshot,
         types::{CoordinatorTerm, MembershipVersion, Revision},
     };
-    use lattice_model::{
-        cluster::ReleaseManifest,
-        cluster::{ClusterId, NodeEndpoint},
-    };
+    use lattice_model::cluster::{ClusterId, NodeEndpoint};
     use lattice_remoting::{config::RemotingConfig, control::CommandId};
 
     #[tokio::test(start_paused = true)]
@@ -573,8 +570,6 @@ mod tests {
             } else {
                 let hello = MemberHello {
                     node: local,
-                    release: ReleaseManifest::development(1),
-                    rollout_participant: true,
                     roles: Default::default(),
                     failure_domains: Default::default(),
                     protocols: Vec::new(),
@@ -626,8 +621,6 @@ mod tests {
             .unwrap();
         let hello = MemberHello {
             node: local,
-            release: ReleaseManifest::development(1),
-            rollout_participant: true,
             roles: Default::default(),
             failure_domains: Default::default(),
             protocols: Vec::new(),

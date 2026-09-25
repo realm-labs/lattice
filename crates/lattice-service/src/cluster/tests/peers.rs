@@ -4,10 +4,7 @@ use std::{
 };
 
 use lattice_actor_distributed::host::ProtocolHostRegistry;
-use lattice_model::{
-    cluster::ReleaseManifest,
-    cluster::{ClusterId, NodeIncarnation},
-};
+use lattice_model::cluster::{ClusterId, NodeIncarnation};
 use lattice_placement::{
     coordinator::{MemberChange, MemberEvent, MemberHello, MemberRecord, MemberStatus},
     types::{CoordinatorTerm, MembershipVersion, NodeKey, Revision},
@@ -32,8 +29,6 @@ fn member(node: NodeKey, revision: u64) -> MemberRecord {
     MemberRecord {
         node: node.clone(),
         hello: MemberHello {
-            release: ReleaseManifest::development(1),
-            rollout_participant: true,
             node,
             roles: BTreeSet::new(),
             failure_domains: BTreeMap::new(),

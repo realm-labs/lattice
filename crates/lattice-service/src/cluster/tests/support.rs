@@ -200,8 +200,6 @@ pub(super) fn test_hello(
 ) -> TestHello {
     TestHello {
         member: MemberHello {
-            release: lattice_model::cluster::ReleaseManifest::development(1),
-            rollout_participant: true,
             node: node.clone(),
             roles: BTreeSet::new(),
             failure_domains: BTreeMap::new(),

@@ -4,7 +4,6 @@ mod actor_watch;
 mod addresses;
 mod coordination;
 mod primitives;
-mod release_model;
 
 pub mod actor;
 pub mod cluster;

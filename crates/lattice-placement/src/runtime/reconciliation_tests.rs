@@ -92,8 +92,6 @@ async fn persist_authority_records(
     let global = MemberRecord {
         node: owner.clone(),
         hello: MemberHello {
-            release: lattice_model::cluster::ReleaseManifest::development(1),
-            rollout_participant: true,
             node: owner.clone(),
             roles: BTreeSet::new(),
             failure_domains: BTreeMap::new(),

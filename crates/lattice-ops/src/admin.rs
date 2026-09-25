@@ -8,7 +8,6 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use lattice_model::cluster::ClusterReleaseState;
 use lattice_model::cluster::{EntityType, PlacementDomainId};
 use lattice_placement::{
     allocation::RebalanceTrigger,
@@ -73,7 +72,6 @@ pub struct AdminSnapshot {
     pub partial: bool,
     pub coordinator_term: Option<u64>,
     pub coordinator_revision: Option<u64>,
-    pub release: Option<ClusterReleaseState>,
     pub nodes: Vec<NodeView>,
     pub associations: Vec<AssociationView>,
     pub actor_paths: Vec<ActorPathView>,

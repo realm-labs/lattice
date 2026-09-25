@@ -213,7 +213,6 @@ async fn deserialized_actor_address_is_bound_at_the_actor_boundary() {
 
     let service = LatticeServiceBuilder::with_actor_runtime(
         NodeConfig {
-            release: lattice_model::cluster::ReleaseManifest::development(1),
             cluster_id,
             node_id: "reference-node".to_owned(),
             address,

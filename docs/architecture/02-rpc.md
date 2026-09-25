@@ -199,8 +199,8 @@ Rules:
 V1 requires an exact fingerprint for a given `ProtocolId`. Business-protocol
 changes are a full-stop deployment boundary, including adding a parallel major
 `ProtocolId`: stop and drain the application deployment, install the complete
-new catalogue, then restart it as one release. Code-only rolling upgrades
-require the entire catalogue fingerprint to remain unchanged. Reusing one
+new catalogue, then restart it as one release. Application rolling upgrades
+are not currently supported. Reusing one
 `ProtocolId` with a changed fingerprint is rejected; silent additive
 compatibility guesses are forbidden.
 

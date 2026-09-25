@@ -32,9 +32,8 @@ pub struct EntityConfig {
         skip_serializing_if = "is_default_shard_mapper_id"
     )]
     pub shard_mapper_id: String,
-    // Keep the generation-5 wire field name so default-mapper rolling upgrades
-    // remain readable by older processes. Custom mapper fingerprints are still
-    // rejected by processes that do not understand `shard_mapper_id`.
+    // Keep the existing storage/wire field name. Removing application release
+    // policy does not change mapper encoding or configuration fingerprints.
     #[serde(
         rename = "shard_hash_version",
         default = "default_shard_mapper_version"
