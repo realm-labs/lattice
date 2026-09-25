@@ -4,11 +4,30 @@ use lattice_model::cluster::{EntityType, NodeIncarnation};
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    allocation::RebalanceLimits,
     coordinator::{GroupMemberRecord, MemberRecord, SingletonConfig},
     plan::RebalancePlan,
     region::EntityConfig,
     types::{ClaimGrant, PlacementSlot, PlacementVersion, Revision, ShardId},
 };
+
+use super::StorageError;
+
+/// Hard per-value bound. Large sets are represented by sealed individual records.
+pub const MAX_DURABLE_VALUE_BYTES: usize = 4 * 1024;
+/// Hard transaction bound for operation-receipt reclamation.
+pub const MAX_ADMIN_GC_BATCH: usize = 16;
+
+pub(crate) fn encode_record<T: Serialize>(value: &T) -> Result<Vec<u8>, StorageError> {
+    let encoded = serde_json::to_vec(value).map_err(|_| StorageError::Codec)?;
+    if encoded.len() > MAX_DURABLE_VALUE_BYTES {
+        return Err(StorageError::RecordTooLarge {
+            actual: encoded.len(),
+            maximum: MAX_DURABLE_VALUE_BYTES,
+        });
+    }
+    Ok(encoded)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LeasedClaim {
@@ -149,6 +168,7 @@ pub struct ActivateAuthority {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReserveMove {
+    pub limits: RebalanceLimits,
     pub expected_plan: RebalancePlan,
     pub plan: RebalancePlan,
     pub expected_slot: PlacementSlot,
@@ -157,6 +177,7 @@ pub struct ReserveMove {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReserveHandoff {
+    pub limits: RebalanceLimits,
     pub expected_slot: PlacementSlot,
     pub slot: PlacementSlot,
 }
@@ -237,6 +258,8 @@ pub enum AdminOperationStatus {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AdminOperationResult {
     AutomaticBalanceUpdated,
+    /// Accepted leader-local proposal. Only admitted moves survive failover;
+    /// querying a receipt without surviving local/admitted work returns expired.
     PlanCreated {
         plan_id: u128,
     },

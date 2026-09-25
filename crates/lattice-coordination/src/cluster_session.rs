@@ -5,13 +5,21 @@ use std::{
     time::Duration,
 };
 
-use lattice_model::{cluster::CoordinatorScope, cluster::NodeIncarnation};
+use crate::{
+    drain::DrainConfirmation,
+    shutdown::{ShutdownReport, ShutdownRequestRejection},
+};
+use lattice_model::{
+    cluster::CoordinatorScope,
+    cluster::NodeIncarnation,
+    run::{ClusterLifecycle, ControlOperationId, RunEpoch, RunPhase},
+};
 use lattice_remoting::{
     association::{AssociationKey, AssociationManager, AssociationState},
     control::ControlDispatchError,
 };
 use tokio::{
-    sync::{Notify, mpsc, watch},
+    sync::{Notify, mpsc, oneshot, watch},
     time::{Instant, MissedTickBehavior},
 };
 
@@ -48,7 +56,48 @@ impl ClusterSessionState {
     }
 }
 
+type PendingShutdownRequests = Arc<
+    Mutex<
+        BTreeMap<
+            ControlOperationId,
+            Option<oneshot::Sender<Result<ClusterLifecycle, ShutdownRequestRejection>>>,
+        >,
+    >,
+>;
+
+#[derive(Debug, thiserror::Error)]
+pub enum ShutdownRequestError {
+    #[error("shutdown request transport failed: {0}")]
+    Transport(#[from] GroupSessionError),
+    #[error(transparent)]
+    Rejected(ShutdownRequestRejection),
+    #[error(
+        "shutdown acceptance wait timed out; the request may still commit; retry the same operation"
+    )]
+    Timeout,
+    #[error("shutdown acceptance session ended; retry the same operation")]
+    Interrupted,
+    #[error("shutdown request is already pending or the pending-request limit is reached")]
+    PendingLimit,
+}
+
+struct ShutdownRequestWaiter {
+    operation: ControlOperationId,
+    pending: PendingShutdownRequests,
+}
+impl Drop for ShutdownRequestWaiter {
+    fn drop(&mut self) {
+        self.pending
+            .lock()
+            .expect("shutdown requests poisoned")
+            .remove(&self.operation);
+    }
+}
+
 pub struct ClusterSession {
+    shutdown_requests: PendingShutdownRequests,
+    shared_epoch: Arc<AtomicU64>,
+    stop_confirmation: DrainConfirmation,
     hello: MemberHello,
     coordinator: AssociationKey,
     associations: Arc<AssociationManager>,
@@ -57,15 +106,21 @@ pub struct ClusterSession {
     stager: Option<SnapshotStager>,
     effects: mpsc::Sender<LogicPlacementEffect>,
     heartbeat_sequence: u64,
+    acknowledged_sequence: u64,
+    last_acknowledgement: Instant,
+    closing: bool,
     coordinator_term: u64,
     shared_coordinator_term: Arc<AtomicU64>,
     hello_pending: bool,
     origin: Instant,
-    drain_confirmation: crate::drain::DrainConfirmation,
+    drain_confirmation: DrainConfirmation,
 }
 
 #[derive(Clone)]
 pub struct ClusterSessionHandle {
+    shutdown_requests: PendingShutdownRequests,
+    shared_epoch: Arc<AtomicU64>,
+    stop_confirmation: DrainConfirmation,
     local_node_id: String,
     local_incarnation: NodeIncarnation,
     coordinator: AssociationKey,
@@ -73,10 +128,149 @@ pub struct ClusterSessionHandle {
     maximum_control_payload: usize,
     coordinator_term: Arc<AtomicU64>,
     drain_acknowledgement_timeout: Duration,
-    drain_confirmation: crate::drain::DrainConfirmation,
+    drain_confirmation: DrainConfirmation,
+}
+
+impl Drop for ClusterSession {
+    fn drop(&mut self) {
+        self.drain_confirmation.close();
+        self.stop_confirmation.close();
+        self.shutdown_requests
+            .lock()
+            .expect("shutdown requests poisoned")
+            .clear();
+    }
 }
 
 impl ClusterSessionHandle {
+    pub async fn request_cluster_shutdown(
+        &self,
+        operation: ControlOperationId,
+    ) -> Result<ClusterLifecycle, ShutdownRequestError> {
+        let epoch = RunEpoch::new(self.shared_epoch.load(Ordering::Acquire))
+            .ok_or(GroupSessionError::StaleGeneration)?;
+        let association = self
+            .associations
+            .get(&self.coordinator)
+            .ok_or(GroupSessionError::AssociationUnavailable)?;
+        let payload = encode_control_command_for_term(
+            &CoordinatorScope::Cluster,
+            self.coordinator_term.load(Ordering::Acquire),
+            &PlacementControlCommand::RequestClusterShutdown {
+                epoch,
+                operation: operation.clone(),
+            },
+            self.maximum_control_payload,
+        )
+        .map_err(GroupSessionError::Control)?;
+        let (sender, response) = oneshot::channel();
+        {
+            let mut pending = self
+                .shutdown_requests
+                .lock()
+                .expect("shutdown requests poisoned");
+            if pending.contains_key(&operation) || pending.len() >= 32 {
+                return Err(ShutdownRequestError::PendingLimit);
+            }
+            pending.insert(operation.clone(), Some(sender));
+        }
+        let _waiter = ShutdownRequestWaiter {
+            operation,
+            pending: self.shutdown_requests.clone(),
+        };
+        association
+            .admit_control_command_in_wait(
+                control_stream_id(&CoordinatorScope::Cluster),
+                payload,
+                super::session::CONTROL_ADMISSION_TIMEOUT,
+            )
+            .await
+            .map_err(GroupSessionError::from)?;
+        let accepted = tokio::time::timeout(self.drain_acknowledgement_timeout, response)
+            .await
+            .map_err(|_| ShutdownRequestError::Timeout)?
+            .map_err(|_| ShutdownRequestError::Interrupted)?
+            .map_err(ShutdownRequestError::Rejected)?;
+        if accepted.epoch != epoch
+            || !matches!(
+                accepted.phase,
+                RunPhase::Closing { .. } | RunPhase::Closed { .. }
+            )
+        {
+            return Err(GroupSessionError::StaleGeneration.into());
+        }
+        Ok(accepted)
+    }
+    /// Confirms positive post-drain evidence before ordinary node teardown.
+    pub async fn confirm_node_stopped(&self, node: NodeKey) -> Result<(), GroupSessionError> {
+        let epoch = RunEpoch::new(self.shared_epoch.load(Ordering::Acquire))
+            .ok_or(GroupSessionError::StaleGeneration)?;
+        if node.node_id != self.local_node_id || node.incarnation != self.local_incarnation {
+            return Err(GroupSessionError::UnauthorizedCommand);
+        }
+        let operation = format!("stopped-{}", node.incarnation.get());
+        let term = self.coordinator_term.load(Ordering::Acquire);
+        self.stop_confirmation.request(&operation, term)?;
+        let association = self
+            .associations
+            .get(&self.coordinator)
+            .ok_or(GroupSessionError::AssociationUnavailable)?;
+        let payload = encode_control_command_for_term(
+            &CoordinatorScope::Cluster,
+            term,
+            &PlacementControlCommand::NodeStopCompleted { epoch, node },
+            self.maximum_control_payload,
+        )
+        .map_err(GroupSessionError::Control)?;
+        association
+            .admit_control_command_in_wait(
+                control_stream_id(&CoordinatorScope::Cluster),
+                payload,
+                super::session::CONTROL_ADMISSION_TIMEOUT,
+            )
+            .await?;
+        self.stop_confirmation
+            .wait(
+                &operation,
+                term,
+                Instant::now() + self.drain_acknowledgement_timeout,
+            )
+            .await
+    }
+    pub async fn report_cluster_stop(
+        &self,
+        report: ShutdownReport,
+    ) -> Result<(), GroupSessionError> {
+        if report.node.node_id != self.local_node_id
+            || report.node.incarnation != self.local_incarnation
+        {
+            return Err(GroupSessionError::UnauthorizedCommand);
+        }
+        let association = self
+            .associations
+            .get(&self.coordinator)
+            .ok_or(GroupSessionError::AssociationUnavailable)?;
+        let payload = encode_control_command_for_term(
+            &CoordinatorScope::Cluster,
+            self.coordinator_term.load(Ordering::Acquire),
+            &PlacementControlCommand::ClusterStopReport {
+                epoch: report.epoch,
+                operation: report.operation,
+                node: report.node,
+                outcome: report.outcome,
+            },
+            self.maximum_control_payload,
+        )
+        .map_err(GroupSessionError::Control)?;
+        association
+            .admit_control_command_in_wait(
+                control_stream_id(&CoordinatorScope::Cluster),
+                payload,
+                super::session::CONTROL_ADMISSION_TIMEOUT,
+            )
+            .await?;
+        Ok(())
+    }
     pub async fn complete_drain(&self, operation_id: String) -> Result<(), GroupSessionError> {
         self.complete_drain_until(
             operation_id,
@@ -159,8 +353,14 @@ impl ClusterSession {
         }
         let (effects, receiver) = mpsc::channel(effect_capacity);
         let shared_coordinator_term = Arc::new(AtomicU64::new(coordinator_term));
-        let drain_confirmation = crate::drain::DrainConfirmation::default();
+        let drain_confirmation = DrainConfirmation::default();
+        let stop_confirmation = DrainConfirmation::default();
+        let shared_epoch = Arc::new(AtomicU64::new(0));
+        let shutdown_requests = Arc::new(Mutex::new(BTreeMap::new()));
         let handle = ClusterSessionHandle {
+            shutdown_requests: shutdown_requests.clone(),
+            shared_epoch: shared_epoch.clone(),
+            stop_confirmation: stop_confirmation.clone(),
             local_node_id: hello.node.node_id.clone(),
             local_incarnation: hello.node.incarnation,
             coordinator: coordinator.clone(),
@@ -173,6 +373,9 @@ impl ClusterSession {
         let local_node = hello.node.clone();
         Ok((
             Self {
+                shutdown_requests,
+                shared_epoch,
+                stop_confirmation,
                 hello,
                 coordinator,
                 associations,
@@ -185,6 +388,9 @@ impl ClusterSession {
                 stager: None,
                 effects,
                 heartbeat_sequence: 0,
+                acknowledged_sequence: 0,
+                last_acknowledgement: Instant::now(),
+                closing: false,
                 coordinator_term,
                 shared_coordinator_term,
                 hello_pending: true,
@@ -210,6 +416,11 @@ impl ClusterSession {
     ) {
         let result = self.run_loop(&mut controls, &mut shutdown).await;
         self.drain_confirmation.close();
+        self.stop_confirmation.close();
+        self.shutdown_requests
+            .lock()
+            .expect("shutdown requests poisoned")
+            .clear();
         (result, controls)
     }
 
@@ -250,8 +461,11 @@ impl ClusterSession {
                         return Err(GroupSessionError::HeartbeatInterrupted);
                     }
                     last_heartbeat = Instant::now();
-                    if self.drain_confirmation.requested() {
+                    if self.closing || self.drain_confirmation.requested() {
                         continue;
+                    }
+                    if !self.hello_pending && self.last_acknowledgement.elapsed() > self.config.heartbeat_interval.saturating_mul(3) {
+                        return Err(GroupSessionError::HeartbeatInterrupted);
                     }
                     if self.hello_pending {
                         // The initial hello may race Coordinator election or membership
@@ -293,17 +507,66 @@ impl ClusterSession {
             }
             PlacementControlEventKind::Command(inbound) => {
                 self.require_coordinator(&inbound.association)?;
-                if matches!(&inbound.command, PlacementControlCommand::SnapshotBegin(_)) {
+                if matches!(
+                    &inbound.command,
+                    PlacementControlCommand::SnapshotBegin(_)
+                        | PlacementControlCommand::ClusterRunning { .. }
+                        | PlacementControlCommand::ClusterShutdownResult { .. }
+                        | PlacementControlCommand::ClusterClosing { .. }
+                        | PlacementControlCommand::ClusterClosed { .. }
+                ) {
                     self.accept_snapshot_term(inbound.coordinator_term)?;
                 } else {
                     self.require_coordinator_term(inbound.coordinator_term)?;
                 }
                 match inbound.command {
+                    PlacementControlCommand::ClusterShutdownResult { request, outcome } => {
+                        if let Some(waiter) = self
+                            .shutdown_requests
+                            .lock()
+                            .expect("shutdown requests poisoned")
+                            .get_mut(&request)
+                            .and_then(Option::take)
+                        {
+                            let _ = waiter.send(outcome);
+                        }
+                        Ok(())
+                    }
+                    PlacementControlCommand::ClusterRunning { epoch } => {
+                        let previous = self.shared_epoch.load(Ordering::Acquire);
+                        if previous != 0 && previous != epoch.get() {
+                            return Err(GroupSessionError::StaleGeneration);
+                        }
+                        self.shared_epoch.store(epoch.get(), Ordering::Release);
+                        Ok(())
+                    }
+                    PlacementControlCommand::NodeHeartbeatAck { sequence } => {
+                        if sequence > self.heartbeat_sequence || sequence == 0 {
+                            return Err(GroupSessionError::UnauthorizedCommand);
+                        }
+                        if sequence > self.acknowledged_sequence {
+                            self.acknowledged_sequence = sequence;
+                            self.last_acknowledgement = Instant::now();
+                        }
+                        Ok(())
+                    }
+                    PlacementControlCommand::NodeStopConfirmed { epoch, node } => {
+                        if epoch.get() != self.shared_epoch.load(Ordering::Acquire)
+                            || node != self.hello.node
+                        {
+                            return Err(GroupSessionError::StaleGeneration);
+                        }
+                        self.stop_confirmation.confirm(
+                            &format!("stopped-{}", node.incarnation.get()),
+                            self.coordinator_term,
+                        )
+                    }
                     PlacementControlCommand::SnapshotBegin(begin) => {
                         if !matches!(begin.version, SnapshotVersion::Membership(_)) {
                             return Err(GroupSessionError::UnauthorizedCommand);
                         }
                         self.hello_pending = false;
+                        self.last_acknowledgement = Instant::now();
                         self.stager = Some(
                             SnapshotStager::begin(
                                 begin,
@@ -356,6 +619,30 @@ impl ClusterSession {
                     }
                     PlacementControlCommand::MemberDelta(event) => {
                         self.apply_member_event(event).await
+                    }
+                    PlacementControlCommand::ClusterClosing { epoch, operation } => {
+                        self.closing = true;
+                        let previous = self.shared_epoch.load(Ordering::Acquire);
+                        if previous != 0 && previous != epoch.get() {
+                            return Err(GroupSessionError::StaleGeneration);
+                        }
+                        self.shared_epoch.store(epoch.get(), Ordering::Release);
+                        self.effects
+                            .send(LogicPlacementEffect::ClusterClosing { epoch, operation })
+                            .await
+                            .map_err(|_| GroupSessionError::EffectBackpressure)
+                    }
+                    PlacementControlCommand::ClusterClosed { lifecycle } => {
+                        let previous = self.shared_epoch.load(Ordering::Acquire);
+                        if previous != 0 && previous != lifecycle.epoch.get() {
+                            return Err(GroupSessionError::StaleGeneration);
+                        }
+                        self.shared_epoch
+                            .store(lifecycle.epoch.get(), Ordering::Release);
+                        self.effects
+                            .send(LogicPlacementEffect::ClusterClosed(lifecycle))
+                            .await
+                            .map_err(|_| GroupSessionError::EffectBackpressure)
                     }
                     PlacementControlCommand::DrainCommitted {
                         operation_id,
@@ -468,7 +755,7 @@ fn decode_members(records: &[SnapshotRecord]) -> Result<Vec<MemberRecord>, Group
         }
         let member: MemberRecord =
             serde_json::from_slice(&record.value).map_err(|_| GroupSessionError::Codec)?;
-        if member.node != member.hello.node
+        if member.node.validate().is_err()
             || members
                 .insert(
                     (member.node.node_id.clone(), member.node.incarnation),

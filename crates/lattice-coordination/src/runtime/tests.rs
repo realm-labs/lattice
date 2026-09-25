@@ -1,3 +1,7 @@
+use crate::candidate_fixture::elect_group;
+use crate::candidate_fixture::prepare_leader;
+use crate::candidates::CandidateGeneration;
+use lattice_model::run::RunEpoch;
 use std::{collections::BTreeSet, time::Instant as StdInstant};
 
 use async_trait::async_trait;
@@ -87,8 +91,8 @@ fn attach_test_session(
     key
 }
 
-async fn ensure_test_global_member(
-    leader: &mut GroupCoordinator<InMemoryCoordinationStore>,
+async fn ensure_test_global_member<S: ScopedElectionStore + MembershipStore + ActorGroupStore>(
+    leader: &mut GroupCoordinator<S>,
     hello: &MemberHello,
 ) -> MemberRecord {
     if leader
@@ -112,10 +116,16 @@ async fn ensure_test_global_member(
                 .await
                 .unwrap();
             let record = LeaderRecord {
+                candidate_generation: CandidateGeneration::new(1).unwrap(),
+                candidate_lease_id: 1,
+                epoch: RunEpoch::INITIAL,
                 scope: CoordinatorScope::Cluster,
                 node: leader.leader.node.clone(),
                 term: CoordinatorTerm::new(1).unwrap(),
             };
+            let record = prepare_leader(leader.store.as_ref(), record, lease)
+                .await
+                .unwrap();
             assert!(leader.store.campaign_leader(&record, lease).await.unwrap());
             record
         };
@@ -126,7 +136,6 @@ async fn ensure_test_global_member(
             .unwrap();
         let member = MemberRecord {
             node: hello.node.clone(),
-            hello: hello.clone(),
             status: MemberStatus::Up,
             version: MembershipVersion::new(
                 membership_record.term,
@@ -157,8 +166,8 @@ async fn ensure_test_global_member(
         .unwrap()
 }
 
-async fn register_up(
-    leader: &mut GroupCoordinator<InMemoryCoordinationStore>,
+async fn register_up<S: ScopedElectionStore + MembershipStore + ActorGroupStore>(
+    leader: &mut GroupCoordinator<S>,
     hello: TestHello,
     association: AssociationKey,
 ) {
@@ -200,11 +209,6 @@ async fn seed_running_slot(
     } else {
         let member = GroupMemberRecord {
             node: owner.clone(),
-            hello: authority_hello
-                .map(|hello| hello.group.clone())
-                .unwrap_or_else(|| {
-                    ActorGroupHello::builder(owner.clone(), leader.version.group.clone(), 1).build()
-                }),
             status: GroupMemberStatus::Up,
             version: leader.next_version().unwrap(),
         };
@@ -233,6 +237,7 @@ async fn seed_running_slot(
         .await
         .unwrap();
     let grant = ClaimGrant {
+        request_id: 0,
         group: slot.key.group().clone(),
         slot: slot.key.clone(),
         owner,
@@ -410,7 +415,7 @@ async fn joining_group_member_advances_existing_sessions_to_latest_revision() {
         200,
     );
     let store = Arc::new(InMemoryCoordinationStore::new(16, 16).unwrap());
-    let mut leader = GroupCoordinator::elect(
+    let mut leader = elect_group(
         store,
         associations.clone(),
         coordinator,
@@ -529,7 +534,7 @@ async fn real_control_session_installs_snapshot_and_matching_claim() {
         shard_id: ShardId::new(3),
     };
     let store = Arc::new(InMemoryCoordinationStore::new(16, 16).unwrap());
-    let mut leader = GroupCoordinator::elect(
+    let mut leader = elect_group(
         store.clone(),
         coordinator_associations,
         coordinator_node,
@@ -658,7 +663,7 @@ async fn persisted_handoff_barrier_replaces_claim_forward() {
         shard_id: ShardId::new(1),
     };
     let store = Arc::new(InMemoryCoordinationStore::new(16, 16).unwrap());
-    let mut leader = GroupCoordinator::elect(
+    let mut leader = elect_group(
         store.clone(),
         associations,
         coordinator_node,
@@ -721,7 +726,7 @@ async fn persisted_handoff_barrier_replaces_claim_forward() {
     register_up(&mut leader, target_hello, target_key).await;
     let relocation = ManualRelocationRequest {
         group: group(),
-        operation_id: "manual-1".to_owned(),
+        operation_id: leader.inspect().await.unwrap().new_operation_id(),
         entity_type: entity_type.clone(),
         shard_id: ShardId::new(1),
         expected_generation: AssignmentGeneration::new(1).unwrap(),
@@ -806,7 +811,7 @@ async fn persisted_handoff_barrier_replaces_claim_forward() {
     assert_eq!(plan.status, PlanStatus::Completed);
     store.revoke_lease(leader.leader_lease_id).await.unwrap();
     let (successor_node, _) = node(&cluster_id, "successor", 26203, 203);
-    let mut successor = GroupCoordinator::elect(
+    let mut successor = elect_group(
         store,
         Arc::new(
             AssociationManager::new(
@@ -867,7 +872,7 @@ async fn first_resolution_allocates_shard_and_singleton_to_declared_host() {
         40,
     );
     let store = Arc::new(InMemoryCoordinationStore::new(16, 16).unwrap());
-    let mut leader = GroupCoordinator::elect(
+    let mut leader = elect_group(
         store.clone(),
         associations,
         coordinator_node,
@@ -985,7 +990,7 @@ async fn first_resolution_allocates_shard_and_singleton_to_declared_host() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn resolution_reassigns_fenced_slots_after_owner_restart() {
     let cluster_id = ClusterId::new("fenced-recovery-test").unwrap();
     let (coordinator_node, _) = node(&cluster_id, "coordinator", 26210, 210);
@@ -1060,7 +1065,7 @@ async fn resolution_reassigns_fenced_slots_after_owner_restart() {
         active_move: None,
         barrier_sessions: Default::default(),
     });
-    let mut leader = GroupCoordinator::elect(
+    let mut leader = elect_group(
         store.clone(),
         associations,
         coordinator_node,
@@ -1092,6 +1097,10 @@ async fn resolution_reassigns_fenced_slots_after_owner_restart() {
     )
     .await;
 
+    // A fresh coordinator must observe the fenced records and wait a complete
+    // maximum grant interval before replacement, even when no claim remains.
+    leader.reconcile_bounded_pass().await.unwrap();
+    tokio::time::advance(Duration::from_secs(16)).await;
     leader
         .ensure_shard_allocated(entity_type, ShardId::new(3))
         .await
@@ -1115,6 +1124,7 @@ async fn resolution_reassigns_fenced_slots_after_owner_restart() {
 
 mod admin;
 mod claim_expiry;
+mod etcd_grants;
 mod history;
 mod lifecycle_tests;
 mod read_amplification;

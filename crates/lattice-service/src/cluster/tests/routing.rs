@@ -456,6 +456,7 @@ async fn stale_generation_never_reaches_entity_loader() {
         .chain(std::iter::once(PlacementControlCommand::SnapshotEnd(end)))
         .chain(std::iter::once(PlacementControlCommand::ClaimGranted(
             ClaimGrant {
+                request_id: 0,
                 group: group(),
                 slot: slot_key.clone(),
                 owner: local_node.clone(),
@@ -465,7 +466,14 @@ async fn stale_generation_never_reaches_entity_loader() {
                 ttl: Duration::from_secs(15),
             },
         )));
-    for command in commands {
+    for mut command in commands {
+        if let PlacementControlCommand::ClaimGranted(grant) = &mut command {
+            grant.request_id = state
+                .lock()
+                .unwrap()
+                .pending_claim_request(&grant.slot)
+                .expect("owner emitted renewal request");
+        }
         control_router
             .apply(
                 association_key.clone(),

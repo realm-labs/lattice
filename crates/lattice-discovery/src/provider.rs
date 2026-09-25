@@ -1,12 +1,20 @@
 use std::collections::BTreeSet;
+use std::future::Future;
 use std::pin::Pin;
 
 use futures_util::Stream;
 use lattice_model::cluster::CoordinatorScope;
 use lattice_model::cluster::NodeEndpoint;
+use lattice_model::run::{ClusterLifecycle, RunEpoch};
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum DiscoveryOrigin {
+    /// Read-only connection hints for one exact runtime namespace. This epoch is
+    /// provenance, not permission to serve or proof of current leadership.
+    Etcd {
+        prefix: String,
+        run_epoch: RunEpoch,
+    },
     Static {
         name: String,
     },
@@ -35,6 +43,7 @@ impl DiscoverySource {
         let tls_server_name = match &origin {
             DiscoveryOrigin::Dns { server_name, .. } => Some(server_name.clone()),
             DiscoveryOrigin::Static { .. }
+            | DiscoveryOrigin::Etcd { .. }
             | DiscoveryOrigin::ConfigStore { .. }
             | DiscoveryOrigin::KubernetesEndpointSlice { .. } => None,
         };
@@ -114,7 +123,15 @@ pub enum DiscoveryError {
     InvalidSnapshot { message: String },
 }
 
+pub type TerminalLifecycleFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<Option<ClusterLifecycle>, DiscoveryError>> + Send + 'a>>;
+
 pub trait CoordinatorDiscovery: Send + Sync {
+    /// Optional authoritative terminal receipt lookup. Seed-only providers
+    /// return None; clients may query those seeds through bootstrap instead.
+    fn terminal_lifecycle(&self, _epoch: RunEpoch) -> TerminalLifecycleFuture<'_> {
+        Box::pin(async { Ok(None) })
+    }
     fn scope(&self) -> &CoordinatorScope;
 
     fn snapshots(
@@ -140,6 +157,7 @@ pub(crate) fn validate_target(target: &DiscoveryTarget) -> Result<(), DiscoveryE
     for origin in target.source.origins() {
         let valid = match origin {
             DiscoveryOrigin::Static { name } => !name.is_empty(),
+            DiscoveryOrigin::Etcd { prefix, .. } => !prefix.is_empty(),
             DiscoveryOrigin::ConfigStore { key } => !key.is_empty(),
             DiscoveryOrigin::Dns {
                 query, server_name, ..

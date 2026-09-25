@@ -1,3 +1,4 @@
+use crate::candidate_fixture::elect_group;
 use lattice_remoting::{
     association::Association,
     protocol::{ProtocolDescriptor, ProtocolFingerprint},
@@ -52,7 +53,7 @@ async fn group_fixture(
         u128::from(port_base) * 10 + 5,
     );
     let store = Arc::new(InMemoryCoordinationStore::new(32, 32).unwrap());
-    let mut leader = GroupCoordinator::elect(
+    let mut leader = elect_group(
         store.clone(),
         associations,
         coordinator,
@@ -153,7 +154,7 @@ fn resolve_shard(
     }))
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn transient_claim_lease_failure_focuses_one_slot_instead_of_ending_leadership() {
     let mut fixture = group_fixture(
         "claim-keepalive-resilience",
@@ -200,6 +201,8 @@ async fn transient_claim_lease_failure_focuses_one_slot_instead_of_ending_leader
     let fenced = fixture.store.get_slot(&shard_key).await.unwrap().unwrap();
     assert_eq!(fenced.state, PlacementSlotState::Fenced);
 
+    fixture.leader.reconcile_bounded_pass().await.unwrap();
+    tokio::time::advance(Duration::from_secs(16)).await;
     fixture.leader.reconcile_bounded_pass().await.unwrap();
     let repaired = fixture.store.get_slot(&shard_key).await.unwrap().unwrap();
     assert_eq!(repaired.assignment_generation.get(), 2);
@@ -466,7 +469,7 @@ async fn singleton_kinds_spread_across_one_eligibility_set() {
         .unwrap(),
     );
     let store = Arc::new(InMemoryCoordinationStore::new(64, 64).unwrap());
-    let mut leader = GroupCoordinator::elect(
+    let mut leader = elect_group(
         store,
         associations.clone(),
         coordinator.clone(),

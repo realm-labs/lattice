@@ -66,7 +66,7 @@ async fn framework_marker_is_initialized_once_and_never_overwritten() {
         .unwrap();
     // A candidate must fail before decoding state, granting a lease, or campaigning.
     raw.put(
-        format!("{prefix}/membership/members/poison"),
+        format!("{prefix}/runs/1/membership/members/poison"),
         "not-json",
         None,
     )
@@ -90,14 +90,14 @@ async fn framework_marker_is_initialized_once_and_never_overwritten() {
         ))
     ));
     assert!(
-        raw.get(format!("{prefix}/membership/leader"), None)
+        raw.get(format!("{prefix}/runs/1/membership/leader"), None)
             .await
             .unwrap()
             .kvs()
             .is_empty()
     );
     assert!(
-        raw.get(format!("{prefix}/membership/term"), None)
+        raw.get(format!("{prefix}/meta/terms/cluster"), None)
             .await
             .unwrap()
             .kvs()

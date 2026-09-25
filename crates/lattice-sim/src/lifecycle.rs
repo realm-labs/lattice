@@ -1,7 +1,7 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use lattice_coordination::coordinator::{
-    MemberChange, MemberEvent, MemberHello, MemberRecord, MemberRemovalReason, MemberStatus,
+    MemberChange, MemberEvent, MemberRecord, MemberRemovalReason, MemberStatus,
 };
 use lattice_coordination::types::{CoordinatorTerm, MembershipVersion, NodeKey, Revision};
 use lattice_model::cluster::{NodeEndpoint, NodeIncarnation};
@@ -285,13 +285,6 @@ fn member(node_id: &str, incarnation: u128, port: u16, revision: u64) -> MemberR
     };
     MemberRecord {
         node: node.clone(),
-        hello: MemberHello {
-            node,
-            roles: BTreeSet::new(),
-            failure_domains: BTreeMap::new(),
-            protocols: Vec::new(),
-            remoting_capabilities: BTreeSet::new(),
-        },
         status: MemberStatus::Up,
         version: MembershipVersion::new(
             CoordinatorTerm::new(1).unwrap(),

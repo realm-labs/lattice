@@ -1,3 +1,4 @@
+use crate::shutdown::ClusterStopHook;
 use lattice_actor_distributed::registry::ActorDefinition;
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -91,6 +92,7 @@ pub(crate) struct LogicalEntityInstaller {
 }
 
 pub struct LatticeServiceBuilder {
+    cluster_stop_hook: Option<Arc<dyn ClusterStopHook>>,
     actor_runtime: ActorRuntime,
     config: NodeConfig,
     associations: Arc<AssociationManager>,
@@ -127,6 +129,7 @@ struct LogicRuntimeAssembly {
 }
 
 struct CoordinatorRuntimeAssembly {
+    lifecycle: watch::Receiver<lattice_model::run::ClusterLifecycle>,
     future: Pin<Box<dyn Future<Output = ()> + Send>>,
     shutdown: watch::Sender<bool>,
     handles: BTreeMap<ActorGroupId, GroupCoordinatorHandle>,
@@ -160,6 +163,7 @@ impl LatticeServiceBuilder {
                 .map_err(ServiceError::Messaging)?,
         );
         Ok(Self {
+            cluster_stop_hook: None,
             actor_runtime,
             hosts: ProtocolHostRegistry::new(config.maximum_actor_protocols)
                 .map_err(ServiceError::Host)?,
@@ -190,6 +194,12 @@ impl LatticeServiceBuilder {
 
     pub fn association_manager(&self) -> Arc<AssociationManager> {
         self.associations.clone()
+    }
+
+    /// Includes detached application work in the cluster-stop evidence contract.
+    pub fn cluster_stop_hook(mut self, hook: Arc<dyn ClusterStopHook>) -> Self {
+        self.cluster_stop_hook = Some(hook);
+        self
     }
 
     /// Execution entry point for registries created before building this service.
@@ -684,6 +694,7 @@ impl LatticeServiceBuilder {
         S: CoordinatorLeaseStore + ScopedElectionStore + MembershipStore + ActorGroupStore,
     {
         let directory = host.subscribe_directory();
+        let lifecycle = host.subscribe_lifecycle();
         let scope_states = host.subscribe_scope_states();
         let mut scope_records = Vec::new();
         if let Some(CoordinatorHostScopeState::Active(record)) =
@@ -718,6 +729,7 @@ impl LatticeServiceBuilder {
             .collect();
         self.control_dispatch = dispatch;
         self.coordinator_runtime = Some(CoordinatorRuntimeAssembly {
+            lifecycle,
             future: Box::pin(async move {
                 if let Err(error) = host.run(controls, shutdown_rx).await {
                     tracing::error!(
@@ -1030,6 +1042,7 @@ impl LatticeServiceBuilder {
         }));
         let (membership_ready, _) = watch::channel(false);
         let membership_handle = Arc::new(Mutex::new(None));
+        let (cluster_run, _) = watch::channel(None);
         let join_runtimes = auto_join
             .into_iter()
             .map(|(discovery, controls, _member_hello, group_hello)| {
@@ -1068,6 +1081,7 @@ impl LatticeServiceBuilder {
                 })
             })
             .collect::<Result<Vec<_>, ServiceError>>()?;
+        let mut completion_controller = None;
         let membership_join_runtime = auto_membership
             .map(|(discovery, controls, hello)| {
                 let controller = JoinController::new(
@@ -1077,8 +1091,15 @@ impl LatticeServiceBuilder {
                     self.join_config.clone(),
                 )
                 .map_err(ServiceError::Join)?;
+                let controller = Arc::new(controller);
+                completion_controller = Some(controller.clone());
                 Ok::<MembershipJoinRuntime, ServiceError>(MembershipJoinRuntime {
-                    controller: Arc::new(controller),
+                    cluster_run: cluster_run.clone(),
+                    stop_result: Mutex::new(None),
+                    hosts: hosts.clone(),
+                    stop_hook: self.cluster_stop_hook.clone(),
+                    stop_timeout: self.join_config.shutdown_timeout,
+                    controller,
                     hello,
                     associations: associations.clone(),
                     controls: Some(controls),
@@ -1096,6 +1117,9 @@ impl LatticeServiceBuilder {
             })
             .transpose()?;
         Ok(LatticeService {
+            completion_controller,
+            cluster_run,
+            cluster_stop_hook: self.cluster_stop_hook,
             actor_runtime: Mutex::new(Some(self.actor_runtime)),
             cluster_id: self.config.cluster_id.clone(),
             actor_system,

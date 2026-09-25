@@ -907,3 +907,39 @@ async fn ordered_free_ports() -> (u16, u16) {
     drop((first_listener, second_listener));
     (first.min(second), first.max(second))
 }
+
+#[cfg(any(feature = "rustls-ring", feature = "rustls-aws-lc"))]
+#[tokio::test]
+async fn tls_association_exposes_verified_control_identity_in_both_directions() {
+    let (lower_port, higher_port) = ordered_free_ports().await;
+    let cluster = ClusterId::new("tls-control-auth").unwrap();
+    let lower_identity = identity(cluster.clone(), "lower", 71, lower_port);
+    let higher_identity = identity(cluster, "higher", 72, higher_port);
+    let (lower_security, higher_security) =
+        tls_security_pair(&lower_identity, &higher_identity, &higher_identity);
+    let (lower, _) = endpoint_with_security(lower_identity.clone(), lower_security);
+    let (higher, higher_manager) = endpoint_with_security(higher_identity.clone(), higher_security);
+    higher.bind().await.unwrap();
+    lower.bind().await.unwrap();
+    let outbound = lower.connect_peer(higher_identity.clone()).await.unwrap();
+    assert_eq!(outbound.authenticated_control_peer(), Some(higher_identity));
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let Some(inbound) = higher_manager.get_exact(
+                &lower_identity.cluster_id,
+                &lower_identity.address,
+                lower_identity.incarnation,
+            ) {
+                if inbound.authenticated_control_peer() == Some(lower_identity.clone()) {
+                    break;
+                }
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("inbound TLS control peer was not recorded");
+    lower.shutdown().await.unwrap();
+    higher.shutdown().await.unwrap();
+    assert!(outbound.authenticated_control_peer().is_none());
+}

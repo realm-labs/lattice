@@ -1,3 +1,20 @@
+/// Fixture-only administration: concurrently started test candidates explicitly
+/// reconcile policy-revision conflicts. Production election never self-enrolls.
+async fn provision_fixture_candidate<S: CandidateStore + ?Sized>(
+    store: &S,
+    scope: CoordinatorScope,
+    node_id: String,
+) -> Result<(), StorageError> {
+    for _ in 0..8 {
+        match provision_candidate(store, scope.clone(), node_id.clone()).await {
+            Ok(_) => return Ok(()),
+            Err(StorageError::CompareFailed) => tokio::task::yield_now().await,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(StorageError::CompareFailed)
+}
+
 fn fixture_entity_config() -> Result<EntityConfig, Box<dyn Error>> {
     Ok(EntityConfig::new(
         actor_group(),

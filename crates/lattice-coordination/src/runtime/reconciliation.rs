@@ -62,6 +62,11 @@ where
                 global.node != member.node || global.status != MemberStatus::Up
             });
             if !stale {
+                if !self.sessions.contains_key(&member.node.incarnation) {
+                    self.reconciliation
+                        .unrecovered_members
+                        .insert(member.node.incarnation, member);
+                }
                 continue;
             }
             let node = member.node.clone();
@@ -89,6 +94,14 @@ where
     }
 
     pub(super) async fn reconcile_bounded_pass(&mut self) -> Result<(), CoordinatorRuntimeError> {
+        self.retire_unrecovered_members().await?;
+        self.reconciliation.barrier_gc_cursor = self
+            .store
+            .reclaim_orphan_barriers(
+                &self.leader_guard,
+                self.reconciliation.barrier_gc_cursor.as_deref(),
+            )
+            .await?;
         if self.reconciliation.focused {
             self.reconciliation.cursor = None;
             self.reconciliation.focused = false;
@@ -141,6 +154,59 @@ where
                 self.reconciliation.oldest_pending = None;
                 self.reconciliation.last_success = Some(Instant::now());
             }
+        }
+        Ok(())
+    }
+
+    /// A recovered participation record is not a live description. Give its node
+    /// the normal heartbeat grace period to reattach; otherwise remove that exact
+    /// group admission, even if another group keeps global membership alive.
+    /// This is only a session fence: prior grants still require the full holdoff.
+    async fn retire_unrecovered_members(&mut self) -> Result<(), CoordinatorRuntimeError> {
+        if self.origin.elapsed() <= self.config.member_heartbeat_timeout {
+            return Ok(());
+        }
+        let candidates = self
+            .reconciliation
+            .unrecovered_members
+            .values()
+            .take(self.config.maximum_reconciliation_work_per_pass)
+            .cloned()
+            .collect::<Vec<_>>();
+        for expected in candidates {
+            let incarnation = expected.node.incarnation;
+            if self.sessions.contains_key(&incarnation) {
+                self.reconciliation.unrecovered_members.remove(&incarnation);
+                continue;
+            }
+            let current = self
+                .store
+                .get_group_member(&self.version.group, &expected.node.node_id)
+                .await?;
+            if current.as_ref().is_some_and(|record| record != &expected) {
+                self.reconciliation.unrecovered_members.remove(&incarnation);
+                continue;
+            }
+            if current.is_some() {
+                self.store
+                    .remove_group_member(
+                        &self.leader_guard,
+                        RemoveGroupMember {
+                            expected: expected.clone(),
+                        },
+                    )
+                    .await?;
+                self.version = PlacementVersion::new(
+                    self.version.group.clone(),
+                    self.version.term,
+                    self.store
+                        .get_placement_revision(&self.version.group)
+                        .await?,
+                );
+            }
+            self.reconciliation.unrecovered_members.remove(&incarnation);
+            self.finish_node_removal(expected.node, MemberRemovalReason::FailureDetected)
+                .await?;
         }
         Ok(())
     }
@@ -256,6 +322,13 @@ where
                 }
                 self.clear_quarantine(&slot.key);
             }
+            (false, None)
+                if slot.state == PlacementSlotState::Fenced && slot.active_move.is_some() =>
+            {
+                if self.handoffs.contains_key(&key) {
+                    Box::pin(self.replace_authority(&key)).await?;
+                }
+            }
             _ => {}
         }
         Ok(())
@@ -269,7 +342,7 @@ where
         claim.grant.slot == slot.key
             && slot.owner.as_ref() == Some(&claim.grant.owner)
             && slot.assignment_generation == claim.grant.assignment_generation
-            && slot.version.term == claim.grant.coordinator_term
+            && slot.version.term <= claim.grant.coordinator_term
     }
 
     async fn adopt_authority_record(
@@ -284,6 +357,7 @@ where
         };
         let lease_id = self.store.grant_lease(self.config.claim_ttl).await?;
         let grant = ClaimGrant {
+            request_id: 0,
             group: slot.key.group().clone(),
             slot: slot.key.clone(),
             owner: previous.grant.owner.clone(),
@@ -365,6 +439,10 @@ where
         if !self.reconciliation.initial_complete {
             return Ok(false);
         }
+        if !self.replacement_wait_complete(&slot.key, slot.assignment_generation) {
+            self.focus_reconciliation(&slot.key);
+            return Ok(false);
+        }
         let owner = match &slot.key {
             PlacementSlotKey::Shard {
                 entity_type,
@@ -419,6 +497,7 @@ where
         allocating.state = PlacementSlotState::Allocating;
         allocating.version = self.next_version()?;
         let grant = ClaimGrant {
+            request_id: 0,
             group: allocating.key.group().clone(),
             slot: allocating.key.clone(),
             owner: owner.clone(),
@@ -484,7 +563,7 @@ where
         }
     }
 
-    fn quarantine(&mut self, key: &PlacementSlotKey, reason: &str) {
+    pub(super) fn quarantine(&mut self, key: &PlacementSlotKey, reason: &str) {
         if self.reconciliation.quarantined.len() < self.config.maximum_quarantined_records {
             self.reconciliation
                 .quarantined

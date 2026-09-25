@@ -138,13 +138,22 @@ where
             .ok_or(CoordinatorRuntimeError::AssociationUnavailable)?;
         let wait_timeout =
             Duration::from_millis(config.group.snapshot_limits.staging_timeout_millis);
-        for command in std::iter::once(PlacementControlCommand::SnapshotBegin(begin))
-            .chain(
-                chunks
-                    .into_iter()
-                    .map(PlacementControlCommand::SnapshotChunk),
-            )
-            .chain(std::iter::once(PlacementControlCommand::SnapshotEnd(end)))
+        let lifecycle = store.lifecycle().await?;
+        if !lifecycle.is_running() {
+            return Err(crate::storage::StorageError::RunNotRunning.into());
+        }
+        for command in std::iter::once(PlacementControlCommand::ClusterRunning {
+            epoch: lifecycle.epoch,
+        })
+        .chain(std::iter::once(PlacementControlCommand::SnapshotBegin(
+            begin,
+        )))
+        .chain(
+            chunks
+                .into_iter()
+                .map(PlacementControlCommand::SnapshotChunk),
+        )
+        .chain(std::iter::once(PlacementControlCommand::SnapshotEnd(end)))
         {
             let payload = encode_control_command_for_term(
                 &CoordinatorScope::Cluster,

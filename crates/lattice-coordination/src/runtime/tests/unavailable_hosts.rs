@@ -1,4 +1,5 @@
 use super::*;
+use crate::candidate_fixture::elect_group;
 
 #[tokio::test]
 async fn unavailable_shard_resolution_fails_fast_and_a_later_request_can_allocate() {
@@ -29,7 +30,7 @@ async fn unavailable_shard_resolution_fails_fast_and_a_later_request_can_allocat
         70,
     );
     let store = Arc::new(InMemoryCoordinationStore::new(16, 16).unwrap());
-    let mut leader = GroupCoordinator::elect(
+    let mut leader = elect_group(
         store.clone(),
         associations,
         coordinator_node,

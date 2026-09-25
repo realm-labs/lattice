@@ -4,6 +4,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use lattice_model::run::ClusterLifecycle;
 use serde::Deserialize;
 
 use super::{testctl_artifacts::ScopedLeadershipArtifact, testctl_commands::output};
@@ -41,7 +42,25 @@ pub(super) fn coordinator_leader_from_etcd(
     etcd_member: &str,
     run_id: &str,
 ) -> Result<ScopedLeadershipArtifact, String> {
-    let key = format!("/lattice-ha/{run_id}/domains/distributed-simulation/leader");
+    let lifecycle_key = format!("/lattice-ha/{run_id}/meta/lifecycle");
+    let lifecycle = output(
+        "docker",
+        &[
+            "exec",
+            etcd_member,
+            "etcdctl",
+            "--endpoints=http://127.0.0.1:2379",
+            "get",
+            &lifecycle_key,
+            "--print-value-only",
+        ],
+    )?;
+    let lifecycle: ClusterLifecycle =
+        serde_json::from_str(&lifecycle).map_err(|error| error.to_string())?;
+    let key = format!(
+        "/lattice-ha/{run_id}/runs/{}/groups/distributed-simulation/leader",
+        lifecycle.epoch.get()
+    );
     let encoded = output(
         "docker",
         &[

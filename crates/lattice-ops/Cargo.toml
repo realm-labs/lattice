@@ -7,6 +7,8 @@ repository.workspace = true
 
 [dependencies]
 async-trait.workspace = true
+clap.workspace = true
+etcd-client.workspace = true
 axum.workspace = true
 lattice-model.workspace = true
 lattice-coordination.workspace = true

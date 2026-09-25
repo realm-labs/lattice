@@ -1,4 +1,5 @@
 use super::*;
+use crate::{candidate_fixture::elect_group, plan::RebalanceMove};
 
 #[tokio::test]
 async fn terminal_plan_history_compacts_oldest_persisted_record() {
@@ -13,7 +14,7 @@ async fn terminal_plan_history_compacts_oldest_persisted_record() {
         .unwrap(),
     );
     let store = Arc::new(InMemoryCoordinationStore::new(8, 8).unwrap());
-    let mut leader = GroupCoordinator::elect(
+    let mut leader = elect_group(
         store.clone(),
         associations,
         coordinator,
@@ -43,7 +44,16 @@ async fn terminal_plan_history_compacts_oldest_persisted_record() {
             policy_id: "test".to_owned(),
             policy_version: 1,
             status: PlanStatus::Completed,
-            moves: Vec::new(),
+            moves: vec![RebalanceMove {
+                shard_id: ShardId::new(id as u32),
+                expected_generation: AssignmentGeneration::new(1).unwrap(),
+                source: node(&cluster_id, "source", 26311, 311).0,
+                target: node(&cluster_id, "target", 26312, 312).0,
+                estimated_weight: 1,
+                progress: MoveProgress::Completed,
+                barrier_version: None,
+                barrier_sessions: BTreeSet::new(),
+            }],
         };
         store
             .create_plan(&leader.leader_guard, CreatePlan { plan: plan.clone() })

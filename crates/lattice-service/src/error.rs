@@ -3,6 +3,7 @@ use lattice_actor_distributed::{
     protocol::ProtocolBuildError,
     recipient::ProtocolRegistrationError,
 };
+use lattice_coordination::{cluster_session::ShutdownRequestError, session::GroupSessionError};
 use lattice_coordination::{
     control::PlacementControlError, region::RegionError, runtime::CoordinatorRuntimeError,
 };
@@ -21,6 +22,18 @@ use crate::{
 
 #[derive(Debug, Error)]
 pub enum ServiceError {
+    #[error("cluster shutdown request failed: {0}")]
+    ClusterShutdownRequest(#[source] ShutdownRequestError),
+    #[error("cluster stop hook failed: {0}")]
+    ClusterStopHook(String),
+    #[error("cluster control session unavailable")]
+    ClusterSessionUnavailable,
+    #[error("cluster shutdown wait timed out; the durable operation continues")]
+    ClusterShutdownTimeout,
+    #[error("observed cluster run differs from the requested shutdown")]
+    ClusterRunChanged,
+    #[error("cluster control session failed")]
+    ClusterSession(#[source] GroupSessionError),
     #[error("node configuration is invalid")]
     Config(#[source] NodeConfigError),
     #[error("cluster join configuration is invalid")]

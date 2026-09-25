@@ -48,14 +48,21 @@ async fn admission_closes_on_the_installed_deadline_even_though_no_tick_ran() {
         active_move: None,
         barrier_sessions: Default::default(),
     };
-    let origin = Instant::now();
+    let origin = AuthorityClock::new().unwrap();
     let mut authority = PlacementAuthority::new(local.clone(), Duration::from_secs(2)).unwrap();
     authority
         .transition(AuthorityEvent::ReconcileSlot(slot.clone()))
         .unwrap();
     authority
+        .transition(AuthorityEvent::BeginRenewal {
+            request_id: 1,
+            now: monotonic_since(origin),
+        })
+        .unwrap();
+    authority
         .transition(AuthorityEvent::InstallGrant {
             grant: ClaimGrant {
+                request_id: 1,
                 group: group.clone(),
                 slot: key.clone(),
                 owner: local.clone(),

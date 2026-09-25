@@ -8,6 +8,7 @@ use broadcast::error::RecvError;
 use lattice_model::{
     cluster::CoordinatorScope,
     cluster::{ActorGroupId, NodeIncarnation},
+    run::{ClusterLifecycle, RunPhase},
 };
 use lattice_remoting::association::{AssociationKey, AssociationManager};
 use tokio::{
@@ -20,22 +21,32 @@ use super::{
     cluster::{ClusterCoordinator, ClusterCoordinatorConfig},
 };
 use crate::{
+    administration::AdministratorAllowlist,
     allocation::{
         ShardAllocationStrategy,
         registry::{ShardAllocationStrategies, StrategyRegistrationError},
     },
+    candidates::CandidateRegistration,
     control::PlacementControlEvent,
     coordinator::{LeaderRecord, MemberEvent, MemberHello},
-    storage::{ActorGroupStore, CoordinatorLeaseStore, MembershipStore, ScopedElectionStore},
+    storage::{
+        ActorGroupStore, CoordinatorLeaseStore, MembershipStore, ScopedElectionStore, StorageError,
+    },
     types::NodeKey,
 };
 
+#[cfg(test)]
+mod candidate_tests;
+mod candidates;
 #[cfg(test)]
 mod cluster_tests;
 mod election;
 mod helpers;
 mod member_fanout;
 mod routing;
+mod shutdown;
+#[cfg(test)]
+mod shutdown_tests;
 #[cfg(test)]
 mod strategy_tests;
 mod tasks;
@@ -48,6 +59,8 @@ use tasks::OwnedTasks;
 
 #[derive(Debug, Clone)]
 pub struct CoordinatorHostConfig {
+    /// Remote management is denied unless an explicit mTLS administrator policy is supplied.
+    pub administrators: Option<AdministratorAllowlist>,
     pub cluster: ClusterCoordinatorConfig,
     pub group: GroupCoordinatorConfig,
     pub maximum_groups: usize,
@@ -62,6 +75,7 @@ pub struct CoordinatorHostConfig {
 impl Default for CoordinatorHostConfig {
     fn default() -> Self {
         Self {
+            administrators: None,
             cluster: ClusterCoordinatorConfig::default(),
             group: GroupCoordinatorConfig::default(),
             maximum_groups: 64,
@@ -157,9 +171,11 @@ pub struct CoordinatorHost<S>
 where
     S: CoordinatorLeaseStore + ScopedElectionStore + MembershipStore + ActorGroupStore,
 {
+    lifecycle_events: watch::Sender<ClusterLifecycle>,
     store: Arc<S>,
     associations: Arc<AssociationManager>,
     node: NodeKey,
+    candidate_registrations: BTreeMap<CoordinatorScope, CandidateRegistration>,
     membership: Option<ClusterCoordinator<S>>,
     membership_events: Option<broadcast::Receiver<MemberEvent>>,
     membership_state: CoordinatorHostScopeState,
@@ -187,7 +203,37 @@ where
         config: CoordinatorHostConfig,
     ) -> Result<Self, CoordinatorRuntimeError> {
         config.validate(&groups)?;
-        store.ensure_framework().await?;
+        if let Err(error) = store.ensure_framework().await {
+            let lifecycle = store.lifecycle().await?;
+            if error == StorageError::RunNotRunning
+                && matches!(lifecycle.phase, RunPhase::Closed { .. })
+            {
+                let (directory_events, _) = watch::channel(BTreeMap::new());
+                let (scope_events, _) = watch::channel(BTreeMap::new());
+                let (lifecycle_events, _) = watch::channel(lifecycle);
+                return Ok(Self {
+                    store,
+                    associations,
+                    node,
+                    candidate_registrations: BTreeMap::new(),
+                    membership: None,
+                    membership_events: None,
+                    membership_state: CoordinatorHostScopeState::Standby,
+                    groups: BTreeMap::new(),
+                    pending_member_hellos: BTreeMap::new(),
+                    membership_associations: BTreeMap::new(),
+                    directory_events,
+                    scope_events,
+                    lifecycle_events,
+                    background_tasks: OwnedTasks::new(),
+                    snapshotting_associations: HashSet::new(),
+                    pending_snapshot_replays: HashSet::new(),
+                    reconciling_groups: BTreeSet::new(),
+                    config,
+                });
+            }
+            return Err(error.into());
+        }
 
         candidate_delay(
             &CoordinatorScope::Cluster,
@@ -205,7 +251,10 @@ where
         .await
         {
             Ok(leader) => Some(leader),
-            Err(CoordinatorRuntimeError::NotLeader) => None,
+            Err(
+                CoordinatorRuntimeError::NotLeader
+                | CoordinatorRuntimeError::Storage(StorageError::CandidateNotEligible),
+            ) => None,
             Err(error) => return Err(error),
         };
         let membership_state = membership
@@ -231,7 +280,10 @@ where
             .await
             {
                 Ok(leader) => Some(leader),
-                Err(CoordinatorRuntimeError::NotLeader) => None,
+                Err(
+                    CoordinatorRuntimeError::NotLeader
+                    | CoordinatorRuntimeError::Storage(StorageError::CandidateNotEligible),
+                ) => None,
                 Err(error) => return Err(error),
             };
             let state = leader
@@ -267,7 +319,10 @@ where
             scope_states.insert(CoordinatorScope::Group(group.clone()), hosted.state.clone());
         }
         let (scope_events, _) = watch::channel(scope_states);
-        Ok(Self {
+        let (lifecycle_events, _) = watch::channel(store.lifecycle().await?);
+        let mut host = Self {
+            lifecycle_events,
+            candidate_registrations: BTreeMap::new(),
             store,
             associations,
             node,
@@ -284,11 +339,31 @@ where
             pending_snapshot_replays: HashSet::new(),
             reconciling_groups: BTreeSet::new(),
             config,
-        })
+        };
+        // Existing active elections registered themselves; reuse those exact
+        // identities rather than replacing a registration underneath a leader.
+        for scope in std::iter::once(CoordinatorScope::Cluster)
+            .chain(host.groups.keys().cloned().map(CoordinatorScope::Group))
+        {
+            for registration in host.store.online_candidates(&scope).await? {
+                if registration.node == host.node {
+                    host.candidate_registrations
+                        .insert(scope.clone(), registration);
+                }
+            }
+        }
+        host.refresh_candidate_registrations().await?;
+        Ok(host)
     }
 
     pub fn node(&self) -> &NodeKey {
         &self.node
+    }
+
+    /// Persisted lifecycle observation, including terminal results when no
+    /// serving leader exists. This stream is not serving authority.
+    pub fn subscribe_lifecycle(&self) -> watch::Receiver<ClusterLifecycle> {
+        self.lifecycle_events.subscribe()
     }
 
     pub fn scope_state(&self, scope: &CoordinatorScope) -> Option<&CoordinatorHostScopeState> {
@@ -361,9 +436,29 @@ where
                     }
                 }
                 _ = renewal.tick() => {
+                    if let Ok(lifecycle) = self.store.lifecycle().await {
+                        if lifecycle.epoch != self.lifecycle_events.borrow().epoch {
+                            // A process belongs to exactly one run; starting a new run
+                            // never revives a stopped coordinator or its old identities.
+                            continue;
+                        }
+                        self.lifecycle_events.send_replace(lifecycle);
+                    }
+                    if matches!(self.lifecycle_events.borrow().phase,RunPhase::Closed{..}) {
+                        let _ = self.drive_cluster_shutdown().await;
+                        continue;
+                    }
+                    if let Err(error) = self.refresh_candidate_registrations().await {
+                        tracing::warn!(%error, "candidate registration refresh failed");
+                    }
                     self.renew_membership().await;
+                    if let Err(error) = self.drive_cluster_shutdown().await {
+                        tracing::warn!(%error, "cluster shutdown progress deferred");
+                    }
+                    if let Ok(lifecycle)=self.store.lifecycle().await {self.lifecycle_events.send_replace(lifecycle);}
                 }
                 _ = election.tick() => {
+                    if !self.lifecycle_events.borrow().is_running() {continue;}
                     let inactive = self.groups
                         .iter()
                         .filter_map(|(group, hosted)| hosted.sender.is_none().then_some(group.clone()))
@@ -371,6 +466,7 @@ where
                     self.spawn_campaigns(inactive, &mut campaigning, &mut elections);
                 }
                 _ = member_reconciliation.tick() => {
+                    if !self.lifecycle_events.borrow().is_running() {continue;}
                     self.spawn_global_member_reconciliation();
                 }
                 Some((group, outcome)) = elections.join_next(), if !elections.is_empty() => {
@@ -461,6 +557,10 @@ where
         while self.background_tasks.join_next().await.is_some() {}
         if let Some(membership) = self.membership.take() {
             membership.shutdown().await?;
+        }
+        for registration in self.candidate_registrations.values() {
+            let _ = self.store.unregister_candidate(registration).await;
+            let _ = self.store.revoke_lease(registration.lease_id).await;
         }
         Ok(())
     }

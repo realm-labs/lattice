@@ -31,7 +31,7 @@ where
 {
     match command {
         ActorCommand::Envelope(mut envelope) => {
-            if handle.business_admission_fenced() {
+            if handle.business_execution_fenced() {
                 reject_prefetched_commands(
                     once(ActorCommand::Envelope(envelope)),
                     lane,
@@ -108,7 +108,7 @@ where
                 mailbox.lane = lane.as_str(),
                 "actor message handled"
             );
-            if handle.business_admission_fenced() {
+            if handle.business_execution_fenced() {
                 *stop_reason = Some(StopReason::Requested);
                 return Ok(true);
             }

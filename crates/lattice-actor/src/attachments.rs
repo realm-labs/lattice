@@ -9,6 +9,12 @@ use std::{
 
 use thiserror::Error;
 
+/// Runtime integration's execution-time authority predicate. Installed before spawn;
+/// a false observation permanently fences this activation. It must be synchronous,
+/// bounded, and must not call back into the Actor runtime.
+#[doc(hidden)]
+pub struct ActorExecutionGate(pub Arc<dyn Fn() -> bool + Send + Sync>);
+
 /// Type-indexed attachments installed by a runtime integration for one Actor activation.
 ///
 /// Attachments let integrations expose activation-specific metadata without adding their concepts

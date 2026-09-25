@@ -1,3 +1,4 @@
+use lattice_model::run::{ClosingStage, ClusterLifecycle, RunPhase};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -12,6 +13,10 @@ use lattice_remoting::{
 };
 use tokio::sync::{mpsc, watch};
 
+use crate::shutdown::ClusterStopHook;
+use lattice_actor_distributed::host::ProtocolHostRegistry;
+use lattice_coordination::shutdown::{NodeStopOutcome, ShutdownReport};
+
 use super::{
     join::{BootstrapView, JoinController, JoinEvent},
     peers::PeerReconciler,
@@ -22,6 +27,11 @@ use crate::lifecycle::{
 };
 
 pub(crate) struct MembershipJoinRuntime {
+    pub cluster_run: watch::Sender<Option<ClusterLifecycle>>,
+    pub stop_result: Mutex<Option<ShutdownReport>>,
+    pub hosts: Arc<ProtocolHostRegistry>,
+    pub stop_hook: Option<Arc<dyn ClusterStopHook>>,
+    pub stop_timeout: Duration,
     pub controller: Arc<JoinController>,
     pub hello: MemberHello,
     pub associations: Arc<AssociationManager>,
@@ -53,6 +63,34 @@ struct ClusterSessionReturn {
 
 impl MembershipJoinRuntime {
     pub async fn run(mut self, mut shutdown: watch::Receiver<bool>) {
+        let terminal_monitor = {
+            let controller = self.controller.clone();
+            let cluster_run = self.cluster_run.clone();
+            let driver = self.lifecycle_driver.clone();
+            let mut cancelled = shutdown.clone();
+            tokio::spawn(async move {
+                loop {
+                    let observed = cluster_run.borrow().clone();
+                    if let Some(run) = observed {
+                        if matches!(run.phase, RunPhase::Closing { .. }) {
+                            if let Some(closed) = controller.query_completion(run.epoch).await {
+                                cluster_run.send_replace(Some(closed));
+                                if driver.state() != NodeLifecycleState::Stopping
+                                    && driver.state() != NodeLifecycleState::Terminated
+                                {
+                                    let _ = driver.transition(ServiceLifecycleEvent::ForceStop);
+                                }
+                                return;
+                            }
+                        }
+                    }
+                    tokio::select! {
+                        changed=cancelled.changed()=>{if changed.is_err()||*cancelled.borrow(){return;}}
+                        ()=tokio::time::sleep(Duration::from_secs(1))=>{}
+                    }
+                }
+            })
+        };
         let (join_events_tx, mut join_events) = mpsc::channel(8);
         let controller = tokio::spawn(
             self.controller
@@ -148,6 +186,8 @@ impl MembershipJoinRuntime {
             }
         }
         controller.abort();
+        terminal_monitor.abort();
+        let _ = terminal_monitor.await;
         {
             let mut handle = self.handle.lock().expect("membership handle poisoned");
             if handle
@@ -180,11 +220,17 @@ impl MembershipJoinRuntime {
             .expect("membership session state poisoned")
             .change_notifier();
         loop {
-            if state
-                .lock()
-                .expect("membership session state poisoned")
-                .ready()
+            if !self
+                .cluster_run
+                .borrow()
+                .as_ref()
+                .is_some_and(|run| !run.is_running())
+                && state
+                    .lock()
+                    .expect("membership session state poisoned")
+                    .ready()
             {
+                self.controller.set_session_healthy(true);
                 // Placement sessions re-bootstrap on readiness transitions, not every heartbeat.
                 self.ready.send_if_modified(|ready| {
                     let changed = !*ready;
@@ -315,6 +361,95 @@ impl MembershipJoinRuntime {
 
     async fn apply_effect(&self, effect: LogicPlacementEffect) -> Result<(), ()> {
         match effect {
+            LogicPlacementEffect::ClusterClosing { epoch, operation } => {
+                if self.cluster_run.borrow().as_ref().is_some_and(|run| {
+                    run.epoch == epoch && matches!(run.phase, RunPhase::Closed { .. })
+                }) {
+                    return Ok(());
+                }
+                self.cluster_run.send_replace(Some(ClusterLifecycle {
+                    epoch,
+                    phase: RunPhase::Closing {
+                        operation: operation.clone(),
+                        stage: ClosingStage::Draining,
+                    },
+                }));
+                if matches!(
+                    self.lifecycle_driver.state(),
+                    NodeLifecycleState::JoiningMembership | NodeLifecycleState::Ready
+                ) {
+                    self.lifecycle_driver
+                        .transition(ServiceLifecycleEvent::BeginDrain)
+                        .map_err(|_| ())?;
+                }
+                self.ready.send_replace(false);
+                self.hosts.close_business_admission();
+                let previous = self
+                    .stop_result
+                    .lock()
+                    .expect("stop result poisoned")
+                    .clone()
+                    .filter(|report| {
+                        report.epoch == epoch
+                            && report.operation == operation
+                            && report.outcome == NodeStopOutcome::Stopped
+                    });
+                let stop = async {
+                    if let Some(hook) = &self.stop_hook {
+                        hook.stop().await?;
+                    }
+                    let remaining = self.hosts.drain_all().await;
+                    if remaining.is_empty() {
+                        Ok(())
+                    } else {
+                        Err(format!(
+                            "{} Actor instances require stop intervention",
+                            remaining.len()
+                        ))
+                    }
+                };
+                let outcome = if previous.is_some() {
+                    NodeStopOutcome::Stopped
+                } else {
+                    match tokio::time::timeout(self.stop_timeout, stop).await {
+                        Ok(Ok(())) => NodeStopOutcome::Stopped,
+                        Ok(Err(reason)) => NodeStopOutcome::Blocked {
+                            reason: reason.chars().take(256).collect(),
+                        },
+                        Err(_) => NodeStopOutcome::Blocked {
+                            reason: "local cluster-stop deadline elapsed; admission remains closed"
+                                .to_owned(),
+                        },
+                    }
+                };
+                let handle = self
+                    .handle
+                    .lock()
+                    .expect("membership handle poisoned")
+                    .clone()
+                    .ok_or(())?;
+                let report = ShutdownReport {
+                    epoch,
+                    operation,
+                    node: self.hello.node.clone(),
+                    outcome,
+                };
+                *self.stop_result.lock().expect("stop result poisoned") = Some(report.clone());
+                handle.report_cluster_stop(report).await.map_err(|_| ())
+            }
+            LogicPlacementEffect::ClusterClosed(lifecycle) => {
+                self.cluster_run.send_replace(Some(lifecycle));
+                // Stop reports were sent while reply/control channels remained
+                // alive. Only a confirmable Closed result tears down runtimes.
+                if self.lifecycle_driver.state() != NodeLifecycleState::Stopping
+                    && self.lifecycle_driver.state() != NodeLifecycleState::Terminated
+                {
+                    self.lifecycle_driver
+                        .transition(ServiceLifecycleEvent::ForceStop)
+                        .map_err(|_| ())?;
+                }
+                Ok(())
+            }
             LogicPlacementEffect::MemberSnapshot { version, members } => self
                 .peers
                 .install_snapshot(version, members)
@@ -349,6 +484,7 @@ impl MembershipJoinRuntime {
     }
 
     fn mark_membership_lost(&self) {
+        self.controller.set_session_healthy(false);
         self.ready.send_replace(false);
         let _ = self
             .lifecycle_driver

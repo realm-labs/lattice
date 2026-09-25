@@ -14,13 +14,18 @@ binaries can safely coexist.
 
 Until that design is implemented, deploy one application version at a time:
 
-1. Close external admission and drain the running deployment using its existing
-   lifecycle APIs. Keep required Coordinators available until draining completes.
+1. Close external admission and request [cluster shutdown](cluster-shutdown.md).
+   Await a durable `Closed { completion: Graceful }` outcome; keep required
+   Coordinators and discovery entries available until draining and cleanup finish.
+   A timeout or blocked participant is not successful shutdown.
 2. Stop all old application and Coordinator processes and confirm their leases and
    ownership are no longer live.
-3. For a framework identity change, prepare a fresh coordination namespace. Existing
-   runtime metadata is not upgraded or automatically deleted. Handle durable business
-   data separately; legacy storage migration tooling has been removed.
+3. For an unchanged framework identity, explicitly start the next run after confirmed
+   cleanup. For a framework identity change, prepare a fresh coordination namespace;
+   use the old version's maintenance tool for any old-run abnormal reset. Do not
+   rewrite the framework marker or load the old runtime schema with the new binary.
+   Reprovision definitions and candidate authorization deliberately. Preserve
+   externally meaningful ID history and handle durable business data separately.
 4. Start the new Coordinators and application nodes, verify readiness, then reopen
    admission.
 
@@ -33,5 +38,8 @@ Coordinator namespace initialization. Published packages and development builds 
 the exact Cargo package version without a source digest. Same-version source changes
 are not detected: developers must deploy consistent builds and bump the version for
 incompatible protocol or storage changes. A restart alone does not change the identity.
-Cluster-wide shutdown and scoped runtime reset remain
-planned; see the [implementation checkpoint](../cluster-control-plane-memo.md#96-verification-and-completion-tracking).
+Cluster shutdown and [scoped abnormal reset](cluster-reset.md) have distinct
+completion contracts. Reset requires proof by the operator that all old processes
+are stopped; it cannot turn missing stop evidence into graceful completion.
+Rollback follows the same full-stop and exact-framework-identity rules, not a
+mixed-version rollout.

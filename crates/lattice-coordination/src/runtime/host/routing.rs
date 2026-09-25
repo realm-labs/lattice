@@ -1,3 +1,5 @@
+#[cfg(test)]
+use crate::candidate_fixture::elect_host;
 use lattice_model::{cluster::CoordinatorScope, cluster::NodeIncarnation};
 use lattice_remoting::{
     association::AssociationKey,
@@ -9,8 +11,12 @@ use super::{
     CoordinatorHost, CoordinatorHostScopeState, CoordinatorRuntimeError, helpers::dispatch_error,
 };
 use crate::{
-    control::{PlacementControlCommand, PlacementControlEvent, PlacementControlEventKind},
+    control::{
+        PlacementControlCommand, PlacementControlEvent, PlacementControlEventKind,
+        control_stream_id, encode_control_command_for_term,
+    },
     coordinator::{MemberHello, MemberRemovalReason, MemberStatus},
+    shutdown::ShutdownReport,
     storage::{ActorGroupStore, CoordinatorLeaseStore, MembershipStore, ScopedElectionStore},
     types::MembershipVersion,
 };
@@ -22,6 +28,52 @@ where
     pub(super) async fn route_control(&mut self, event: PlacementControlEvent) {
         match event.kind {
             PlacementControlEventKind::Command(inbound) => {
+                if let PlacementControlCommand::NodeStopCompleted { epoch, node } = &inbound.command
+                {
+                    let result = self
+                        .accept_node_stopped(&inbound.association, *epoch, node.clone())
+                        .await;
+                    let _ = event.completion.send(result.map_err(dispatch_error));
+                    return;
+                }
+                if let PlacementControlCommand::RequestClusterShutdown { epoch, operation } =
+                    &inbound.command
+                {
+                    let result = self
+                        .respond_shutdown_request(
+                            &inbound.association,
+                            inbound.coordinator_term,
+                            *epoch,
+                            operation.clone(),
+                        )
+                        .await;
+                    let _ = event.completion.send(result.map_err(dispatch_error));
+                    return;
+                }
+                if let PlacementControlCommand::ClusterStopReport {
+                    epoch,
+                    operation,
+                    node,
+                    outcome,
+                } = &inbound.command
+                {
+                    let report = ShutdownReport {
+                        epoch: *epoch,
+                        operation: operation.clone(),
+                        node: node.clone(),
+                        outcome: outcome.clone(),
+                    };
+                    let result = self.accept_stop_report(&inbound.association, report).await;
+                    let _ = event.completion.send(result.map_err(dispatch_error));
+                    return;
+                }
+                if let PlacementControlCommand::ChangeCandidate(request) = &inbound.command {
+                    let result = self
+                        .change_remote_candidate(&inbound.association, request.clone())
+                        .await;
+                    let _ = event.completion.send(result.map_err(dispatch_error));
+                    return;
+                }
                 // Hello is the re-bootstrap path after a coordinator election. The session may
                 // have discovered this host just before the group term advanced, so fencing a
                 // stale hello here would leave the member retrying the same stale term forever.
@@ -62,6 +114,20 @@ where
                 }
                 match (&inbound.scope, &inbound.command) {
                     (CoordinatorScope::Cluster, PlacementControlCommand::MemberHello(hello)) => {
+                        match self
+                            .resume_shutdown_hello(&inbound.association, &hello.node)
+                            .await
+                        {
+                            Ok(true) => {
+                                let _ = event.completion.send(Ok(()));
+                                return;
+                            }
+                            Err(error) => {
+                                let _ = event.completion.send(Err(dispatch_error(error)));
+                                return;
+                            }
+                            Ok(false) => {}
+                        }
                         let result = self.admit_member(hello.clone()).await;
                         if result.is_ok() {
                             self.pending_member_hellos
@@ -95,23 +161,55 @@ where
                         } else if let Some(hello) =
                             self.pending_member_hellos.get(incarnation).cloned()
                         {
-                            self.admit_member(hello).await
+                            if self.lifecycle_events.borrow().is_running() {
+                                self.admit_member(hello).await
+                            } else {
+                                // A pre-Closing heartbeat must not head-of-line block
+                                // the positive stop report behind it. This is only a
+                                // transport no-op, never renewed membership authority.
+                                Ok(())
+                            }
                         } else {
                             Err(CoordinatorRuntimeError::UnknownSession)
                         };
+                        if result.is_ok() {
+                            if let (Some(peer), Some(membership)) = (
+                                self.associations.get(&inbound.association),
+                                self.membership.as_ref(),
+                            ) {
+                                if let Ok(payload) = encode_control_command_for_term(
+                                    &CoordinatorScope::Cluster,
+                                    membership.leader().term.get(),
+                                    &PlacementControlCommand::NodeHeartbeatAck {
+                                        sequence: *sequence,
+                                    },
+                                    self.config.group.maximum_control_payload,
+                                ) {
+                                    let _ = peer.admit_ephemeral_control(payload);
+                                }
+                            }
+                        }
                         let _ = event.completion.send(result.map_err(dispatch_error));
                     }
                     (
                         CoordinatorScope::Cluster,
                         PlacementControlCommand::JoinReady { snapshot_version },
                     ) => {
-                        let result = self
-                            .complete_member_join(
+                        let result = if !self.lifecycle_events.borrow().is_running()
+                            && self
+                                .membership_associations
+                                .get(&inbound.association.remote_incarnation)
+                                == Some(&inbound.association)
+                        {
+                            Ok(())
+                        } else {
+                            self.complete_member_join(
                                 inbound.association.remote_incarnation,
                                 *snapshot_version,
                                 &inbound.association,
                             )
-                            .await;
+                            .await
+                        };
                         let _ = event.completion.send(result.map_err(dispatch_error));
                     }
                     (
@@ -186,8 +284,7 @@ where
             PlacementControlEventKind::Reconcile { association, gap } => {
                 for (group, hosted) in &self.groups {
                     if gap.is_some_and(|gap| {
-                        crate::control::control_stream_id(&CoordinatorScope::Group(group.clone()))
-                            != gap.stream_id
+                        control_stream_id(&CoordinatorScope::Group(group.clone())) != gap.stream_id
                     }) {
                         continue;
                     }
@@ -233,11 +330,7 @@ where
             .store
             .get_member(&hello.node.node_id)
             .await?
-            .filter(|member| {
-                member.node == hello.node
-                    && member.hello == hello
-                    && member.status == MemberStatus::Up
-            })
+            .filter(|member| member.node == hello.node && member.status == MemberStatus::Up)
             .ok_or(CoordinatorRuntimeError::NotLeader)?;
         self.store.keep_lease_alive(current.lease_id).await?;
         Ok(())
@@ -285,7 +378,7 @@ where
             .store
             .get_member(&hello.node.node_id)
             .await?
-            .filter(|member| member.node == hello.node && member.hello == hello)
+            .filter(|member| member.node == hello.node)
             .ok_or(CoordinatorRuntimeError::StaleMember)?;
         match member.status {
             MemberStatus::Joining => {
@@ -364,7 +457,7 @@ where
             .associations
             .get(association)
             .ok_or(CoordinatorRuntimeError::AssociationUnavailable)?;
-        let payload = crate::control::encode_control_command_for_term(
+        let payload = encode_control_command_for_term(
             &CoordinatorScope::Cluster,
             leader.term.get(),
             &PlacementControlCommand::DrainCommitted {
@@ -503,7 +596,7 @@ mod routing_backpressure_tests {
                 departing.incarnation,
             )
             .unwrap();
-        let mut host = CoordinatorHost::elect(
+        let mut host = elect_host(
             store.clone(),
             associations.clone(),
             local.clone(),
@@ -557,7 +650,7 @@ mod routing_backpressure_tests {
         );
         // No response is delivered to the departing node before the leader restarts.
         host.membership.take().unwrap().shutdown().await.unwrap();
-        let mut replacement = CoordinatorHost::elect(
+        let mut replacement = elect_host(
             store.clone(),
             associations,
             local,

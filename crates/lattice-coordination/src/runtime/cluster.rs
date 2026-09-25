@@ -20,7 +20,7 @@ use crate::{
         CoordinatorLeaseStore, MembershipStore, ScopedElectionStore,
         records::{CreateMember, RemoveExpiredMember, RemoveMember, UpdateMember},
     },
-    types::{CoordinatorTerm, MembershipVersion, NodeKey},
+    types::{CoordinatorTerm, MembershipVersion, NodeKey, Revision},
 };
 
 #[derive(Debug, Clone)]
@@ -103,24 +103,68 @@ where
         config: ClusterCoordinatorConfig,
     ) -> Result<Self, CoordinatorRuntimeError> {
         config.validate()?;
-        store.ensure_framework().await?;
+        let epoch = store.ensure_framework().await?;
+        let authorization = store
+            .candidate_authorization(&CoordinatorScope::Cluster, &node.node_id)
+            .await?
+            .ok_or(super::StorageError::CandidateNotEligible)?;
         let leader_lease_id = store.grant_lease(config.leader_lease_ttl).await?;
+        let registration = store
+            .online_candidates(&authorization.scope)
+            .await?
+            .into_iter()
+            .find(|existing| existing.authorization == authorization && existing.node == node);
+        let candidate_lease_id = registration
+            .as_ref()
+            .map_or(leader_lease_id, |existing| existing.lease_id);
         let leader = LeaderRecord {
+            candidate_generation: authorization.generation,
+            candidate_lease_id,
+            epoch,
             scope: CoordinatorScope::Cluster,
             node,
             term,
         };
-        if !store.campaign_leader(&leader, leader_lease_id).await? {
+        if let Err(error) = store
+            .register_candidate(&leader.candidate_registration())
+            .await
+        {
             let _ = store.revoke_lease(leader_lease_id).await;
-            return Err(CoordinatorRuntimeError::NotLeader);
+            return Err(error.into());
         }
-        let revision = store.get_membership_revision().await?;
-        let known_members = store
-            .list_members()
-            .await?
-            .into_iter()
-            .map(|member| (member.node.node_id.clone(), member))
-            .collect();
+        match store.campaign_leader(&leader, leader_lease_id).await {
+            Ok(true) => {}
+            result => {
+                let _ = store.revoke_lease(leader_lease_id).await;
+                return Err(match result {
+                    Ok(false) => CoordinatorRuntimeError::NotLeader,
+                    Err(error) => error.into(),
+                    Ok(true) => unreachable!(),
+                });
+            }
+        }
+        let cleaning = matches!(
+            store.lifecycle().await?.phase,
+            lattice_model::run::RunPhase::Closing {
+                stage: lattice_model::run::ClosingStage::Cleaning,
+                ..
+            }
+        );
+        let revision = if cleaning {
+            Revision::new(1).expect("nonzero")
+        } else {
+            store.get_membership_revision().await?
+        };
+        let known_members = if cleaning {
+            BTreeMap::new()
+        } else {
+            store
+                .list_members()
+                .await?
+                .into_iter()
+                .map(|member| (member.node.node_id.clone(), member))
+                .collect()
+        };
         let (events, _) = broadcast::channel(config.maximum_events);
         Ok(Self {
             store,
@@ -148,6 +192,21 @@ where
     }
 
     pub async fn renew_leadership(&self) -> Result<(), CoordinatorRuntimeError> {
+        let expected = self.leader.candidate_registration();
+        if self
+            .store
+            .candidate_authorization(&self.leader.scope, &self.leader.node.node_id)
+            .await?
+            .as_ref()
+            != Some(&expected.authorization)
+            || !self
+                .store
+                .online_candidates(&self.leader.scope)
+                .await?
+                .contains(&expected)
+        {
+            return Err(super::StorageError::CandidateNotEligible.into());
+        }
         self.store.keep_lease_alive(self.leader_lease_id).await?;
         Ok(())
     }
@@ -165,7 +224,7 @@ where
             .validate(&self.config.session_limits)
             .map_err(CoordinatorRuntimeError::Coordinator)?;
         if let Some(current) = self.store.get_member(&hello.node.node_id).await? {
-            if current.node == hello.node && current.hello == hello {
+            if current.node == hello.node {
                 self.store.keep_lease_alive(current.lease_id).await?;
                 if current.version.term == self.version.term {
                     self.known_members
@@ -217,7 +276,6 @@ where
         let lease_id = self.store.grant_lease(self.config.member_lease_ttl).await?;
         let member = MemberRecord {
             node: hello.node.clone(),
-            hello,
             status: MemberStatus::Joining,
             version: self.next_version()?,
             lease_id,
@@ -410,6 +468,7 @@ where
 
 #[cfg(test)]
 mod tests {
+    use crate::candidate_fixture::elect_cluster;
     use std::{
         collections::{BTreeMap, BTreeSet},
         sync::Arc,
@@ -417,7 +476,7 @@ mod tests {
 
     use lattice_model::cluster::{NodeEndpoint, NodeIncarnation};
 
-    use super::{ClusterCoordinator, ClusterCoordinatorConfig};
+    use super::ClusterCoordinatorConfig;
     use crate::{
         coordinator::{MemberChange, MemberHello, MemberRemovalReason},
         storage::{CoordinatorLeaseStore, InMemoryCoordinationStore, MembershipStore},
@@ -445,7 +504,7 @@ mod tests {
     #[tokio::test]
     async fn expired_member_key_becomes_a_revisioned_removal_event() {
         let store = Arc::new(InMemoryCoordinationStore::new(8, 8).unwrap());
-        let mut leader = ClusterCoordinator::elect(
+        let mut leader = elect_cluster(
             store.clone(),
             NodeKey {
                 node_id: "coordinator".to_owned(),
@@ -489,7 +548,7 @@ mod tests {
     #[tokio::test]
     async fn immediate_rejoin_commits_expired_predecessor_before_replacement() {
         let store = Arc::new(InMemoryCoordinationStore::new(8, 8).unwrap());
-        let mut leader = ClusterCoordinator::elect(
+        let mut leader = elect_cluster(
             store.clone(),
             NodeKey {
                 node_id: "coordinator".to_owned(),

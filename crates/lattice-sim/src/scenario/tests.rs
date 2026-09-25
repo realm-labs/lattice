@@ -3,6 +3,8 @@
 //! The shared fixtures build either a seeded workload or a fully controlled schedule so that a
 //! test can assert on one boundary at a time.
 
+use lattice_coordination::storage::candidates::provision_candidate;
+use lattice_model::cluster::CoordinatorScope;
 use std::collections::BTreeSet;
 
 use lattice_model::actor::TerminatedReason;
@@ -272,6 +274,13 @@ async fn production_membership_commit_fails_under_an_injected_store_failure() {
     let injector = SharedFaultInjector::default();
     let installed = injector.install();
     let store = std::sync::Arc::new(InMemoryCoordinationStore::new(8, 8).unwrap());
+    provision_candidate(
+        store.as_ref(),
+        CoordinatorScope::Cluster,
+        "coordinator".to_owned(),
+    )
+    .await
+    .unwrap();
     let mut leader = ClusterCoordinator::elect(
         store,
         node("coordinator", 5, 29500),
@@ -458,6 +467,13 @@ async fn injected_membership_evidence() -> Vec<FaultEvidence> {
     let injector = SharedFaultInjector::default();
     let installed = injector.install();
     let store = std::sync::Arc::new(InMemoryCoordinationStore::new(8, 8).unwrap());
+    provision_candidate(
+        store.as_ref(),
+        CoordinatorScope::Cluster,
+        "coordinator".to_owned(),
+    )
+    .await
+    .unwrap();
     let mut leader = ClusterCoordinator::elect(
         store,
         node("coordinator", 5, 29500),

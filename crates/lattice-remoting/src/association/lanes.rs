@@ -149,6 +149,10 @@ impl Association {
             self.bulk_lane_epochs[usize::from(index)].fetch_add(1, Ordering::AcqRel);
         }
         let lane_mask = lane_mask(attachment.lane);
+        if attachment.lane == LaneKind::Control && decision != AttachmentDecision::RejectedDuplicate
+        {
+            inner.authenticated_control_peer = None;
+        }
         self.attached_lanes
             .store(attached_lanes_mask(&inner.lanes), Ordering::Release);
         self.wake_pending_lanes
@@ -220,6 +224,9 @@ impl Association {
             return;
         }
         inner.lanes.remove(&lane);
+        if lane == LaneKind::Control {
+            inner.authenticated_control_peer = None;
+        }
         self.attached_lanes
             .store(attached_lanes_mask(&inner.lanes), Ordering::Release);
         if lane == LaneKind::Control || self.state() != AssociationState::Active {

@@ -192,7 +192,7 @@ pub fn placement_matrix(
 
     let limits = RebalanceLimits {
         moves_per_round: 4,
-        concurrent_cluster: 4,
+        concurrent_group: 4,
         concurrent_entity: 4,
         concurrent_source: 4,
         concurrent_target: 4,
@@ -296,7 +296,7 @@ fn allocation_fixture(
                 assigned_at: MonotonicTime::from_millis(0),
                 active_move: false,
             }],
-            active_cluster_moves: 0,
+            active_group_moves: 0,
             active_entity_moves: BTreeMap::new(),
             active_source_moves: BTreeMap::new(),
             active_target_moves: BTreeMap::new(),

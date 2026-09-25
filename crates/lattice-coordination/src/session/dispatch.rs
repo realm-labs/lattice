@@ -1,11 +1,12 @@
 use std::collections::BTreeMap;
+use tokio::time::Instant;
 
 use super::{
     GroupSession, GroupSessionError, LocalAuthorityEvent, LogicPlacementEffect,
     snapshot::decode_slots,
 };
 use crate::{
-    authority::{AuthorityEffect, AuthorityEvent, PlacementAuthority},
+    authority::{AuthorityEffect, AuthorityError, AuthorityEvent, PlacementAuthority},
     control::{PlacementControlCommand, PlacementControlEventKind},
     coordinator::{CoordinatorDelta, MemberRecord, MemberStatus, SnapshotStager, SnapshotVersion},
     failpoints,
@@ -13,6 +14,41 @@ use crate::{
 };
 
 impl GroupSession {
+    /// At most one request per slot is outstanding. Retries use a new unpredictable
+    /// ID and start time; a late response consumes no newer request or deadline.
+    pub(super) fn request_claim(&self, key: &PlacementSlotKey) -> Result<(), GroupSessionError> {
+        let request = {
+            let mut state = self.state.lock().expect("logic placement state poisoned");
+            let now = self.now();
+            let Some(authority) = state.authorities.get_mut(key) else {
+                return Ok(());
+            };
+            if !authority.renewal_needed(now) {
+                return Ok(());
+            }
+            let Some(slot) = authority.slot() else {
+                return Ok(());
+            };
+            if slot.owner.as_ref() != Some(&self.group_hello.node) {
+                return Ok(());
+            }
+            let generation = slot.assignment_generation;
+            let request_id = uuid::Uuid::new_v4().as_u128();
+            if authority
+                .transition(AuthorityEvent::BeginRenewal { request_id, now })
+                .is_err()
+            {
+                return Ok(());
+            }
+            PlacementControlCommand::RequestClaim {
+                request_id,
+                slot: key.clone(),
+                generation,
+            }
+        };
+        self.send_runtime_progress(request)
+    }
+
     pub(super) async fn handle_local_event(
         &self,
         event: LocalAuthorityEvent,
@@ -61,6 +97,28 @@ impl GroupSession {
                     self.require_coordinator_term(inbound.coordinator_term)?;
                 }
                 match inbound.command {
+                    PlacementControlCommand::NodeHeartbeatAck { sequence } => {
+                        if sequence > self.heartbeat_ack_sequence
+                            && sequence <= self.heartbeat_sequence
+                        {
+                            self.heartbeat_ack_sequence = sequence;
+                            self.last_heartbeat_ack = Instant::now();
+                        }
+                        Ok(())
+                    }
+                    PlacementControlCommand::ClusterRunning { .. }
+                    | PlacementControlCommand::NodeStopCompleted { .. }
+                    | PlacementControlCommand::NodeStopConfirmed { .. }
+                    | PlacementControlCommand::RequestClusterShutdown { .. }
+                    | PlacementControlCommand::ClusterShutdownResult { .. }
+                    | PlacementControlCommand::ChangeCandidate(_)
+                    | PlacementControlCommand::CandidateChanged { .. }
+                    | PlacementControlCommand::ClusterClosing { .. }
+                    | PlacementControlCommand::ClusterStopReport { .. }
+                    | PlacementControlCommand::ClusterClosed { .. }
+                    | PlacementControlCommand::RequestClaim { .. } => {
+                        Err(GroupSessionError::UnauthorizedCommand)
+                    }
                     PlacementControlCommand::SnapshotBegin(begin) => {
                         self.hello_pending = false;
                         self.stager = Some(
@@ -119,18 +177,29 @@ impl GroupSession {
                         if grant.coordinator_term.get() != self.coordinator_term {
                             return Err(GroupSessionError::StaleGeneration);
                         }
+                        if grant.request_id == 0 {
+                            return self.request_claim(&grant.slot);
+                        }
                         let effects = {
                             let mut state =
                                 self.state.lock().expect("logic placement state poisoned");
-                            state
+                            match state
                                 .authorities
                                 .get_mut(&grant.slot)
                                 .ok_or(GroupSessionError::UnknownAuthority)?
                                 .transition(AuthorityEvent::InstallGrant {
                                     grant: grant.clone(),
                                     now: self.now(),
-                                })
-                                .map_err(GroupSessionError::Authority)?
+                                }) {
+                                Ok(effects) => effects,
+                                Err(
+                                    AuthorityError::StaleGrant
+                                    | AuthorityError::UncorrelatedGrant
+                                    | AuthorityError::Retired
+                                    | AuthorityError::InvalidClaimDeadline,
+                                ) => Vec::new(),
+                                Err(error) => return Err(GroupSessionError::Authority(error)),
+                            }
                         };
                         self.publish_effects(grant.slot, effects).await
                     }
@@ -334,7 +403,8 @@ impl GroupSession {
             }
         }
         for (key, effects) in all_effects {
-            self.publish_effects(key, effects).await?;
+            self.publish_effects(key.clone(), effects).await?;
+            self.request_claim(&key)?;
         }
         self.state
             .lock()

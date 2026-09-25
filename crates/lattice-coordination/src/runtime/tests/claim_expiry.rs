@@ -1,3 +1,4 @@
+use crate::candidate_fixture::elect_group;
 use lattice_model::actor::ProtocolId;
 use lattice_remoting::{
     association::Association,
@@ -68,7 +69,7 @@ async fn claim_fixture(
         protocol_id,
         fingerprint: ProtocolFingerprint::new([3; 32]),
     };
-    let mut leader = GroupCoordinator::elect(
+    let mut leader = elect_group(
         store.clone(),
         associations.clone(),
         coordinator_node,
@@ -158,6 +159,201 @@ fn collected_grants(control: &mut mpsc::Receiver<Frame>) -> (usize, usize) {
     (ephemeral, reliable)
 }
 
+#[tokio::test]
+async fn correlated_issuance_is_guarded_and_persisted_before_response() {
+    let mut fixture = claim_fixture(
+        "fresh-grant",
+        34800,
+        34800,
+        GroupCoordinatorConfig::default(),
+    )
+    .await;
+    let association = fixture.associations.get(&fixture.host_key).unwrap();
+    let mut outgoing = drain_control(&association);
+    let original = fixture
+        .store
+        .get_claim(&fixture.shard_key)
+        .await
+        .unwrap()
+        .unwrap();
+    fixture
+        .leader
+        .issue_requested_claim(
+            &fixture.host_key,
+            123,
+            fixture.shard_key.clone(),
+            original.grant.assignment_generation,
+        )
+        .await
+        .unwrap();
+    let committed = fixture
+        .store
+        .get_claim(&fixture.shard_key)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(committed.grant.request_id, 123);
+    assert!(committed.grant.grant_sequence > original.grant.grant_sequence);
+    assert_eq!(committed.lease_id, original.lease_id);
+    let frame = outgoing.recv().await.unwrap();
+    let command = decode_control_command(frame.payload(), DEFAULT_MAX_CONTROL_PAYLOAD)
+        .unwrap()
+        .command;
+    assert_eq!(
+        command,
+        PlacementControlCommand::ClaimGranted(committed.grant.clone())
+    );
+    fixture
+        .store
+        .revoke_lease(fixture.leader.leader.candidate_lease_id)
+        .await
+        .unwrap();
+    assert!(
+        fixture
+            .leader
+            .issue_requested_claim(
+                &fixture.host_key,
+                124,
+                fixture.shard_key.clone(),
+                original.grant.assignment_generation
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        fixture
+            .store
+            .get_claim(&fixture.shard_key)
+            .await
+            .unwrap()
+            .unwrap()
+            .grant,
+        committed.grant
+    );
+    assert!(outgoing.try_recv().is_err());
+}
+
+#[tokio::test(start_paused = true)]
+async fn unreconnected_group_admission_expires_without_claiming_the_owner_stopped() {
+    let mut fixture = claim_fixture(
+        "group-reconnect-grace",
+        34820,
+        34820,
+        GroupCoordinatorConfig::default(),
+    )
+    .await;
+    fixture.leader.sessions.clear();
+    fixture.leader.reconcile_initial_inventory().await.unwrap();
+    assert!(
+        fixture
+            .store
+            .get_group_member(&group(), &fixture.host.node_id)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    fixture.leader.reconcile_bounded_pass().await.unwrap();
+    assert!(
+        fixture
+            .store
+            .get_group_member(&group(), &fixture.host.node_id)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    tokio::time::advance(fixture.leader.config.member_heartbeat_timeout + Duration::from_secs(1))
+        .await;
+    fixture.leader.reconcile_bounded_pass().await.unwrap();
+    assert!(
+        fixture
+            .store
+            .get_group_member(&group(), &fixture.host.node_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        fixture
+            .store
+            .get_member(&fixture.host.node_id)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        fixture
+            .store
+            .get_claim(&fixture.shard_key)
+            .await
+            .unwrap()
+            .is_some(),
+        "removing group admission is not permission to revoke outstanding grants"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn missing_claim_cannot_reinstall_before_full_protocol_holdoff() {
+    let mut fixture = claim_fixture(
+        "replacement-wait",
+        34810,
+        34810,
+        GroupCoordinatorConfig::default(),
+    )
+    .await;
+    let claim = fixture
+        .store
+        .get_claim(&fixture.shard_key)
+        .await
+        .unwrap()
+        .unwrap();
+    fixture.store.revoke_lease(claim.lease_id).await.unwrap();
+    let slot = fixture
+        .store
+        .get_slot(&fixture.shard_key)
+        .await
+        .unwrap()
+        .unwrap();
+    fixture.leader.fence_missing_claim(slot).await.unwrap();
+    let fenced = fixture
+        .store
+        .get_slot(&fixture.shard_key)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        !fixture
+            .leader
+            .reinstall_fenced_authority(fenced.clone())
+            .await
+            .unwrap()
+    );
+    tokio::time::advance(Duration::from_secs(15)).await;
+    assert!(
+        !fixture
+            .leader
+            .reinstall_fenced_authority(fenced.clone())
+            .await
+            .unwrap()
+    );
+    // Losing the process-local observation starts the whole conservative wait again.
+    fixture.leader.reconciliation.replacement_waits.clear();
+    assert!(
+        !fixture
+            .leader
+            .reinstall_fenced_authority(fenced.clone())
+            .await
+            .unwrap()
+    );
+    tokio::time::advance(Duration::from_secs(16)).await;
+    assert!(
+        fixture
+            .leader
+            .reinstall_fenced_authority(fenced)
+            .await
+            .unwrap()
+    );
+}
+
 fn fenced_config() -> GroupCoordinatorConfig {
     GroupCoordinatorConfig {
         renewal_interval: Duration::from_millis(10),
@@ -168,7 +364,7 @@ fn fenced_config() -> GroupCoordinatorConfig {
     }
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn heartbeat_timeout_defers_fencing_until_the_claim_lease_expires() {
     let mut fixture = claim_fixture("claim-expiry-test", 26500, 500, fenced_config()).await;
     let leased = fixture
@@ -239,6 +435,18 @@ async fn heartbeat_timeout_defers_fencing_until_the_claim_lease_expires() {
 
     let spare_hello = (fixture.hello)(fixture.spare.clone());
     register_up(&mut fixture.leader, spare_hello, fixture.spare_key.clone()).await;
+    fixture.leader.reconcile_bounded_pass().await.unwrap();
+    assert_eq!(
+        fixture
+            .store
+            .get_slot(&fixture.shard_key)
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        PlacementSlotState::Fenced
+    );
+    tokio::time::advance(Duration::from_secs(16)).await;
     fixture.leader.reconcile_bounded_pass().await.unwrap();
     let reinstalled = fixture
         .store

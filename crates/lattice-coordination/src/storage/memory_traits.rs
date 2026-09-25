@@ -1,3 +1,4 @@
+use lattice_model::run::RunEpoch;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -35,7 +36,7 @@ use crate::{
 
 #[async_trait]
 impl CoordinatorLeaseStore for InMemoryCoordinationStore {
-    async fn ensure_framework(&self) -> Result<(), StorageError> {
+    async fn ensure_framework(&self) -> Result<RunEpoch, StorageError> {
         InMemoryCoordinationStore::ensure_framework(self).await
     }
 
@@ -224,6 +225,7 @@ impl ActorGroupStore for InMemoryCoordinationStore {
         guard: &GroupLeaderGuard,
         request: PutEntityConfig,
     ) -> Result<EntityConfigCommit, StorageError> {
+        super::records::encode_record(&request.config)?;
         let CoordinatorScope::Group(group) = guard.scope() else {
             return Err(StorageError::InvalidRecord);
         };
@@ -292,6 +294,7 @@ impl ActorGroupStore for InMemoryCoordinationStore {
         guard: &GroupLeaderGuard,
         request: PutSingletonConfig,
     ) -> Result<SingletonConfigCommit, StorageError> {
+        super::records::encode_record(&request.config)?;
         let CoordinatorScope::Group(group) = guard.scope() else {
             return Err(StorageError::InvalidRecord);
         };

@@ -10,6 +10,9 @@ test-failpoints = ["lattice-failpoint/enabled"]
 test-harness = []
 
 [dependencies]
+async-stream.workspace = true
+futures-util.workspace = true
+lattice-discovery.workspace = true
 async-trait.workspace = true
 blake3.workspace = true
 bytes = { workspace = true, features = ["serde"] }
@@ -19,6 +22,7 @@ http.workspace = true
 lattice-failpoint.workspace = true
 lattice-model.workspace = true
 lattice-remoting.workspace = true
+libc.workspace = true
 prost.workspace = true
 serde.workspace = true
 serde_json.workspace = true

@@ -6,12 +6,12 @@ use std::{
     time::Duration,
 };
 
-use futures_util::{Stream, StreamExt};
-use lattice_model::cluster::CoordinatorScope;
+use futures_util::{Stream, StreamExt, future::join_all};
+use lattice_model::{cluster::CoordinatorScope, run::RunEpoch};
 
 use crate::provider::{
     CoordinatorDirectorySnapshot, CoordinatorDiscovery, DiscoveryError, DiscoveryTarget,
-    validate_snapshot,
+    TerminalLifecycleFuture, validate_snapshot,
 };
 
 /// How long the aggregate waits for every provider's first snapshot before it
@@ -71,6 +71,32 @@ impl AggregateDiscovery {
 }
 
 impl CoordinatorDiscovery for AggregateDiscovery {
+    fn terminal_lifecycle(&self, epoch: RunEpoch) -> TerminalLifecycleFuture<'_> {
+        Box::pin(async move {
+            let results = join_all(
+                self.providers
+                    .iter()
+                    .map(|provider| provider.terminal_lifecycle(epoch)),
+            )
+            .await;
+            let mut selected = None;
+            for result in results {
+                if let Ok(Some(completion)) = result {
+                    if selected
+                        .as_ref()
+                        .is_some_and(|current| current != &completion)
+                    {
+                        return Err(DiscoveryError::InvalidSnapshot {
+                            message: "discovery providers returned conflicting terminal receipts"
+                                .to_owned(),
+                        });
+                    }
+                    selected = Some(completion);
+                }
+            }
+            Ok(selected)
+        })
+    }
     fn scope(&self) -> &CoordinatorScope {
         &self.scope
     }

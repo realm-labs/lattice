@@ -1,8 +1,8 @@
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    sync::Arc,
-    time::Duration,
-};
+use crate::candidate_fixture::elect_group;
+use crate::candidate_fixture::prepare_leader;
+use crate::candidates::CandidateGeneration;
+use lattice_model::run::RunEpoch;
+use std::{collections::BTreeSet, sync::Arc, time::Duration};
 
 use lattice_model::{
     cluster::CoordinatorScope,
@@ -10,11 +10,11 @@ use lattice_model::{
 };
 use lattice_remoting::{association::AssociationManager, config::RemotingConfig};
 
-use super::{GroupCoordinator, GroupCoordinatorConfig};
+use super::GroupCoordinatorConfig;
 use crate::{
     coordinator::{
-        ActorGroupHello, ClusterLeaderGuard, GroupLeaderGuard, GroupMemberRecord,
-        GroupMemberStatus, LeaderRecord, MemberHello, MemberRecord, MemberStatus,
+        ClusterLeaderGuard, GroupLeaderGuard, GroupMemberRecord, GroupMemberStatus, LeaderRecord,
+        MemberRecord, MemberStatus,
     },
     storage::{
         ActorGroupStore, CoordinatorLeaseStore, InMemoryCoordinationStore, MembershipStore,
@@ -76,10 +76,16 @@ async fn persist_authority_records(
 ) -> (MemberRecord, GroupMemberRecord, i64) {
     let membership_lease = store.grant_lease(Duration::from_secs(10)).await.unwrap();
     let membership_leader = LeaderRecord {
+        candidate_generation: CandidateGeneration::new(1).unwrap(),
+        candidate_lease_id: 1,
+        epoch: RunEpoch::INITIAL,
         scope: CoordinatorScope::Cluster,
         node: node("membership", 91, 32991),
         term: CoordinatorTerm::new(1).unwrap(),
     };
+    let membership_leader = prepare_leader(store, membership_leader, membership_lease)
+        .await
+        .unwrap();
     assert!(
         store
             .campaign_leader(&membership_leader, membership_lease)
@@ -90,13 +96,6 @@ async fn persist_authority_records(
     let member_lease = store.grant_lease(Duration::from_secs(10)).await.unwrap();
     let global = MemberRecord {
         node: owner.clone(),
-        hello: MemberHello {
-            node: owner.clone(),
-            roles: BTreeSet::new(),
-            failure_domains: BTreeMap::new(),
-            protocols: Vec::new(),
-            remoting_capabilities: BTreeSet::new(),
-        },
         status: MemberStatus::Up,
         version: MembershipVersion::new(
             membership_guard.term(),
@@ -121,7 +120,6 @@ async fn persist_authority_records(
     let actor_group = group();
     let group_member = GroupMemberRecord {
         node: owner.clone(),
-        hello: ActorGroupHello::builder(owner, actor_group.clone(), 1).build(),
         status: GroupMemberStatus::Up,
         version: PlacementVersion::new(
             actor_group.clone(),
@@ -154,10 +152,16 @@ async fn election_adopts_claim_without_rewriting_the_durable_slot() {
     let old_leader = node("old", 1, 32101);
     let old_lease = store.grant_lease(Duration::from_secs(10)).await.unwrap();
     let record = LeaderRecord {
+        candidate_generation: CandidateGeneration::new(1).unwrap(),
+        candidate_lease_id: 1,
+        epoch: RunEpoch::INITIAL,
         scope: CoordinatorScope::Group(group()),
         node: old_leader,
         term: CoordinatorTerm::new(1).unwrap(),
     };
+    let record = prepare_leader(store.as_ref(), record, old_lease)
+        .await
+        .unwrap();
     assert!(store.campaign_leader(&record, old_lease).await.unwrap());
     let guard = GroupLeaderGuard::new(record).unwrap();
     let owner = node("owner", 2, 32102);
@@ -170,6 +174,7 @@ async fn election_adopts_claim_without_rewriting_the_durable_slot() {
     persisted.state = PlacementSlotState::Allocating;
     let claim_lease = store.grant_lease(Duration::from_secs(10)).await.unwrap();
     let grant = ClaimGrant {
+        request_id: 0,
         group: group(),
         slot: persisted.key.clone(),
         owner: owner.clone(),
@@ -198,7 +203,7 @@ async fn election_adopts_claim_without_rewriting_the_durable_slot() {
     store.revoke_lease(old_lease).await.unwrap();
 
     let new_leader = node("new", 3, 32103);
-    let leader = GroupCoordinator::elect(
+    let leader = elect_group(
         store.clone(),
         associations(&new_leader),
         new_leader,
@@ -243,7 +248,7 @@ async fn legacy_allocating_without_claim_is_deterministically_fenced() {
     );
     legacy.state = PlacementSlotState::Allocating;
     store.insert_slot_record(legacy.clone());
-    let leader = GroupCoordinator::elect(
+    let leader = elect_group(
         store.clone(),
         associations(&coordinator),
         coordinator,
@@ -268,10 +273,16 @@ async fn election_removes_orphaned_group_members_before_recovery() {
     let old_leader = node("old", 20, 32220);
     let placement_lease = store.grant_lease(Duration::from_secs(10)).await.unwrap();
     let placement_record = LeaderRecord {
+        candidate_generation: CandidateGeneration::new(1).unwrap(),
+        candidate_lease_id: 1,
+        epoch: RunEpoch::INITIAL,
         scope: CoordinatorScope::Group(group()),
         node: old_leader,
         term: CoordinatorTerm::new(1).unwrap(),
     };
+    let placement_record = prepare_leader(store.as_ref(), placement_record, placement_lease)
+        .await
+        .unwrap();
     assert!(
         store
             .campaign_leader(&placement_record, placement_lease)
@@ -282,11 +293,11 @@ async fn election_removes_orphaned_group_members_before_recovery() {
     let owner = node("orphan", 21, 32221);
     let (global, _group_member, membership_leader_lease) =
         persist_authority_records(store.as_ref(), &placement_guard, owner.clone()).await;
-    let membership_record = LeaderRecord {
-        scope: CoordinatorScope::Cluster,
-        node: node("membership", 91, 32991),
-        term: CoordinatorTerm::new(1).unwrap(),
-    };
+    let membership_record = store
+        .get_leader(&CoordinatorScope::Cluster)
+        .await
+        .unwrap()
+        .unwrap();
     let membership_guard = ClusterLeaderGuard::new(membership_record).unwrap();
     store
         .remove_member(&membership_guard, RemoveMember { expected: global })
@@ -296,7 +307,7 @@ async fn election_removes_orphaned_group_members_before_recovery() {
     store.revoke_lease(placement_lease).await.unwrap();
 
     let coordinator = node("new", 22, 32222);
-    let leader = GroupCoordinator::elect(
+    let leader = elect_group(
         store.clone(),
         associations(&coordinator),
         coordinator,
@@ -321,7 +332,7 @@ async fn election_removes_orphaned_group_members_before_recovery() {
 async fn automatic_pause_and_operation_result_survive_leader_failover() {
     let store = Arc::new(InMemoryCoordinationStore::new(8, 8).unwrap());
     let first_node = node("first", 40, 32340);
-    let mut first = GroupCoordinator::elect(
+    let mut first = elect_group(
         store.clone(),
         associations(&first_node),
         first_node,
@@ -332,14 +343,15 @@ async fn automatic_pause_and_operation_result_survive_leader_failover() {
     .await
     .unwrap();
     let entity = EntityType::new("paused").unwrap();
+    let operation_id = first.inspect().await.unwrap().new_operation_id();
     first
-        .set_automatic_paused("pause-stable".to_owned(), Some(entity.clone()), true)
+        .set_automatic_paused(operation_id.clone(), Some(entity.clone()), true)
         .await
         .unwrap();
     store.revoke_lease(first.leader_lease_id).await.unwrap();
 
     let second_node = node("second", 41, 32341);
-    let mut second = GroupCoordinator::elect(
+    let mut second = elect_group(
         store.clone(),
         associations(&second_node),
         second_node,
@@ -351,18 +363,18 @@ async fn automatic_pause_and_operation_result_survive_leader_failover() {
     .unwrap();
     assert!(second.paused_entity_types.contains(&entity));
     second
-        .set_automatic_paused("pause-stable".to_owned(), Some(entity.clone()), true)
+        .set_automatic_paused(operation_id.clone(), Some(entity.clone()), true)
         .await
         .unwrap();
     assert!(matches!(
         second
-            .set_automatic_paused("pause-stable".to_owned(), Some(entity), false)
+            .set_automatic_paused(operation_id.clone(), Some(entity), false)
             .await,
         Err(super::CoordinatorRuntimeError::IdempotencyConflict)
     ));
     assert!(
         store
-            .get_admin_operation(&group(), "pause-stable")
+            .get_admin_operation(&group(), &operation_id)
             .await
             .unwrap()
             .is_some()

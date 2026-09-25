@@ -1,6 +1,7 @@
 //! Cluster membership: discovery-driven join, leave, per-group health and Coordinator rollover.
 
 use lattice_actor::runtime::ActorRuntime;
+use lattice_coordination::storage::candidates::provision_candidate;
 use lattice_model::actor::ActorId;
 
 use lattice_actor_distributed::registry::ActorDefinition;
@@ -159,6 +160,14 @@ async fn static_discovery_joins_and_leaves_without_manual_peer_connection() {
     .unwrap();
     let associations = coordinator_builder.association_manager();
     let store = Arc::new(InMemoryCoordinationStore::new(32, 32).unwrap());
+    for scope in [
+        CoordinatorScope::Cluster,
+        CoordinatorScope::Group(actor_group()),
+    ] {
+        provision_candidate(store.as_ref(), scope, "coordinator".to_owned())
+            .await
+            .unwrap();
+    }
     let host = CoordinatorHost::elect(
         store.clone(),
         associations,

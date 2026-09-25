@@ -1,7 +1,7 @@
 use etcd_client::{GetOptions, SortOrder, SortTarget, Txn, TxnOp, TxnOpResponse};
 use lattice_model::cluster::ActorGroupId;
 
-use super::{EtcdCoordinationStore, decode, prefix_range_end};
+use super::{EtcdCoordinationStore, MAX_STORE_PAGE_RECORDS, decode, prefix_range_end};
 use crate::{
     coordinator::MemberRecord,
     plan::RebalancePlan,
@@ -14,6 +14,7 @@ use crate::{
 };
 
 struct RawPage {
+    revision: i64,
     records: Vec<(Vec<u8>, Vec<u8>, i64)>,
     next_cursor: Option<PageCursor>,
     remaining: usize,
@@ -35,7 +36,8 @@ impl EtcdCoordinationStore {
         if limit == 0 {
             return Err(StorageError::BackendArgument);
         }
-        let page_limit = i64::try_from(limit).map_err(|_| StorageError::BackendArgument)?;
+        let page_limit = i64::try_from(limit.min(MAX_STORE_PAGE_RECORDS))
+            .map_err(|_| StorageError::BackendArgument)?;
         let position = cursor.map(PageCursor::as_bytes);
         let mut ranges = Vec::new();
         for suffix in suffixes {
@@ -58,6 +60,7 @@ impl EtcdCoordinationStore {
         }
         if ranges.is_empty() {
             return Ok(RawPage {
+                revision: 0,
                 records: Vec::new(),
                 next_cursor: None,
                 remaining: 0,
@@ -98,6 +101,7 @@ impl EtcdCoordinationStore {
             })
             .flatten();
         Ok(RawPage {
+            revision: response.header().ok_or(StorageError::Codec)?.revision(),
             records,
             next_cursor,
             remaining,
@@ -114,8 +118,8 @@ impl EtcdCoordinationStore {
         let page = self
             .list_page_raw(
                 &[
-                    format!("domains/{}/shards/", group.as_str()),
-                    format!("domains/{}/singletons/", group.as_str()),
+                    format!("groups/{}/shards/", group.as_str()),
+                    format!("groups/{}/singletons/", group.as_str()),
                 ],
                 cursor,
                 limit,
@@ -125,7 +129,7 @@ impl EtcdCoordinationStore {
         for (_, value, _) in &page.records {
             let slot: PlacementSlot = decode(value)?;
             if states.is_empty() || states.contains(&slot.state) {
-                records.push(slot);
+                records.push(self.hydrate_slot_barrier(slot).await?);
             }
         }
         Ok(StorePage {
@@ -143,17 +147,17 @@ impl EtcdCoordinationStore {
     ) -> Result<StorePage<RebalancePlan>, StorageError> {
         let page = self
             .list_page_raw(
-                &[format!("domains/{}/rebalances/", group.as_str())],
+                &[format!("groups/{}/rebalances/", group.as_str())],
                 cursor,
                 limit,
             )
             .await?;
+        let mut records = Vec::with_capacity(page.records.len());
+        for (_, value, _) in &page.records {
+            records.push(self.hydrate_plan(value, page.revision).await?);
+        }
         Ok(StorePage {
-            records: page
-                .records
-                .iter()
-                .map(|(_, value, _)| decode(value))
-                .collect::<Result<Vec<_>, _>>()?,
+            records,
             next_cursor: page.next_cursor,
             remaining: page.remaining,
         })
@@ -168,8 +172,8 @@ impl EtcdCoordinationStore {
         let page = self
             .list_page_raw(
                 &[
-                    format!("domains/{}/shard_claims/", group.as_str()),
-                    format!("domains/{}/singleton_claims/", group.as_str()),
+                    format!("groups/{}/shard_claims/", group.as_str()),
+                    format!("groups/{}/singleton_claims/", group.as_str()),
                 ],
                 cursor,
                 limit,

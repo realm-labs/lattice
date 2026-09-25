@@ -294,6 +294,7 @@ pub(super) async fn stage_logic_runtime(
     for slot in slots {
         if slot.owner.as_ref() == Some(&hello.member.node) {
             commands.push(PlacementControlCommand::ClaimGranted(ClaimGrant {
+                request_id: 0,
                 group: slot.key.group().clone(),
                 slot: slot.key,
                 owner: hello.member.node.clone(),
@@ -304,7 +305,14 @@ pub(super) async fn stage_logic_runtime(
             }));
         }
     }
-    for command in commands {
+    for mut command in commands {
+        if let PlacementControlCommand::ClaimGranted(grant) = &mut command {
+            grant.request_id = state
+                .lock()
+                .unwrap()
+                .pending_claim_request(&grant.slot)
+                .expect("owner emitted renewal request");
+        }
         control
             .apply(
                 coordinator.clone(),

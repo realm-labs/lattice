@@ -1,6 +1,8 @@
 //! Node lifecycle: registration validation, start rollback, shutdown and forced drain.
 
 use lattice_actor::runtime::ActorRuntime;
+use lattice_coordination::storage::candidates::provision_candidate;
+use lattice_model::cluster::CoordinatorScope;
 
 use lattice_actor_distributed::registry::ActorDefinition;
 use std::{
@@ -352,7 +354,11 @@ async fn leave_deadline_retains_an_actor_waiting_for_its_stop_hook() {
     assert!(matches!(outcome, Err(ServiceError::LeaveTimeout)));
     assert_eq!(service.node_lifecycle_state(), NodeLifecycleState::Stopping);
     assert_eq!(registry.live_cells().len(), 1);
-    assert_eq!(handle.lifecycle_state(), ActorLifecycleState::Passivating);
+    // Closing registry admission is irreversible. The Actor fence starts the
+    // requested-stop path before the drain's passivation command can run; the
+    // timeout must retain that stopping instance and must not force its hook.
+    assert!(handle.business_admission_fenced());
+    assert_eq!(handle.lifecycle_state(), ActorLifecycleState::Stopping);
     finish.notify_one();
     service
         .leave(tokio::time::Instant::now() + Duration::from_secs(2))
@@ -430,6 +436,14 @@ async fn startup_failure_rolls_back_partially_started_components() {
     );
     config.maximum_supervised_tasks = 1;
     let builder = LatticeService::builder(config).unwrap();
+    for scope in [
+        CoordinatorScope::Cluster,
+        CoordinatorScope::Group(actor_group()),
+    ] {
+        provision_candidate(store.as_ref(), scope, "startup-rollback".to_owned())
+            .await
+            .unwrap();
+    }
     let host = CoordinatorHost::elect(
         store,
         builder.association_manager(),

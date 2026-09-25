@@ -1,11 +1,16 @@
 use std::{collections::BTreeSet, sync::Arc, time::Duration};
 
-use lattice_model::{cluster::ActorGroupId, cluster::CoordinatorScope};
+use lattice_model::{
+    cluster::{ActorGroupId, CoordinatorScope},
+    run::RunPhase,
+};
 use lattice_remoting::association::AssociationManager;
 use tokio::sync::{mpsc, watch};
 
 use crate::{
-    storage::{ActorGroupStore, CoordinatorLeaseStore, MembershipStore, ScopedElectionStore},
+    storage::{
+        ActorGroupStore, CoordinatorLeaseStore, MembershipStore, ScopedElectionStore, StorageError,
+    },
     types::{CoordinatorTerm, NodeKey},
 };
 
@@ -26,6 +31,9 @@ pub(super) async fn elect_group_leader<S>(
 where
     S: CoordinatorLeaseStore + ScopedElectionStore + MembershipStore + ActorGroupStore,
 {
+    if !store.lifecycle().await?.is_running() {
+        return Err(CoordinatorRuntimeError::NotLeader);
+    }
     GroupCoordinator::elect_with_strategies(
         store,
         associations,
@@ -110,10 +118,26 @@ where
     S: CoordinatorLeaseStore + ScopedElectionStore + MembershipStore + ActorGroupStore,
 {
     pub(super) async fn renew_membership(&mut self) {
+        if self
+            .store
+            .lifecycle()
+            .await
+            .is_ok_and(|run| matches!(run.phase, RunPhase::Closed { .. }))
+        {
+            // Preserve the last locally validated term for completion delivery;
+            // no leader lease or ordinary write is renewed after Closed.
+            return;
+        }
         let mut membership_failed = false;
         if let Some(membership) = self.membership.as_mut() {
             let result = match membership.renew_leadership().await {
-                Ok(()) => membership.reconcile_expired_members().await,
+                Ok(()) => match self.store.lifecycle().await {
+                    Ok(lifecycle) if lifecycle.is_running() => {
+                        membership.reconcile_expired_members().await
+                    }
+                    Ok(_) => Ok(()),
+                    Err(error) => Err(error.into()),
+                },
                 Err(error) => Err(error),
             };
             if let Err(error) = result {
@@ -163,7 +187,10 @@ where
                 self.membership_events = Some(leader.subscribe());
                 self.membership = Some(leader);
             }
-            Err(CoordinatorRuntimeError::NotLeader) => {
+            Err(
+                CoordinatorRuntimeError::NotLeader
+                | CoordinatorRuntimeError::Storage(StorageError::CandidateNotEligible),
+            ) => {
                 self.membership_state = CoordinatorHostScopeState::Standby;
             }
             Err(error) => {

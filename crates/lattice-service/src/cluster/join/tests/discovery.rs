@@ -130,6 +130,71 @@ async fn probes_hint_first_and_falls_back_when_it_no_longer_knows_a_leader() {
 
 struct SilentDiscovery;
 
+#[tokio::test]
+async fn terminal_receipt_is_recoverable_from_a_seed_without_any_leader() {
+    use lattice_discovery::static_provider::{StaticDiscovery, StaticEndpoint};
+    use lattice_model::run::{
+        ClusterLifecycle, ControlOperationId, RunCompletion, RunEpoch, RunPhase,
+    };
+    let _network = network_test_guard().await;
+    let cluster = ClusterId::new("terminal-receipt").unwrap();
+    let client_identity = NodeIdentity {
+        cluster_id: cluster.clone(),
+        node_id: "client".into(),
+        address: unused_address().await,
+        incarnation: NodeIncarnation::new(1).unwrap(),
+    };
+    let (client, manager) = endpoint(client_identity);
+    client.bind().await.unwrap();
+    let seed_identity = NodeIdentity {
+        cluster_id: cluster,
+        node_id: "observer".into(),
+        address: unused_address().await,
+        incarnation: NodeIncarnation::new(2).unwrap(),
+    };
+    let (seed, _) = endpoint(seed_identity.clone());
+    let view = Arc::new(BootstrapView::new(seed_identity.clone()));
+    let closed = ClusterLifecycle {
+        epoch: RunEpoch::INITIAL,
+        phase: RunPhase::Closed {
+            operation: ControlOperationId::new("stop").unwrap(),
+            completion: RunCompletion::Graceful,
+        },
+    };
+    view.install_lifecycle(closed.clone());
+    seed.install_bootstrap_handler(view);
+    seed.bind().await.unwrap();
+    let discovery = StaticDiscovery::new(
+        CoordinatorScope::Cluster,
+        "terminal",
+        vec![StaticEndpoint {
+            address: seed_identity.address.clone(),
+            expected_node_id: Some(seed_identity.node_id.clone()),
+            priority: 0,
+        }],
+    )
+    .unwrap();
+    let controller = JoinController::new(
+        Arc::new(discovery),
+        client.clone(),
+        manager,
+        ClusterJoinConfig::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        controller.query_completion(RunEpoch::INITIAL).await,
+        Some(closed)
+    );
+    assert!(
+        controller
+            .query_completion(RunEpoch::INITIAL.next().unwrap())
+            .await
+            .is_none()
+    );
+    client.shutdown().await.unwrap();
+    seed.shutdown().await.unwrap();
+}
+
 #[tokio::test(start_paused = true)]
 async fn discovery_updates_do_not_skip_or_extend_the_retry_deadline() {
     let mut updates = stream::iter((1..=100).map(|generation| {

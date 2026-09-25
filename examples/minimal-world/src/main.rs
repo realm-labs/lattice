@@ -1,6 +1,8 @@
 #![cfg_attr(not(test), deny(clippy::wildcard_imports))]
 use lattice_actor::context::HandlerContext;
+use lattice_coordination::storage::candidates::provision_candidate;
 use lattice_model::actor::ActorId;
+use lattice_model::cluster::CoordinatorScope;
 
 use std::{
     collections::{BTreeSet, HashSet},
@@ -280,6 +282,14 @@ async fn main() -> Result<(), Box<dyn StdError>> {
     )?
     .try_typed()?;
 
+    // This example owns a fresh development control plane. Production candidate
+    // policy is provisioned explicitly by an administrator, never by election.
+    for scope in [
+        CoordinatorScope::Cluster,
+        CoordinatorScope::Group(group.clone()),
+    ] {
+        provision_candidate(store.as_ref(), scope, "coordinator".to_owned()).await?;
+    }
     let application = LatticeService::builder(node_config(
         cluster_id.clone(),
         "world-a",

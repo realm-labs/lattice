@@ -1,3 +1,4 @@
+use lattice_model::run::{ClusterLifecycle, RunPhase};
 use std::time::Duration;
 
 use crate::framework::{decode_framework_frame, encode_framework_frame};
@@ -116,6 +117,10 @@ pub struct BootstrapLeader {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BootstrapResult {
+    Closed {
+        remote: NodeIdentity,
+        lifecycle: ClusterLifecycle,
+    },
     Identity {
         remote: NodeIdentity,
         leader: Option<BootstrapLeader>,
@@ -174,6 +179,12 @@ impl BootstrapResponse {
             return Err(BootstrapError::NonceMismatch);
         }
         match &self.result {
+            BootstrapResult::Closed { remote, lifecycle } => {
+                validate_remote(request, remote)?;
+                if !matches!(lifecycle.phase, RunPhase::Closed { .. }) {
+                    return Err(BootstrapError::InvalidResponse);
+                }
+            }
             BootstrapResult::Identity { remote, leader }
             | BootstrapResult::ReverseDial { remote, leader } => {
                 validate_remote(request, remote)?;
@@ -202,6 +213,7 @@ impl BootstrapResponse {
     pub fn remote_identity(&self) -> Option<&NodeIdentity> {
         match &self.result {
             BootstrapResult::Identity { remote, .. }
+            | BootstrapResult::Closed { remote, .. }
             | BootstrapResult::Redirect { remote, .. }
             | BootstrapResult::ReverseDial { remote, .. } => Some(remote),
             BootstrapResult::Rejected { .. } | BootstrapResult::RetryAfter { .. } => None,
@@ -220,6 +232,7 @@ pub enum BootstrapRejectionCode {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BootstrapRoute {
+    Closed { lifecycle: ClusterLifecycle },
     Accept { leader: Option<BootstrapLeader> },
     Redirect { leader: BootstrapLeader },
     RetryAfter { delay: Duration, reason: String },
@@ -277,6 +290,8 @@ struct BootstrapRequestWire {
 
 #[derive(Clone, PartialEq, Message)]
 struct BootstrapResponseWire {
+    #[prost(string, tag = "11")]
+    terminal_lifecycle: String,
     #[prost(bytes = "vec", tag = "4")]
     nonce: Vec<u8>,
     #[prost(enumeration = "BootstrapResultKind", tag = "5")]
@@ -322,6 +337,7 @@ struct BootstrapLeaderWire {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Enumeration)]
 #[repr(i32)]
 enum BootstrapResultKind {
+    Closed = 6,
     Identity = 1,
     Redirect = 2,
     ReverseDial = 3,
@@ -367,6 +383,14 @@ impl From<&BootstrapResponse> for BootstrapResponseWire {
     fn from(value: &BootstrapResponse) -> Self {
         let (result_kind, remote, leader, rejection_code, retry_after_millis, reason) =
             match &value.result {
+                BootstrapResult::Closed { remote, .. } => (
+                    BootstrapResultKind::Closed,
+                    Some(NodeIdentityWire::from(remote)),
+                    None,
+                    None,
+                    0,
+                    String::new(),
+                ),
                 BootstrapResult::Identity { remote, leader } => (
                     BootstrapResultKind::Identity,
                     Some(NodeIdentityWire::from(remote)),
@@ -410,6 +434,12 @@ impl From<&BootstrapResponse> for BootstrapResponseWire {
             };
         Self {
             nonce: value.nonce.to_be_bytes().to_vec(),
+            terminal_lifecycle: match &value.result {
+                BootstrapResult::Closed { lifecycle, .. } => {
+                    serde_json::to_string(lifecycle).expect("lifecycle serializes")
+                }
+                _ => String::new(),
+            },
             result_kind: result_kind as i32,
             remote,
             leader,
@@ -429,6 +459,20 @@ impl TryFrom<BootstrapResponseWire> for BootstrapResponse {
         let result = match BootstrapResultKind::try_from(value.result_kind)
             .map_err(|_| BootstrapError::InvalidResult)?
         {
+            BootstrapResultKind::Closed => {
+                if value.terminal_lifecycle.len() > 1024 {
+                    return Err(BootstrapError::InvalidResponse);
+                }
+                let lifecycle: ClusterLifecycle = serde_json::from_str(&value.terminal_lifecycle)
+                    .map_err(|_| BootstrapError::InvalidResponse)?;
+                if !matches!(lifecycle.phase, RunPhase::Closed { .. }) {
+                    return Err(BootstrapError::InvalidResponse);
+                }
+                BootstrapResult::Closed {
+                    remote: remote.ok_or(BootstrapError::InvalidResult)?,
+                    lifecycle,
+                }
+            }
             BootstrapResultKind::Identity => BootstrapResult::Identity {
                 remote: remote.ok_or(BootstrapError::InvalidResult)?,
                 leader,
@@ -652,5 +696,41 @@ mod tests {
             request.rejection(&identity("replacement", 2, 7448)),
             Some(BootstrapRejectionCode::ExpectedNodeMismatch)
         );
+    }
+
+    #[test]
+    fn terminal_result_round_trips_without_a_leader_and_rejects_nonterminal_payload() {
+        use lattice_model::run::{ControlOperationId, RunCompletion, RunEpoch};
+        let request = BootstrapRequest::new(
+            CoordinatorScope::Cluster,
+            identity("client", 1, 7447),
+            ClusterId::new("test").unwrap(),
+            Some("server".to_owned()),
+        );
+        let closed = ClusterLifecycle {
+            epoch: RunEpoch::INITIAL,
+            phase: RunPhase::Closed {
+                operation: ControlOperationId::new("close").unwrap(),
+                completion: RunCompletion::Graceful,
+            },
+        };
+        let response = BootstrapResponse::new(
+            request.nonce,
+            BootstrapResult::Closed {
+                remote: identity("server", 2, 7448),
+                lifecycle: closed,
+            },
+        );
+        let decoded = BootstrapResponse::from_frame(&response.to_frame()).unwrap();
+        decoded.validate_for(&request).unwrap();
+        assert_eq!(decoded, response);
+        let invalid = BootstrapResponse::new(
+            request.nonce,
+            BootstrapResult::Closed {
+                remote: identity("server", 2, 7448),
+                lifecycle: ClusterLifecycle::initial(),
+            },
+        );
+        assert!(BootstrapResponse::from_frame(&invalid.to_frame()).is_err());
     }
 }

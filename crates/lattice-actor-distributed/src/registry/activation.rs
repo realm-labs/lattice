@@ -99,6 +99,14 @@ impl<D: ActorDefinition, A: Actor> ActorRegistry<D, A> {
         fencing_token: Option<ActorFencingToken>,
     ) -> Result<RegistryLookup<A>, ActorActivationError> {
         loop {
+            // A quarantined activation may still be executing its admitted handler or
+            // retrying persistence. A fresh grant is not proof that it stopped.
+            if self.quarantined.iter().any(|entry| {
+                &entry.value().actor_id == actor_id
+                    && entry.value().handle.lifecycle_state() != ActorLifecycleState::Stopped
+            }) {
+                return Err(ActorActivationError::RetainedStopFailure);
+            }
             match self.entries.entry(actor_id.clone()) {
                 Entry::Occupied(entry) => {
                     let existing_token = match entry.get() {
@@ -131,6 +139,16 @@ impl<D: ActorDefinition, A: Actor> ActorRegistry<D, A> {
                     };
                 }
                 Entry::Vacant(entry) => {
+                    // A concurrent fence may have transferred the old handle to
+                    // quarantine while this lookup waited for the entry lock.
+                    // Recheck under that same lock before publishing a loader.
+                    if self.quarantined.iter().any(|retired| {
+                        &retired.value().actor_id == actor_id
+                            && retired.value().handle.lifecycle_state()
+                                != ActorLifecycleState::Stopped
+                    }) {
+                        return Err(ActorActivationError::RetainedStopFailure);
+                    }
                     let activation =
                         ActivationState::new(self.config.waiter_capacity, fencing_token);
                     entry.insert(RegistryEntry::Activating(activation.clone()));

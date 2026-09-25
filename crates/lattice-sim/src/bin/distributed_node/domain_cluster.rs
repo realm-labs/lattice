@@ -45,6 +45,9 @@ async fn group_host(
     let address = NodeEndpoint::new(node_id.clone(), port)?;
     let builder =
         LatticeService::builder(node_config(cluster, &node_id, address.clone(), incarnation))?;
+    for scope in std::iter::once(CoordinatorScope::Cluster).chain(parse_distributed_groups(&groups)?.into_iter().map(CoordinatorScope::Group)) {
+        provision_fixture_candidate(store.as_ref(), scope, node_id.clone()).await?;
+    }
     let host = CoordinatorHost::elect(
         store,
         builder.association_manager(),

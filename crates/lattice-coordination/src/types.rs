@@ -205,6 +205,8 @@ pub struct PlacementSlot {
     pub state: PlacementSlotState,
     pub active_move: Option<u128>,
     #[serde(default)]
+    /// Reconstructed cache; durable identities live in the sealed transfer barrier.
+    #[serde(skip)]
     pub barrier_sessions: BTreeSet<NodeIncarnation>,
 }
 
@@ -251,6 +253,9 @@ impl PlacementSlot {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClaimGrant {
+    /// Zero is a notification that a claim exists, never serving permission.
+    /// Nonzero values bind an issuance commit to one owner-initiated request.
+    pub request_id: u128,
     pub group: ActorGroupId,
     pub slot: PlacementSlotKey,
     pub owner: NodeKey,

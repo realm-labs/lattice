@@ -2,13 +2,14 @@
 use lattice_actor::context::HandlerContext;
 use lattice_actor::runtime::{ActorRuntime, ActorRuntimeConfig};
 use lattice_actor_distributed::registry::ActorDefinition;
+use lattice_coordination::storage::candidates::{CandidateStore, provision_candidate};
 
 use std::{
     collections::{BTreeMap, BTreeSet},
     error::Error,
     io::{Error as IoError, ErrorKind},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
@@ -37,7 +38,7 @@ use lattice_coordination::{
         control_stream_id, encode_control_command_for_term,
     },
     coordinator::{
-        ActorGroupHello, MemberHello, MemberRecord, MemberStatus, SnapshotLimits, SnapshotRecord,
+        ActorGroupHello, MemberRecord, MemberStatus, SnapshotLimits, SnapshotRecord,
         SnapshotVersion, build_snapshot,
     },
     region::EntityConfig,
@@ -45,7 +46,7 @@ use lattice_coordination::{
         CoordinatorRuntimeError, GroupCoordinator, GroupCoordinatorConfig,
         host::{CoordinatorHost, CoordinatorHostConfig},
     },
-    session::{GroupSession, GroupSessionConfig},
+    session::{GroupSession, GroupSessionConfig, LogicPlacementState},
     storage::{
         InMemoryCoordinationStore, ScopedElectionStore, StorageError,
         etcd::{EtcdCoordinationConfig, EtcdCoordinationStore},
@@ -290,6 +291,7 @@ struct EntityFixture {
 }
 
 struct EntityServiceFixture {
+    state: Arc<Mutex<LogicPlacementState>>,
     service: LatticeService,
     control: Arc<PlacementControlRouter>,
     coordinator: AssociationKey,
@@ -408,6 +410,12 @@ async fn discovery_coordinator(
     let builder =
         LatticeService::builder(node_config(cluster, &node_id, address.clone(), incarnation))?;
     let store = Arc::new(InMemoryCoordinationStore::new(64, 64)?);
+    for scope in [
+        CoordinatorScope::Cluster,
+        CoordinatorScope::Group(actor_group()),
+    ] {
+        provision_fixture_candidate(store.as_ref(), scope, node_id.clone()).await?;
+    }
     let host = CoordinatorHost::elect(
         store,
         builder.association_manager(),
@@ -821,6 +829,7 @@ async fn entity_owner(reference: PathBuf) -> Result<(), Box<dyn Error>> {
     let entity_id = ActorId::new(b"gateway-account-42".to_vec())?;
     let slot = fixture_entity_slot(&entity_config, &entity_id, owner.clone())?;
     let EntityServiceFixture {
+        state,
         service,
         control,
         coordinator,
@@ -833,7 +842,8 @@ async fn entity_owner(reference: PathBuf) -> Result<(), Box<dyn Error>> {
         true,
     )?;
     service.start().await?;
-    install_fixture_snapshot(&control, &coordinator, &slot, member, true).await?;
+    let _grant_oracle =
+        install_fixture_snapshot(&control, &coordinator, &state, &slot, member, true).await?;
     wait_for_node_ready(&service).await?;
     std::fs::write(
         "/artifacts/coordinator-placement-snapshot.json",
@@ -886,13 +896,15 @@ async fn gateway(reference: PathBuf) -> Result<(), Box<dyn Error>> {
     }
     let slot = fixture_entity_slot(&entity_config, fixture.reference.entity_id(), owner.clone())?;
     let EntityServiceFixture {
+        state,
         service,
         control,
         coordinator,
         member,
     } = entity_service(cluster.clone(), local, entity_config, &slot, false)?;
     service.start().await?;
-    install_fixture_snapshot(&control, &coordinator, &slot, member, false).await?;
+    let _grant_oracle =
+        install_fixture_snapshot(&control, &coordinator, &state, &slot, member, false).await?;
     wait_for_node_ready(&service).await?;
     let owner_identity = NodeIdentity {
         cluster_id: cluster,
@@ -996,16 +1008,8 @@ fn entity_service(
             connection_nonce: nonce,
         })?;
     }
-    let member_hello = MemberHello {
-        node: node.clone(),
-        roles: BTreeSet::from([if owns_slot { "entity" } else { "gateway" }.to_owned()]),
-        failure_domains: BTreeMap::new(),
-        protocols: Vec::new(),
-        remoting_capabilities: BTreeSet::new(),
-    };
     let member = MemberRecord {
         node: node.clone(),
-        hello: member_hello,
         status: MemberStatus::Up,
         version: MembershipVersion::new(slot.version.term, slot.version.revision),
         lease_id: 1,
@@ -1038,7 +1042,7 @@ fn entity_service(
     let control = Arc::new(control);
     let mut router = GroupLogicalRouter::new(
         node,
-        state,
+        state.clone(),
         associations,
         messaging,
         coordinator.clone(),
@@ -1056,6 +1060,7 @@ fn entity_service(
         .register_actor(registry, protocol)?
         .cluster_logic_runtime(router, control.clone(), logic, controls, effects);
     Ok(EntityServiceFixture {
+        state,
         service: builder.build()?,
         control,
         coordinator,
@@ -1064,12 +1069,13 @@ fn entity_service(
 }
 
 async fn install_fixture_snapshot(
-    control: &PlacementControlRouter,
+    control: &Arc<PlacementControlRouter>,
     coordinator: &AssociationKey,
+    state: &Arc<Mutex<LogicPlacementState>>,
     slot: &PlacementSlot,
     member: MemberRecord,
     owns_slot: bool,
-) -> Result<(), Box<dyn Error>> {
+) -> Result<Option<FixtureGrantOracle>, Box<dyn Error>> {
     let limits = SnapshotLimits::default();
     let record = SnapshotRecord {
         key: match &slot.key {
@@ -1108,6 +1114,7 @@ async fn install_fixture_snapshot(
     commands.push(PlacementControlCommand::MemberUp(member));
     if owns_slot {
         commands.push(PlacementControlCommand::ClaimGranted(ClaimGrant {
+            request_id: 0,
             group: slot.key.group().clone(),
             slot: slot.key.clone(),
             owner: slot.owner.clone().ok_or("fixture slot has no owner")?,
@@ -1117,7 +1124,14 @@ async fn install_fixture_snapshot(
             ttl: Duration::from_secs(300),
         }));
     }
-    for command in commands {
+    for mut command in commands {
+        if let PlacementControlCommand::ClaimGranted(grant) = &mut command {
+            grant.request_id = state
+                .lock()
+                .unwrap()
+                .pending_claim_request(&grant.slot)
+                .ok_or("owner did not request authority")?;
+        }
         control
             .apply(
                 coordinator.clone(),
@@ -1132,7 +1146,14 @@ async fn install_fixture_snapshot(
             )
             .await?;
     }
-    Ok(())
+    Ok(owns_slot.then(|| {
+        FixtureGrantOracle::spawn(
+            control.clone(),
+            coordinator.clone(),
+            state.clone(),
+            slot.clone(),
+        )
+    }))
 }
 
 async fn wait_for_node_ready(service: &LatticeService) -> Result<(), Box<dyn Error>> {
@@ -1148,6 +1169,7 @@ async fn wait_for_node_ready(service: &LatticeService) -> Result<(), Box<dyn Err
 }
 
 include!("distributed_node/helpers.rs");
+include!("distributed_node/grant_oracle.rs");
 include!("distributed_node/domain_cluster.rs");
 include!("distributed_node/split_entity.rs");
 include!("distributed_node/ha_coordinator.rs");

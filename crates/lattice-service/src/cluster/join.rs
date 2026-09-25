@@ -2,7 +2,10 @@ use std::{
     collections::{BTreeMap, hash_map::RandomState},
     future::pending,
     hash::BuildHasher,
-    sync::{Arc, RwLock},
+    sync::{
+        Arc, RwLock,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
@@ -13,6 +16,7 @@ use lattice_discovery::provider::{
 };
 use lattice_discovery::shared::SharedDiscovery;
 use lattice_model::cluster::CoordinatorScope;
+use lattice_model::run::{ClusterLifecycle, RunEpoch, RunPhase};
 use lattice_remoting::{
     association::{Association, AssociationManager, AssociationState},
     bootstrap::{
@@ -43,6 +47,7 @@ pub enum JoinEvent {
 }
 
 pub struct JoinController {
+    session_healthy: AtomicBool,
     discovery: Arc<dyn CoordinatorDiscovery>,
     endpoint: Arc<RemotingEndpoint>,
     associations: Arc<AssociationManager>,
@@ -50,6 +55,43 @@ pub struct JoinController {
 }
 
 impl JoinController {
+    pub fn set_session_healthy(&self, healthy: bool) {
+        self.session_healthy.store(healthy, Ordering::Release);
+    }
+    /// Queries retained terminal facts through configured bootstrap endpoints.
+    /// No live leader or Association is required and results from other epochs
+    /// never complete the caller's operation.
+    pub async fn query_completion(&self, epoch: RunEpoch) -> Option<ClusterLifecycle> {
+        if let Ok(Some(completion)) = self.discovery.terminal_lifecycle(epoch).await
+            && completion.epoch == epoch
+            && matches!(completion.phase, RunPhase::Closed { .. })
+        {
+            return Some(completion);
+        }
+        let snapshot = self.discovery.snapshots().next().await?.ok()?;
+        let mut targets = snapshot.targets;
+        if let Some(hint) = snapshot.leader_hint {
+            targets.insert(0, hint);
+        }
+        let scope = snapshot.scope;
+        let probes = stream::iter(targets.into_iter().map(|target| {
+            let target = probe_target(scope.clone(), target);
+            async move { self.endpoint.probe_candidate(target).await }
+        }))
+        .buffer_unordered(self.config.probe_concurrency);
+        tokio::pin!(probes);
+        while let Some(response) = probes.next().await {
+            let Ok(response) = response else {
+                continue;
+            };
+            if let BootstrapResult::Closed { lifecycle, .. } = response.result {
+                if lifecycle.epoch == epoch {
+                    return Some(lifecycle);
+                }
+            }
+        }
+        None
+    }
     pub fn new(
         discovery: Arc<dyn CoordinatorDiscovery>,
         endpoint: Arc<RemotingEndpoint>,
@@ -58,6 +100,7 @@ impl JoinController {
     ) -> Result<Self, JoinError> {
         config.validate().map_err(JoinError::Config)?;
         Ok(Self {
+            session_healthy: AtomicBool::new(false),
             discovery: Arc::new(SharedDiscovery::new(discovery)),
             endpoint,
             associations,
@@ -212,6 +255,10 @@ impl JoinController {
                                     }
                                 }
                                 _ = leadership_refresh.tick() => {
+                                    if self.session_healthy.load(Ordering::Acquire) && association.state()==AssociationState::Active {
+                                        leadership_confirmed_at=Instant::now();
+                                        continue;
+                                    }
                                     let Some(snapshot) = latest.clone() else {
                                         continue;
                                     };
@@ -438,6 +485,7 @@ async fn probe_targets(
     let mut leaders = Vec::new();
     for response in results.into_iter().flatten() {
         match response.result {
+            BootstrapResult::Closed { .. } => {}
             BootstrapResult::Identity {
                 remote,
                 leader: Some(leader),
@@ -516,6 +564,7 @@ async fn establish_coordinator(
 
 #[derive(Debug)]
 pub struct BootstrapView {
+    lifecycle: RwLock<Option<ClusterLifecycle>>,
     local: NodeIdentity,
     leaders: RwLock<BTreeMap<CoordinatorScope, BootstrapLeader>>,
 }
@@ -524,6 +573,7 @@ impl BootstrapView {
     pub fn new(local: NodeIdentity) -> Self {
         Self {
             local,
+            lifecycle: RwLock::new(None),
             leaders: RwLock::new(BTreeMap::new()),
         }
     }
@@ -533,6 +583,13 @@ impl BootstrapView {
             .write()
             .expect("bootstrap leader view poisoned")
             .insert(leader.scope.clone(), leader);
+    }
+
+    pub fn install_lifecycle(&self, lifecycle: ClusterLifecycle) {
+        *self
+            .lifecycle
+            .write()
+            .expect("bootstrap lifecycle poisoned") = Some(lifecycle);
     }
 
     pub fn clear(&self, scope: &CoordinatorScope) {
@@ -555,6 +612,17 @@ impl BootstrapView {
 
 impl BootstrapHandler for BootstrapView {
     fn route(&self, request: &BootstrapRequest) -> BootstrapRoute {
+        if let Some(lifecycle) = self
+            .lifecycle
+            .read()
+            .expect("bootstrap lifecycle poisoned")
+            .as_ref()
+            .filter(|run| matches!(run.phase, RunPhase::Closed { .. }))
+        {
+            return BootstrapRoute::Closed {
+                lifecycle: lifecycle.clone(),
+            };
+        }
         let Some(leader) = self
             .leaders
             .read()

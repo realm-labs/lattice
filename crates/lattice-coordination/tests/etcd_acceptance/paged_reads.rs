@@ -41,7 +41,7 @@ fn singleton_key() -> PlacementSlotKey {
 
 fn shard_record_key(prefix: &str, shard: u32) -> String {
     format!(
-        "{prefix}/domains/{}/shards/{PAGED_ENTITY}/{shard}",
+        "{prefix}/runs/1/groups/{}/shards/{PAGED_ENTITY}/{shard}",
         group().as_str()
     )
 }
@@ -112,7 +112,7 @@ async fn real_etcd_slot_pages_are_bounded_ranges_over_both_slot_prefixes() {
     }
     raw.put(
         format!(
-            "{prefix}/domains/{}/singletons/{PAGED_SINGLETON}",
+            "{prefix}/runs/1/groups/{}/singletons/{PAGED_SINGLETON}",
             group().as_str()
         ),
         paged_slot(singleton_key()),

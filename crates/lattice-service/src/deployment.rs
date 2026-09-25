@@ -332,6 +332,8 @@ where
 
 #[cfg(test)]
 mod tests {
+    use lattice_coordination::storage::candidates::provision_candidate;
+    use lattice_model::cluster::CoordinatorScope;
     use std::{collections::BTreeSet, net::TcpListener, sync::Arc, time::Duration};
 
     use lattice_coordination::{
@@ -455,10 +457,18 @@ mod tests {
     #[tokio::test]
     async fn embedded_candidate_joins_the_managed_control_plane() {
         let cluster = ClusterId::new("embedded-mode-test").unwrap();
+        let store = Arc::new(InMemoryCoordinationStore::new(16, 16).unwrap());
+        provision_candidate(
+            store.as_ref(),
+            CoordinatorScope::Cluster,
+            "coordinator".to_owned(),
+        )
+        .await
+        .unwrap();
         let application = LatticeService::builder(node(&cluster, "logic"))
             .unwrap()
             .build_embedded(
-                Arc::new(InMemoryCoordinationStore::new(16, 16).unwrap()),
+                store,
                 EmbeddedCoordinatorConfig::new(node(&cluster, "coordinator")),
             )
             .await

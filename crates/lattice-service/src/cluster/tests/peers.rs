@@ -1,11 +1,8 @@
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    sync::Arc,
-};
+use std::sync::Arc;
 
 use lattice_actor_distributed::host::ProtocolHostRegistry;
 use lattice_coordination::{
-    coordinator::{MemberChange, MemberEvent, MemberHello, MemberRecord, MemberStatus},
+    coordinator::{MemberChange, MemberEvent, MemberRecord, MemberStatus},
     types::{CoordinatorTerm, MembershipVersion, NodeKey, Revision},
 };
 use lattice_model::cluster::{ClusterId, NodeIncarnation};
@@ -28,13 +25,6 @@ fn member(node: NodeKey, revision: u64) -> MemberRecord {
     );
     MemberRecord {
         node: node.clone(),
-        hello: MemberHello {
-            node,
-            roles: BTreeSet::new(),
-            failure_domains: BTreeMap::new(),
-            protocols: Vec::new(),
-            remoting_capabilities: BTreeSet::new(),
-        },
         status: MemberStatus::Up,
         version,
         lease_id: 1,

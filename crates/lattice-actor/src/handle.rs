@@ -19,6 +19,7 @@ use tokio::{
 };
 
 use crate::{
+    attachments::ActorExecutionGate,
     error::{ActorAdminError, ActorCallError, ActorTellError},
     mailbox::{
         ActorCommand, ActorEnvelope, MailboxLane, RequestEnvelope, TellEnvelope,
@@ -38,6 +39,7 @@ pub(crate) type TerminalHook = Box<dyn FnOnce(LocalActorRef) + Send + 'static>;
 const COOPERATIVE_CAPACITY_WAITER_LIMIT: usize = 2;
 
 pub(crate) struct ActorHandleInit<A: Actor> {
+    pub(crate) execution_gate: Option<Arc<ActorExecutionGate>>,
     pub(crate) local_ref: LocalActorRef,
     pub(crate) terminated_tx: broadcast::Sender<ActorTermination>,
     pub(crate) lifecycle_tx: watch::Sender<ActorLifecycleState>,
@@ -50,6 +52,7 @@ pub(crate) struct ActorHandleInit<A: Actor> {
 }
 
 pub struct ActorHandle<A: Actor> {
+    execution_gate: Option<Arc<ActorExecutionGate>>,
     local_ref: LocalActorRef,
     terminated_tx: broadcast::Sender<ActorTermination>,
     termination: Arc<Mutex<Option<ActorTermination>>>,
@@ -144,6 +147,7 @@ impl<A: Actor> fmt::Debug for ActorHandle<A> {
 impl<A: Actor> Clone for ActorHandle<A> {
     fn clone(&self) -> Self {
         Self {
+            execution_gate: self.execution_gate.clone(),
             local_ref: self.local_ref,
             terminated_tx: self.terminated_tx.clone(),
             termination: self.termination.clone(),
@@ -167,6 +171,7 @@ impl<A: Actor> Clone for ActorHandle<A> {
 impl<A: Actor> ActorHandle<A> {
     pub(crate) fn new(init: ActorHandleInit<A>) -> Self {
         Self {
+            execution_gate: init.execution_gate,
             local_ref: init.local_ref,
             terminated_tx: init.terminated_tx,
             termination: Arc::new(Mutex::new(None)),
@@ -308,6 +313,18 @@ impl<A: Actor> ActorHandle<A> {
     #[doc(hidden)]
     pub fn business_admission_fenced(&self) -> bool {
         self.business_fenced.load(Ordering::Acquire)
+    }
+
+    /// Must be checked where queued business work is admitted, not only on send.
+    /// The callback is intentionally not invoked by the raw flag accessor: registry
+    /// publication uses that accessor while holding the authority publication lock.
+    pub(crate) fn business_execution_fenced(&self) -> bool {
+        if !self.business_admission_fenced()
+            && self.execution_gate.as_ref().is_some_and(|gate| !(gate.0)())
+        {
+            self.fence_business_admission();
+        }
+        self.business_admission_fenced()
     }
 
     pub(crate) async fn wait_business_fenced(&self) {

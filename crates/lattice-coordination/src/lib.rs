@@ -4,11 +4,16 @@ use lattice_model::framework::assert_release;
 
 const _: () = assert_release(env!("CARGO_PKG_VERSION"));
 
+pub mod administration;
 pub mod allocation;
 pub mod authority;
+#[cfg(any(test, feature = "test-harness"))]
+mod candidate_fixture;
+pub mod candidates;
 pub mod cluster_session;
 pub mod control;
 pub mod coordinator;
+pub mod discovery;
 mod drain;
 pub mod failpoints;
 pub mod handoff;
@@ -17,6 +22,7 @@ pub mod plan;
 pub mod region;
 pub mod runtime;
 pub mod session;
+pub mod shutdown;
 pub mod singleton;
 pub mod storage;
 pub mod types;
@@ -78,8 +84,15 @@ mod tests {
             .transition(AuthorityEvent::ReconcileSlot(slot.clone()))
             .unwrap();
         authority
+            .transition(AuthorityEvent::BeginRenewal {
+                request_id: 1,
+                now: MonotonicTime::from_millis(100),
+            })
+            .unwrap();
+        authority
             .transition(AuthorityEvent::InstallGrant {
                 grant: ClaimGrant {
+                    request_id: 1,
                     group: slot.key.group().clone(),
                     slot: slot.key.clone(),
                     owner: local.clone(),
@@ -125,7 +138,7 @@ mod tests {
     }
 
     #[test]
-    fn a_reinstalled_grant_reopens_admission_against_the_new_deadline() {
+    fn expired_authority_cannot_be_reopened_by_a_late_grant() {
         let local = node("a", 1, 1001);
         let slot = running_slot(local.clone());
         let mut authority = granted_authority(&local, &slot, Duration::from_secs(15));
@@ -133,6 +146,7 @@ mod tests {
         authority
             .transition(AuthorityEvent::InstallGrant {
                 grant: ClaimGrant {
+                    request_id: 1,
                     group: slot.key.group().clone(),
                     slot: slot.key.clone(),
                     owner: local,
@@ -143,8 +157,8 @@ mod tests {
                 },
                 now: MonotonicTime::from_millis(20_000),
             })
-            .unwrap();
-        assert!(authority.admission_open_at(MonotonicTime::from_millis(20_001)));
+            .unwrap_err();
+        assert!(!authority.admission_open_at(MonotonicTime::from_millis(20_001)));
         assert!(!authority.admission_open_at(MonotonicTime::from_millis(33_000)));
     }
 
@@ -154,8 +168,15 @@ mod tests {
         let slot = running_slot(local.clone());
         let mut authority = granted_authority(&local, &slot, Duration::from_secs(15));
         authority
+            .transition(AuthorityEvent::BeginRenewal {
+                request_id: 1,
+                now: MonotonicTime::from_millis(500),
+            })
+            .unwrap();
+        authority
             .transition(AuthorityEvent::InstallGrant {
                 grant: ClaimGrant {
+                    request_id: 1,
                     group: slot.key.group().clone(),
                     slot: slot.key.clone(),
                     owner: local.clone(),
@@ -169,8 +190,15 @@ mod tests {
             .unwrap();
         assert!(authority.admission_open_at(MonotonicTime::from_millis(501)));
 
+        authority
+            .transition(AuthorityEvent::BeginRenewal {
+                request_id: 1,
+                now: MonotonicTime::from_millis(600),
+            })
+            .unwrap();
         let stale = authority.transition(AuthorityEvent::InstallGrant {
             grant: ClaimGrant {
+                request_id: 1,
                 group: slot.key.group().clone(),
                 slot: slot.key,
                 owner: local,
@@ -238,7 +266,7 @@ mod tests {
             degraded: false,
             nodes: vec![placement_node(a, 1, 10), placement_node(b.clone(), 4, 20)],
             shards: Vec::<PlacedShard>::new(),
-            active_cluster_moves: 0,
+            active_group_moves: 0,
             active_entity_moves: BTreeMap::new(),
             active_source_moves: BTreeMap::new(),
             active_target_moves: BTreeMap::new(),
@@ -286,3 +314,4 @@ mod tests {
         assert!(slot.validate().is_ok());
     }
 }
+mod admin_operation;

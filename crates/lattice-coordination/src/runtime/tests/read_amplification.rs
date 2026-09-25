@@ -1,4 +1,5 @@
 use super::*;
+use crate::candidate_fixture::elect_group;
 
 const SHARDS: u32 = 24;
 
@@ -65,7 +66,7 @@ async fn fixture(cluster: &str, port_base: u16, page_size: usize) -> Amplificati
         fingerprint: ProtocolFingerprint::new([13; 32]),
     };
     let store = Arc::new(InMemoryCoordinationStore::new(128, 16).unwrap());
-    let mut leader = GroupCoordinator::elect(
+    let mut leader = elect_group(
         store.clone(),
         associations,
         coordinator_node,

@@ -14,6 +14,7 @@ use crate::{
     coordinator::CoordinatorDelta,
     storage::{
         StorageError,
+        barrier::BarrierProgress,
         records::{
             ActivateAuthority, AuthorityCommit, ClaimPredicate, CompleteMove, FenceAuthority,
             InstallAuthority, LeasedClaim, ReserveMove, TransitionSlot,
@@ -43,7 +44,12 @@ where
             if !self.can_start_move(plan_id, shard_id)? {
                 continue;
             }
-            self.begin_move(plan_id, shard_id).await?;
+            match self.begin_move(plan_id, shard_id).await {
+                // The store is the final admission arbiter, including recovered
+                // reservations not yet reflected in this process's cache.
+                Err(CoordinatorRuntimeError::Storage(StorageError::Capacity)) => continue,
+                result => result?,
+            }
         }
         Ok(())
     }
@@ -63,30 +69,26 @@ where
             .find(|movement| movement.shard_id == shard_id)
             .ok_or(CoordinatorRuntimeError::UnknownSlot)?;
         let limits = self.config.rebalance_limits;
-        let active = self
-            .plans
-            .values()
-            .flat_map(|plan| {
-                plan.moves
-                    .iter()
-                    .filter(|movement| movement.progress == MoveProgress::Handoff)
-                    .map(move |movement| (&plan.entity_type, movement))
-            })
-            .collect::<Vec<_>>();
-        Ok(active.len() < limits.concurrent_cluster
+        // Include singleton and recovered handoffs; plans alone omit these
+        // durable reservations and undercount source/target occupancy.
+        let active = self.handoffs.values().collect::<Vec<_>>();
+        Ok(active.len() < limits.concurrent_group
             && active
                 .iter()
-                .filter(|(entity, _)| *entity == &plan.entity_type)
+                .filter(|handoff| {
+                    matches!(&handoff.slot, PlacementSlotKey::Shard { entity_type, .. }
+                    if entity_type == &plan.entity_type)
+                })
                 .count()
                 < limits.concurrent_entity
             && active
                 .iter()
-                .filter(|(_, active)| active.source == movement.source)
+                .filter(|handoff| handoff.source == movement.source)
                 .count()
                 < limits.concurrent_source
             && active
                 .iter()
-                .filter(|(_, active)| active.target == movement.target)
+                .filter(|handoff| handoff.target == movement.target)
                 .count()
                 < limits.concurrent_target)
     }
@@ -122,16 +124,10 @@ where
         plan.begin_move(shard_id, slot.assignment_generation, slot.active_move)
             .map_err(CoordinatorRuntimeError::Plan)?;
         let barrier_version = self.next_version()?;
-        let barrier_sessions: BTreeSet<NodeIncarnation> = self
-            .sessions
-            .iter()
-            .filter_map(|(incarnation, session)| {
-                session
-                    .hello
-                    .subscribes_to(&plan.entity_type)
-                    .then_some(*incarnation)
-            })
-            .collect();
+        // Every admitted group session acknowledges the fence revision, even
+        // when its delta contains no slot payload. Durable member records need
+        // not duplicate application subscription descriptions.
+        let barrier_sessions: BTreeSet<NodeIncarnation> = self.sessions.keys().copied().collect();
         plan.install_barrier(shard_id, barrier_version.clone(), barrier_sessions.clone())
             .map_err(CoordinatorRuntimeError::Plan)?;
         plan.record_revision = plan
@@ -148,6 +144,7 @@ where
             .reserve_move(
                 &self.leader_guard,
                 ReserveMove {
+                    limits: self.config.rebalance_limits,
                     expected_plan,
                     plan,
                     expected_slot,
@@ -232,12 +229,34 @@ where
         key: PlacementSlotKey,
         event: HandoffEvent,
     ) -> Result<(), CoordinatorRuntimeError> {
-        let effects = self
+        let mut next = self
             .handoffs
-            .get_mut(&key)
-            .ok_or(CoordinatorRuntimeError::UnknownHandoff)?
+            .get(&key)
+            .cloned()
+            .ok_or(CoordinatorRuntimeError::UnknownHandoff)?;
+        let progress = match &event {
+            HandoffEvent::AppliedRevision { session, .. } => {
+                Some((*session, BarrierProgress::Applied))
+            }
+            HandoffEvent::FenceSession(session) => Some((*session, BarrierProgress::SessionFenced)),
+            _ => None,
+        };
+        let effects = next
             .transition(event)
             .map_err(CoordinatorRuntimeError::Handoff)?;
+        if let Some((participant, progress)) = progress {
+            self.store
+                .advance_transfer_barrier(
+                    &self.leader_guard,
+                    &key,
+                    next.plan_id,
+                    participant,
+                    progress,
+                )
+                .await?;
+        }
+        // Do not advance the local machine if the guarded evidence commit fails.
+        self.handoffs.insert(key.clone(), next);
         self.apply_handoff_effects(key, effects).await
     }
 
@@ -248,7 +267,22 @@ where
     ) -> Result<(), CoordinatorRuntimeError> {
         for effect in effects {
             match effect {
-                HandoffEffect::DrainSource => self.drain_source(&key).await?,
+                HandoffEffect::DrainSource => {
+                    let operation = self
+                        .handoffs
+                        .get(&key)
+                        .ok_or(CoordinatorRuntimeError::UnknownHandoff)?
+                        .plan_id;
+                    let barrier = self.store.transfer_barrier(&key, operation).await?;
+                    if barrier
+                        .participants
+                        .values()
+                        .any(|progress| *progress == BarrierProgress::Pending)
+                    {
+                        return Err(StorageError::StorageMetadataMismatch.into());
+                    }
+                    self.drain_source(&key).await?;
+                }
                 HandoffEffect::ReplaceAuthority => self.replace_authority(&key).await?,
                 HandoffEffect::PublishActive => self.publish_active(&key).await?,
                 HandoffEffect::StopFailed => self.record_stop_failed(&key).await?,
@@ -428,6 +462,12 @@ where
         if slot.state != PlacementSlotState::Fenced || slot.active_move != Some(handoff.plan_id) {
             return Err(CoordinatorRuntimeError::StaleHandoff);
         }
+        if !handoff.source_stopped()
+            && !self.replacement_wait_complete(key, slot.assignment_generation)
+        {
+            self.focus_reconciliation(key);
+            return Ok(());
+        }
         let lease_id = self.store.grant_lease(self.config.claim_ttl).await?;
         let expected_slot = slot.clone();
         slot.owner = Some(handoff.target.clone());
@@ -436,6 +476,7 @@ where
         slot.state = PlacementSlotState::Allocating;
         slot.version = self.next_version()?;
         let grant = ClaimGrant {
+            request_id: 0,
             group: key.group().clone(),
             slot: key.clone(),
             owner: handoff.target.clone(),
@@ -585,6 +626,9 @@ where
         self.slot_assigned_at.insert(key.clone(), self.now());
         self.handoffs.remove(key);
         self.publish_slot_delta(&slot).await?;
+        self.store
+            .reclaim_transfer_barrier(&self.leader_guard, key, handoff.plan_id)
+            .await?;
         if let Some(plan) = completed_plan {
             self.plans.insert(plan.plan_id, plan);
             self.start_pending_moves(handoff.plan_id).await?;

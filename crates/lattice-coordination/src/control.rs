@@ -1,6 +1,9 @@
 use std::{collections::BTreeMap, sync::RwLock, time::Duration};
 
+use crate::candidates::{CandidateChange, CandidateChangeResult};
+use crate::shutdown::{NodeStopOutcome, ShutdownRequestRejection};
 use bytes::Bytes;
+use lattice_model::run::{ClusterLifecycle, ControlOperationId, RunEpoch};
 use lattice_model::{
     cluster::CoordinatorScope,
     cluster::{ActorGroupId, EntityType, NodeIncarnation, SingletonKind},
@@ -71,10 +74,51 @@ fn completion_closed() -> ControlDispatchError {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PlacementControlCommand {
+    ClusterRunning {
+        epoch: RunEpoch,
+    },
+    NodeStopCompleted {
+        epoch: RunEpoch,
+        node: NodeKey,
+    },
+    NodeStopConfirmed {
+        epoch: RunEpoch,
+        node: NodeKey,
+    },
+    RequestClusterShutdown {
+        epoch: RunEpoch,
+        operation: ControlOperationId,
+    },
+    ClusterShutdownResult {
+        request: ControlOperationId,
+        outcome: Result<ClusterLifecycle, ShutdownRequestRejection>,
+    },
+    ChangeCandidate(CandidateChange),
+    CandidateChanged {
+        operation: ControlOperationId,
+        result: CandidateChangeResult,
+    },
+    ClusterClosing {
+        epoch: RunEpoch,
+        operation: ControlOperationId,
+    },
+    ClusterStopReport {
+        epoch: RunEpoch,
+        operation: ControlOperationId,
+        node: NodeKey,
+        outcome: NodeStopOutcome,
+    },
+    ClusterClosed {
+        lifecycle: ClusterLifecycle,
+    },
     MemberHello(MemberHello),
     ActorGroupHello(ActorGroupHello),
     NodeHeartbeat {
         incarnation: NodeIncarnation,
+        sequence: u64,
+    },
+    /// Session responsiveness only; never extends serving authority.
+    NodeHeartbeatAck {
         sequence: u64,
     },
     JoinReady {
@@ -90,6 +134,11 @@ pub enum PlacementControlCommand {
     StateDelta(CoordinatorDelta),
     AppliedRevision(PlacementVersion),
     ClaimGranted(ClaimGrant),
+    RequestClaim {
+        request_id: u128,
+        slot: PlacementSlotKey,
+        generation: AssignmentGeneration,
+    },
     NodeLoad(NodeLoadReport),
     ShardLoad(ShardLoadReport),
     ResolveShard {
@@ -157,9 +206,20 @@ pub enum PlacementControlCommand {
 impl PlacementControlCommand {
     pub const fn name(&self) -> &'static str {
         match self {
+            Self::ClusterRunning { .. } => "ClusterRunning",
+            Self::NodeStopCompleted { .. } => "NodeStopCompleted",
+            Self::NodeStopConfirmed { .. } => "NodeStopConfirmed",
+            Self::RequestClusterShutdown { .. } => "RequestClusterShutdown",
+            Self::ClusterShutdownResult { .. } => "ClusterShutdownResult",
+            Self::ChangeCandidate(_) => "ChangeCandidate",
+            Self::CandidateChanged { .. } => "CandidateChanged",
+            Self::ClusterClosing { .. } => "ClusterClosing",
+            Self::ClusterStopReport { .. } => "ClusterStopReport",
+            Self::ClusterClosed { .. } => "ClusterClosed",
             Self::MemberHello(_) => "MemberHello",
             Self::ActorGroupHello(_) => "ActorGroupHello",
             Self::NodeHeartbeat { .. } => "NodeHeartbeat",
+            Self::NodeHeartbeatAck { .. } => "NodeHeartbeatAck",
             Self::JoinReady { .. } => "JoinReady",
             Self::MemberUp(_) => "MemberUp",
             Self::MemberDelta(_) => "MemberDelta",
@@ -171,6 +231,7 @@ impl PlacementControlCommand {
             Self::StateDelta(_) => "StateDelta",
             Self::AppliedRevision(_) => "AppliedRevision",
             Self::ClaimGranted(_) => "ClaimGranted",
+            Self::RequestClaim { .. } => "RequestClaim",
             Self::NodeLoad(_) => "NodeLoad",
             Self::ShardLoad(_) => "ShardLoad",
             Self::ResolveShard { .. } => "ResolveShard",
@@ -254,6 +315,7 @@ fn encode_control_command_unbounded(
     coordinator_term: Option<u64>,
     command: &PlacementControlCommand,
 ) -> Result<Vec<u8>, PlacementControlError> {
+    validate_command_scope(scope, command)?;
     if coordinator_term == Some(0) {
         return Err(PlacementControlError::InvalidCoordinatorTerm);
     }
@@ -287,11 +349,38 @@ pub fn decode_control_command(
         .command
         .ok_or(PlacementControlError::Codec)?
         .into_command()?;
+    validate_command_scope(&scope, &command)?;
     Ok(ScopedPlacementControlCommand {
         scope,
         coordinator_term: wire.coordinator_term,
         command,
     })
+}
+
+fn validate_command_scope(
+    scope: &CoordinatorScope,
+    command: &PlacementControlCommand,
+) -> Result<(), PlacementControlError> {
+    if matches!(
+        command,
+        PlacementControlCommand::ClusterRunning { .. }
+            | PlacementControlCommand::NodeStopCompleted { .. }
+            | PlacementControlCommand::NodeStopConfirmed { .. }
+            | PlacementControlCommand::RequestClusterShutdown { .. }
+            | PlacementControlCommand::ClusterShutdownResult { .. }
+            | PlacementControlCommand::ClusterClosing { .. }
+            | PlacementControlCommand::ClusterStopReport { .. }
+            | PlacementControlCommand::ClusterClosed { .. }
+    ) && *scope != CoordinatorScope::Cluster
+    {
+        return Err(PlacementControlError::Codec);
+    }
+    if let PlacementControlCommand::ChangeCandidate(request) = command
+        && &request.scope != scope
+    {
+        return Err(PlacementControlError::Codec);
+    }
+    Ok(())
 }
 
 #[derive(Clone, PartialEq, Message)]

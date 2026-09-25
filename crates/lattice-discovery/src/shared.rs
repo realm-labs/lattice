@@ -10,7 +10,7 @@ use std::{
 };
 
 use futures_util::{Stream, StreamExt};
-use lattice_model::cluster::CoordinatorScope;
+use lattice_model::{cluster::CoordinatorScope, run::RunEpoch};
 use tokio::{
     runtime::Handle,
     sync::watch,
@@ -18,7 +18,8 @@ use tokio::{
 };
 
 use crate::provider::{
-    CoordinatorDirectorySnapshot, CoordinatorDiscovery, DiscoveryError, validate_snapshot,
+    CoordinatorDirectorySnapshot, CoordinatorDiscovery, DiscoveryError, TerminalLifecycleFuture,
+    validate_snapshot,
 };
 
 /// Fans out one provider stream and retains its latest validated snapshot.
@@ -100,6 +101,9 @@ impl Drop for SharedState {
 }
 
 impl CoordinatorDiscovery for SharedDiscovery {
+    fn terminal_lifecycle(&self, epoch: RunEpoch) -> TerminalLifecycleFuture<'_> {
+        self.inner.provider.terminal_lifecycle(epoch)
+    }
     fn scope(&self) -> &CoordinatorScope {
         self.inner.provider.scope()
     }

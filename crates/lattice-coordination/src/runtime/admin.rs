@@ -1,4 +1,4 @@
-use crate::failpoints;
+use crate::{admin_operation::matches_current, failpoints};
 
 use std::time::SystemTime;
 
@@ -20,7 +20,8 @@ use crate::{
         records::{
             AdminOperationRecord, AdminOperationResult, AdminOperationStatus,
             AutomaticBalanceSettings, CommitAutomaticSettings, CompactAdminOperations, CreatePlan,
-            CreatePlanWithOperation, RecordAdminOperation, UpdatePlan, UpdatePlanWithOperation,
+            CreatePlanWithOperation, MAX_ADMIN_GC_BATCH, RecordAdminOperation, UpdatePlan,
+            UpdatePlanWithOperation,
         },
     },
     types::{PlacementVersion, ShardId},
@@ -191,12 +192,12 @@ where
             }
             None => settings.globally_paused = paused,
         }
-        settings.version = self.version.clone();
+        settings.version = self.next_version()?;
         let operation = self.new_admin_operation(
             operation_id,
             fingerprint,
             AdminOperationResult::AutomaticBalanceUpdated,
-            self.version.clone(),
+            settings.version.clone(),
         )?;
         super::guarded_commit_failpoint(failpoints::ADMIN_BEFORE_GUARDED_COMMIT)?;
         let settings = self
@@ -213,7 +214,9 @@ where
         super::post_commit_failpoint(failpoints::ADMIN_AFTER_COMMIT_BEFORE_RESPONSE)?;
         self.automatic_globally_paused = settings.globally_paused;
         self.paused_entity_types = settings.paused_entity_types.clone();
+        self.version = settings.version.clone();
         self.automatic_settings = Some(settings);
+        self.synchronize_sessions().await?;
         self.applied_admin_operations
             .insert(operation.operation_id.clone(), operation);
         self.compact_admin_operation_history().await
@@ -274,12 +277,7 @@ where
                         .hello
                         .hosted_entity_types
                         .contains(&request.entity_type)
-                    && session
-                        .record
-                        .hello
-                        .protocols
-                        .iter()
-                        .any(|protocol| protocol.protocol_id == config.protocol_id)
+                    && session.hello.entity_configs.contains(&config)
             })
             .map(|session| session.hello.node.clone())
             .ok_or(CoordinatorRuntimeError::IneligibleTarget)?;
@@ -372,6 +370,7 @@ where
             )
             .await?;
         self.version = version;
+        self.synchronize_sessions().await?;
         self.applied_admin_operations
             .insert(operation.operation_id.clone(), operation);
         self.compact_admin_operation_history().await
@@ -380,6 +379,7 @@ where
     pub(super) async fn inspect(&self) -> Result<CoordinatorInspection, CoordinatorRuntimeError> {
         let now = Instant::now();
         Ok(CoordinatorInspection {
+            epoch: self.leader_guard.record().epoch,
             version: self.version.clone(),
             automatic_globally_paused: self.automatic_globally_paused,
             paused_entity_types: self.paused_entity_types.iter().cloned().collect(),
@@ -419,10 +419,27 @@ where
         if operation_id.is_empty() || operation_id.len() > 256 {
             return Err(CoordinatorRuntimeError::InvalidAdminOperation);
         }
+        if !self.applied_admin_operations.contains_key(operation_id)
+            && !matches_current(
+                operation_id,
+                self.leader_guard.record().epoch,
+                &self.version,
+            )
+        {
+            return Err(CoordinatorRuntimeError::OperationExpired);
+        }
         self.applied_admin_operations
             .get(operation_id)
             .map(|previous| {
                 if previous.fingerprint == fingerprint {
+                    let proposal = match previous.result {
+                        AdminOperationResult::PlanCreated { plan_id } => Some(plan_id),
+                        AdminOperationResult::EvaluationCompleted { plan_id } => plan_id,
+                        _ => None,
+                    };
+                    if proposal.is_some_and(|plan_id| !self.plans.contains_key(&plan_id)) {
+                        return Err(CoordinatorRuntimeError::OperationExpired);
+                    }
                     Ok(previous.result.clone())
                 } else {
                     Err(CoordinatorRuntimeError::IdempotencyConflict)
@@ -468,6 +485,8 @@ where
                 },
             )
             .await?;
+        self.version = operation.version.clone();
+        self.synchronize_sessions().await?;
         self.applied_admin_operations
             .insert(operation.operation_id.clone(), operation);
         self.compact_admin_operation_history().await
@@ -508,6 +527,7 @@ where
             .filter_map(|(index, record)| {
                 (record.expires_unix_millis <= now || index < excess).then_some(record)
             })
+            .take(MAX_ADMIN_GC_BATCH)
             .collect::<Vec<_>>();
         if expected.is_empty() {
             return Ok(());
@@ -620,7 +640,7 @@ where
                 operation_id,
                 fingerprint,
                 AdminOperationResult::EvaluationCompleted { plan_id: None },
-                self.version.clone(),
+                self.next_version()?,
             )?;
             self.persist_admin_operation(operation).await?;
             return Ok(None);
@@ -682,6 +702,16 @@ where
             self.reserve_admin_operation_capacity().await?;
         }
         self.preempt_lower_priority(plan.reason.clone()).await?;
+        let pending_capacity = self.store.durable_limits(&self.version.group).maximum_plans;
+        if self
+            .plans
+            .values()
+            .filter(|plan| matches!(plan.status, PlanStatus::Planned | PlanStatus::Running))
+            .count()
+            >= pending_capacity
+        {
+            return Err(CoordinatorRuntimeError::PlanConflict);
+        }
         self.revalidate_plan(&plan).await?;
         let plan_id = plan.plan_id;
         let operation = admin
@@ -697,7 +727,7 @@ where
                     admin.operation_id,
                     admin.fingerprint,
                     result,
-                    self.version.clone(),
+                    self.next_version()?,
                 )
             })
             .transpose()?;
@@ -712,6 +742,8 @@ where
                     },
                 )
                 .await?;
+            self.version = operation.version.clone();
+            self.synchronize_sessions().await?;
             self.applied_admin_operations
                 .insert(operation.operation_id.clone(), operation);
         } else {
@@ -826,12 +858,7 @@ where
                             .hello
                             .hosted_entity_types
                             .contains(&plan.entity_type)
-                        && session
-                            .record
-                            .hello
-                            .protocols
-                            .iter()
-                            .any(|protocol| protocol.protocol_id == config.protocol_id)
+                        && session.hello.entity_configs.contains(&config)
                 })
                 .ok_or(CoordinatorRuntimeError::IneligibleTarget)?;
             let reservation = target_reservations
@@ -877,7 +904,7 @@ where
             operation_id,
             fingerprint,
             AdminOperationResult::PendingMoveCancelled { plan_id, shard_id },
-            self.version.clone(),
+            self.next_version()?,
         )?;
         self.store
             .update_plan_with_operation(
@@ -890,6 +917,8 @@ where
             )
             .await?;
         self.plans.insert(plan_id, plan);
+        self.version = operation.version.clone();
+        self.synchronize_sessions().await?;
         self.applied_admin_operations
             .insert(operation.operation_id.clone(), operation);
         self.compact_plan_history().await?;

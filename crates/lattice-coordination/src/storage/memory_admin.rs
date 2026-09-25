@@ -1,20 +1,29 @@
 use super::records::{
     AdminOperationRecord, AutomaticBalanceSettings, CommitAutomaticSettings,
-    CompactAdminOperations, CreatePlanWithOperation, PlanCommit, RecordAdminOperation,
-    UpdatePlanWithOperation,
+    CompactAdminOperations, CreatePlanWithOperation, MAX_ADMIN_GC_BATCH, PlanCommit,
+    RecordAdminOperation, UpdatePlanWithOperation, encode_record,
 };
 use super::{
     ExactLeaderGuard, GroupLeaderGuard, InMemoryCoordinationStore, StorageError, set_revision,
     validate_admin_operation, validate_guard, validate_next_revision, validate_plan_group,
     validate_plan_update,
 };
+use crate::admin_operation::matches_committed;
 
 pub(super) fn commit_automatic_settings(
     store: &InMemoryCoordinationStore,
     guard: &GroupLeaderGuard,
     request: CommitAutomaticSettings,
 ) -> Result<AutomaticBalanceSettings, StorageError> {
+    encode_record(&request.settings)?;
     validate_admin_operation(guard, &request.operation)?;
+    if !matches_committed(
+        &request.operation.operation_id,
+        guard.record().epoch,
+        &request.operation.version,
+    ) {
+        return Err(StorageError::InvalidRecord);
+    }
     if request.settings.version.group != request.operation.version.group
         || request.settings.version.term != guard.term()
         || request
@@ -26,6 +35,7 @@ pub(super) fn commit_automatic_settings(
     }
     let mut state = store.inner.lock().expect("placement memory store poisoned");
     validate_guard(&state, guard)?;
+    validate_next_revision(&state, guard.scope(), request.operation.version.revision)?;
     let group = request.operation.version.group.clone();
     if state.automatic_settings.get(&group) != request.expected.as_ref()
         || state
@@ -47,6 +57,11 @@ pub(super) fn commit_automatic_settings(
     state
         .automatic_settings
         .insert(group.clone(), request.settings.clone());
+    set_revision(
+        &mut state,
+        guard.scope(),
+        request.operation.version.revision,
+    );
     state.admin_operations.insert(
         (group, request.operation.operation_id.clone()),
         request.operation,
@@ -60,9 +75,17 @@ pub(super) fn create_plan_with_operation(
     request: CreatePlanWithOperation,
 ) -> Result<PlanCommit, StorageError> {
     validate_admin_operation(guard, &request.operation)?;
+    if !matches_committed(
+        &request.operation.operation_id,
+        guard.record().epoch,
+        &request.operation.version,
+    ) {
+        return Err(StorageError::InvalidRecord);
+    }
     validate_plan_group(guard, &request.plan)?;
     let mut state = store.inner.lock().expect("placement memory store poisoned");
     validate_guard(&state, guard)?;
+    validate_next_revision(&state, guard.scope(), request.operation.version.revision)?;
     let group = request.plan.group.clone();
     if request.plan.coordinator_term != guard.term()
         || request.plan.record_revision.get() != 1
@@ -75,12 +98,13 @@ pub(super) fn create_plan_with_operation(
     {
         return Err(StorageError::CompareFailed);
     }
-    if state
-        .plans
-        .keys()
-        .filter(|(candidate, _)| candidate == &group)
-        .count()
-        == store.maximum_plans
+    if (request.plan.durable().is_some()
+        && state
+            .plans
+            .keys()
+            .filter(|(candidate, _)| candidate == &group)
+            .count()
+            == store.maximum_plans)
         || state
             .admin_operations
             .keys()
@@ -90,9 +114,14 @@ pub(super) fn create_plan_with_operation(
     {
         return Err(StorageError::Capacity);
     }
-    state
-        .plans
-        .insert((group.clone(), request.plan.plan_id), request.plan.clone());
+    if let Some(record) = request.plan.durable() {
+        state.plans.insert((group.clone(), record.plan_id), record);
+    }
+    set_revision(
+        &mut state,
+        guard.scope(),
+        request.operation.version.revision,
+    );
     state.admin_operations.insert(
         (group, request.operation.operation_id.clone()),
         request.operation,
@@ -106,16 +135,24 @@ pub(super) fn update_plan_with_operation(
     request: UpdatePlanWithOperation,
 ) -> Result<PlanCommit, StorageError> {
     validate_admin_operation(guard, &request.operation)?;
+    if !matches_committed(
+        &request.operation.operation_id,
+        guard.record().epoch,
+        &request.operation.version,
+    ) {
+        return Err(StorageError::InvalidRecord);
+    }
     validate_plan_group(guard, &request.expected_plan)?;
     validate_plan_group(guard, &request.plan)?;
     validate_plan_update(&request.expected_plan, &request.plan)?;
     let mut state = store.inner.lock().expect("placement memory store poisoned");
     validate_guard(&state, guard)?;
+    validate_next_revision(&state, guard.scope(), request.operation.version.revision)?;
     let group = request.plan.group.clone();
     if state
         .plans
         .get(&(group.clone(), request.expected_plan.plan_id))
-        != Some(&request.expected_plan)
+        != request.expected_plan.durable().as_ref()
         || state
             .admin_operations
             .contains_key(&(group.clone(), request.operation.operation_id.clone()))
@@ -131,9 +168,14 @@ pub(super) fn update_plan_with_operation(
     {
         return Err(StorageError::Capacity);
     }
-    state
-        .plans
-        .insert((group.clone(), request.plan.plan_id), request.plan.clone());
+    if let Some(record) = request.plan.durable() {
+        state.plans.insert((group.clone(), record.plan_id), record);
+    }
+    set_revision(
+        &mut state,
+        guard.scope(),
+        request.operation.version.revision,
+    );
     state.admin_operations.insert(
         (group, request.operation.operation_id.clone()),
         request.operation,
@@ -183,8 +225,13 @@ pub(super) fn compact_admin_operations(
     guard: &GroupLeaderGuard,
     request: CompactAdminOperations,
 ) -> Result<(), StorageError> {
+    if request.expected.len() > MAX_ADMIN_GC_BATCH {
+        return Err(StorageError::Capacity);
+    }
     for record in &request.expected {
-        validate_admin_operation(guard, record)?;
+        if &record.version.group != guard.group() {
+            return Err(StorageError::InvalidRecord);
+        }
     }
     let mut state = store.inner.lock().expect("placement memory store poisoned");
     validate_guard(&state, guard)?;

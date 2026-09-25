@@ -155,6 +155,41 @@ async fn fencing_loading_activation_does_not_remove_a_replacement() {
 }
 
 #[tokio::test]
+async fn registry_shutdown_serializes_with_loading_publication_and_fences_cached_handles() {
+    let actor_runtime = ActorRuntime::default();
+    let registry = ActorRegistry::<GenerationLoadingDefinition, SlowActor>::new(
+        actor_runtime.spawner(),
+        ActorRegistryConfig::default(),
+    );
+    let active_id = ActorId::new(175_u64.to_be_bytes().to_vec()).unwrap();
+    let loading_id = ActorId::new(176_u64.to_be_bytes().to_vec()).unwrap();
+    let cached = registry
+        .get_or_activate(active_id, || async { Ok(SlowActor) })
+        .await
+        .unwrap();
+    let (release, ready) = oneshot::channel();
+    let mut loading = Box::pin(registry.get_or_activate(loading_id.clone(), || async {
+        ready.await.unwrap();
+        Ok(SlowActor)
+    }));
+    assert!(futures_util::poll!(&mut loading).is_pending());
+    registry.close_business_admission();
+    assert!(cached.business_admission_fenced());
+    release.send(()).unwrap();
+    assert!(loading.await.is_err());
+    assert!(registry.get_running(&loading_id).is_none());
+    assert!(
+        registry
+            .get_or_activate(loading_id, || async {
+                panic!("closed registry must not load")
+            })
+            .await
+            .is_err()
+    );
+    assert!(registry.drain().await.completed());
+}
+
+#[tokio::test]
 async fn authority_change_during_loading_rejects_publication_and_allows_retry() {
     let actor_runtime = ActorRuntime::default();
     let registry = ActorRegistry::<GenerationLoadingDefinition, SlowActor>::new(
@@ -188,13 +223,24 @@ async fn authority_change_during_loading_rejects_publication_and_allows_retry() 
         .await
         .unwrap();
     *generation.lock().unwrap() = Some(3);
-    let replacement = registry
-        .get_or_activate(actor_id.clone(), || async {
-            assert!(old.business_admission_fenced());
-            Ok(SlowActor)
-        })
-        .await
-        .expect("current authority must retire an activation left by an older generation");
+    let replacement = tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            match registry
+                .get_or_activate(actor_id.clone(), || async {
+                    assert!(old.business_admission_fenced());
+                    assert_eq!(old.lifecycle_state(), ActorLifecycleState::Stopped);
+                    Ok(SlowActor)
+                })
+                .await
+            {
+                Ok(handle) => break handle,
+                Err(ActorActivationError::RetainedStopFailure) => tokio::task::yield_now().await,
+                Err(error) => panic!("unexpected activation error: {error}"),
+            }
+        }
+    })
+    .await
+    .expect("replacement waits for old-instance retirement");
     assert_ne!(old.local_ref(), replacement.local_ref());
     assert_eq!(
         registry.get_running(&actor_id).unwrap().local_ref(),
@@ -273,15 +319,14 @@ async fn new_generation_preserves_an_old_stop_failure_in_quarantine() {
         Err(ActorActivationError::RetainedStopFailure)
     ));
     *generation.lock().unwrap() = Some(2);
-    let replacement = registry
-        .get_or_activate(actor_id.clone(), || async {
-            Ok(RetainedRegistryActor {
-                persistence_available: Arc::new(AtomicBool::new(true)),
-                dropped: Arc::new(AtomicUsize::new(0)),
+    assert!(matches!(
+        registry
+            .get_or_activate(actor_id.clone(), || async {
+                panic!("new generation must not overlap retained stop failure")
             })
-        })
-        .await
-        .unwrap();
+            .await,
+        Err(ActorActivationError::RetainedStopFailure)
+    ));
     assert!(old.business_admission_fenced());
     assert!(registry.inspect_quarantined(&actor_id).is_some());
     assert_eq!(dropped.load(Ordering::SeqCst), 0);
@@ -299,6 +344,15 @@ async fn new_generation_preserves_an_old_stop_failure_in_quarantine() {
     .await
     .unwrap();
     assert_eq!(registry.quarantine_len(), 0);
+    let replacement = registry
+        .get_or_activate(actor_id.clone(), || async {
+            Ok(RetainedRegistryActor {
+                persistence_available: Arc::new(AtomicBool::new(true)),
+                dropped: Arc::new(AtomicUsize::new(0)),
+            })
+        })
+        .await
+        .unwrap();
     assert_eq!(
         registry.get_running(&actor_id).unwrap().local_ref(),
         replacement.local_ref()
@@ -681,7 +735,7 @@ async fn voluntary_stop_failed_blocks_replacement_until_same_actor_retries() {
 }
 
 #[tokio::test]
-async fn external_authority_loss_quarantines_old_actor_and_allows_replacement() {
+async fn external_authority_loss_blocks_replacement_until_quarantine_retires() {
     let actor_runtime = ActorRuntime::default();
     let registry = ActorRegistry::<RetainedRegistryActorDefinition, _>::new(
         actor_runtime.spawner(),
@@ -723,6 +777,21 @@ async fn external_authority_loss_quarantines_old_actor_and_allows_replacement() 
     assert_eq!(registry.quarantine_len(), 1);
     assert_eq!(dropped.load(Ordering::SeqCst), 0);
 
+    assert!(matches!(
+        registry
+            .get_or_activate(actor_id.clone(), || async {
+                panic!("external authority loss is not old-instance stop proof")
+            })
+            .await,
+        Err(ActorActivationError::RetainedStopFailure)
+    ));
+    persistence_available.store(true, Ordering::SeqCst);
+    registry.retry_quarantined(&actor_id).await.unwrap();
+    while *old_lifecycle.borrow() != ActorLifecycleState::Stopped {
+        old_lifecycle.changed().await.unwrap();
+    }
+    assert_eq!(dropped.load(Ordering::SeqCst), 1);
+
     let replacement = registry
         .get_or_activate(actor_id.clone(), || async {
             Ok(RetainedRegistryActor {
@@ -738,11 +807,6 @@ async fn external_authority_loss_quarantines_old_actor_and_allows_replacement() 
         replacement.local_ref()
     );
 
-    persistence_available.store(true, Ordering::SeqCst);
-    registry.retry_quarantined(&actor_id).await.unwrap();
-    while *old_lifecycle.borrow() != ActorLifecycleState::Stopped {
-        old_lifecycle.changed().await.unwrap();
-    }
     assert_eq!(registry.quarantine_len(), 0);
     assert_eq!(
         registry.get_running(&actor_id).unwrap().local_ref(),
@@ -829,7 +893,7 @@ async fn quarantine_capacity_exhaustion_is_explicit_and_never_drops_retained_sta
 }
 
 #[tokio::test]
-async fn repeated_authority_loss_retains_every_exact_activation() {
+async fn repeated_replacement_attempts_cannot_overlap_retained_exact_activation() {
     let actor_runtime = ActorRuntime::default();
     let registry = ActorRegistry::<RetainedRegistryActorDefinition, _>::new(
         actor_runtime.spawner(),
@@ -855,23 +919,9 @@ async fn repeated_authority_loss_retains_every_exact_activation() {
         .await
         .unwrap();
 
-    let second = registry
-        .get_or_activate(actor_id.clone(), || async {
-            Ok(RetainedRegistryActor {
-                persistence_available: persistence_available.clone(),
-                dropped: Arc::new(AtomicUsize::new(0)),
-            })
-        })
-        .await
-        .unwrap();
-    registry
-        .fence_after_authority_loss(&actor_id)
-        .await
-        .unwrap();
-
     tokio::time::timeout(Duration::from_secs(1), async {
         loop {
-            if registry.quarantined_activations(&actor_id).len() == 2 {
+            if first.lifecycle_state() == ActorLifecycleState::StopFailed {
                 break;
             }
             tokio::task::yield_now().await;
@@ -879,17 +929,23 @@ async fn repeated_authority_loss_retains_every_exact_activation() {
     })
     .await
     .unwrap();
+    for _ in 0..16 {
+        assert!(matches!(
+            registry
+                .get_or_activate(actor_id.clone(), || async {
+                    panic!("retained exact activation must not be bypassed by retry")
+                })
+                .await,
+            Err(ActorActivationError::RetainedStopFailure)
+        ));
+    }
     let retained = registry.quarantined_activations(&actor_id);
+    assert_eq!(retained.len(), 1);
     assert_eq!(retained[0].local_ref, first.local_ref());
-    assert_eq!(retained[1].local_ref, second.local_ref());
 
     persistence_available.store(true, Ordering::SeqCst);
     registry
         .retry_quarantined_exact(first.local_ref())
-        .await
-        .unwrap();
-    registry
-        .retry_quarantined_exact(second.local_ref())
         .await
         .unwrap();
     tokio::time::timeout(Duration::from_secs(1), async {
@@ -899,6 +955,17 @@ async fn repeated_authority_loss_retains_every_exact_activation() {
     })
     .await
     .unwrap();
+    let second = registry
+        .get_or_activate(actor_id.clone(), || async {
+            Ok(RetainedRegistryActor {
+                persistence_available: persistence_available.clone(),
+                dropped: Arc::new(AtomicUsize::new(0)),
+            })
+        })
+        .await
+        .unwrap();
+    assert_ne!(first.local_ref(), second.local_ref());
+    assert!(registry.drain().await.completed());
 }
 
 #[tokio::test]

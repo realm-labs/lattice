@@ -9,6 +9,9 @@ use crate::types::{
     AssignmentGeneration, CoordinatorTerm, NodeKey, PlacementVersion, PlanRevision, ShardId,
 };
 
+/// Bound for one atomic plan metadata/move update (including reservation guards).
+pub const MAXIMUM_PLAN_MOVES: usize = 64;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PlanStatus {
     Planned,
@@ -36,6 +39,8 @@ pub struct RebalanceMove {
     pub estimated_weight: u64,
     pub progress: MoveProgress,
     pub barrier_version: Option<PlacementVersion>,
+    /// Reconstructed cache; durable identities live in the sealed transfer barrier.
+    #[serde(skip)]
     pub barrier_sessions: BTreeSet<NodeIncarnation>,
 }
 
@@ -74,13 +79,48 @@ impl From<&RebalanceTrigger> for PlanReason {
 }
 
 impl RebalancePlan {
+    /// Only admitted moves are recovery facts. Queued policy proposals and
+    /// cancelled-before-admission moves belong to the current leader's memory.
+    pub(crate) fn durable(&self) -> Option<Self> {
+        let mut record = self.clone();
+        record.moves.retain(|movement| {
+            !matches!(
+                movement.progress,
+                MoveProgress::Pending | MoveProgress::Cancelled
+            )
+        });
+        if record.moves.is_empty() {
+            return None;
+        }
+        record.status = if record
+            .moves
+            .iter()
+            .any(|movement| movement.progress == MoveProgress::Handoff)
+        {
+            PlanStatus::Running
+        } else if record
+            .moves
+            .iter()
+            .all(|movement| movement.progress == MoveProgress::Completed)
+        {
+            PlanStatus::Completed
+        } else {
+            PlanStatus::Failed
+        };
+        Some(record)
+    }
+
     pub fn from_proposal(
         proposal: RebalanceProposal,
         entity_type: EntityType,
         coordinator_term: CoordinatorTerm,
         maximum_moves: usize,
     ) -> Result<Self, PlanError> {
-        if maximum_moves == 0 || proposal.moves.is_empty() || proposal.moves.len() > maximum_moves {
+        if maximum_moves == 0
+            || proposal.moves.is_empty()
+            || proposal.moves.len() > maximum_moves
+            || proposal.moves.len() > MAXIMUM_PLAN_MOVES
+        {
             return Err(PlanError::InvalidMoveCount);
         }
         let mut shards = BTreeSet::new();
@@ -260,4 +300,69 @@ pub enum PlanError {
     CannotRollbackHandoff,
     #[error("rebalance move progress transition is illegal")]
     IllegalProgress,
+}
+
+#[cfg(test)]
+mod persistence_tests {
+    use super::{MoveProgress, PlanStatus, RebalancePlan};
+    use crate::{
+        allocation::{ProposedMove, RebalanceProposal, RebalanceTrigger},
+        storage::plan_records::validate_plan_payload,
+        types::{
+            AssignmentGeneration, CoordinatorTerm, NodeKey, PlacementVersion, Revision, ShardId,
+        },
+    };
+    use lattice_model::cluster::{ActorGroupId, EntityType, NodeEndpoint, NodeIncarnation};
+
+    #[test]
+    fn recovery_projection_contains_only_admitted_work() {
+        let group = ActorGroupId::new("projection").unwrap();
+        let entity = EntityType::new("entity").unwrap();
+        let node = |id| NodeKey {
+            node_id: format!("node-{id}"),
+            address: NodeEndpoint::new("localhost", 31000).unwrap(),
+            incarnation: NodeIncarnation::new(id).unwrap(),
+        };
+        let mut plan = RebalancePlan::from_proposal(
+            RebalanceProposal {
+                group: group.clone(),
+                policy_id: "test",
+                policy_version: 1,
+                base_version: PlacementVersion::new(
+                    group.clone(),
+                    CoordinatorTerm::new(1).unwrap(),
+                    Revision::new(1).unwrap(),
+                ),
+                trigger: RebalanceTrigger::Automatic,
+                moves: (0..2)
+                    .map(|id| ProposedMove {
+                        group: group.clone(),
+                        entity_type: entity.clone(),
+                        shard_id: ShardId::new(id),
+                        expected_generation: AssignmentGeneration::new(1).unwrap(),
+                        source: node(1),
+                        target: node(2),
+                        estimated_weight: 1,
+                    })
+                    .collect(),
+            },
+            entity,
+            CoordinatorTerm::new(1).unwrap(),
+            2,
+        )
+        .unwrap();
+        assert!(plan.durable().is_none());
+        plan.moves[0].progress = MoveProgress::Handoff;
+        plan.status = PlanStatus::Running;
+        let recovered = plan.durable().unwrap();
+        assert_eq!(recovered.moves.len(), 1);
+        assert_eq!(recovered.moves[0].shard_id, ShardId::new(0));
+        assert_eq!(recovered.status, PlanStatus::Running);
+        plan.moves[0].progress = MoveProgress::Completed;
+        assert_eq!(plan.durable().unwrap().status, PlanStatus::Completed);
+        assert_eq!(plan.moves[1].progress, MoveProgress::Pending);
+        validate_plan_payload(&plan).unwrap();
+        plan.policy_id = "x".repeat(4096);
+        assert!(validate_plan_payload(&plan).is_err());
+    }
 }

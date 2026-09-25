@@ -10,7 +10,7 @@ pub(super) async fn create_plan(
     }
     let key = store.plan_key(&request.plan.group, request.plan.plan_id);
     let count =
-        cardinality_counter(store, guard.scope(), "plans", 1, store.limits.maximum_plans).await?;
+        cardinality_counter(store, guard.scope(), "plans", i64::from(request.plan.durable().is_some()), store.limits.maximum_plans).await?;
     commit(
         store,
         guard,
@@ -18,7 +18,7 @@ pub(super) async fn create_plan(
             Compare::version(key.clone(), CompareOp::Equal, 0),
             count.compare,
         ],
-        vec![TxnOp::put(key, encode(&request.plan)?, None), count.put],
+        [plan_puts(store, &request.plan)?, vec![count.put]].concat(),
     )
     .await?;
     Ok(PlanCommit { plan: request.plan })
@@ -34,7 +34,7 @@ pub(super) async fn update_plan(
     validate_plan_group(guard, &request.plan)?;
     validate_plan_update(&request.expected, &request.plan)?;
     let key = store.plan_key(&request.plan.group, request.plan.plan_id);
-    let revision = exact_record(store, &key, &request.expected).await?;
+    let revision = exact_plan(store, &key, &request.expected).await?;
     commit(
         store,
         guard,
@@ -43,7 +43,7 @@ pub(super) async fn update_plan(
             CompareOp::Equal,
             revision,
         )],
-        vec![TxnOp::put(key, encode(&request.plan)?, None)],
+        plan_puts(store, &request.plan)?,
     )
     .await?;
     Ok(PlanCommit { plan: request.plan })
@@ -57,12 +57,12 @@ pub(super) async fn delete_plan(
     ensure_guard_live(store, guard).await?;
     validate_plan_group(guard, &request.expected)?;
     let key = store.plan_key(&request.expected.group, request.expected.plan_id);
-    let revision = exact_record(store, &key, &request.expected).await?;
+    let revision = exact_plan(store, &key, &request.expected).await?;
     let count = cardinality_counter(
         store,
         guard.scope(),
         "plans",
-        -1,
+        -i64::from(request.expected.durable().is_some()),
         store.limits.maximum_plans,
     )
     .await?;
@@ -73,7 +73,7 @@ pub(super) async fn delete_plan(
             Compare::mod_revision(key.clone(), CompareOp::Equal, revision),
             count.compare,
         ],
-        vec![TxnOp::delete(key, None), count.put],
+        [plan_deletes(store, &request.expected)?, vec![count.put]].concat(),
     )
     .await?;
     Ok(PlanCommit {
@@ -203,18 +203,19 @@ pub(super) async fn activate_authority(
     let claim_key = store.claim_key(&request.slot.key);
     let slot_revision = exact_record(store, &slot_key, &request.expected_slot).await?;
     let claim_revision = exact_claim(store, &claim_key, &request.expected_claim).await?;
+    let capacity = store.release_transfer_capacity(&request.expected_slot).await?;
     commit(
         store,
         guard,
-        vec![
+        [capacity.compares, vec![
             Compare::mod_revision(slot_key.clone(), CompareOp::Equal, slot_revision),
             Compare::mod_revision(claim_key, CompareOp::Equal, claim_revision),
             state.compare,
-        ],
-        vec![
+        ]].concat(),
+        [capacity.operations, vec![
             TxnOp::put(slot_key, encode(&request.slot)?, None),
             state.put,
-        ],
+        ]].concat(),
     )
     .await?;
     Ok(SlotCommit { slot: request.slot })
@@ -247,20 +248,26 @@ pub(super) async fn reserve_move(
     let slot_key = store.slot_key(&request.slot.key);
     let plan_key = store.plan_key(&request.plan.group, request.plan.plan_id);
     let slot_revision = exact_record(store, &slot_key, &request.expected_slot).await?;
-    let plan_revision = exact_record(store, &plan_key, &request.expected_plan).await?;
+    let plan_revision = exact_plan(store, &plan_key, &request.expected_plan).await?;
+    let capacity = store.reserve_transfer_capacity(guard, &request.slot, request.limits).await?;
+    let plan_count = cardinality_counter(
+        store, guard.scope(), "plans", i64::from(request.expected_plan.durable().is_none()),
+        store.limits.maximum_plans,
+    ).await?;
     commit(
         store,
         guard,
-        vec![
+        [capacity.compares, vec![
             Compare::mod_revision(slot_key.clone(), CompareOp::Equal, slot_revision),
             Compare::mod_revision(plan_key.clone(), CompareOp::Equal, plan_revision),
             state.compare,
-        ],
-        vec![
+            plan_count.compare,
+        ]].concat(),
+        [capacity.operations, plan_puts(store, &request.plan)?, vec![
             TxnOp::put(slot_key, encode(&request.slot)?, None),
-            TxnOp::put(plan_key, encode(&request.plan)?, None),
             state.put,
-        ],
+            plan_count.put,
+        ]].concat(),
     )
     .await?;
     Ok(MoveCommit {
@@ -289,17 +296,18 @@ pub(super) async fn reserve_handoff(
     let state = state_counter(store, guard.scope(), request.slot.version.revision).await?;
     let slot_key = store.slot_key(&request.slot.key);
     let slot_revision = exact_record(store, &slot_key, &request.expected_slot).await?;
+    let capacity = store.reserve_transfer_capacity(guard, &request.slot, request.limits).await?;
     commit(
         store,
         guard,
-        vec![
+        [capacity.compares, vec![
             Compare::mod_revision(slot_key.clone(), CompareOp::Equal, slot_revision),
             state.compare,
-        ],
-        vec![
+        ]].concat(),
+        [capacity.operations, vec![
             TxnOp::put(slot_key, encode(&request.slot)?, None),
             state.put,
-        ],
+        ]].concat(),
     )
     .await?;
     Ok(SlotCommit { slot: request.slot })
@@ -485,7 +493,9 @@ pub(super) async fn adopt_authority(
     .await?;
     if request.expected_claim.owner != request.claim.grant.owner
         || request.expected_claim.assignment_generation != request.claim.grant.assignment_generation
-        || request.expected_claim.coordinator_term >= request.claim.grant.coordinator_term
+        || request.expected_claim.coordinator_term > request.claim.grant.coordinator_term
+        || request.claim.grant.grant_sequence <= request.expected_claim.grant_sequence
+        || (request.expected_claim.coordinator_term == request.claim.grant.coordinator_term && request.claim.grant.request_id == 0)
         || request.claim.grant.coordinator_term != guard.term()
     {
         return Err(StorageError::InvalidTransition);
@@ -551,21 +561,21 @@ pub(super) async fn complete_move(
     let plan_key = store.plan_key(&request.plan.group, request.plan.plan_id);
     let slot_revision = exact_record(store, &slot_key, &request.expected_slot).await?;
     let claim_revision = exact_claim(store, &claim_key, &request.expected_claim).await?;
-    let plan_revision = exact_record(store, &plan_key, &request.expected_plan).await?;
+    let plan_revision = exact_plan(store, &plan_key, &request.expected_plan).await?;
+    let capacity = store.release_transfer_capacity(&request.expected_slot).await?;
     commit(
         store,
         guard,
-        vec![
+        [capacity.compares, vec![
             Compare::mod_revision(slot_key.clone(), CompareOp::Equal, slot_revision),
             Compare::mod_revision(claim_key, CompareOp::Equal, claim_revision),
             Compare::mod_revision(plan_key.clone(), CompareOp::Equal, plan_revision),
             state.compare,
-        ],
-        vec![
+        ]].concat(),
+        [capacity.operations, plan_puts(store, &request.plan)?, vec![
             TxnOp::put(slot_key, encode(&request.slot)?, None),
-            TxnOp::put(plan_key, encode(&request.plan)?, None),
             state.put,
-        ],
+        ]].concat(),
     )
     .await?;
     Ok(MoveCommit {
@@ -581,6 +591,10 @@ pub(super) async fn commit_automatic_settings(
 ) -> Result<AutomaticBalanceSettings, StorageError> {
     ensure_guard_live(store, guard).await?;
     validate_operation(guard, &request.operation)?;
+    if !matches_committed(&request.operation.operation_id, guard.record().epoch, &request.operation.version) {
+        return Err(StorageError::InvalidRecord);
+    }
+    let state = state_counter(store, guard.scope(), request.operation.version.revision).await?;
     if request.settings.version.term != guard.term()
         || request.settings.version.group != request.operation.version.group
         || request
@@ -591,7 +605,7 @@ pub(super) async fn commit_automatic_settings(
         return Err(StorageError::InvalidRecord);
     }
     let settings_key = store.key(&format!(
-        "domains/{}/settings/automatic_balance",
+        "definitions/groups/{}/settings/automatic_balance",
         request.operation.version.group.as_str()
     ));
     let operation_key = store.operation_key(
@@ -621,11 +635,13 @@ pub(super) async fn commit_automatic_settings(
             settings_compare,
             Compare::version(operation_key.clone(), CompareOp::Equal, 0),
             operation_count.compare,
+            state.compare,
         ],
         vec![
             TxnOp::put(settings_key, encode(&request.settings)?, None),
             TxnOp::put(operation_key, encode(&request.operation)?, None),
             operation_count.put,
+            state.put,
         ],
     )
     .await?;
@@ -639,6 +655,10 @@ pub(super) async fn create_plan_with_operation(
 ) -> Result<PlanCommit, StorageError> {
     ensure_guard_live(store, guard).await?;
     validate_operation(guard, &request.operation)?;
+    if !matches_committed(&request.operation.operation_id, guard.record().epoch, &request.operation.version) {
+        return Err(StorageError::InvalidRecord);
+    }
+    let state = state_counter(store, guard.scope(), request.operation.version.revision).await?;
     validate_plan_group(guard, &request.plan)?;
     if request.plan.coordinator_term != guard.term() || request.plan.record_revision.get() != 1 {
         return Err(StorageError::InvalidRecord);
@@ -649,7 +669,7 @@ pub(super) async fn create_plan_with_operation(
         &request.operation.operation_id,
     );
     let plan_count =
-        cardinality_counter(store, guard.scope(), "plans", 1, store.limits.maximum_plans).await?;
+        cardinality_counter(store, guard.scope(), "plans", i64::from(request.plan.durable().is_some()), store.limits.maximum_plans).await?;
     let operation_count = cardinality_counter(
         store,
         guard.scope(),
@@ -666,13 +686,14 @@ pub(super) async fn create_plan_with_operation(
             Compare::version(operation_key.clone(), CompareOp::Equal, 0),
             plan_count.compare,
             operation_count.compare,
+            state.compare,
         ],
-        vec![
-            TxnOp::put(plan_key, encode(&request.plan)?, None),
+        [plan_puts(store, &request.plan)?, vec![
             TxnOp::put(operation_key, encode(&request.operation)?, None),
             plan_count.put,
             operation_count.put,
-        ],
+            state.put,
+        ]].concat(),
     )
     .await?;
     Ok(PlanCommit { plan: request.plan })
@@ -685,6 +706,10 @@ pub(super) async fn update_plan_with_operation(
 ) -> Result<PlanCommit, StorageError> {
     ensure_guard_live(store, guard).await?;
     validate_operation(guard, &request.operation)?;
+    if !matches_committed(&request.operation.operation_id, guard.record().epoch, &request.operation.version) {
+        return Err(StorageError::InvalidRecord);
+    }
+    let state = state_counter(store, guard.scope(), request.operation.version.revision).await?;
     validate_plan_group(guard, &request.expected_plan)?;
     validate_plan_group(guard, &request.plan)?;
     validate_plan_update(&request.expected_plan, &request.plan)?;
@@ -693,7 +718,7 @@ pub(super) async fn update_plan_with_operation(
         &request.operation.version.group,
         &request.operation.operation_id,
     );
-    let plan_revision = exact_record(store, &plan_key, &request.expected_plan).await?;
+    let plan_revision = exact_plan(store, &plan_key, &request.expected_plan).await?;
     let operation_count = cardinality_counter(
         store,
         guard.scope(),
@@ -709,12 +734,13 @@ pub(super) async fn update_plan_with_operation(
             Compare::mod_revision(plan_key.clone(), CompareOp::Equal, plan_revision),
             Compare::version(operation_key.clone(), CompareOp::Equal, 0),
             operation_count.compare,
+            state.compare,
         ],
-        vec![
-            TxnOp::put(plan_key, encode(&request.plan)?, None),
+        [plan_puts(store, &request.plan)?, vec![
             TxnOp::put(operation_key, encode(&request.operation)?, None),
             operation_count.put,
-        ],
+            state.put,
+        ]].concat(),
     )
     .await?;
     Ok(PlanCommit { plan: request.plan })
@@ -763,9 +789,10 @@ pub(super) async fn compact_admin_operations(
     guard: &GroupLeaderGuard,
     request: CompactAdminOperations,
 ) -> Result<(), StorageError> {
+    if request.expected.len() > MAX_ADMIN_GC_BATCH { return Err(StorageError::Capacity); }
     ensure_guard_live(store, guard).await?;
     for record in &request.expected {
-        validate_operation(guard, record)?;
+        if &record.version.group != guard.group() { return Err(StorageError::InvalidRecord); }
     }
     if request.expected.is_empty() {
         return Ok(());

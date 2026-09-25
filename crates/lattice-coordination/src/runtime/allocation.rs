@@ -7,8 +7,8 @@ use lattice_model::cluster::{ActorGroupId, EntityType, SingletonKind};
 use super::{
     ActorGroupStore, AllocationRequest, BTreeMap, ClaimGrant, CoordinatorLeaseStore,
     CoordinatorRuntimeError, GrantSequence, GroupCoordinator, HandoffMachine, LoadSample,
-    MembershipStore, MoveProgress, NodeKey, PlacedShard, PlacementNode, PlacementSlot,
-    PlacementSlotKey, PlacementSlotState, PlacementView, ScopedElectionStore, SingletonConfig,
+    MembershipStore, NodeKey, PlacedShard, PlacementNode, PlacementSlot, PlacementSlotKey,
+    PlacementSlotState, PlacementView, ScopedElectionStore, SingletonConfig,
 };
 
 use crate::{
@@ -165,12 +165,6 @@ where
                     && exclude != Some(&session.hello.node)
                     && session.hello.singleton_eligibility.contains(kind)
                     && session.hello.singleton_configs.contains(config)
-                    && session
-                        .record
-                        .hello
-                        .protocols
-                        .iter()
-                        .any(|protocol| protocol.protocol_id == config.protocol_id)
             })
             .map(|session| session.hello.node.clone())
             .min_by(|left, right| {
@@ -201,17 +195,18 @@ where
             .cloned()
             .ok_or(CoordinatorRuntimeError::UnknownSingletonConfig)?;
         let target = self.select_singleton_target(kind, &config, Some(&source))?;
-        let plan_id = uuid::Uuid::new_v4().as_u128();
+        // Retrying an unpublished singleton recovery reuses one operation key,
+        // rather than leaking an orphan barrier for every failed attempt.
+        let identity = serde_json::to_vec(&(&slot.key, slot.assignment_generation))
+            .map_err(|_| CoordinatorRuntimeError::Codec)?;
+        let digest = blake3::hash(&identity);
+        let plan_id = u128::from_be_bytes(
+            digest.as_bytes()[..16]
+                .try_into()
+                .expect("a BLAKE3 digest contains sixteen bytes"),
+        );
         let barrier_version = self.next_version()?;
-        let barrier_sessions = self
-            .sessions
-            .iter()
-            .filter_map(|(incarnation, session)| {
-                (session.hello.used_singletons.contains(kind)
-                    || session.hello.singleton_eligibility.contains(kind))
-                .then_some(*incarnation)
-            })
-            .collect::<BTreeSet<_>>();
+        let barrier_sessions = self.sessions.keys().copied().collect::<BTreeSet<_>>();
         let expected_slot = slot.clone();
         slot.target = Some(target.clone());
         slot.state = PlacementSlotState::BeginHandoff;
@@ -223,6 +218,7 @@ where
             .reserve_handoff(
                 &self.leader_guard,
                 ReserveHandoff {
+                    limits: self.config.rebalance_limits,
                     expected_slot,
                     slot,
                 },
@@ -258,6 +254,7 @@ where
             self.assignment_members(&owner).await?;
         let lease_id = self.store.grant_lease(self.config.claim_ttl).await?;
         let grant = ClaimGrant {
+            request_id: 0,
             group: slot.key.group().clone(),
             slot: slot.key.clone(),
             owner: owner.clone(),
@@ -383,11 +380,17 @@ where
                 ready: session.placement_up(),
                 eligible_entity_types: session.hello.hosted_entity_types.clone(),
                 protocols: session
-                    .record
                     .hello
-                    .protocols
+                    .entity_configs
                     .iter()
-                    .map(|protocol| protocol.protocol_id)
+                    .map(|config| config.protocol_id)
+                    .chain(
+                        session
+                            .hello
+                            .singleton_configs
+                            .iter()
+                            .map(|config| config.protocol_id),
+                    )
                     .collect(),
                 capacity_units: session.hello.capacity_units,
                 joined_at: session.joined_at,
@@ -446,22 +449,22 @@ where
         let mut active_entity_moves = BTreeMap::new();
         let mut active_source_moves = BTreeMap::new();
         let mut active_target_moves = BTreeMap::new();
-        let mut active_cluster_moves = 0;
-        for plan in self.plans.values().filter(|plan| &plan.group == group) {
-            for movement in &plan.moves {
-                if movement.progress == MoveProgress::Handoff {
-                    active_cluster_moves += 1;
-                    *active_entity_moves
-                        .entry(plan.entity_type.clone())
-                        .or_default() += 1;
-                    *active_source_moves
-                        .entry(movement.source.clone())
-                        .or_default() += 1;
-                    *active_target_moves
-                        .entry(movement.target.clone())
-                        .or_default() += 1;
-                }
+        let mut active_group_moves = 0;
+        for handoff in self
+            .handoffs
+            .values()
+            .filter(|handoff| handoff.slot.group() == group)
+        {
+            active_group_moves += 1;
+            if let PlacementSlotKey::Shard { entity_type, .. } = &handoff.slot {
+                *active_entity_moves.entry(entity_type.clone()).or_default() += 1;
             }
+            *active_source_moves
+                .entry(handoff.source.clone())
+                .or_default() += 1;
+            *active_target_moves
+                .entry(handoff.target.clone())
+                .or_default() += 1;
         }
         Ok(PlacementView {
             group: group.clone(),
@@ -471,7 +474,7 @@ where
             degraded: !self.reconciliation.quarantined.is_empty(),
             nodes,
             shards,
-            active_cluster_moves,
+            active_group_moves,
             active_entity_moves,
             active_source_moves,
             active_target_moves,

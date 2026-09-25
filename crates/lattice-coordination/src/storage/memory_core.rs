@@ -76,6 +76,18 @@ fn initial_revision() -> Revision {
 }
 
 fn validate_guard(state: &MemoryState, guard: &impl ExactLeaderGuard) -> Result<(), StorageError> {
+    validate_leader(state, guard)?;
+    if !state.lifecycle.as_ref().ok_or(StorageError::StorageMetadataMismatch)?.is_running() {
+        return Err(StorageError::RunNotRunning);
+    }
+    Ok(())
+}
+
+fn validate_leader(state: &MemoryState, guard: &impl ExactLeaderGuard) -> Result<(), StorageError> {
+    let lifecycle = state.lifecycle.as_ref().ok_or(StorageError::StorageMetadataMismatch)?;
+    if lifecycle.epoch != guard.record().epoch {
+        return Err(StorageError::RunMismatch);
+    }
     let Some((lease_id, leader)) = state.leaders.get(guard.scope()) else {
         return Err(StorageError::LeadershipLost);
     };
@@ -85,11 +97,13 @@ fn validate_guard(state: &MemoryState, guard: &impl ExactLeaderGuard) -> Result<
     {
         return Err(StorageError::LeadershipLost);
     }
+    validate_candidate(state, guard.record())?;
     Ok(())
 }
 
 fn validate_member_record(member: &MemberRecord) -> Result<(), StorageError> {
-    if member.node != member.hello.node || member.lease_id <= 0 || member.node.validate().is_err() {
+    records::encode_record(member)?;
+    if member.lease_id <= 0 || member.node.validate().is_err() {
         return Err(StorageError::InvalidRecord);
     }
     Ok(())
@@ -105,7 +119,7 @@ fn validate_group_member_record(
     member
         .validate(&SessionLimits::default())
         .map_err(|_| StorageError::InvalidRecord)?;
-    if &member.hello.group != group || &member.version.group != group {
+    if &member.version.group != group {
         return Err(StorageError::InvalidRecord);
     }
     Ok(())
@@ -188,6 +202,14 @@ fn validate_plan_update(
     plan: &RebalancePlan,
 ) -> Result<(), StorageError> {
     if expected.plan_id != plan.plan_id
+        || expected.moves.len() != plan.moves.len()
+        || expected.entity_type != plan.entity_type
+        || expected.moves.iter().zip(&plan.moves).any(|(before, after)| {
+            before.shard_id != after.shard_id
+                || before.source != after.source || before.target != after.target
+                || before.expected_generation != after.expected_generation
+                || before.estimated_weight != after.estimated_weight
+        })
         || expected.group != plan.group
         || plan.record_revision
             != expected
@@ -201,10 +223,13 @@ fn validate_plan_update(
 }
 
 fn validate_plan_group(guard: &GroupLeaderGuard, plan: &RebalancePlan) -> Result<(), StorageError> {
+    validate_plan_payload(plan)?;
     let CoordinatorScope::Group(group) = guard.scope() else {
         return Err(StorageError::InvalidRecord);
     };
-    if &plan.group != group || plan.coordinator_term != guard.term() {
+    if &plan.group != group || plan.coordinator_term != guard.term()
+        || plan.moves.is_empty() || plan.moves.len() > MAXIMUM_PLAN_MOVES
+    {
         return Err(StorageError::InvalidRecord);
     }
     Ok(())
@@ -233,6 +258,7 @@ fn validate_slot_common(
     expected: Option<&PlacementSlot>,
     slot: &PlacementSlot,
 ) -> Result<(), StorageError> {
+    records::encode_record(slot)?;
     slot.validate().map_err(|_| StorageError::InvalidRecord)?;
     if slot.version.term != guard.term() {
         return Err(StorageError::InvalidRecord);
@@ -447,4 +473,15 @@ impl InMemoryCoordinationStore {
             .cloned()
             .collect())
     }
+}
+fn validate_candidate(state: &MemoryState, leader: &LeaderRecord) -> Result<(), StorageError> {
+    let registration = leader.candidate_registration();
+    let key = (leader.scope.clone(), leader.node.node_id.clone());
+    if state.candidate_authorizations.get(&key) != Some(&registration.authorization)
+        || state.candidate_registrations.get(&key) != Some(&registration)
+        || !state.leases.contains_key(&registration.lease_id)
+    {
+        return Err(StorageError::CandidateNotEligible);
+    }
+    Ok(())
 }

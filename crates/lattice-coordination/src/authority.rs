@@ -2,6 +2,10 @@ use std::time::Duration;
 
 use thiserror::Error;
 
+pub mod clock;
+#[cfg(test)]
+mod tests;
+
 use crate::types::{
     ClaimGrant, GrantSequence, MonotonicTime, NodeKey, PlacementSlot, PlacementSlotState,
     PlacementTypeError,
@@ -10,6 +14,10 @@ use crate::types::{
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AuthorityEvent {
     ReconcileSlot(PlacementSlot),
+    BeginRenewal {
+        request_id: u128,
+        now: MonotonicTime,
+    },
     InstallGrant {
         grant: ClaimGrant,
         now: MonotonicTime,
@@ -50,6 +58,8 @@ pub struct PlacementAuthority {
     slot: Option<PlacementSlot>,
     grant: Option<InstalledGrant>,
     admission_open: bool,
+    retired: bool,
+    pending_request: Option<(u128, MonotonicTime)>,
 }
 
 impl PlacementAuthority {
@@ -64,6 +74,8 @@ impl PlacementAuthority {
             slot: None,
             grant: None,
             admission_open: false,
+            retired: false,
+            pending_request: None,
         })
     }
 
@@ -71,12 +83,36 @@ impl PlacementAuthority {
         &mut self,
         event: AuthorityEvent,
     ) -> Result<Vec<AuthorityEffect>, AuthorityError> {
+        if let AuthorityEvent::BeginRenewal { now, .. } | AuthorityEvent::InstallGrant { now, .. } =
+            &event
+        {
+            if self
+                .grant
+                .as_ref()
+                .is_some_and(|grant| *now >= grant.deadline)
+            {
+                self.retired = true;
+                self.admission_open = false;
+            }
+        }
         let before = self.clone();
         let result = self.apply(event);
         if result.is_err() {
             *self = before;
         }
         result
+    }
+
+    pub fn renewal_needed(&self, now: MonotonicTime) -> bool {
+        !self.retired
+            && self.pending_request.is_none_or(|(_, started)| {
+                now.as_millis().saturating_sub(started.as_millis()) >= 1_000
+            })
+    }
+
+    #[cfg(any(test, feature = "test-harness"))]
+    pub(crate) fn pending_request_id(&self) -> Option<u128> {
+        self.pending_request.map(|(id, _)| id)
     }
 
     pub fn slot(&self) -> Option<&PlacementSlot> {
@@ -88,7 +124,8 @@ impl PlacementAuthority {
     /// otherwise let a retired owner answer one more request before the next tick fences it. `now`
     /// must come from the same monotonic base that installed the grant.
     pub fn admission_open_at(&self, now: MonotonicTime) -> bool {
-        self.admission_open
+        !self.retired
+            && self.admission_open
             && self
                 .grant
                 .as_ref()
@@ -103,13 +140,30 @@ impl PlacementAuthority {
                     current.key == slot.key
                         && current.owner == slot.owner
                         && current.assignment_generation == slot.assignment_generation
-                        && current.version.term == slot.version.term
                 });
+                let new_generation = self.slot.as_ref().is_none_or(|old| {
+                    old.assignment_generation != slot.assignment_generation
+                        || old.owner != slot.owner
+                });
+                if new_generation {
+                    self.retired = false;
+                }
                 self.slot = Some(slot);
                 if !same_authority {
                     self.grant = None;
+                    self.pending_request = None;
                     return Ok(self.fence_effects());
                 }
+                Ok(Vec::new())
+            }
+            AuthorityEvent::BeginRenewal { request_id, now } => {
+                if self.retired {
+                    return Err(AuthorityError::Retired);
+                }
+                if request_id == 0 {
+                    return Err(AuthorityError::StaleGrant);
+                }
+                self.pending_request = Some((request_id, now));
                 Ok(Vec::new())
             }
             AuthorityEvent::InstallGrant { grant, now } => self.install_grant(grant, now),
@@ -119,6 +173,8 @@ impl PlacementAuthority {
                     .as_ref()
                     .is_some_and(|grant| now >= grant.deadline)
                 {
+                    self.retired = true;
+                    self.pending_request = None;
                     self.grant = None;
                     let mut effects = self.fence_effects();
                     effects.push(AuthorityEffect::StopSlot);
@@ -153,6 +209,8 @@ impl PlacementAuthority {
                 Ok(vec![AuthorityEffect::PublishStopFailed])
             }
             AuthorityEvent::ExternalClaimLost => {
+                self.retired = true;
+                self.pending_request = None;
                 self.grant = None;
                 let mut effects = self.fence_effects();
                 effects.push(AuthorityEffect::StopSlot);
@@ -173,6 +231,15 @@ impl PlacementAuthority {
         grant: ClaimGrant,
         now: MonotonicTime,
     ) -> Result<Vec<AuthorityEffect>, AuthorityError> {
+        if self.retired {
+            return Err(AuthorityError::Retired);
+        }
+        let (request_id, started) = self
+            .pending_request
+            .ok_or(AuthorityError::UncorrelatedGrant)?;
+        if request_id != grant.request_id {
+            return Err(AuthorityError::UncorrelatedGrant);
+        }
         grant
             .validate(self.safety_margin)
             .map_err(AuthorityError::InvalidType)?;
@@ -187,17 +254,22 @@ impl PlacementAuthority {
         if self.grant.as_ref().is_some_and(|current| {
             grant.coordinator_term < current.coordinator_term
                 || (grant.coordinator_term == current.coordinator_term
-                    && grant.grant_sequence < current.sequence)
+                    && grant.grant_sequence <= current.sequence)
         }) {
             return Err(AuthorityError::StaleGrant);
         }
         let usable_ttl = grant
             .ttl
+            .min(clock::MAXIMUM_GRANT_INTERVAL)
             .checked_sub(self.safety_margin)
             .ok_or(AuthorityError::InvalidClaimDeadline)?;
-        let deadline = now
+        let deadline = started
             .checked_add(usable_ttl)
             .ok_or(AuthorityError::InvalidClaimDeadline)?;
+        if now >= deadline {
+            return Err(AuthorityError::InvalidClaimDeadline);
+        }
+        self.pending_request = None;
         let first = self.grant.is_none();
         self.grant = Some(InstalledGrant {
             coordinator_term: grant.coordinator_term,
@@ -248,6 +320,10 @@ pub enum AuthorityError {
     NoSlot,
     #[error("claim grant is stale or does not match the exact slot owner")]
     StaleGrant,
+    #[error("grant response has no outstanding correlated request")]
+    UncorrelatedGrant,
+    #[error("retired authority cannot reopen admission")]
+    Retired,
     #[error("claim deadline cannot be represented")]
     InvalidClaimDeadline,
     #[error("slot does not currently have serving authority")]

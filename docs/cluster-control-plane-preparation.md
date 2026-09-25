@@ -1,6 +1,6 @@
 # Cluster Control Plane: P0 Source Inventory and Protocol Evidence
 
-> Source inspection: 2026-09-25. No runtime implementation, storage migration, or etcd cleanup was performed.
+> Historical source inspection: 2026-09-25, before W1-W3 implementation. This inventory describes the original code, not today's implementation; see memo section 9.6 for current status.
 > Design and implementation checklist: [cluster control-plane memo](cluster-control-plane-memo.md), especially sections 7-9.
 > This is supporting evidence, not a second decision backlog. Proposed replacements require the contracts tracked in memo section 9. No tests or workload measurements were run for this inspection.
 

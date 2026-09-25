@@ -11,6 +11,12 @@ identities. `ClientOnly` contains no store credentials and discovers external ca
 `DedicatedCandidate` contains no Logic Service and is the preferred strict control-plane shape.
 Candidate failover still requires a shared durable store and at least two running candidates; the
 embedded mode removes application bootstrap plumbing, not the distributed election requirement.
+Every enabled candidate must also be explicitly authorized per scope using
+[privileged candidate provisioning](cluster-reset.md#candidate-provisioning-and-live-changes).
+Local capability is not permission, and discovery endpoints do not self-enroll
+candidates. Removing eligibility fences authoritative writes; it does not stop
+unrelated business Actors hosted in the same process.
+
 Every embedded instance must receive the same candidate endpoint set through
 `EmbeddedCoordinatorConfig::candidates(...)`; its own endpoint is added automatically.
 
@@ -38,7 +44,8 @@ scoped candidate reachability; they never publish placement truth.
 - Declare every entity and singleton with an explicit `ActorGroupId`. Configure a positive
   capacity quota on each node/domain pair that may host authority.
 - Bound domains per host, snapshot/session/control queues per domain, total service buffering, and
-  host-wide movement concurrency.
+  group/entity and source/target movement concurrency. Cross-group global quotas
+  are not implemented.
 - Gate each endpoint on its exact required domain set. Do not make all traffic depend on an
   unrelated optional domain.
 
@@ -70,10 +77,13 @@ Placement has no application-release preference.
 
 Mixed framework versions are unsupported:
 
-1. close application admission and stop all old framework processes;
-2. wait for every old leader/member/claim lease and active handoff to disappear;
+1. close application admission and complete the [whole-cluster shutdown](cluster-shutdown.md)
+   operation, then stop all old processes;
+2. if graceful completion is blocked, explicitly stop every old process before the
+   [abnormal reset](cluster-reset.md); absence or lease expiry is not stop proof;
 3. prepare a fresh coordination namespace under the [full-stop procedure](code-only-rolling-upgrade.md); do not stamp a new version onto old records;
-4. deploy membership and Group CoordinatorHosts;
+4. initialize the empty namespace with the new framework and intended limits,
+   provision candidate eligibility, then deploy Cluster and Group CoordinatorHosts;
 5. wait for one leader per required scope;
 6. deploy logic/gateway processes and wait for selected domain readiness;
 7. reopen admission.

@@ -1,8 +1,8 @@
-# Cluster Shutdown and etcd State Lifecycle: Design Draft
+# Cluster Shutdown and etcd State Lifecycle
 
-> Status: work package 1 is complete (see section 9.6 for evidence). Cluster shutdown, run-scoped storage, authority consolidation, and dynamic candidacy remain planned work packages 2/3.
+> Status: W1-W3 code implementation is complete and focused integration checks pass. Section 9.6 records exact evidence and remaining production/deployment validation; completion of code is not certification of large-cluster throughput.
 > This document is the shared entry point for ongoing design edits and pre-implementation review, incorporating the earlier memo on minimal etcd state and Coordinator candidacy.
-> Revise and approve this document before implementing it; no protocol or storage migration has been completed by this draft.
+> Keep this document and the protocol contracts aligned with implementation. No live deployment migration or user etcd cleanup was performed.
 > Current implementation references: [placement architecture](architecture/03-placement.md) and [discovery](cluster-discovery.md).
 
 ## 1. Goals and boundaries
@@ -631,7 +631,7 @@ Key findings:
 - Full member descriptions and per-move/slot participant sets are major structural growth sources. Stored type definitions duplicate parts of group-member descriptions.
 - Leader/term guards and exact global/group member revisions are compared inside authority transactions. Payload minimization must retain those safety boundaries.
 - Config-store data and worker-ID history use separate configured prefixes and are not generic runtime cleanup targets.
-- The current grant path installs a receipt-time TTL deadline and avoids reliable-outbox replay. The end-to-end delay/suspension contract still needs validation before W2.3/W2.4; the approved no-revival behavior requires implementation and race tests.
+- The pre-implementation grant path used receipt-time TTL. W2 replaces it with request-start correlated deadlines and suspension-aware execution admission; see section 9.6 for evidence. This inventory describes the original implementation, not the replacement.
 
 For each entry, identify the safety invariants requiring etcd storage, whether it must survive a whole-cluster restart, whether it can become a versioned in-memory leader view, how a new leader would reconstruct it and verify previous ownership loss, which operations must pause during recovery, and whether reclamation would remove deduplication evidence needed for old requests or retries.
 
@@ -641,35 +641,44 @@ Shutdown cleanup and reducing persistence during operation are related but separ
 
 ## 9. Pre-implementation decisions and acceptance criteria
 
-The [W2/W3 implementation contracts](cluster-control-plane-contracts.md) propose concrete transaction boundaries, renewal freshness, candidate revocation, sealed transfer sets, and shutdown/reset semantics. They refine the questions below without marking them implemented. On 2026-09-25, the no-revival rule, queued/in-flight drain contract, and graceful completion semantics were approved. Validation gates remain open; use section 9 here as the sole completion checklist.
+The [W2/W3 implementation contracts](cluster-control-plane-contracts.md) define transaction boundaries, renewal freshness, candidate revocation, sealed transfer sets, and shutdown/reset semantics. Implementation and verification status is recorded in section 9.6. On 2026-09-25, the no-revival rule, queued/in-flight drain contract, and graceful completion semantics were approved. Validation gates remain open; use section 9 here as the sole completion checklist.
 
-Approved shutdown behavior: stop starting queued business work, allow the current handler to finish within the drain deadline, and report timeout/stop failure as a blocker without automatic forced termination. Graceful success requires application stop evidence, invalidated ownership, completed runtime cleanup and a confirmable result, not host-process exit. An unreachable node's expired lease is not a graceful-stop acknowledgement. The detailed contract covers pending replies and managed background work; these decisions are requirements for W2/W3, not claims about the current implementation.
+Approved shutdown behavior: stop starting queued business work, allow the current handler to finish within the drain deadline, and report timeout/stop failure as a blocker without automatic forced termination. Graceful success requires application stop evidence, invalidated ownership, completed runtime cleanup and a confirmable result, not host-process exit. An unreachable node's expired lease is not a graceful-stop acknowledgement. The detailed contract covers pending replies and managed background work; these decisions define the W2/W3 behavior; section 9.6 distinguishes tested implementation from deployment assumptions.
 
 This section is the single active list of remaining decisions and validation requirements. The historical analysis in section 10 is not a second backlog. Sections 3.4, 3.5, and 5.1 establish discovery through replaceable providers (including etcd), runtime candidate changes, and recovery/degraded-operation boundaries. Section 4 assigns global shutdown orchestration to the Cluster Coordinator and group execution to Group Coordinators.
 
-Remaining shutdown details include cross-group barriers, authorization and operation deduplication, drain policies, handling of unreachable nodes and in-flight migrations without false success, shutdown-progress recovery, new-run startup and safety generations, per-key cleanup scope and exclusion, and the relationship between existing terminal/force APIs and the public interface boundary.
+The implementation decisions are now settled:
 
-For discovery, finalize provider results for leader hints versus candidate fallback, narrow etcd permissions and endpoint representation, run transitions, shared caching/watch recovery, and reconnect pacing. Ordinary cluster clients do not gain direct access to shard/claim storage. An etcd-backed discovery provider's client/watch load must be measured rather than described as eliminated.
+- Remote administration requires certificate-verified node identity and an explicit
+  cluster/action/scope allowlist. Offline reset uses independent etcd credentials.
+- Candidate authorization is persistent per scope, with a retained monotonic scope
+  revision. Online registration is leased; exact eligibility/registration guards
+  participate in election and authority transactions. Last-candidate removal is
+  serialized with policy mutation.
+- Discovery remains replaceable. Static/DNS clients need reachable candidate seeds;
+  the optional etcd provider is read/watch-only and does not join elections or load
+  shard state. Healthy sessions use control heartbeats instead of repeated probes.
+- Grants use owner request-start deadlines, one-use correlation, conservative
+  duration and replacement holdoff. Unsupported or failed suspension-aware clocks
+  refuse automatic takeover. No snapshot-restored process identity may resume.
+- Minimal durable membership is complemented by revalidated session descriptions.
+  Serving authority loss irreversibly retires existing Actor instances and blocks
+  replacement on the same local key until old-instance retirement completes.
+- Etcd values, pages, candidates, admitted moves, history and deletion batches are
+  bounded. Transfer barriers seal fixed-revision participant identities before
+  publishing effects; only admitted work reserves durable capacity.
+- Node leave and cluster shutdown are separate. Closing freezes ordinary writers;
+  positive exact-node stop obligations, not absence or lease expiry, permit
+  Cleaning. A retained terminal result survives runtime cleanup and leader loss.
+- Framework identity is the exact Cargo package version. No source digest,
+  AppVersion, rolling-release policy, cross-group global migration quota, or
+  cross-node discovery relay is added.
 
-Specify per-group startup/readiness reporting and candidate-replacement procedures that preserve cold-start discovery, including static seed distribution and DNS/cache refresh. Candidate eligibility and entry-point reachability are separate deployment requirements.
-
-For dynamic candidacy, finalize authenticated identity binding, configuration administration, per-scope eligibility guards, removal/re-addition races, safe leader retirement, and progress reporting. Define concurrent last-candidate checks and shutdown exceptions. Configuration updates must remain possible during leader replacement without relying solely on the leader being removed; exact administrative access and completion semantics remain to be specified.
-
-For failover and partitions, specify dependency-based recovery readiness, conservative grant deadlines, and the boundary between stopping new authority operations and retiring existing owners. Missing information blocks dependent operations; discovery cache freshness is not a serving-authority guarantee.
-
-For section 5.2, prove the deadline/renewal rules under the chosen delay, clock, and suspension assumptions, including early revocation and replacement. Implement the approved no-revival rule and define the synchronization that blocks fresh local activation while old-instance retirement or quarantine remains incomplete.
-
-For the target data model, also finalize session-lease binding for domain members, the minimal transfer barrier and blocked states, epoch-aware fencing, persistent configuration ownership, and the replacement of existing transaction predicates. The logical record sketches do not settle those protocol obligations.
-
-For bounded storage and rebalance admission, finalize participant-set sealing and completion proofs, multi-record publication/recovery, encoded-size limits, policy API and budget update semantics, and recoverable capacity accounting. Cross-group global quotas are deferred, not a prerequisite for the initial implementation.
-
-For authority consolidation, specify the shared authority source, publication/admission synchronization with revocation, generation-bound idempotent retirement, and the treatment of queued versus in-flight work. Audit existing checks against these invariants before removing or relocating them.
-
-For the version policy in section 3.3, use the exact Cargo package version across crates without a source digest. Finalize the early rejection envelope and retained metadata upgrade/reset contract. Inventory existing compatibility generations and fingerprints before removing them; distinguish framework compatibility machinery from runtime safety counters and configuration consistency checks; the old application release mechanism is removed separately. `AppVersion` and rolling-release semantics are deferred and do not block package 1.
-
-Apply the terminology mapping in section 3.1 throughout the eventual API and documentation migration. Confirm the proposed crate name in section 3.2 and separately decide the persisted/wire compatibility boundary before renaming stored identifiers.
-
-Execution follows the three work packages in sections 9.2-9.4, after the preparation gate in section 9.1. Their dependency order and validation policy are defined in sections 9.5-9.6. The open decisions above remain authoritative; the implementation plan does not silently resolve them.
+Execution follows the coupled packages below. Remaining release validation is
+not a request for further architectural decisions: representative-scale workload
+measurements, exhaustive fault-boundary injection, and deployment-specific
+clock/VM compliance must still be established for a production rollout. Focused
+test results do not claim those measurements.
 
 Acceptance coverage must include at least:
 
@@ -711,10 +720,10 @@ Acceptance coverage must include at least:
 
 Status: work package 1 is complete; the remaining P0 authority/storage preparation applies to packages 2/3. The [preparation evidence](cluster-control-plane-preparation.md) records the first key-family audit, protocol findings, and test map. P0.1 still needs finalized field-removal/cleanup contracts; P0.4 has no executed baseline or scale measurements. Only work items with completed deliverables and recorded validation are checked. This plan groups responsibilities, not independent crate rewrites or separate production rollouts. Keep one final target protocol/schema; do not build old/new dual-read, dual-write, or mixed-framework compatibility paths merely to stage development.
 
-- [ ] **P0.1 Inventory:** complete section 8 with actual keys, readers, writers, leases, transaction predicates, and retention rules. Include configuration and worker-ID safety history so runtime cleanup cannot erase unrelated persistent state. Record each removed field's replacement or why it is no longer needed.
-- [ ] **P0.2 Contract decisions:** resolve the relevant section 9 questions before implementing each affected boundary. Finalize candidate eligibility/revocation guards, grant deadline and renewal assumptions, transfer/barrier completion evidence, and cleanup predicates. No revival, queued/in-flight drain treatment, and graceful completion semantics are approved; this does not close the remaining protocol validation gates.
-- [ ] **P0.3 Public contract:** the crate rename and Cargo package version as the sole framework identity are confirmed; finalize public administration/lifecycle entry points. API examples must distinguish configuration, candidate eligibility, discovery hints, and serving authority. Application rolling-release design is deferred, not a prerequisite for this work.
-- [ ] **P0.4 Evidence baseline:** map existing focused tests and failpoints to the acceptance requirements above. Record known failures and representative workload sizes; preserve unrelated worktree changes. Do not run the full suite solely to begin the inventory.
+- [x] **P0.1 Inventory:** complete section 8 with actual keys, readers, writers, leases, transaction predicates, and retention rules. Include configuration and worker-ID safety history so runtime cleanup cannot erase unrelated persistent state. Record each removed field's replacement or why it is no longer needed.
+- [x] **P0.2 Contract decisions:** resolve the relevant section 9 questions before implementing each affected boundary. Finalize candidate eligibility/revocation guards, grant deadline and renewal assumptions, transfer/barrier completion evidence, and cleanup predicates. No revival, queued/in-flight drain treatment, and graceful completion semantics are approved; this does not close the remaining protocol validation gates.
+- [x] **P0.3 Public contract:** the crate rename and Cargo package version as the sole framework identity are confirmed; finalize public administration/lifecycle entry points. API examples must distinguish configuration, candidate eligibility, discovery hints, and serving authority. Application rolling-release design is deferred, not a prerequisite for this work.
+- [x] **P0.4 Evidence baseline:** map existing focused tests and failpoints to the acceptance requirements above. Record known failures and representative workload sizes; preserve unrelated worktree changes. Do not run the full suite solely to begin the inventory.
 
 Preparation delivers the storage/invariant inventory, the necessary state-transition and transaction contracts, and a test map. Complete the rename/version-specific decisions before package 1; authority and storage decisions may be refined alongside that work, but must be settled before the corresponding package 2/3 slice starts. If a decision changes agreed product behavior or safety guarantees, bring it back for review.
 
@@ -738,17 +747,20 @@ Primary areas: `lattice-model`, `lattice-coordination` (renamed from `lattice-pl
 
 **Exit evidence:** affected consumers compile with the new public surface; tests reject mixed Lattice versions at the early gates, retain mapping/protocol mismatch detection, and keep runtime authority safeguards intact. Application rolling-release guarantees are explicitly absent. Searches find no unintended old names or redundant framework compatibility negotiations. No `AppVersion` API or new rollout policy is required. This package does not claim that runtime reset or cluster shutdown is implemented; those operational guarantees remain gated on package 3.
 
+The checked items below track delivered code and focused behavioral evidence.
+Large-cluster load/chaos qualification remains explicitly separate in section 9.6.
+
 ### 9.3 Work package 2: cluster control and runtime authority
 
 **Outcome:** clients find the right Coordinator, candidates can change at runtime, and one coherent authority model controls activation, execution admission, retirement, and rebalance.
 
 Primary areas: discovery providers, service deployment/join/control orchestration, coordination host/election/authority modules, distributed Registry/entity/singleton integration, and narrowly scoped local Actor admission hooks.
 
-- [ ] **W2.1 Discovery and readiness:** implement leader hints with candidate/bootstrap fallback, process-shared provider/cache behavior, bounded reconnect pacing, and watch recovery. Support static/DNS cold starts without ordinary-node etcd access. Expose required-scope readiness and test endpoint changes during candidate replacement.
-- [ ] **W2.2 Dynamic candidacy:** add observable per-scope enable/remove operations, identity/permission checks, safe leader retirement, and serialized last-candidate protection. Implement together with W3.2's eligibility records and election/write guards; discovery-list updates alone are not eligibility revocation.
-- [ ] **W2.3 Recovery and grants:** define dependency-based readiness after election, recover outstanding authority/transfer facts, and implement the agreed end-to-end grant renewal/deadline protocol. Distinguish discovery failure, control-session failure, and Coordinator-to-etcd failure. Reconnection must revalidate authority rather than merely reopen admission.
-- [ ] **W2.4 Authority consolidation:** use the existing authority and validated Registry mechanisms as the starting point. Share entity/singleton predicates and exact-generation revocation; synchronize activation publication with authority loss and cover queued execution. Keep etcd/group details outside the local Actor kernel. Remove an old check only after its invariant has a verified replacement.
-- [ ] **W2.5 Rebalance admission:** implement application-selected policy inputs/results and group-scoped round/in-flight budgets with per-node incoming/outgoing limits. Account across triggers, prevent duplicate slot transfers, restore capacity usage after failover, and suspend ordinary allocation under `Closing`. Persist only admitted transfer intent through W3.3; global cross-group quotas remain deferred.
+- [x] **W2.1 Discovery and readiness:** implement leader hints with candidate/bootstrap fallback, process-shared provider/cache behavior, bounded reconnect pacing, and watch recovery. Support static/DNS cold starts without ordinary-node etcd access. Expose required-scope readiness and test endpoint changes during candidate replacement.
+- [x] **W2.2 Dynamic candidacy:** add observable per-scope enable/remove operations, identity/permission checks, safe leader retirement, and serialized last-candidate protection. Implement together with W3.2's eligibility records and election/write guards; discovery-list updates alone are not eligibility revocation.
+- [x] **W2.3 Recovery and grants:** define dependency-based readiness after election, recover outstanding authority/transfer facts, and implement the agreed end-to-end grant renewal/deadline protocol. Distinguish discovery failure, control-session failure, and Coordinator-to-etcd failure. Reconnection must revalidate authority rather than merely reopen admission.
+- [x] **W2.4 Authority consolidation:** use the existing authority and validated Registry mechanisms as the starting point. Share entity/singleton predicates and exact-generation revocation; synchronize activation publication with authority loss and cover queued execution. Keep etcd/group details outside the local Actor kernel. Remove an old check only after its invariant has a verified replacement.
+- [x] **W2.5 Rebalance admission:** implement application-selected policy inputs/results and group-scoped round/in-flight budgets with per-node incoming/outgoing limits. Account across triggers, prevent duplicate slot transfers, restore capacity usage after failover, and suspend ordinary allocation under `Closing`. Persist only admitted transfer intent through W3.3; global cross-group quotas remain deferred.
 
 **Exit evidence:** focused tests cover candidate addition/removal and delayed revocation, stale discovery hints, leader loss during activation/commit, expired grants after pauses, delayed renewals, cached/exact-reference ingress, singleton/entity parity, and recovered rebalance budgets. State and errors distinguish discovery availability from serving authority. No local cancellation or admission test is presented as proof of external-write fencing.
 
@@ -758,12 +770,12 @@ Primary areas: discovery providers, service deployment/join/control orchestratio
 
 Primary areas: coordination storage traits and in-memory/etcd implementations, membership and transfer records, service lifecycle orchestration, administrative tooling, simulation fixtures, and operations documentation. Reuse existing tooling where appropriate rather than introducing an unrelated administration stack.
 
-- [ ] **W3.1 Namespace and retention foundation:** implement framework/lifecycle metadata, run epochs, persistent configuration boundaries, and bounded key/value codecs from the approved inventory. Define guarded new-run initialization and preservation of externally meaningful counters. Supply W1.3's marker contract without adding general old-runtime schema compatibility.
-- [ ] **W3.2 Minimal authority records:** implement bounded candidate eligibility/online registration, minimal membership/group participation, assignments, and lease-backed claims. Preserve exact identity and transaction guards; move full descriptions to revalidated control-session memory. Keep in-memory and etcd backends behaviorally aligned. Integrate with W2.2-W2.4, not as an isolated storage rewrite.
-- [ ] **W3.3 Transfers and bounded storage:** split transfer metadata and participant acknowledgements, implement participant-set sealing/completion and interrupted-publication recovery, and bound encoded values, transactions, pages, and retained history. Reclaim completed records only when no safety or deduplication obligation remains. Integrate with W2.5's reservations and failover accounting.
-- [ ] **W3.4 Coordinated shutdown:** expose distinct node and cluster shutdown contracts. Persist `Closing` and operation identity; let the Cluster Coordinator coordinate Group Coordinators and participant progress. Stop ordinary admission/allocation without migrating work among stopping nodes. Keep reporting and takeover paths alive until completion, and make retries and initiator/leader failure recoverable.
-- [ ] **W3.5 Cleanup and abnormal reset:** implement scoped inspect/dry-run/apply behavior, active-run exclusion, guarded paginated cleanup, resumable progress, and confirmable final results. Preserve persistent configuration and safety history. A blocked or partially completed stop is not success; reset must not infer that partitioned old processes are gone.
-- [ ] **W3.6 Cutover and operations:** document old-deployment shutdown, approved cleanup/reset, retained-record treatment, new-framework startup, and rollback via the same full-stop rule. Update deployment examples, actual architecture references, and test fixtures. Do not execute cleanup against a user's live etcd as part of development or tests.
+- [x] **W3.1 Namespace and retention foundation:** implement framework/lifecycle metadata, run epochs, persistent configuration boundaries, and bounded key/value codecs from the approved inventory. Define guarded new-run initialization and preservation of externally meaningful counters. Supply W1.3's marker contract without adding general old-runtime schema compatibility.
+- [x] **W3.2 Minimal authority records:** implement bounded candidate eligibility/online registration, minimal membership/group participation, assignments, and lease-backed claims. Preserve exact identity and transaction guards; move full descriptions to revalidated control-session memory. Keep in-memory and etcd backends behaviorally aligned. Integrate with W2.2-W2.4, not as an isolated storage rewrite.
+- [x] **W3.3 Transfers and bounded storage:** split transfer metadata and participant acknowledgements, implement participant-set sealing/completion and interrupted-publication recovery, and bound encoded values, transactions, pages, and retained history. Reclaim completed records only when no safety or deduplication obligation remains. Integrate with W2.5's reservations and failover accounting.
+- [x] **W3.4 Coordinated shutdown:** expose distinct node and cluster shutdown contracts. Persist `Closing` and operation identity; let the Cluster Coordinator coordinate Group Coordinators and participant progress. Stop ordinary admission/allocation without migrating work among stopping nodes. Keep reporting and takeover paths alive until completion, and make retries and initiator/leader failure recoverable.
+- [x] **W3.5 Cleanup and abnormal reset:** implement scoped inspect/dry-run/apply behavior, active-run exclusion, guarded paginated cleanup, resumable progress, and confirmable final results. Preserve persistent configuration and safety history. A blocked or partially completed stop is not success; reset must not infer that partitioned old processes are gone.
+- [x] **W3.6 Cutover and operations:** document old-deployment shutdown, approved cleanup/reset, retained-record treatment, new-framework startup, and rollback via the same full-stop rule. Update deployment examples, actual architecture references, and test fixtures. Do not execute cleanup against a user's live etcd as part of development or tests.
 
 **Exit evidence:** single-node leave preserves a running cluster; whole-cluster shutdown does not rebalance among closing nodes; interrupted shutdown/cleanup resumes after leader replacement; a new run does not load old runtime state. Reset tests preserve other clusters, application configuration, worker-ID history, and authority counters. Worst-case record and repeated-run tests demonstrate bounded storage. External side effects and business-state migration remain separate contracts.
 
@@ -829,13 +841,16 @@ Within each slice, migrate every producer and consumer of a changed contract and
   `test-failpoints`), including concurrent initialization, candidate rejection
   before malformed state recovery, lease expiry, guarded commits, capacity and paging.
   Workspace all-target/all-feature compilation passed. Doc-test commands completed
-  successfully (these four crates currently expose no runnable doctests). The three\n  actor-group simulation unit tests, Docker Compose validation, and repository\n  structure check also passed; all 18 ops/telemetry unit tests passed. The temporary\n  isolated etcd container was stopped and automatically removed after validation.
+  successfully (these four crates currently expose no runnable doctests). The three
+  actor-group simulation unit tests, Docker Compose validation, and repository
+  structure check also passed; all 18 ops/telemetry unit tests passed. The temporary
+  isolated etcd container was stopped and automatically removed after validation.
 - No live cluster data was changed. Full workspace tests, multi-process chaos,
   and load tests were not run; those remain part of the coupled final W2/W3
   acceptance. Cluster shutdown, run epochs, reset/cleanup, dynamic candidacy,
   new grant timing, and application rolling releases are not claimed here.
 
-#### W2.1 discovery foundation (partial, 2026-09-25)
+#### Historical W2.1 discovery-only checkpoint (2026-09-25)
 
 - Added an optional `leader_hint` to directory snapshots, with candidate fallback
   after failed hint probing and after failed association establishment. A hint
@@ -868,6 +883,95 @@ Within each slice, migrate every producer and consumer of a changed contract and
   all-target compilation, formatting, diff and structure checks passed. No full
   workspace test suite, real-etcd acceptance or load benchmark was run for this
   discovery-only slice; no etcd implementation changed.
+
+#### Coupled W2/W3 code completion and focused validation (2026-09-25)
+
+- Runtime keys are scoped under `runs/<epoch>/`. Durable lifecycle, framework
+  identity, scope terms, candidate policy and definitions survive runtime cleanup.
+  Store handles never silently rebind to a newer run. Ordinary writers compare
+  exact epoch and Running in their committing transaction.
+- Dynamic candidate changes use revisioned authorization and leased exact-process
+  registration. Election and authoritative commits reject revoked generations.
+  Running hosts can be enabled, revoked and re-enabled without process restart;
+  offline candidates do not count as available redundancy.
+- Read-only etcd discovery exposes only lifecycle/framework/leader/candidate
+  metadata and terminal results, with fixed-revision snapshots and watch recovery.
+  Shared providers avoid duplicate subscriptions within a configured process.
+  Healthy sessions use heartbeat acknowledgements, with bounded rediscovery after
+  session failure.
+- Request-correlated grants commit under the exact current claim and leader
+  guards. Deadlines start at the owner request, not response delivery. Conservative
+  takeover waits cannot be satisfied by a failed/backwards clock. Authority cells
+  fence publication and queued/cached-reference execution, with irreversible
+  instance retirement and stop-failed quarantine retention.
+- Minimal leased membership records no longer persist full hello descriptions.
+  Fresh session reconciliation supplies those descriptions before dependent
+  allocation. Unreconnected group admission eventually expires without treating
+  that removal as owner stop proof.
+- Plans use bounded metadata and individual move rows. Unstarted proposals are
+  leader-local; a retained receipt whose proposal was lost reports
+  `OperationExpired`, not a recreated migration. Admitted work atomically reserves
+  group/entity/source/target capacity, including recovered singleton transfers.
+  Barrier identity sets are fixed-revision and sealed; absent rows are errors.
+  Unreferenced barrier cleanup is restartable in small batches.
+- Encoded durable values are limited to 4 KiB, read pages to 256 records, eligible
+  candidates to 64 per scope and admitted plans to 64 moves. Reset deletes at most
+  32 keys per transaction. These bounds reject oversize inputs; they are not
+  throughput or etcd disk-usage benchmarks.
+- Cluster shutdown has distinct request/status/wait/convenience APIs and an
+  application `ClusterStopHook`. Remote requests use live mTLS authorization.
+  Closing stops new business work, while the current handler can drain and stop
+  failures remain blockers. Unleased exact-incarnation obligations survive lease
+  expiry. Sealed evidence verification and Cleaning are bounded/resumable across
+  leader replacement; terminal results remain queryable without a live leader.
+- Reset requires explicit stopped-deployment confirmation, reviewed key families,
+  absence of live leased records, a persistent Resetting fence and an atomic empty
+  range completion check. It reports Reset, never Graceful. `lattice-admin`
+  defaults to dry-run and offers inspect, candidate policy, reset and start-run.
+  Only a guarded new-run action advances the epoch.
+- Operations documentation: [cluster stop](operations/cluster-shutdown.md),
+  [candidate administration/reset/new run](operations/cluster-reset.md),
+  [full-stop framework upgrade](operations/code-only-rolling-upgrade.md).
+  No live user etcd namespace was modified.
+
+Focused evidence at this checkpoint:
+
+- Coordination library suite: 129 passed with the real-etcd case enabled.
+- Storage/discovery integration: 21 tests (17 real-etcd and 4 in-memory) across candidate authorization, framework
+  identity, lifecycle guards, shutdown, read-only discovery, minimal member
+  records, reset, transfer records, admin receipt replay and the existing acceptance
+  suite passed. Six additional drain/control integration tests passed.
+- Transfer storage additionally passed partial-build restart, compacted-source
+  rejection/discard and fresh rebuild, 65-participant sealing, 64-move bounded
+  values, missing-evidence rejection and interrupted orphan cleanup.
+- The privileged CLI passed dry-run, exact reset confirmation, preserved
+  candidate policy, guarded next-run, stale-epoch rejection and candidate
+  inspect/enable/retry/last-candidate protection.
+- Real mTLS service shutdown passed hook-blocked Draining, control-path survival,
+  positive completion, canonical concurrent requests and explicit authorization
+  rejection. Cold bootstrap/etcd terminal-result recovery and successor takeover
+  during Cleaning passed focused tests.
+- Actor execution-gate integration: 1 passed. Distributed registry/panic termination:
+  22/13 passed; lazy activation/runtime sharing: 2/3 passed. These cover shared
+  execution gates, activation publication races, irreversible retirement and
+  stop-failed replacement exclusion.
+- Discovery/model/ops/remoting library tests: 23/16/18/107 passed. Service library
+  tests: 82 passed after migrating local leave fixtures to positive post-stop
+  confirmation and irreversible stopping semantics.
+- Simulator library tests: 36 passed. The explorer retains its original state/
+  transition bounds and now models positive source-stop versus blocked-stop
+  outcomes; crash recovery asserts admitted-only persistence and expired retries.
+- Workspace all-target/all-feature compilation, formatting, effective-LOC/module
+  structure checks and diff whitespace validation passed. No full workspace test
+  suite was repeated. The isolated disposable etcd test container was cleaned up;
+  no application namespace or user-managed service was touched.
+
+Remaining production validation: representative thousands-node/shard
+throughput, real system suspend/resume, VM clock-rate guarantees, exhaustive
+crash-after-every-write injection and the full Docker chaos/load profiles are
+not established by these focused tests. In particular, correlated renewal makes
+one guarded request per owned slot; queue/etcd saturation fails closed and must
+be capacity-tested for the deployment's intended scale.
 
 #### Validation policy
 

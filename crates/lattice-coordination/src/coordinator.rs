@@ -4,6 +4,7 @@ use std::{
 };
 
 use bytes::Bytes;
+use lattice_model::run::RunEpoch;
 use lattice_model::{
     actor::ProtocolId,
     cluster::CoordinatorScope,
@@ -14,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
+    candidates::{CandidateAuthorization, CandidateGeneration, CandidateRegistration},
     control::{PlacementControlCommand, encoded_control_command_len},
     region::EntityConfig,
     types::{
@@ -58,6 +60,9 @@ impl SingletonConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LeaderRecord {
+    pub candidate_generation: CandidateGeneration,
+    pub candidate_lease_id: i64,
+    pub epoch: RunEpoch,
     pub scope: CoordinatorScope,
     pub node: NodeKey,
     pub term: CoordinatorTerm,
@@ -143,7 +148,23 @@ impl GroupLeaderGuard {
 }
 
 impl LeaderRecord {
+    pub fn candidate_registration(&self) -> CandidateRegistration {
+        CandidateRegistration {
+            epoch: self.epoch,
+            authorization: CandidateAuthorization {
+                scope: self.scope.clone(),
+                node_id: self.node.node_id.clone(),
+                generation: self.candidate_generation,
+            },
+            node: self.node.clone(),
+            lease_id: self.candidate_lease_id,
+        }
+    }
+
     pub fn validate(&self) -> Result<(), CoordinatorError> {
+        if self.candidate_lease_id <= 0 {
+            return Err(CoordinatorError::InvalidLeader);
+        }
         self.node
             .validate()
             .map_err(|_| CoordinatorError::InvalidLeader)?;
@@ -182,10 +203,11 @@ pub enum MemberStatus {
     Leaving,
 }
 
+/// Minimal lease-backed membership authority. Roles, capabilities and protocol
+/// descriptions belong to fresh runtime hellos, never durable recovery state.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemberRecord {
     pub node: NodeKey,
-    pub hello: MemberHello,
     pub status: MemberStatus,
     pub version: MembershipVersion,
     pub lease_id: i64,
@@ -198,18 +220,18 @@ pub enum GroupMemberStatus {
     Leaving,
 }
 
+/// Group participation bound to the node's global membership lease. Scheduling
+/// eligibility is reconstructed from a live group session after leader recovery.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GroupMemberRecord {
     pub node: NodeKey,
-    pub hello: ActorGroupHello,
     pub status: GroupMemberStatus,
     pub version: PlacementVersion,
 }
 
 impl GroupMemberRecord {
-    pub fn validate(&self, limits: &SessionLimits) -> Result<(), CoordinatorError> {
-        self.hello.validate(limits)?;
-        if self.node != self.hello.node || self.version.group != self.hello.group {
+    pub fn validate(&self, _limits: &SessionLimits) -> Result<(), CoordinatorError> {
+        if self.node.validate().is_err() {
             return Err(CoordinatorError::InvalidGroupMember);
         }
         Ok(())
@@ -217,9 +239,8 @@ impl GroupMemberRecord {
 }
 
 impl MemberRecord {
-    pub fn validate(&self, limits: &SessionLimits) -> Result<(), CoordinatorError> {
-        self.hello.validate(limits)?;
-        if self.node != self.hello.node || self.lease_id == 0 {
+    pub fn validate(&self, _limits: &SessionLimits) -> Result<(), CoordinatorError> {
+        if self.node.validate().is_err() || self.lease_id <= 0 {
             return Err(CoordinatorError::InvalidMember);
         }
         Ok(())

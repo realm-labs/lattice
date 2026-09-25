@@ -1,4 +1,7 @@
-use std::collections::{BTreeMap, BTreeSet};
+use crate::candidate_fixture::prepare_leader;
+use crate::candidates::CandidateGeneration;
+use lattice_model::run::RunEpoch;
+use std::collections::BTreeSet;
 use std::time::Duration;
 
 use lattice_model::actor::ProtocolId;
@@ -15,8 +18,8 @@ use super::records::{
 use super::{ActorGroupStore, InMemoryCoordinationStore, MembershipStore, StorageError};
 use crate::allocation::{ProposedMove, RebalanceProposal, RebalanceTrigger};
 use crate::coordinator::{
-    ActorGroupHello, ClusterLeaderGuard, GroupLeaderGuard, GroupMemberRecord, GroupMemberStatus,
-    LeaderRecord, MemberHello, MemberRecord, MemberStatus, SingletonConfig,
+    ClusterLeaderGuard, GroupLeaderGuard, GroupMemberRecord, GroupMemberStatus, LeaderRecord,
+    MemberRecord, MemberStatus, SingletonConfig,
 };
 use crate::plan::RebalancePlan;
 use crate::region::EntityConfig;
@@ -37,37 +40,21 @@ fn node(id: &str, incarnation: u128, port: u16) -> NodeKey {
     }
 }
 
-fn hello(node: NodeKey) -> MemberHello {
-    MemberHello {
-        node,
-        roles: BTreeSet::new(),
-        failure_domains: BTreeMap::new(),
-        protocols: Vec::new(),
-        remoting_capabilities: BTreeSet::new(),
-    }
-}
-
-fn group_hello(node: NodeKey, group: ActorGroupId) -> ActorGroupHello {
-    ActorGroupHello::builder(node, group, 1).build()
-}
-
 fn authority_records(
     owner: NodeKey,
-    actor_group: ActorGroupId,
+    _actor_group: ActorGroupId,
     lease_id: i64,
     membership_version: MembershipVersion,
     placement_version: PlacementVersion,
 ) -> (MemberRecord, GroupMemberRecord) {
     let global = MemberRecord {
         node: owner.clone(),
-        hello: hello(owner.clone()),
         status: MemberStatus::Up,
         version: membership_version,
         lease_id,
     };
     let group = GroupMemberRecord {
         node: owner.clone(),
-        hello: group_hello(owner, actor_group),
         status: GroupMemberStatus::Up,
         version: placement_version,
     };
@@ -82,10 +69,16 @@ async fn persist_authority_records(
     let member_lease = store.grant_lease(Duration::from_secs(10)).await.unwrap();
     let membership_lease = store.grant_lease(Duration::from_secs(10)).await.unwrap();
     let membership_leader = LeaderRecord {
+        candidate_generation: CandidateGeneration::new(1).unwrap(),
+        candidate_lease_id: 1,
+        epoch: RunEpoch::INITIAL,
         scope: CoordinatorScope::Cluster,
         node: node("membership-leader", 90, 31990),
         term: CoordinatorTerm::new(1).unwrap(),
     };
+    let membership_leader = prepare_leader(store, membership_leader, membership_lease)
+        .await
+        .unwrap();
     assert!(
         store
             .campaign_leader(&membership_leader, membership_lease)
@@ -149,10 +142,14 @@ async fn elected_placement(
     store.ensure_framework().await.unwrap();
     let lease = store.grant_lease(Duration::from_secs(10)).await.unwrap();
     let leader = LeaderRecord {
+        candidate_generation: CandidateGeneration::new(1).unwrap(),
+        candidate_lease_id: 1,
+        epoch: RunEpoch::INITIAL,
         scope: CoordinatorScope::Group(group),
         node: node("leader", 1, 31001),
         term: CoordinatorTerm::new(1).unwrap(),
     };
+    let leader = prepare_leader(&store, leader, lease).await.unwrap();
     assert!(store.campaign_leader(&leader, lease).await.unwrap());
     (store, GroupLeaderGuard::new(leader).unwrap(), lease)
 }
@@ -162,10 +159,14 @@ async fn elected_membership() -> (InMemoryCoordinationStore, ClusterLeaderGuard,
     store.ensure_framework().await.unwrap();
     let lease = store.grant_lease(Duration::from_secs(10)).await.unwrap();
     let leader = LeaderRecord {
+        candidate_generation: CandidateGeneration::new(1).unwrap(),
+        candidate_lease_id: 1,
+        epoch: RunEpoch::INITIAL,
         scope: CoordinatorScope::Cluster,
         node: node("leader", 1, 31001),
         term: CoordinatorTerm::new(1).unwrap(),
     };
+    let leader = prepare_leader(&store, leader, lease).await.unwrap();
     assert!(store.campaign_leader(&leader, lease).await.unwrap());
     (store, ClusterLeaderGuard::new(leader).unwrap(), lease)
 }
@@ -192,6 +193,7 @@ fn allocating_slot(key: PlacementSlotKey, owner: NodeKey, revision: u64) -> Plac
 fn claim(slot: &PlacementSlot, lease_id: i64) -> LeasedClaim {
     LeasedClaim {
         grant: ClaimGrant {
+            request_id: 0,
             group: slot.key.group().clone(),
             slot: slot.key.clone(),
             owner: slot.owner.clone().unwrap(),
@@ -281,6 +283,23 @@ async fn allocation_and_move_commits_are_all_or_nothing() {
     let (expected_global_member, expected_group_member) =
         persist_authority_records(&store, &guard, source.clone()).await;
     let target = node("target", 11, 31111);
+    // Reservation now compares the exact target admission in its transaction.
+    let target_lease = store.grant_lease(Duration::from_secs(10)).await.unwrap();
+    let (target_member, target_group_member) = authority_records(
+        target.clone(),
+        actor_group.clone(),
+        target_lease,
+        expected_global_member.version.clone(),
+        expected_group_member.version.clone(),
+    );
+    {
+        let mut state = store.inner.lock().unwrap();
+        state.members.insert(target.node_id.clone(), target_member);
+        state.group_members.insert(
+            (actor_group.clone(), target.node_id.clone()),
+            target_group_member,
+        );
+    }
     let entity_type = EntityType::new("atomic").unwrap();
     let key = PlacementSlotKey::Shard {
         group: actor_group.clone(),
@@ -379,6 +398,7 @@ async fn allocation_and_move_commits_are_all_or_nothing() {
         .reserve_move(
             &guard,
             ReserveMove {
+                limits: Default::default(),
                 expected_plan: pending,
                 plan: handoff_plan.clone(),
                 expected_slot: running,
@@ -406,14 +426,12 @@ async fn member_store_allows_one_incarnation_and_exact_record_cas_only() {
     let second = node("same-id", 21, 31201);
     let joining = MemberRecord {
         node: first.clone(),
-        hello: hello(first),
         status: MemberStatus::Joining,
         version: MembershipVersion::new(guard.term(), Revision::new(2).unwrap()),
         lease_id: first_lease,
     };
     let mut replacement = MemberRecord {
         node: second.clone(),
-        hello: hello(second),
         status: MemberStatus::Joining,
         version: MembershipVersion::new(guard.term(), Revision::new(3).unwrap()),
         lease_id: second_lease,
@@ -734,10 +752,14 @@ async fn group_configuration_is_durable_revisioned_and_exactly_scoped() {
     store.ensure_framework().await.unwrap();
     let lease = store.grant_lease(Duration::from_secs(10)).await.unwrap();
     let leader = LeaderRecord {
+        candidate_generation: CandidateGeneration::new(1).unwrap(),
+        candidate_lease_id: 1,
+        epoch: RunEpoch::INITIAL,
         scope: CoordinatorScope::Group(group()),
         node: node("config-leader", 60, 31600),
         term: CoordinatorTerm::new(1).unwrap(),
     };
+    let leader = prepare_leader(&store, leader, lease).await.unwrap();
     assert!(store.campaign_leader(&leader, lease).await.unwrap());
     let guard = GroupLeaderGuard::new(leader).unwrap();
     let entity = EntityConfig::new(
@@ -802,3 +824,6 @@ async fn group_configuration_is_durable_revisioned_and_exactly_scoped() {
         vec![singleton]
     );
 }
+
+#[path = "tests/transfer_capacity.rs"]
+mod transfer_capacity_tests;

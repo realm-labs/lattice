@@ -30,6 +30,9 @@ tracing.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+rcgen.workspace = true
+tokio-rustls.workspace = true
+lattice-coordination = { workspace = true, features = ["test-harness"] }
 tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "test-util"] }
 lattice-failpoint = { workspace = true, features = ["enabled"] }
 prost.workspace = true

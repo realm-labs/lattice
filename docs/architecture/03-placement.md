@@ -20,23 +20,59 @@ Normal `ActorRef`, `EntityRef`, and `SingletonRef` messages never go through etc
 
 ## 2. etcd Metadata
 
-Recommended logical keys:
+Current storage layout (runtime families are bound to one run):
 
 ```text
 /lattice/<cluster>/meta/framework
+/lattice/<cluster>/meta/lifecycle
+/lattice/<cluster>/meta/last_completion
+/lattice/<cluster>/meta/terms/cluster
+/lattice/<cluster>/meta/terms/groups/<group>
+/lattice/<cluster>/meta/candidates/{cluster,groups/<group>}/{state,authorized/<encoded_node>}
 /lattice/<cluster>/schema/limits
-/lattice/<cluster>/membership/{leader,term,state_revision}
-/lattice/<cluster>/membership/members/<node_id>
-/lattice/<cluster>/domains/<domain>/{leader,term,state_revision}
-/lattice/<cluster>/domains/<domain>/members/<node_id>
-/lattice/<cluster>/domains/<domain>/entity_types/<entity_type>
-/lattice/<cluster>/domains/<domain>/shards/<entity_type>/<shard_id>
-/lattice/<cluster>/domains/<domain>/shard_claims/<entity_type>/<shard_id>
-/lattice/<cluster>/domains/<domain>/singletons/<singleton_kind>
-/lattice/<cluster>/domains/<domain>/singleton_claims/<singleton_kind>
-/lattice/<cluster>/domains/<domain>/rebalances/<plan_id>
-/lattice/<cluster>/domains/<domain>/admin/<operation_id>
+/lattice/<cluster>/definitions/groups/<group>/entity_types/<entity_type>
+/lattice/<cluster>/definitions/groups/<group>/singleton_types/<singleton_kind>
+/lattice/<cluster>/definitions/groups/<group>/settings/automatic_balance
+/lattice/<cluster>/definitions/groups/<group>/counters/{entity_configs,singleton_configs}
+/lattice/<cluster>/runs/<epoch>/candidates/{cluster,groups/<group>}/<encoded_node>
+/lattice/<cluster>/runs/<epoch>/shutdown/{manifest,obligations/...,stopped/...,reports/...,verification}
+/lattice/<cluster>/runs/<epoch>/membership/{leader,state_revision}
+/lattice/<cluster>/runs/<epoch>/membership/members/<node_id>
+/lattice/<cluster>/runs/<epoch>/membership/counters/members
+/lattice/<cluster>/runs/<epoch>/groups/<group>/{leader,state_revision}
+/lattice/<cluster>/runs/<epoch>/groups/<group>/members/<node_id>
+/lattice/<cluster>/runs/<epoch>/groups/<group>/shards/<entity_type>/<shard_id>
+/lattice/<cluster>/runs/<epoch>/groups/<group>/shard_claims/<entity_type>/<shard_id>
+/lattice/<cluster>/runs/<epoch>/groups/<group>/singletons/<singleton_kind>
+/lattice/<cluster>/runs/<epoch>/groups/<group>/singleton_claims/<singleton_kind>
+/lattice/<cluster>/runs/<epoch>/groups/<group>/rebalances/<plan_id>
+/lattice/<cluster>/runs/<epoch>/groups/<group>/transfers/plans/<plan_id>/moves/<move_id>
+/lattice/<cluster>/runs/<epoch>/groups/<group>/transfers/...  # barriers and reservations
+/lattice/<cluster>/runs/<epoch>/groups/<group>/admin/<operation_id>
+/lattice/<cluster>/runs/<epoch>/groups/<group>/counters/<family>
 ```
+
+Run-bound store handles cannot automatically follow a newer epoch. Ordinary
+guarded writes compare the exact epoch and `Running` lifecycle in the same
+transaction as the data change. Entering `Closing` stops those writes across
+all scopes, while election remains possible during both Draining and Cleaning
+so another eligible Cluster Coordinator can finish the operation.
+
+The low-level offline-reset path is implemented separately from graceful
+shutdown: explicit operator confirmation, durable `Resetting` fence, bounded
+reviewed-family deletion, live-lease blockers, retained completion, then a
+guarded new-run transition. See [offline maintenance](../operations/cluster-reset.md).
+[Cluster shutdown](../operations/cluster-shutdown.md) instead requires sealed,
+exact-incarnation positive stop evidence before Cleaning. Unleased shutdown
+obligations survive node lease expiry. Minimal leased member records contain
+identity, lifecycle/order and lease facts; descriptions are session memory.
+Plans, barrier participants and progress use separate bounded records.
+
+Encoded durable values are capped at 4 KiB; oversized definitions are rejected,
+not silently chunked. Store pages are capped at 256 records, admitted plans at
+64 moves, candidate sets at 64 per scope, and maintenance deletion batches at
+32 keys. These are storage safeguards, not a measured throughput claim. Etcd
+MVCC compaction and disk defragmentation remain server/operator concerns.
 
 There are no per-entity placement keys and no concrete actor-path keys. Concrete `ActorRef` identity lives in remoting/runtime state; logical entity activation is local to its shard owner.
 
@@ -45,8 +81,8 @@ compatibility identity. Startup validates it before reading version-sensitive st
 Only an empty prefix can be initialized; missing/different identities, legacy
 `schema_generation` records, or inconsistent durable limits refuse startup.
 `MembershipVersion` and group-qualified `PlacementVersion` still order runtime
-state; they are not release versions. The existing `membership/` and `domains/`
-key families remain until the run-scoped storage work package.
+state; they are not release versions. Legacy unscoped runtime namespaces are
+not automatically migrated or stamped with a lifecycle marker.
 
 Bootstrap and handshake admission check the same framework identity. There are no
 separate transport/control/watch generation negotiations. A framework upgrade
@@ -74,8 +110,9 @@ The shared engine owns assignment persistence, term/generation validation, claim
 
 Nodes first register through a membership session with bounded `MemberHello` (exact `NodeKey`, roles,
 failure-domain attributes, protocol catalogue, and remoting capabilities). Persisted `MemberRecord`
-contains that hello, `Joining | Up | Leaving`, `MembershipVersion`, and lease ID. Removed is an
-ordered exact-incarnation event, not a stored status.
+contains only the exact node identity, `Joining | Up | Leaving`, `MembershipVersion`,
+and lease ID. Full descriptions remain in validated control-session memory. Removed
+is an ordered exact-incarnation event, not a stored status.
 
 Registration persists `Joining` and sends a membership snapshot. `JoinReady(snapshot_version)` from
 the same Association performs the only `Joining -> Up` transition. A Joining snapshot never opens
@@ -85,7 +122,11 @@ are idempotent.
 After global `Up`, each explicit domain session sends bounded `ActorGroupHello`: domain/config
 fingerprint, positive quota, hosted configurations, proxy subscriptions, and constraints. The
 domain leader persists `GroupMemberRecord` and allocates only when both exact global and domain
-records are `Up`. A mismatch rejects only that domain.
+records are `Up`, with a freshly validated in-memory description. Group records
+retain the exact identity, configuration fingerprint, lifecycle/order and lease
+facts, not the full hello. A mismatch rejects only that group. After leader loss,
+recovered durable membership alone does not make descriptions ready: nodes must
+reconcile their control sessions before allocation uses those inputs.
 
 Membership and placement snapshots/deltas use distinct reducers and error families. Scope/domain
 mismatch is rejected before mutation. A higher term requires a full snapshot for only that scope;
@@ -98,6 +139,19 @@ A new Group Coordinator:
 3. verifies exact authoritative global `Up` records;
 4. reconciles claim holders before issuing mutations;
 5. resumes required recovery/drain work, then allocation and automatic rebalancing only after reconciliation and fresh-input checks.
+
+Local scope capability, durable candidate eligibility, online registration, and
+elected leadership are separate. Explicit administrators enable/revoke eligibility.
+Online registration is leased and includes the exact incarnation and authorization
+generation. Elections and authoritative writes compare both current authorization
+and exact registration; revocation is not delayed until a process notices it.
+Re-addition uses a newer generation. Removing the last eligible candidate is
+rejected, but eligibility alone does not guarantee a reachable candidate.
+
+Discovery hints never grant authority. Static/DNS discovery need reachable
+bootstrap seeds; read-only etcd discovery watches only narrow metadata/endpoint
+keys. Healthy control sessions use heartbeat acknowledgement and do not create
+periodic Bootstrap probe connections; lost sessions reenter bounded discovery.
 
 Every authoritative mutation is a named domain transaction comparing an exact
 `GroupLeaderGuard`, domain revision, global member, domain member/config, and operation-specific
@@ -112,7 +166,8 @@ it may temporarily leave an active record claimless, but recovery must fence it 
 only the same owner until previous authority invalidity is proven.
 
 Placement leadership does not itself grant serving authority. The domain leader persists a claim and
-sends bounded `ClaimGranted`; owners validate domain, slot, generation, sequence, and monotonic TTL.
+answers a correlated owner `ClaimRequest` with bounded `ClaimGranted`; owners
+validate the run, request ID, session, slot generation, sequence and local deadline.
 Runtime nodes never acquire claims directly from etcd.
 
 ### 3.1 Revisioned State Snapshot
@@ -337,39 +392,42 @@ Recovery and drain bypass balance improvement and residence thresholds but still
 bounded concurrency. Automatic rebalancing requires a healthy reconciled domain leader and fresh
 inputs. Failure or reconciliation in another domain does not pause this domain.
 
-### 6.4 Persisted Plan and Limits
+### 6.4 Admitted Transfers and Limits
 
-The Group Coordinator converts an accepted proposal into a persisted, domain/term/revision-fenced plan before starting a move:
+Accepted policy proposals remain in the current Group Coordinator's bounded memory. A `Pending`
+move has no durable transfer record or in-flight reservation. At most one automatic proposal is
+active per entity type; higher-priority work may cancel unstarted moves without changing authority.
 
-```text
-RebalancePlan {
-  plan_id
-  entity_type
-  reason
-  domain and coordinator_term
-  base_revision
-  policy_id and policy_version
-  status: Planned | Running | Completed | Cancelled | Failed
-  moves: [
-    shard_id
-    expected_generation
-    source_incarnation
-    target_incarnation
-    status: Pending | Handoff | Completed | Cancelled | Failed
-  ]
-}
-```
+Admission writes the slot's `active_move`, admitted plan projection, and capacity reservation in one
+guarded transaction. It compares the run lifecycle, exact leader authorization, current slot and
+generation, target membership, plan revision, and capacity counters. A custom policy cannot bypass
+these checks. Once admitted, a move must complete or recover forward.
 
-Only one move may be active for a shard, and at most one automatic plan may be active per entity
-type. Pending moves reserve domain capacity. Limits apply per domain/entity/source/target plus an
-optional CoordinatorHost-wide cap; revisions and write sets are never shared across domains.
-Cooldown, history, and deletion remain bounded and revision-conditional.
+Persisted plans are split into a small metadata record and separate indexed move records. Metadata
+contains the group, plan ID, policy identity, revisions, admitted move count, and canonical digest;
+it does not embed a moves array or participant set. Each move records the shard, generation, exact
+source/target identities, and progress. A fixed-revision read verifies all rows against the
+metadata. Only admitted and terminal moves appear in this recovery projection.
 
-Higher-priority recovery/drain work may cancel or preempt lower-priority moves only while they remain `Pending`; their reservations are then released idempotently. A move that has entered `Handoff` owns the slot's `active_move` marker and must complete or recover forward before another plan may target that shard.
+`RebalanceLimits` bounds moves per round and concurrent work per actor group, entity type, source,
+and target. The configured plan batch cannot exceed 64 moves; encoded metadata and individual move
+values cannot exceed 4 KiB. There is no CoordinatorHost-wide or cross-group global quota. Recovery,
+drain, manual, and automatic triggers share the same in-flight accounting, including singleton
+handoffs. Reservations retain exact endpoints across ownership changes and leader replacement.
+Lower limits stop new admissions but do not abandon existing work.
 
-A new domain leader reconstructs only its plans and handoffs after claim reconciliation. It cancels
-stale `Pending` moves and resumes persisted handoffs forward; another domain's state is neither read
-nor changed.
+Transfer completion and reservation release are atomic. Terminal plan history and administrative
+receipts have bounded retention. A new leader resumes admitted work only; it does not replay lost
+unstarted proposals. A matching administrative receipt whose proposal is no longer retained returns
+`OperationExpired`; a deliberate new evaluation requires a fresh operation ID. Cooldown, terminal
+history, and cleanup remain group-local.
+
+Administrative operation IDs come from `CoordinatorInspection::new_operation_id()`, not arbitrary
+labels. They bind the run epoch, actor group, leader term, current group revision, and a nonce.
+Retry checks the retained receipt first, including after leader replacement. Without a receipt, only
+an ID for the exact current context is eligible. Receipt-producing mutations advance the group
+revision atomically, so deleting an old receipt cannot make its operation executable again. A
+stale/expired response requires inspection and an explicit new decision, never automatic ID refresh.
 
 ### 6.5 Singleton Boundary
 
@@ -377,25 +435,47 @@ Singletons reuse the shared placement move, drain, claim, and fencing machinery 
 
 ## 7. Handoff
 
-A controlled shard handoff uses its domain's revision stream. Its barrier contains only live sessions
-whose `ActorGroupHello` subscribes to the affected entity type. Unrelated domains and types
-cannot block it.
+A controlled handoff uses its actor group's revision stream. The frozen barrier includes every
+admitted group-session incarnation, not only subscribers to the affected entity type. An attached
+session without relevant slot payload receives an empty revisioned delta and acknowledges the
+revision. Other actor groups are outside this barrier.
+
+Before publishing `BeginHandoff`, the store captures the group membership at one fixed etcd
+revision, writes a small Building manifest and bounded batches of participant identity rows, and
+verifies their count and canonical digest before sealing. Repeated batches are idempotent. A
+compacted or changed unpublished source is discarded and rebuilt; pages from different revisions
+are never combined. Slot publication compares the sealed manifest. No invalidation or drain effect
+may depend on a partially built set.
 
 ```text
-Domain leader transactionally links optional plan/move ID and persists BeginHandoff(next generation, target)
-  -> publishes domain delta(handoff revision)
-  -> every subscribed Region in the frozen barrier set invalidates home, buffers, and AppliedRevision(revision)
+Group leader seals the participant manifest
+  -> transactionally reserves capacity and persists BeginHandoff(source generation, target, operation)
+  -> publishes group delta(handoff revision)
+  -> every frozen group session applies the revision; affected Regions invalidate home and buffer
   -> a node joining later receives the Handoff state in its snapshot before becoming Ready
   -> a node adding the entity-type subscription during handoff installs that snapshot slice before routing
   -> a failed barrier member leaves only through membership/lease fencing, not by handoff timeout alone
-  -> domain leader sends DrainShard to source
+  -> group leader verifies sealed, complete terminal participant evidence and sends DrainShard to source
   -> source stops admission, drains handlers, and stops entities
-  -> source sends ShardDrained; domain leader revokes or proves expiry of old claim
-  -> domain leader persists next-generation claim and sends ClaimGranted to target
+  -> source sends ShardDrained; group leader fences old authority
+  -> without exact graceful-stop proof, replacement waits the conservative old-grant holdoff
+  -> group leader persists next-generation claim and sends ClaimGranted to target
   -> target installs the grant, starts Shard, and sends ShardReady
-  -> domain leader persists Active and publishes the next domain delta
+  -> group leader atomically persists Active and releases the reservation, then publishes the delta
   -> Regions apply the revision and flush unexpired bounded buffers
 ```
+
+Group-member admission advances the same placement revision used by transfer publication. A
+concurrent join invalidates a stale publication comparison; a later join installs the handoff
+snapshot before routing or authority replay. The sealed identity set never shrinks through lease
+deletion. Per-participant progress distinguishes Applied from SessionFenced; both are idempotent
+terminal transitions, but neither substitutes for the source's graceful-stop proof.
+
+Recovery verifies the manifest and every participant row. Missing evidence is an integrity error,
+not successful completion; already-draining or starting transfers must have terminal evidence for
+every participant. Completed and unpublished orphan barriers are reclaimed only when no live slot
+references them. Restartable background cleanup deletes at most 16 participant rows per pass and
+deletes the manifest last.
 
 The first version does not transfer in-memory actor state. Reactivated entities load state through business hooks when applicable. Stateful migration therefore needs business-level save/load correctness.
 
@@ -403,8 +483,8 @@ The first version does not transfer in-memory actor state. Reactivated entities 
 the old claim is valid. The same Actor instance and registry reservation remain retained for
 `RetryStop`. It never overrides fencing: explicit claim loss or local grant expiry first closes node,
 slot, exact-activation, and logical admission; removes the old activation from routing; and places it
-in bounded non-authoritative quarantine. The Coordinator may then install replacement authority
-using the unchanged term/generation/claim proof. Quarantine can only inspect, retry persistence,
+in bounded non-authoritative quarantine. Replacement still requires the durable fence boundary and
+old-grant holdoff when no exact graceful-stop proof exists. Quarantine can only inspect, retry persistence,
 export diagnostics, or explicitly force-discard; it cannot regain authority implicitly.
 
 ## 8. Claims, Failure, and Coordinator Outage
@@ -413,6 +493,7 @@ A shard owner may serve only while its locally installed grant matches the Coord
 
 ```text
 ClaimGranted {
+  run_epoch, request_id,
   coordinator_term,
   assignment_generation,
   grant_sequence,
@@ -420,7 +501,33 @@ ClaimGranted {
 }
 ```
 
-The wire carries a duration, never a remote wall-clock timestamp. On receipt, the owner computes `local_deadline = monotonic_now + ttl - safety_margin`. Initial defaults are 15 s TTL, renewal every 5 s, and 2 s safety margin. A renewal must have the same generation, a nondecreasing grant sequence, and the current or a higher reconciled Coordinator term. A higher term supersedes the old grant only after the new leader reconciles the etcd claim. Process suspension or delayed renewal that crosses the local deadline fences admission immediately before shutdown.
+The owner records a suspension-aware local clock reading when it sends each
+correlated request. The Coordinator renews the backing lease, conservatively
+bounds the permitted duration, and commits the exact correlated grant under
+current leader/candidate/slot guards before replying. The owner installs
+`deadline = request_start + permitted_duration`, never receipt time plus TTL.
+Network and processing delays consume the existing interval. Consumed requests,
+wrong sessions/generations, stale sequences and expired responses are rejected.
+
+The maximum grant interval is 15 seconds. Measured lease TTL is rounded down,
+then reduced by clock/transport safety margins. Without an exact positive old
+stop proof, replacement waits the full maximum possible interval plus clock
+margin; Coordinator restart restarts that conservative wait. A missing claim or
+expired etcd lease alone cannot bypass it.
+
+Admission checks the shared authority cell before activation publication and
+before queued/cached-reference business execution. Expired or explicitly revoked
+authority irreversibly retires those Actor instances. Reconnection and later
+grants cannot revive them. Stop-failed local instances remain quarantined; the
+same local key cannot publish a replacement until its old instance stops.
+Quarantine recovery does not authorize business effects.
+
+Automatic takeover is supported only with the validated suspension-aware clock
+implementation and its deployment assumptions (Windows uptime or Linux
+`CLOCK_BOOTTIME`). Unsupported clocks, failed reads and backwards readings fail
+closed. Do not restore old VM process snapshots or reuse old process identities.
+External storage writes still require an application/resource-specific fencing
+contract; framework admission is not proof of external-write cancellation.
 
 During temporary Coordinator unavailability:
 
@@ -453,6 +560,24 @@ member, publishes the next generation, and activates the new singleton.
 
 ## 11. Drain and Shutdown
 
+Node leave and whole-cluster shutdown are different operations. Node leave can
+handoff work to remaining members; cluster shutdown must not move work between
+nodes that are all stopping. The library does not intercept operating-system
+signals. Applications choose `shutdown()` for local leave or
+`shutdown_cluster(operation, deadline)` for whole-run shutdown.
+
+Whole-run shutdown commits `Closing`, seals exact-incarnation stop obligations,
+and closes business admission on notified members. Nodes drain managed Actors
+and their application `ClusterStopHook`, while retaining control/reply paths for
+positive completion or explicit blockers. Lease expiry is never a stop report.
+Once all sealed obligations are verified, bounded Cleaning removes runtime
+records before an atomic `Closed { completion: Graceful }` and retained result.
+A replacement Coordinator can continue either phase; waiter cancellation never
+cancels the durable operation. See [cluster shutdown](../operations/cluster-shutdown.md)
+for administration, hooks and terminal-result recovery.
+
+The following describes local node leave:
+
 `LatticeService::leave(deadline)` uses one operation ID and one absolute monotonic deadline for the
 whole exit, including membership confirmation and local component shutdown:
 
@@ -464,6 +589,7 @@ whole exit, including membership confirmation and local component shutdown:
 5. after every required domain is confirmed, send `MembershipDrainComplete` with the same
    operation and exact node identity, and wait for the Cluster Coordinator's `DrainCommitted`;
 6. fence the removed incarnation locally, enter `Stopping`, drain remaining local Actors, and
+   send exact `NodeStopCompleted` to discharge the durable stop obligation, then
    join endpoint and supervised tasks before publishing `Terminated`.
 
 `DrainCommitted` is an application-level response bound to the requested operation and incarnation,
@@ -501,4 +627,6 @@ Different framework versions cannot share a live cluster or coordination namespa
 Stop the old deployment and follow the explicit full-stop procedure before creating
 a namespace for the new version. The old schema migration CLI has been removed;
 startup never converts old runtime records or overwrites their identity marker.
-Run-scoped cleanup/reset remains a separate work package, not an implemented shortcut.
+[Run-scoped cleanup/reset](../operations/cluster-reset.md) is an explicit
+administrative operation, not schema migration or an automatic startup shortcut.
+It preserves persistent configuration and safety history.

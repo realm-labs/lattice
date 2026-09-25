@@ -49,9 +49,38 @@ Join timeout and shutdown cancellation cover the initial snapshot, bootstrap and
 establishment waits. Discovery updates do not bypass retry backoff; jitter is independently seeded
 and delays are capped by `retry_max`.
 
-This first W2.1 slice does not yet replace periodic leadership probes with control-session health
-signals. Existing leadership refresh remains necessary until that integration is implemented.
-It also does not introduce run-aware etcd election-record discovery or new readiness semantics.
+Healthy admitted control sessions use heartbeat acknowledgements instead of opening
+periodic Bootstrap connections. Missed acknowledgement deadlines close that session
+and reenter discovery; provider failure alone does not extend or revoke grants.
+Serving authority has an independent, request-correlated local deadline.
+
+## Read-only etcd election discovery
+
+`lattice_coordination::discovery::EtcdCoordinatorDiscovery` is a programmatic
+adapter for the coordination namespace, distinct from ConfigStore's arbitrary
+endpoint document. Construct it using `connect(endpoints, options, prefix, scope)`
+or an existing read/watch-only client through `from_client`. Wrap it once in
+`SharedDiscovery` when multiple consumers use the same scope and credentials.
+
+It reads the exact framework marker and lifecycle, the selected scope's current
+leader and bounded leased candidate registrations. Fixed-revision reads prevent
+mixing runs. Narrow watches trigger resnapshot after changes, interruption or
+compaction. It does not initialize the namespace, grant leases, campaign, or
+read membership/shard/claim records. Static and DNS consumers need none of these
+etcd permissions.
+
+Provision read/watch permissions only for `meta/framework`, `meta/lifecycle`,
+`meta/last_completion`, the selected run's scope leader key and scoped candidate
+prefix. Permissions for new run epochs must be reprovisioned or delegated through
+a suitable deployment-specific prefix policy; do not grant broad write access
+just to simplify discovery. Closed results can be read from retained lifecycle
+metadata even after all runtime candidates and leader keys have been cleaned.
+
+A node must still perform Bootstrap and validate its admitted control session.
+Hints, cached addresses and candidate registration alone never grant authority.
+This adapter reduces the data surface, not the number of configured clients:
+measure aggregate watches/connections and use static/DNS entry points where
+ordinary workers should not contact etcd at all.
 
 ## Configuration
 

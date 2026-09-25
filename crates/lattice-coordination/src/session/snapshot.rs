@@ -53,7 +53,7 @@ pub(super) fn decode_members(
         }
         let member: MemberRecord =
             serde_json::from_slice(&record.value).map_err(|_| GroupSessionError::Codec)?;
-        if member.node != member.hello.node
+        if member.node.validate().is_err()
             || members
                 .insert(
                     (member.node.node_id.clone(), member.node.incarnation),

@@ -88,7 +88,7 @@ impl MemberDirectory {
         let mut members = BTreeMap::new();
         let mut node_ids = BTreeSet::new();
         for record in records {
-            if record.version > version || record.node != record.hello.node {
+            if record.version > version || record.node.validate().is_err() {
                 return Err(MemberDirectoryError::InvalidRecord);
             }
             if !node_ids.insert(record.node.node_id.clone()) {
@@ -119,7 +119,7 @@ impl MemberDirectory {
         }
         match &event.change {
             MemberChange::Upsert(record) => {
-                if record.version != event.version || record.node != record.hello.node {
+                if record.version != event.version || record.node.validate().is_err() {
                     return Err(MemberDirectoryError::InvalidRecord);
                 }
                 if !state.fenced_incarnations.contains(&record.node.incarnation) {
@@ -173,12 +173,9 @@ pub enum MemberDirectoryError {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeMap, BTreeSet};
 
     use lattice_coordination::{
-        coordinator::{
-            MemberChange, MemberEvent, MemberHello, MemberRecord, MemberRemovalReason, MemberStatus,
-        },
+        coordinator::{MemberChange, MemberEvent, MemberRecord, MemberRemovalReason, MemberStatus},
         types::{CoordinatorTerm, MembershipVersion, NodeKey, Revision},
     };
     use lattice_model::cluster::{NodeEndpoint, NodeIncarnation};
@@ -193,13 +190,6 @@ mod tests {
         };
         MemberRecord {
             node: node.clone(),
-            hello: MemberHello {
-                node,
-                roles: BTreeSet::new(),
-                failure_domains: BTreeMap::new(),
-                protocols: Vec::new(),
-                remoting_capabilities: BTreeSet::new(),
-            },
             status: MemberStatus::Up,
             version: MembershipVersion::new(
                 CoordinatorTerm::new(1).unwrap(),

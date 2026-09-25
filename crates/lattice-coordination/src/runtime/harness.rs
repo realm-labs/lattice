@@ -6,6 +6,11 @@
 //! narrow set of drive-and-observe operations instead of widening the runtime API. It is compiled
 //! only under the `test-harness` feature and is not part of the supported surface.
 
+use crate::candidate_fixture::elect_group;
+use crate::candidate_fixture::prepare_leader;
+use crate::candidates::CandidateGeneration;
+use lattice_model::run::RunEpoch;
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::Arc,
@@ -65,6 +70,7 @@ pub struct GroupHarness {
     group: ActorGroupId,
     entity_type: EntityType,
     hosts: Vec<HarnessHost>,
+    operation_ids: BTreeMap<String, String>,
 }
 
 impl GroupHarness {
@@ -92,7 +98,7 @@ impl GroupHarness {
             .map_err(rejected)?,
         );
         let store = Arc::new(InMemoryCoordinationStore::new(64, 64).map_err(rejected)?);
-        let mut leader = GroupCoordinator::elect(
+        let mut leader = elect_group(
             store.clone(),
             associations.clone(),
             coordinator.clone(),
@@ -157,6 +163,7 @@ impl GroupHarness {
             group: group_id,
             entity_type,
             hosts,
+            operation_ids: BTreeMap::new(),
         })
     }
 
@@ -193,6 +200,7 @@ impl GroupHarness {
         operation_id: &str,
         shard: u32,
     ) -> Result<u128, CoordinatorRuntimeError> {
+        let operation_id = self.operation_id(operation_id).await?;
         let key = self.shard_key(shard);
         let slot = self.require_slot(&key).await?;
         let owner = slot.owner.ok_or(CoordinatorRuntimeError::UnknownSlot)?;
@@ -207,7 +215,7 @@ impl GroupHarness {
         self.leader
             .manual_relocate(ManualRelocationRequest {
                 group: self.group.clone(),
-                operation_id: operation_id.to_owned(),
+                operation_id: operation_id.clone(),
                 entity_type: self.entity_type.clone(),
                 shard_id: ShardId::new(shard),
                 expected_generation: slot.assignment_generation,
@@ -271,13 +279,23 @@ impl GroupHarness {
         self.leader.transition_handoff(key, event).await
     }
 
+    async fn operation_id(&mut self, label: &str) -> Result<String, CoordinatorRuntimeError> {
+        if let Some(id) = self.operation_ids.get(label) {
+            return Ok(id.clone());
+        }
+        let id = self.leader.inspect().await?.new_operation_id();
+        self.operation_ids.insert(label.to_owned(), id.clone());
+        Ok(id)
+    }
+
     pub async fn set_automatic_paused(
         &mut self,
         operation_id: &str,
         paused: bool,
     ) -> Result<(), CoordinatorRuntimeError> {
+        let operation_id = self.operation_id(operation_id).await?;
         self.leader
-            .set_automatic_paused(operation_id.to_owned(), None, paused)
+            .set_automatic_paused(operation_id, None, paused)
             .await
     }
 
@@ -286,7 +304,7 @@ impl GroupHarness {
     /// reconciliation commit boundary can be exercised.
     pub async fn reelect(&mut self, term: u64) -> Result<(), CoordinatorRuntimeError> {
         self.store.revoke_lease(self.leader.leader_lease_id).await?;
-        let leader = GroupCoordinator::elect(
+        let leader = elect_group(
             self.store.clone(),
             self.associations.clone(),
             self.coordinator.clone(),
@@ -495,10 +513,16 @@ async fn ensure_global_member(
         None => {
             let lease = leader.store.grant_lease(MEMBER_LEASE).await?;
             let record = LeaderRecord {
+                candidate_generation: CandidateGeneration::new(1).unwrap(),
+                candidate_lease_id: 1,
+                epoch: RunEpoch::INITIAL,
                 scope,
                 node: leader.leader.node.clone(),
                 term: CoordinatorTerm::new(1).map_err(rejected)?,
             };
+            let record = prepare_leader(leader.store.as_ref(), record, lease)
+                .await
+                .unwrap();
             if !leader.store.campaign_leader(&record, lease).await? {
                 return Err(CoordinatorRuntimeError::NotLeader);
             }
@@ -514,7 +538,6 @@ async fn ensure_global_member(
         .map_err(|_| CoordinatorRuntimeError::RevisionExhausted)?;
     let member = MemberRecord {
         node: hello.node.clone(),
-        hello: hello.clone(),
         status: MemberStatus::Up,
         version: MembershipVersion::new(membership.term, revision),
         lease_id,

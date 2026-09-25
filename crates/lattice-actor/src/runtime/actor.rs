@@ -155,7 +155,7 @@ where
 {
     let behavior = catch_unwind(AssertUnwindSafe(|| actor.initial_behavior()))
         .map_err(|payload| ActorPanic::new("initial_behavior", payload))?;
-    if handle.business_admission_fenced() {
+    if handle.business_execution_fenced() {
         return Ok((behavior, Some(StopReason::Requested)));
     }
 
@@ -195,7 +195,7 @@ where
                 "actor started"
             );
             handle
-                .business_admission_fenced()
+                .business_execution_fenced()
                 .then_some(StopReason::Requested)
         }
         Err(payload) => return Err(ActorPanic::new("started", payload)),
@@ -252,7 +252,7 @@ where
 {
     let mut normal_batch = Vec::with_capacity(NORMAL_RECEIVE_BATCH_SIZE.min(turn_budget));
     while stop_reason.is_none() {
-        if active.handle.business_admission_fenced() {
+        if active.handle.business_execution_fenced() {
             stop_reason = Some(StopReason::Requested);
             break;
         }

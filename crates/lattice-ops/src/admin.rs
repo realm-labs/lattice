@@ -72,6 +72,9 @@ pub struct AdminSnapshot {
     pub partial: bool,
     pub coordinator_term: Option<u64>,
     pub coordinator_revision: Option<u64>,
+    /// Populate from CoordinatorInspection::new_operation_id for the inspected group.
+    /// Clients reuse this identity on retries, never silently refresh an expired operation.
+    pub next_operation_id: Option<String>,
     pub nodes: Vec<NodeView>,
     pub associations: Vec<AssociationView>,
     pub actor_paths: Vec<ActorPathView>,
@@ -190,6 +193,7 @@ fn constant_time_eq(actual: &[u8], expected: &[u8]) -> bool {
 #[derive(Debug, Clone, Deserialize)]
 pub struct ManualRelocation {
     pub group: String,
+    /// Revision-bound identity obtained from Coordinator inspection, not a free-form label.
     pub operation_id: String,
     pub entity_type: String,
     pub shard_id: u32,
@@ -326,7 +330,8 @@ fn map_coordinator_error(error: CoordinatorRuntimeError) -> AdminApiError {
         | CoordinatorRuntimeError::UnknownEntityConfig
         | CoordinatorRuntimeError::UnknownPlan
         | CoordinatorRuntimeError::UnknownSlot => AdminApiError::Invalid,
-        CoordinatorRuntimeError::IdempotencyConflict
+        CoordinatorRuntimeError::OperationExpired
+        | CoordinatorRuntimeError::IdempotencyConflict
         | CoordinatorRuntimeError::StaleProposal
         | CoordinatorRuntimeError::PlanConflict
         | CoordinatorRuntimeError::IneligibleTarget => AdminApiError::Conflict,

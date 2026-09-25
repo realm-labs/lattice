@@ -1,25 +1,25 @@
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    sync::Arc,
-    time::Duration,
-};
+mod candidate_fixture;
+use candidate_fixture::prepare_leader;
+use lattice_coordination::candidates::CandidateGeneration;
+use lattice_model::run::RunEpoch;
+use std::{sync::Arc, time::Duration};
 
 use etcd_client::Client;
 use lattice_coordination::{
     allocation::{ProposedMove, RebalanceProposal, RebalanceTrigger},
     coordinator::{
-        ActorGroupHello, ClusterLeaderGuard, GroupLeaderGuard, GroupMemberRecord,
-        GroupMemberStatus, LeaderRecord, MemberHello, MemberRecord, MemberStatus, SingletonConfig,
+        ClusterLeaderGuard, GroupLeaderGuard, GroupMemberRecord, GroupMemberStatus, LeaderRecord,
+        MemberRecord, MemberStatus, SingletonConfig,
     },
-    plan::RebalancePlan,
+    plan::{MoveProgress, PlanStatus, RebalancePlan},
     region::EntityConfig,
     storage::{
         ActorGroupStore, CoordinatorLeaseStore, MembershipStore, ScopedElectionStore, StorageError,
         etcd::{EtcdCoordinationConfig, EtcdCoordinationStore},
         records::{
-            ActivateAuthority, AllocateInitial, CreateGroupMember, CreateMember, CreatePlan,
-            DeletePlan, DurableStorageLimits, LeasedClaim, PutEntityConfig, PutSingletonConfig,
-            RemoveMember, TransitionSlot, UpdateMember,
+            ActivateAuthority, AdoptAuthority, AllocateInitial, CreateGroupMember, CreateMember,
+            CreatePlan, DeletePlan, DurableStorageLimits, LeasedClaim, PutEntityConfig,
+            PutSingletonConfig, RemoveMember, TransitionSlot, UpdateMember,
         },
     },
     types::{
@@ -56,20 +56,6 @@ fn node(id: &str, incarnation: u128, port: u16) -> NodeKey {
         address: NodeEndpoint::new("127.0.0.1", port).unwrap(),
         incarnation: NodeIncarnation::new(incarnation).unwrap(),
     }
-}
-
-fn member_hello(node: NodeKey) -> MemberHello {
-    MemberHello {
-        node,
-        roles: BTreeSet::new(),
-        failure_domains: BTreeMap::new(),
-        protocols: Vec::new(),
-        remoting_capabilities: BTreeSet::new(),
-    }
-}
-
-fn group_hello(node: NodeKey, group: ActorGroupId) -> ActorGroupHello {
-    ActorGroupHello::builder(node, group, 1).build()
 }
 
 fn limits(maximum_slots: usize) -> DurableStorageLimits {
@@ -184,10 +170,16 @@ async fn real_etcd_guarded_group_commits_and_lease_expiry() {
 
     let membership_lease = store.grant_lease(Duration::from_secs(10)).await.unwrap();
     let membership_leader = LeaderRecord {
+        candidate_generation: CandidateGeneration::new(1).unwrap(),
+        candidate_lease_id: 1,
+        epoch: RunEpoch::INITIAL,
         scope: CoordinatorScope::Cluster,
         node: node("coordinator", 1, 29001),
         term: CoordinatorTerm::new(1).unwrap(),
     };
+    let membership_leader = prepare_leader(&store, membership_leader, membership_lease)
+        .await
+        .unwrap();
     assert!(
         store
             .campaign_leader(&membership_leader, membership_lease)
@@ -201,10 +193,14 @@ async fn real_etcd_guarded_group_commits_and_lease_expiry() {
     let membership_guard = ClusterLeaderGuard::new(membership_leader).unwrap();
     let leader_lease = store.grant_lease(Duration::from_secs(10)).await.unwrap();
     let leader = LeaderRecord {
+        candidate_generation: CandidateGeneration::new(1).unwrap(),
+        candidate_lease_id: 1,
+        epoch: RunEpoch::INITIAL,
         scope: CoordinatorScope::Group(group()),
         node: node("coordinator", 1, 29001),
         term: CoordinatorTerm::new(1).unwrap(),
     };
+    let leader = prepare_leader(&store, leader, leader_lease).await.unwrap();
     assert!(store.campaign_leader(&leader, leader_lease).await.unwrap());
     let guard = GroupLeaderGuard::new(leader).unwrap();
 
@@ -233,14 +229,12 @@ async fn real_etcd_guarded_group_commits_and_lease_expiry() {
     let foreign_claim_lease = store.grant_lease(Duration::from_secs(10)).await.unwrap();
     let foreign_global_member = MemberRecord {
         node: foreign_owner.clone(),
-        hello: member_hello(foreign_owner.clone()),
         status: MemberStatus::Up,
         version: MembershipVersion::new(membership_guard.term(), Revision::new(1).unwrap()),
         lease_id: foreign_claim_lease,
     };
     let foreign_group_member = GroupMemberRecord {
         node: foreign_owner.clone(),
-        hello: group_hello(foreign_owner.clone(), foreign_group.clone()),
         status: GroupMemberStatus::Up,
         version: PlacementVersion::new(
             foreign_group.clone(),
@@ -257,6 +251,7 @@ async fn real_etcd_guarded_group_commits_and_lease_expiry() {
                 slot: foreign_slot,
                 claim: LeasedClaim {
                     grant: ClaimGrant {
+                        request_id: 0,
                         group: foreign_group.clone(),
                         slot: foreign_key.clone(),
                         owner: foreign_owner,
@@ -280,10 +275,8 @@ async fn real_etcd_guarded_group_commits_and_lease_expiry() {
 
     let member_lease = store.grant_lease(Duration::from_secs(10)).await.unwrap();
     let member_node = node("member", 7, 29007);
-    let hello = member_hello(member_node.clone());
     let joining = MemberRecord {
         node: member_node,
-        hello,
         status: MemberStatus::Joining,
         version: MembershipVersion::new(membership_guard.term(), Revision::new(2).unwrap()),
         lease_id: member_lease,
@@ -330,7 +323,6 @@ async fn real_etcd_guarded_group_commits_and_lease_expiry() {
     let owner_lease = store.grant_lease(Duration::from_secs(10)).await.unwrap();
     let owner_member = MemberRecord {
         node: owner.clone(),
-        hello: member_hello(owner.clone()),
         status: MemberStatus::Up,
         version: MembershipVersion::new(membership_guard.term(), Revision::new(5).unwrap()),
         lease_id: owner_lease,
@@ -346,7 +338,6 @@ async fn real_etcd_guarded_group_commits_and_lease_expiry() {
         .unwrap();
     let owner_group_member = GroupMemberRecord {
         node: owner.clone(),
-        hello: group_hello(owner.clone(), group()),
         status: GroupMemberStatus::Up,
         version: PlacementVersion::new(group(), guard.term(), Revision::new(2).unwrap()),
     };
@@ -373,6 +364,7 @@ async fn real_etcd_guarded_group_commits_and_lease_expiry() {
     };
     let claim_lease = store.grant_lease(Duration::from_secs(2)).await.unwrap();
     let claim = ClaimGrant {
+        request_id: 1,
         group: group(),
         slot: key.clone(),
         owner,
@@ -385,8 +377,8 @@ async fn real_etcd_guarded_group_commits_and_lease_expiry() {
         .allocate_initial(
             &guard,
             AllocateInitial {
-                expected_global_member: owner_member,
-                expected_group_member: owner_group_member,
+                expected_global_member: owner_member.clone(),
+                expected_group_member: owner_group_member.clone(),
                 slot: allocating.clone(),
                 claim: LeasedClaim {
                     grant: claim.clone(),
@@ -398,6 +390,38 @@ async fn real_etcd_guarded_group_commits_and_lease_expiry() {
         .unwrap();
     assert!(store.get_slot(&key).await.unwrap().is_some());
     assert!(store.get_claim(&key).await.unwrap().is_some());
+
+    // Renewal must bind a nonzero owner request and compare the exact previously
+    // issued grant. A duplicate commit cannot silently mint another sequence.
+    let mut renewal = claim.clone();
+    renewal.request_id = 123;
+    renewal.grant_sequence = GrantSequence::new(2).unwrap();
+    let request = AdoptAuthority {
+        expected_global_member: owner_member,
+        expected_group_member: owner_group_member,
+        expected_slot: allocating.clone(),
+        expected_claim: claim,
+        claim: LeasedClaim {
+            grant: renewal.clone(),
+            lease_id: claim_lease,
+        },
+    };
+    let mut unsolicited = request.clone();
+    unsolicited.claim.grant.request_id = 0;
+    assert!(matches!(
+        store.adopt_authority(&guard, unsolicited).await,
+        Err(StorageError::InvalidTransition)
+    ));
+    store
+        .adopt_authority(&guard, request.clone())
+        .await
+        .unwrap();
+    assert!(matches!(
+        store.adopt_authority(&guard, request).await,
+        Err(StorageError::CompareFailed)
+    ));
+    assert_eq!(store.get_claim(&key).await.unwrap().unwrap().grant, renewal);
+    let claim = renewal;
 
     let mut running = allocating.clone();
     running.state = PlacementSlotState::Running;
@@ -499,10 +523,14 @@ async fn real_etcd_group_configuration_is_durable_and_cross_group_guarded() {
     store.ensure_framework().await.unwrap();
     let lease = store.grant_lease(Duration::from_secs(10)).await.unwrap();
     let leader = LeaderRecord {
+        candidate_generation: CandidateGeneration::new(1).unwrap(),
+        candidate_lease_id: 1,
+        epoch: RunEpoch::INITIAL,
         scope: CoordinatorScope::Group(group()),
         node: node("config-leader", 61, 29261),
         term: CoordinatorTerm::new(1).unwrap(),
     };
+    let leader = prepare_leader(&store, leader, lease).await.unwrap();
     assert!(store.campaign_leader(&leader, lease).await.unwrap());
     let guard = GroupLeaderGuard::new(leader).unwrap();
     let entity = EntityConfig::new(
@@ -627,10 +655,14 @@ async fn real_etcd_plan_capacity_is_exact_and_recovers_after_guarded_delete() {
     store.ensure_framework().await.unwrap();
     let lease = store.grant_lease(Duration::from_secs(10)).await.unwrap();
     let leader = LeaderRecord {
+        candidate_generation: CandidateGeneration::new(1).unwrap(),
+        candidate_lease_id: 1,
+        epoch: RunEpoch::INITIAL,
         scope: CoordinatorScope::Group(group()),
         node: node("capacity-leader", 50, 29250),
         term: CoordinatorTerm::new(1).unwrap(),
     };
+    let leader = prepare_leader(&store, leader, lease).await.unwrap();
     assert!(store.campaign_leader(&leader, lease).await.unwrap());
     let guard = GroupLeaderGuard::new(leader).unwrap();
     let entity_type = EntityType::new("capacity-entity").unwrap();
@@ -666,8 +698,13 @@ async fn real_etcd_plan_capacity_is_exact_and_recovers_after_guarded_delete() {
         )
         .unwrap()
     };
-    let first = make_plan(0);
-    let second = make_plan(1);
+    let mut first = make_plan(0);
+    let mut second = make_plan(1);
+    // Capacity bounds admitted work/history, never unstarted policy proposals.
+    first.moves[0].progress = MoveProgress::Completed;
+    first.status = PlanStatus::Completed;
+    second.moves[0].progress = MoveProgress::Completed;
+    second.status = PlanStatus::Completed;
     store
         .create_plan(
             &guard,
@@ -705,7 +742,7 @@ async fn real_etcd_plan_capacity_is_exact_and_recovers_after_guarded_delete() {
     let mut raw = Client::connect(endpoints, None).await.unwrap();
     let counter = raw
         .get(
-            format!("{prefix}/domains/{}/counters/plans", group().as_str()),
+            format!("{prefix}/runs/1/groups/{}/counters/plans", group().as_str()),
             None,
         )
         .await

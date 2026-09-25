@@ -16,7 +16,7 @@ use tokio::sync::{broadcast, watch};
 use tracing::Instrument;
 
 use crate::{
-    attachments::ActorRuntimeAttachments,
+    attachments::{ActorExecutionGate, ActorRuntimeAttachments},
     environment::ActorEnvironment,
     error::ActorSpawnError,
     handle::{ActorHandle, ActorHandleInit, TerminalHook},
@@ -585,6 +585,7 @@ where
     let (forced_data_loss_tx, _forced_data_loss_rx) = broadcast::channel(16);
     let terminal_hook = Arc::new(Mutex::new(terminal_hook));
     let handle = ActorHandle::new(ActorHandleInit {
+        execution_gate: runtime_attachments.get::<ActorExecutionGate>(),
         local_ref,
         terminated_tx,
         lifecycle_tx,

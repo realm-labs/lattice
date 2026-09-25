@@ -4,7 +4,9 @@ use std::{
     time::Duration,
 };
 
+use crate::shutdown::{ShutdownManifest, ShutdownReport, participant_key};
 use async_trait::async_trait;
+use lattice_model::run::{ClusterLifecycle, ControlOperationId, RunEpoch};
 use lattice_model::{
     cluster::CoordinatorScope,
     cluster::{ActorGroupId, EntityType, SingletonKind},
@@ -12,24 +14,33 @@ use lattice_model::{
 use thiserror::Error;
 
 use crate::{
+    candidates::{CandidateAuthorization, CandidateRegistration, CandidateSetState},
     coordinator::{
         ClusterLeaderGuard, ExactLeaderGuard, GroupLeaderGuard, GroupMemberRecord,
         GroupMemberStatus, LeaderRecord, MemberRecord, MemberStatus, SessionLimits,
         SingletonConfig,
     },
-    plan::{MoveProgress, RebalancePlan},
+    plan::{MAXIMUM_PLAN_MOVES, MoveProgress, RebalancePlan},
     region::EntityConfig,
     types::{PlacementSlot, PlacementSlotKey, PlacementSlotState, Revision},
 };
 
+pub mod barrier;
+pub mod candidates;
 pub mod counters;
 pub mod etcd;
+mod lifecycle;
+pub mod maintenance;
 mod memory_admin;
+mod memory_candidates;
 mod memory_coordination;
 mod memory_page;
+mod memory_shutdown;
 mod memory_traits;
 pub mod page;
+pub(crate) mod plan_records;
 pub mod records;
+mod transfer_capacity;
 
 #[cfg(test)]
 mod tests;
@@ -37,6 +48,7 @@ mod tests;
 use counters::{StoreReadCounters, StoreReadCounts};
 use page::{PageCursor, StorePage};
 
+use plan_records::validate_plan_payload;
 use records::{
     ActivateAuthority, AdminOperationRecord, AdoptAuthority, AllocateInitial, AuthorityCommit,
     AutomaticBalanceSettings, ClaimPredicate, CommitAutomaticSettings, CompactAdminOperations,
@@ -51,15 +63,30 @@ use records::{
 
 #[async_trait]
 pub trait CoordinatorLeaseStore: Send + Sync + 'static {
-    async fn ensure_framework(&self) -> Result<(), StorageError>;
+    /// Validates or atomically initializes a pristine namespace and returns its
+    /// current run. An etcd handle binds to that epoch permanently; access before
+    /// initialization fails, and a later run requires a fresh handle.
+    async fn ensure_framework(&self) -> Result<RunEpoch, StorageError>;
     async fn grant_lease(&self, ttl: Duration) -> Result<i64, StorageError>;
     async fn keep_lease_alive(&self, lease_id: i64) -> Result<(), StorageError>;
     async fn revoke_lease(&self, lease_id: i64) -> Result<(), StorageError>;
     async fn lease_time_to_live(&self, lease_id: i64) -> Result<Option<Duration>, StorageError>;
 }
 
+/// Low-level, privileged lifecycle operations. Remote callers must pass the
+/// management authorization boundary before reaching these store operations.
 #[async_trait]
-pub trait ScopedElectionStore: CoordinatorLeaseStore {
+pub trait ClusterLifecycleStore: CoordinatorLeaseStore {
+    async fn lifecycle(&self) -> Result<ClusterLifecycle, StorageError>;
+    async fn begin_shutdown(
+        &self,
+        guard: &ClusterLeaderGuard,
+        operation: ControlOperationId,
+    ) -> Result<ClusterLifecycle, StorageError>;
+}
+
+#[async_trait]
+pub trait ScopedElectionStore: candidates::CandidateStore {
     async fn campaign_leader(
         &self,
         leader: &LeaderRecord,
@@ -73,7 +100,7 @@ pub trait ScopedElectionStore: CoordinatorLeaseStore {
 }
 
 #[async_trait]
-pub trait MembershipStore: CoordinatorLeaseStore {
+pub trait MembershipStore: crate::shutdown::ClusterShutdownStore {
     async fn get_membership_revision(&self) -> Result<Revision, StorageError>;
     async fn get_member(&self, node_id: &str) -> Result<Option<MemberRecord>, StorageError>;
     async fn list_members(&self) -> Result<Vec<MemberRecord>, StorageError>;
@@ -108,7 +135,7 @@ pub trait MembershipStore: CoordinatorLeaseStore {
 }
 
 #[async_trait]
-pub trait ActorGroupStore: CoordinatorLeaseStore {
+pub trait ActorGroupStore: CoordinatorLeaseStore + barrier::TransferBarrierStore {
     fn durable_limits(&self, group: &ActorGroupId) -> DurableStorageLimits;
     async fn get_placement_revision(&self, group: &ActorGroupId) -> Result<Revision, StorageError>;
     async fn get_group_member(
@@ -314,7 +341,17 @@ pub struct InMemoryCoordinationStore {
 
 #[derive(Debug, Default)]
 struct MemoryState {
+    shutdown_obligations: BTreeMap<String, NodeKey>,
+    shutdown_manifest: Option<ShutdownManifest>,
+    shutdown_reports: BTreeMap<String, ShutdownReport>,
+    stopped_nodes: BTreeMap<String, NodeKey>,
+    lifecycle: Option<ClusterLifecycle>,
+    candidate_sets: BTreeMap<CoordinatorScope, CandidateSetState>,
+    candidate_authorizations: BTreeMap<(CoordinatorScope, String), CandidateAuthorization>,
+    candidate_registrations: BTreeMap<(CoordinatorScope, String), CandidateRegistration>,
     slots: BTreeMap<PlacementSlotKey, PlacementSlot>,
+    transfer_reservations: BTreeMap<PlacementSlotKey, transfer_capacity::TransferReservation>,
+    transfer_barriers: BTreeMap<(PlacementSlotKey, u128), barrier::BarrierSnapshot>,
     plans: BTreeMap<(ActorGroupId, u128), RebalancePlan>,
     framework_identity: Option<String>,
     membership_revision: Option<Revision>,
@@ -365,7 +402,18 @@ impl InMemoryCoordinationStore {
         if state.members.len() == self.maximum_members {
             return Err(StorageError::Capacity);
         }
+        if !state
+            .shutdown_obligations
+            .contains_key(&participant_key(&request.member.node))
+            && state.shutdown_obligations.len() >= self.maximum_members
+        {
+            return Err(StorageError::Capacity);
+        }
         set_revision(&mut state, guard.scope(), request.member.version.revision);
+        state.shutdown_obligations.insert(
+            participant_key(&request.member.node),
+            request.member.node.clone(),
+        );
         state
             .members
             .insert(request.member.node.node_id.clone(), request.member.clone());
@@ -580,19 +628,21 @@ impl InMemoryCoordinationStore {
         {
             return Err(StorageError::CompareFailed);
         }
-        if state
-            .plans
-            .keys()
-            .filter(|(group, _)| group == &request.plan.group)
-            .count()
-            == self.maximum_plans
+        if request.plan.durable().is_some()
+            && state
+                .plans
+                .keys()
+                .filter(|(group, _)| group == &request.plan.group)
+                .count()
+                == self.maximum_plans
         {
             return Err(StorageError::Capacity);
         }
-        state.plans.insert(
-            (request.plan.group.clone(), request.plan.plan_id),
-            request.plan.clone(),
-        );
+        if let Some(record) = request.plan.durable() {
+            state
+                .plans
+                .insert((record.group.clone(), record.plan_id), record);
+        }
         Ok(PlanCommit { plan: request.plan })
     }
 
@@ -609,14 +659,15 @@ impl InMemoryCoordinationStore {
         if state
             .plans
             .get(&(request.expected.group.clone(), request.expected.plan_id))
-            != Some(&request.expected)
+            != request.expected.durable().as_ref()
         {
             return Err(StorageError::CompareFailed);
         }
-        state.plans.insert(
-            (request.plan.group.clone(), request.plan.plan_id),
-            request.plan.clone(),
-        );
+        if let Some(record) = request.plan.durable() {
+            state
+                .plans
+                .insert((record.group.clone(), record.plan_id), record);
+        }
         Ok(PlanCommit { plan: request.plan })
     }
 
@@ -631,7 +682,7 @@ impl InMemoryCoordinationStore {
         if state
             .plans
             .get(&(request.expected.group.clone(), request.expected.plan_id))
-            != Some(&request.expected)
+            != request.expected.durable().as_ref()
         {
             return Err(StorageError::CompareFailed);
         }
@@ -739,6 +790,7 @@ impl InMemoryCoordinationStore {
         {
             return Err(StorageError::InvalidTransition);
         }
+        transfer_capacity::release_memory(&mut state, &request.expected_slot)?;
         set_revision(&mut state, guard.scope(), request.slot.version.revision);
         state
             .slots
@@ -760,7 +812,7 @@ impl InMemoryCoordinationStore {
         if state.plans.get(&(
             request.expected_plan.group.clone(),
             request.expected_plan.plan_id,
-        )) != Some(&request.expected_plan)
+        )) != request.expected_plan.durable().as_ref()
             || request.expected_slot.state != PlacementSlotState::Running
             || request.expected_slot.active_move.is_some()
             || request.slot.state != PlacementSlotState::BeginHandoff
@@ -774,14 +826,29 @@ impl InMemoryCoordinationStore {
         {
             return Err(StorageError::InvalidTransition);
         }
+        if request.expected_plan.durable().is_none()
+            && state
+                .plans
+                .keys()
+                .filter(|(group, _)| group == &request.plan.group)
+                .count()
+                >= self.maximum_plans
+        {
+            return Err(StorageError::Capacity);
+        }
+        if request.slot.barrier_sessions.len() > self.maximum_members {
+            return Err(StorageError::Capacity);
+        }
+        transfer_capacity::reserve_memory(&mut state, &request.slot, request.limits)?;
         set_revision(&mut state, guard.scope(), request.slot.version.revision);
         state
             .slots
             .insert(request.slot.key.clone(), request.slot.clone());
-        state.plans.insert(
-            (request.plan.group.clone(), request.plan.plan_id),
-            request.plan.clone(),
-        );
+        if let Some(record) = request.plan.durable() {
+            state
+                .plans
+                .insert((record.group.clone(), record.plan_id), record);
+        }
         Ok(MoveCommit {
             slot: request.slot,
             plan: request.plan,
@@ -806,6 +873,10 @@ impl InMemoryCoordinationStore {
         {
             return Err(StorageError::InvalidTransition);
         }
+        if request.slot.barrier_sessions.len() > self.maximum_members {
+            return Err(StorageError::Capacity);
+        }
+        transfer_capacity::reserve_memory(&mut state, &request.slot, request.limits)?;
         set_revision(&mut state, guard.scope(), request.slot.version.revision);
         state
             .slots
@@ -919,7 +990,10 @@ impl InMemoryCoordinationStore {
             || request.expected_claim.owner != request.claim.grant.owner
             || request.expected_claim.assignment_generation
                 != request.claim.grant.assignment_generation
-            || request.expected_claim.coordinator_term >= request.claim.grant.coordinator_term
+            || request.expected_claim.coordinator_term > request.claim.grant.coordinator_term
+            || request.claim.grant.grant_sequence <= request.expected_claim.grant_sequence
+            || (request.expected_claim.coordinator_term == request.claim.grant.coordinator_term
+                && request.claim.grant.request_id == 0)
             || request.claim.grant.coordinator_term != guard.term()
             || !request.claim.matches_slot(&request.expected_slot)
         {
@@ -946,7 +1020,7 @@ impl InMemoryCoordinationStore {
             || state.plans.get(&(
                 request.expected_plan.group.clone(),
                 request.expected_plan.plan_id,
-            )) != Some(&request.expected_plan)
+            )) != request.expected_plan.durable().as_ref()
             || request.expected_slot.state != PlacementSlotState::Allocating
             || request.slot.state != PlacementSlotState::Running
             || request.expected_slot.active_move != Some(request.plan.plan_id)
@@ -969,14 +1043,16 @@ impl InMemoryCoordinationStore {
         {
             return Err(StorageError::InvalidTransition);
         }
+        transfer_capacity::release_memory(&mut state, &request.expected_slot)?;
         set_revision(&mut state, guard.scope(), request.slot.version.revision);
         state
             .slots
             .insert(request.slot.key.clone(), request.slot.clone());
-        state.plans.insert(
-            (request.plan.group.clone(), request.plan.plan_id),
-            request.plan.clone(),
-        );
+        if let Some(record) = request.plan.durable() {
+            state
+                .plans
+                .insert((record.group.clone(), record.plan_id), record);
+        }
         Ok(MoveCommit {
             slot: request.slot,
             plan: request.plan,
@@ -1026,6 +1102,8 @@ impl InMemoryCoordinationStore {
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum StorageError {
+    #[error("durable record is {actual} bytes, exceeding the {maximum}-byte limit")]
+    RecordTooLarge { actual: usize, maximum: usize },
     #[error("placement store limits must be nonzero")]
     ZeroLimit,
     #[error("placement storage configuration is invalid")]
@@ -1044,6 +1122,8 @@ pub enum StorageError {
     InvalidRecord,
     #[error("placement backend transport is unavailable")]
     Unavailable,
+    #[error("the fixed source revision was compacted before publication")]
+    SnapshotCompacted,
     #[error("placement backend read deadline expired")]
     Deadline,
     #[error("placement backend deadline expired; commit outcome may be unknown")]
@@ -1060,6 +1140,24 @@ pub enum StorageError {
         "framework identity is missing or differs from this build; an explicit full-stop upgrade is required"
     )]
     FrameworkMismatch,
+    #[error("the operation belongs to another cluster run")]
+    RunMismatch,
+    #[error("initialize the coordination store before accessing a run")]
+    RunNotInitialized,
+    #[error("offline maintenance requires exact stopped-deployment confirmation")]
+    ResetConfirmationRequired,
+    #[error("offline cleanup is blocked by live leased records")]
+    ResetLiveLease,
+    #[error("candidate is not currently eligible for this scope")]
+    CandidateNotEligible,
+    #[error("cannot remove the last eligible candidate")]
+    LastCandidate,
+    #[error("runtime namespace contains an unrecognized key family; inspect before cleanup")]
+    UnrecognizedRuntimeKey,
+    #[error("the cluster run does not permit this operation")]
+    RunNotRunning,
+    #[error("cluster shutdown is blocked by missing or unsuccessful stop evidence")]
+    ShutdownBlocked,
     #[error("node ID is still leased to another incarnation")]
     IncarnationConflict,
 }

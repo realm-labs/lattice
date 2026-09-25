@@ -1,3 +1,4 @@
+use crate::candidate_fixture::elect_host;
 use std::{collections::BTreeSet, sync::Arc, time::Duration};
 
 use lattice_model::actor::ProtocolId;
@@ -5,7 +6,7 @@ use lattice_model::actor::ProtocolId;
 use lattice_model::cluster::{ActorGroupId, EntityType, NodeEndpoint, NodeIncarnation};
 use lattice_remoting::{association::AssociationManager, config::RemotingConfig};
 
-use super::{CoordinatorHost, CoordinatorHostConfig};
+use super::CoordinatorHostConfig;
 use crate::{
     allocation::{
         AllocationDecision, AllocationError, AllocationRequest, PlacementView, RebalanceLimits,
@@ -94,7 +95,7 @@ async fn host_installs_custom_strategies_into_elected_group_leaders() {
     let config = config()
         .with_allocation_strategy(Arc::new(TestAllocationStrategy))
         .unwrap();
-    let host = CoordinatorHost::elect(
+    let host = elect_host(
         store,
         associations(&local),
         local,

@@ -1,9 +1,13 @@
-use std::{future::Future, time::Duration};
+use std::{
+    future::Future,
+    sync::{Arc, OnceLock},
+    time::Duration,
+};
 
 use etcd_client::{
     Client, Compare, CompareOp, ConnectOptions, GetOptions, SortOrder, SortTarget, Txn, TxnOp,
 };
-use lattice_model::framework::LatticeVersion;
+use lattice_model::run::RunEpoch;
 use lattice_model::{
     cluster::CoordinatorScope,
     cluster::{ActorGroupId, EntityType, SingletonKind},
@@ -11,7 +15,7 @@ use lattice_model::{
 use serde::{Serialize, de::DeserializeOwned};
 
 use super::{
-    StorageError,
+    ClusterLifecycleStore, StorageError,
     records::{
         ActivateAuthority, AdminOperationRecord, AdoptAuthority, AllocateInitial, AuthorityCommit,
         AutomaticBalanceSettings, CommitAutomaticSettings, CompactAdminOperations, CompleteMove,
@@ -32,9 +36,19 @@ use crate::{
     types::{PlacementSlot, PlacementSlotKey, Revision},
 };
 
+mod barrier;
+mod barrier_gc;
+mod candidates;
+mod lifecycle;
+mod maintenance;
 mod page;
+mod plan_records;
+mod shutdown;
 mod traits;
 mod transactions;
+mod transfer_capacity;
+
+pub const MAX_STORE_PAGE_RECORDS: usize = 256;
 
 pub const DEFAULT_ETCD_OPERATION_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -53,6 +67,7 @@ impl EtcdCoordinationConfig {
         if self.endpoints.is_empty()
             || self.endpoints.len() > 16
             || self.list_page_size == 0
+            || self.list_page_size > MAX_STORE_PAGE_RECORDS
             || !self.limits.validate()
             || self
                 .endpoints
@@ -72,6 +87,7 @@ pub struct EtcdCoordinationStore {
     list_page_size: usize,
     pub(super) limits: DurableStorageLimits,
     operation_timeout: Duration,
+    epoch: Arc<OnceLock<RunEpoch>>,
 }
 
 impl EtcdCoordinationStore {
@@ -88,6 +104,7 @@ impl EtcdCoordinationStore {
             list_page_size: config.list_page_size,
             limits: config.limits,
             operation_timeout: DEFAULT_ETCD_OPERATION_TIMEOUT,
+            epoch: Arc::new(OnceLock::new()),
         })
     }
 
@@ -99,7 +116,7 @@ impl EtcdCoordinationStore {
     ) -> Result<Self, StorageError> {
         let prefix = cluster_prefix.into();
         validate_prefix(&prefix)?;
-        if list_page_size == 0 || !limits.validate() {
+        if list_page_size == 0 || list_page_size > MAX_STORE_PAGE_RECORDS || !limits.validate() {
             return Err(StorageError::ZeroLimit);
         }
         Ok(Self {
@@ -108,6 +125,7 @@ impl EtcdCoordinationStore {
             list_page_size,
             limits,
             operation_timeout: DEFAULT_ETCD_OPERATION_TIMEOUT,
+            epoch: Arc::new(OnceLock::new()),
         })
     }
 
@@ -135,79 +153,6 @@ impl EtcdCoordinationStore {
         F: Future<Output = Result<T, etcd_client::Error>>,
     {
         run_write_deadline(self.operation_timeout, operation).await
-    }
-
-    async fn ensure_framework_inner(&self) -> Result<(), StorageError> {
-        let framework_key = self.key("meta/framework");
-        let limits_key = self.key("schema/limits");
-        let revision_key = self.key("membership/state_revision");
-        let expected_limits = encode(&self.limits)?;
-        let counter_keys = [self.key("membership/counters/members")];
-        if self.read_raw(&framework_key).await?.is_some() {
-            return self.validate_framework_metadata(&expected_limits).await;
-        }
-        // Only an entirely empty namespace may be initialized. Existing legacy
-        // keys, missing metadata, and foreign identities are never overwritten.
-        let compares = vec![Compare::version(self.key(""), CompareOp::Equal, 0).with_prefix()];
-        let mut puts = vec![
-            TxnOp::put(framework_key, LatticeVersion::CURRENT, None),
-            TxnOp::put(limits_key.clone(), expected_limits.clone(), None),
-        ];
-        for key in &counter_keys {
-            puts.push(TxnOp::put(key.clone(), "0", None));
-        }
-        puts.push(TxnOp::put(revision_key, "1", None));
-        let mut client = self.client.clone();
-        let response = self
-            .write_deadline(client.txn(Txn::new().when(compares).and_then(puts)))
-            .await?;
-        if response.succeeded() {
-            return Ok(());
-        }
-
-        // A matching concurrent initializer may have won the empty-prefix CAS.
-        self.validate_framework_metadata(&expected_limits).await
-    }
-
-    async fn validate_framework_metadata(
-        &self,
-        expected_limits: &[u8],
-    ) -> Result<(), StorageError> {
-        if self
-            .read_raw(&self.key("meta/framework"))
-            .await?
-            .is_none_or(|(value, _, _)| value != LatticeVersion::CURRENT.as_bytes())
-        {
-            return Err(StorageError::FrameworkMismatch);
-        }
-        // Transitional or legacy schemas are not supported, even if someone has
-        // manually stamped the current version onto them.
-        if self
-            .read_raw(&self.key("schema_generation"))
-            .await?
-            .is_some()
-        {
-            return Err(StorageError::FrameworkMismatch);
-        }
-        if self
-            .read_raw(&self.key("schema/limits"))
-            .await?
-            .is_none_or(|(value, _, _)| value != expected_limits)
-        {
-            return Err(StorageError::StorageMetadataMismatch);
-        }
-        if self
-            .read_raw(&self.key("membership/counters/members"))
-            .await?
-            .is_none()
-            || self
-                .read_raw(&self.key("membership/state_revision"))
-                .await?
-                .is_none()
-        {
-            return Err(StorageError::StorageMetadataMismatch);
-        }
-        Ok(())
     }
 
     async fn grant_lease_inner(&self, ttl: Duration) -> Result<i64, StorageError> {
@@ -257,9 +202,20 @@ impl EtcdCoordinationStore {
         lease_id: i64,
     ) -> Result<bool, StorageError> {
         leader.validate().map_err(|_| StorageError::InvalidRecord)?;
+        if self.bound_epoch()? != leader.epoch {
+            return Err(StorageError::RunMismatch);
+        }
         if lease_id <= 0 {
             return Err(StorageError::InvalidRecord);
         }
+        let lifecycle = self.lifecycle().await?;
+        if lifecycle.epoch != leader.epoch {
+            return Err(StorageError::RunMismatch);
+        }
+        if !lifecycle.permits_election() {
+            return Err(StorageError::RunNotRunning);
+        }
+        let registration = leader.candidate_registration();
         let leader_key = self.scope_key(&leader.scope, "leader");
         let term_key = self.scope_key(&leader.scope, "term");
         let current_term = self.read_raw(&term_key).await?;
@@ -284,8 +240,23 @@ impl EtcdCoordinationStore {
             client.txn(
                 Txn::new()
                     .when([
+                        Compare::value(
+                            self.candidate_authorization_key(&leader.scope, &leader.node.node_id),
+                            CompareOp::Equal,
+                            encode(&registration.authorization)?,
+                        ),
+                        Compare::value(
+                            self.candidate_registration_key(&leader.scope, &leader.node.node_id),
+                            CompareOp::Equal,
+                            encode(&registration)?,
+                        ),
                         Compare::version(leader_key.clone(), CompareOp::Equal, 0),
                         term_compare,
+                        Compare::value(
+                            self.key("meta/lifecycle"),
+                            CompareOp::Equal,
+                            encode(&lifecycle)?,
+                        ),
                     ])
                     .and_then([
                         TxnOp::put(term_key, expected.to_string(), None),
@@ -301,15 +272,63 @@ impl EtcdCoordinationStore {
         .map(|response| response.succeeded())
     }
 
-    pub(super) fn key(&self, suffix: &str) -> String {
+    pub(super) fn root_key(&self, suffix: &str) -> String {
         format!("{}/{}", self.prefix, suffix)
     }
 
+    pub(super) fn run_key(&self, epoch: RunEpoch, suffix: &str) -> String {
+        self.root_key(&format!("runs/{}/{suffix}", epoch.get()))
+    }
+
+    pub(super) fn bound_epoch(&self) -> Result<RunEpoch, StorageError> {
+        self.epoch
+            .get()
+            .copied()
+            .ok_or(StorageError::RunNotInitialized)
+    }
+
+    pub(super) fn bind_epoch(&self, epoch: RunEpoch) -> Result<RunEpoch, StorageError> {
+        let bound = *self.epoch.get_or_init(|| epoch);
+        if bound != epoch {
+            return Err(StorageError::RunMismatch);
+        }
+        Ok(bound)
+    }
+
+    // Public store operations validate initialization before reaching key construction.
+    // The binding is immutable: an old store can never silently follow a new run.
+    pub(super) fn key(&self, suffix: &str) -> String {
+        if suffix.starts_with("meta/") || suffix.starts_with("definitions/") {
+            return self.root_key(suffix);
+        }
+        self.run_key(
+            self.bound_epoch()
+                .expect("store operation validated run initialization"),
+            suffix,
+        )
+    }
+
     pub(super) fn scope_key(&self, scope: &CoordinatorScope, suffix: &str) -> String {
+        if matches!(
+            suffix,
+            "counters/entity_configs" | "counters/singleton_configs"
+        ) {
+            if let CoordinatorScope::Group(group) = scope {
+                return self.root_key(&format!("definitions/groups/{}/{suffix}", group.as_str()));
+            }
+        }
+        if suffix == "term" {
+            return match scope {
+                CoordinatorScope::Cluster => self.root_key("meta/terms/cluster"),
+                CoordinatorScope::Group(group) => {
+                    self.root_key(&format!("meta/terms/groups/{}", group.as_str()))
+                }
+            };
+        }
         match scope {
             CoordinatorScope::Cluster => self.key(&format!("membership/{suffix}")),
             CoordinatorScope::Group(group) => {
-                self.key(&format!("domains/{}/{suffix}", group.as_str()))
+                self.key(&format!("groups/{}/{suffix}", group.as_str()))
             }
         }
     }
@@ -321,13 +340,13 @@ impl EtcdCoordinationStore {
                 entity_type,
                 shard_id,
             } => self.key(&format!(
-                "domains/{}/shards/{}/{}",
+                "groups/{}/shards/{}/{}",
                 group.as_str(),
                 entity_type.as_str(),
                 shard_id.get()
             )),
             PlacementSlotKey::Singleton { group, kind } => self.key(&format!(
-                "domains/{}/singletons/{}",
+                "groups/{}/singletons/{}",
                 group.as_str(),
                 kind.as_str()
             )),
@@ -341,13 +360,13 @@ impl EtcdCoordinationStore {
                 entity_type,
                 shard_id,
             } => self.key(&format!(
-                "domains/{}/shard_claims/{}/{}",
+                "groups/{}/shard_claims/{}/{}",
                 group.as_str(),
                 entity_type.as_str(),
                 shard_id.get()
             )),
             PlacementSlotKey::Singleton { group, kind } => self.key(&format!(
-                "domains/{}/singleton_claims/{}",
+                "groups/{}/singleton_claims/{}",
                 group.as_str(),
                 kind.as_str()
             )),
@@ -356,13 +375,13 @@ impl EtcdCoordinationStore {
 
     pub(super) fn plan_key(&self, group: &ActorGroupId, plan_id: u128) -> String {
         self.key(&format!(
-            "domains/{}/rebalances/{plan_id:032x}",
+            "groups/{}/rebalances/{plan_id:032x}",
             group.as_str()
         ))
     }
 
     pub(super) fn group_member_key(&self, group: &ActorGroupId, node_id: &str) -> String {
-        self.key(&format!("domains/{}/members/{node_id}", group.as_str()))
+        self.key(&format!("groups/{}/members/{node_id}", group.as_str()))
     }
 
     pub(super) fn entity_config_key(
@@ -371,7 +390,7 @@ impl EtcdCoordinationStore {
         entity_type: &EntityType,
     ) -> String {
         self.key(&format!(
-            "domains/{}/entity_types/{}",
+            "definitions/groups/{}/entity_types/{}",
             group.as_str(),
             entity_type.as_str()
         ))
@@ -383,7 +402,7 @@ impl EtcdCoordinationStore {
         kind: &SingletonKind,
     ) -> String {
         self.key(&format!(
-            "domains/{}/singleton_types/{}",
+            "definitions/groups/{}/singleton_types/{}",
             group.as_str(),
             kind.as_str()
         ))
@@ -395,7 +414,7 @@ impl EtcdCoordinationStore {
             .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect::<String>();
-        self.key(&format!("domains/{}/admin/{encoded}", group.as_str()))
+        self.key(&format!("groups/{}/admin/{encoded}", group.as_str()))
     }
 
     async fn get_json<T: DeserializeOwned>(&self, suffix: &str) -> Result<Option<T>, StorageError> {
@@ -518,7 +537,10 @@ impl EtcdCoordinationStore {
         &self,
         key: &PlacementSlotKey,
     ) -> Result<Option<PlacementSlot>, StorageError> {
-        self.get_json_key(&self.slot_key(key)).await
+        match self.get_json_key(&self.slot_key(key)).await? {
+            Some(slot) => self.hydrate_slot_barrier(slot).await.map(Some),
+            None => Ok(None),
+        }
     }
 
     async fn get_plan(
@@ -526,7 +548,10 @@ impl EtcdCoordinationStore {
         group: &ActorGroupId,
         plan_id: u128,
     ) -> Result<Option<RebalancePlan>, StorageError> {
-        self.get_json_key(&self.plan_key(group, plan_id)).await
+        Ok(self
+            .read_plan_record(&self.plan_key(group, plan_id))
+            .await?
+            .map(|(plan, _)| plan))
     }
 
     async fn get_claim(&self, key: &PlacementSlotKey) -> Result<Option<LeasedClaim>, StorageError> {
@@ -565,7 +590,7 @@ impl EtcdCoordinationStore {
         group: &ActorGroupId,
     ) -> Result<Vec<GroupMemberRecord>, StorageError> {
         self.list_json(
-            &format!("domains/{}/members/", group.as_str()),
+            &format!("groups/{}/members/", group.as_str()),
             self.limits.maximum_members,
         )
         .await
@@ -574,13 +599,13 @@ impl EtcdCoordinationStore {
     async fn list_slots(&self, group: &ActorGroupId) -> Result<Vec<PlacementSlot>, StorageError> {
         let mut slots = self
             .list_json(
-                &format!("domains/{}/shards/", group.as_str()),
+                &format!("groups/{}/shards/", group.as_str()),
                 self.limits.maximum_slots,
             )
             .await?;
         slots.extend(
             self.list_json(
-                &format!("domains/{}/singletons/", group.as_str()),
+                &format!("groups/{}/singletons/", group.as_str()),
                 self.limits.maximum_slots,
             )
             .await?,
@@ -588,23 +613,37 @@ impl EtcdCoordinationStore {
         if slots.len() > self.limits.maximum_slots {
             return Err(StorageError::Capacity);
         }
-        Ok(slots)
+        let mut hydrated = Vec::with_capacity(slots.len());
+        for slot in slots {
+            hydrated.push(self.hydrate_slot_barrier(slot).await?);
+        }
+        Ok(hydrated)
     }
 
     async fn list_plans(&self, group: &ActorGroupId) -> Result<Vec<RebalancePlan>, StorageError> {
-        self.list_json(
-            &format!("domains/{}/rebalances/", group.as_str()),
-            self.limits.maximum_plans,
-        )
-        .await
+        let mut cursor = None;
+        let mut result = Vec::new();
+        loop {
+            let page = self
+                .list_plans_page_inner(group, cursor.as_ref(), self.list_page_size)
+                .await?;
+            result.extend(page.records);
+            if result.len() > self.limits.maximum_plans {
+                return Err(StorageError::Capacity);
+            }
+            let Some(next) = page.next_cursor else {
+                return Ok(result);
+            };
+            cursor = Some(next);
+        }
     }
 
     async fn list_claims(&self, group: &ActorGroupId) -> Result<Vec<LeasedClaim>, StorageError> {
         let mut claims = self
-            .list_claims_suffix(&format!("domains/{}/shard_claims/", group.as_str()))
+            .list_claims_suffix(&format!("groups/{}/shard_claims/", group.as_str()))
             .await?;
         claims.extend(
-            self.list_claims_suffix(&format!("domains/{}/singleton_claims/", group.as_str()))
+            self.list_claims_suffix(&format!("groups/{}/singleton_claims/", group.as_str()))
                 .await?,
         );
         if claims.len() > self.limits.maximum_slots {
@@ -618,7 +657,7 @@ impl EtcdCoordinationStore {
         group: &ActorGroupId,
     ) -> Result<Option<AutomaticBalanceSettings>, StorageError> {
         self.get_json(&format!(
-            "domains/{}/settings/automatic_balance",
+            "definitions/groups/{}/settings/automatic_balance",
             group.as_str()
         ))
         .await
@@ -638,7 +677,7 @@ impl EtcdCoordinationStore {
         group: &ActorGroupId,
     ) -> Result<Vec<AdminOperationRecord>, StorageError> {
         self.list_json(
-            &format!("domains/{}/admin/", group.as_str()),
+            &format!("groups/{}/admin/", group.as_str()),
             self.limits.maximum_admin_operations,
         )
         .await
@@ -646,7 +685,7 @@ impl EtcdCoordinationStore {
 }
 
 impl EtcdCoordinationStore {
-    async fn ensure_framework(&self) -> Result<(), StorageError> {
+    async fn ensure_framework(&self) -> Result<RunEpoch, StorageError> {
         self.ensure_framework_inner().await
     }
 
@@ -670,9 +709,12 @@ impl EtcdCoordinationStore {
         if response.ttl() <= 0 {
             Ok(None)
         } else {
-            Ok(Some(Duration::from_secs(
-                u64::try_from(response.ttl()).map_err(|_| StorageError::InvalidRecord)?,
-            )))
+            Ok(Some(
+                Duration::from_secs(
+                    u64::try_from(response.ttl()).map_err(|_| StorageError::InvalidRecord)?,
+                )
+                .saturating_sub(Duration::from_secs(1)),
+            ))
         }
     }
 
@@ -938,10 +980,16 @@ fn prefix_range_end(mut prefix: Vec<u8>) -> Result<Vec<u8>, StorageError> {
 }
 
 pub(super) fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>, StorageError> {
-    serde_json::to_vec(value).map_err(|_| StorageError::Codec)
+    super::records::encode_record(value)
 }
 
 pub(super) fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, StorageError> {
+    if bytes.len() > super::records::MAX_DURABLE_VALUE_BYTES {
+        return Err(StorageError::RecordTooLarge {
+            actual: bytes.len(),
+            maximum: super::records::MAX_DURABLE_VALUE_BYTES,
+        });
+    }
     serde_json::from_slice(bytes).map_err(|_| StorageError::Codec)
 }
 
@@ -959,6 +1007,7 @@ pub(super) fn map_etcd_read(error: etcd_client::Error) -> StorageError {
         | etcd_client::Error::InvalidUri(_)
         | etcd_client::Error::InvalidMetadataValue(_) => StorageError::BackendArgument,
         etcd_client::Error::GRpcStatus(status) => match status.code() as i32 {
+            11 if status.message().contains("compacted") => StorageError::SnapshotCompacted,
             3 => StorageError::BackendArgument,
             4 => StorageError::Deadline,
             7 | 16 => StorageError::Authentication,

@@ -1,4 +1,6 @@
+use crate::shutdown::ClusterStopHook;
 use lattice_actor::runtime::ActorRuntime;
+use lattice_model::run::{ClusterLifecycle, ControlOperationId, RunEpoch, RunPhase};
 use std::{sync::atomic::Ordering, time::Duration};
 
 use lattice_actor_distributed::{
@@ -42,6 +44,9 @@ use super::{
 };
 
 pub struct LatticeService {
+    pub(super) completion_controller: Option<Arc<crate::cluster::join::JoinController>>,
+    pub(super) cluster_run: watch::Sender<Option<ClusterLifecycle>>,
+    pub(super) cluster_stop_hook: Option<Arc<dyn ClusterStopHook>>,
     pub(super) actor_runtime: Mutex<Option<ActorRuntime>>,
     pub(super) cluster_id: ClusterId,
     pub(super) actor_system: ActorSystem,
@@ -356,6 +361,19 @@ impl LatticeService {
             .take()
         {
             let mut directory = runtime.directory;
+            let mut lifecycle = runtime.lifecycle;
+            let terminal_view = self.bootstrap_view.clone();
+            let cluster_run = self.cluster_run.clone();
+            self.supervisor.spawn(async move {
+                loop {
+                    let run = lifecycle.borrow_and_update().clone();
+                    terminal_view.install_lifecycle(run.clone());
+                    cluster_run.send_replace(Some(run));
+                    if lifecycle.changed().await.is_err() {
+                        break;
+                    }
+                }
+            })?;
             let mut scope_states = runtime.scope_states;
             let bootstrap_view = self.bootstrap_view.clone();
             let cluster_id = self.cluster_id.clone();
@@ -608,6 +626,35 @@ impl LatticeService {
                         .await
                     {
                         Ok(()) => {
+                            // Keep membership control alive until positive local
+                            // stop evidence is committed; lease removal alone
+                            // must not strand an unresolved shutdown obligation.
+                            self.hosts.close_business_admission();
+                            if let Some(hook) = &self.cluster_stop_hook {
+                                tokio::time::timeout(
+                                    self.join_config.shutdown_timeout,
+                                    hook.stop(),
+                                )
+                                .await
+                                .map_err(|_| ServiceError::LeaveTimeout)?
+                                .map_err(ServiceError::ClusterStopHook)?;
+                            }
+                            let remaining = self.hosts.drain_all().await;
+                            if !remaining.is_empty() {
+                                return Err(ServiceError::InterventionRequired(
+                                    LifecycleInterventionReport {
+                                        blocked_slots: BTreeMap::new(),
+                                        retained_actor_cells: remaining
+                                            .into_iter()
+                                            .map(|cell| format!("{cell:?}"))
+                                            .collect(),
+                                    },
+                                ));
+                            }
+                            membership
+                                .confirm_node_stopped(self.cluster().local_node().clone())
+                                .await
+                                .map_err(|_| ServiceError::LeaveTimeout)?;
                             // DrainCommitted is the authority proof. This local fence only prevents
                             // a snapshot already in flight from restoring the removed incarnation.
                             self.members
@@ -673,7 +720,99 @@ impl LatticeService {
         self.leave(deadline).await
     }
 
-    /// Stops this service as part of an intentional whole-deployment termination.
+    /// Requests durable whole-cluster shutdown. This is an administrator action
+    /// requiring an allowlisted mTLS identity. Returns only after the coordinator
+    /// accepts the canonical durable operation; this is not shutdown completion.
+    pub async fn request_cluster_shutdown(
+        &self,
+        operation: ControlOperationId,
+    ) -> Result<RunEpoch, ServiceError> {
+        let handle = self
+            .membership_handle
+            .lock()
+            .expect("membership handle poisoned")
+            .clone()
+            .ok_or(ServiceError::ClusterSessionUnavailable)?;
+        let accepted = handle
+            .request_cluster_shutdown(operation)
+            .await
+            .map_err(ServiceError::ClusterShutdownRequest)?;
+        let epoch = accepted.epoch;
+        self.cluster_run.send_if_modified(|observed| {
+            if observed.as_ref().is_some_and(|run| {
+                run.epoch == epoch && matches!(run.phase, RunPhase::Closed { .. })
+            }) {
+                return false;
+            }
+            *observed = Some(accepted);
+            true
+        });
+        Ok(epoch)
+    }
+
+    pub fn cluster_shutdown_status(&self) -> Option<ClusterLifecycle> {
+        self.cluster_run.borrow().clone()
+    }
+
+    /// A timeout cancels only this waiter, never the durable close operation.
+    pub async fn wait_cluster_shutdown(
+        &self,
+        epoch: RunEpoch,
+        deadline: Instant,
+    ) -> Result<ClusterLifecycle, ServiceError> {
+        let mut run = self.cluster_run.subscribe();
+        tokio::time::timeout_at(deadline, async {
+            loop {
+                if let Some(state) = run.borrow().clone() {
+                    if state.epoch != epoch {
+                        return Err(ServiceError::ClusterRunChanged);
+                    }
+                    if matches!(state.phase, RunPhase::Closed { .. }) {
+                        return Ok(state);
+                    }
+                }
+                tokio::select! {
+                    changed=run.changed()=>{changed.map_err(|_|ServiceError::ClusterSessionUnavailable)?;}
+                    ()=tokio::time::sleep(Duration::from_millis(500))=>{
+                        if let Some(controller)=&self.completion_controller {
+                            if let Some(result)=controller.query_completion(epoch).await {
+                                self.cluster_run.send_replace(Some(result.clone()));
+                                return Ok(result);
+                            }
+                        }
+                    }
+                }
+            }
+        })
+        .await
+        .map_err(|_| ServiceError::ClusterShutdownTimeout)?
+    }
+
+    /// Waits for the durable result and this node's managed teardown. Call this
+    /// outside the Actor runtime being destroyed; it does not install signals.
+    pub async fn shutdown_cluster(
+        &self,
+        operation: ControlOperationId,
+        deadline: Instant,
+    ) -> Result<ClusterLifecycle, ServiceError> {
+        tokio::time::timeout_at(deadline, async {
+            let epoch = self.request_cluster_shutdown(operation).await?;
+            let result = self.wait_cluster_shutdown(epoch, deadline).await?;
+            if self.node_lifecycle_state() != NodeLifecycleState::Stopping
+                && self.node_lifecycle_state() != NodeLifecycleState::Terminated
+            {
+                self.transition(ServiceLifecycleEvent::ForceStop)?;
+            }
+            self.stop_components().await?;
+            Ok(result)
+        })
+        .await
+        .map_err(|_| ServiceError::ClusterShutdownTimeout)?
+    }
+
+    /// Stops only this local service without migrating its Actors.
+    /// This is not durable whole-cluster shutdown; use [`Self::shutdown_cluster`]
+    /// to coordinate every member and runtime-data cleanup.
     ///
     /// Unlike [`Self::shutdown`], terminal shutdown does not require hosted placement slots to
     /// migrate to another member. It fences cluster authority first, then drains local actors and
@@ -968,7 +1107,7 @@ mod drain_deadline_tests {
             PlacementControlCommand, PlacementControlRouter, control_stream_id,
             decode_control_command, encode_control_command_for_term,
         };
-        use lattice_model::cluster::CoordinatorScope;
+        use lattice_model::{cluster::CoordinatorScope, run::RunEpoch};
         use lattice_remoting::control::{CommandId, ControlDispatch, decode_control_envelope};
         let service = Arc::new(service());
         let identity = service.endpoint.local_identity();
@@ -1014,6 +1153,7 @@ mod drain_deadline_tests {
                 NodeIncarnation::new(3).unwrap(),
             )
             .unwrap();
+        let stopped_node = hello.node.clone();
         let (session, handle, _effects) = ClusterSession::new(
             hello,
             replacement.key().clone(),
@@ -1027,6 +1167,25 @@ mod drain_deadline_tests {
         let (shutdown, stopped) = watch::channel(false);
         let session_task = tokio::spawn(session.run_recoverable(receiver, stopped));
         *service.membership_handle.lock().unwrap() = Some(handle);
+        // A real replacement coordinator announces the run before its snapshot.
+        // The fixture must not confirm post-stop evidence against an unknown epoch.
+        controls
+            .apply(
+                replacement.key().clone(),
+                control_stream_id(&CoordinatorScope::Cluster),
+                CommandId::generate(),
+                encode_control_command_for_term(
+                    &CoordinatorScope::Cluster,
+                    2,
+                    &PlacementControlCommand::ClusterRunning {
+                        epoch: RunEpoch::INITIAL,
+                    },
+                    16 * 1024,
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
         loop {
             let sent = replacement.replay_control_frames().into_iter().any(|frame| {
                 let Ok(envelope) = decode_control_envelope(&frame) else { return false; };
@@ -1055,6 +1214,42 @@ mod drain_deadline_tests {
                 control_stream_id(&CoordinatorScope::Cluster),
                 CommandId::generate(),
                 payload,
+            )
+            .await
+            .unwrap();
+        // Removal is not stop proof. The node must keep control alive, send the
+        // post-drain evidence and await its durable confirmation before teardown.
+        loop {
+            let sent = replacement.replay_control_frames().into_iter().any(|frame| {
+                let Ok(envelope) = decode_control_envelope(&frame) else { return false; };
+                let Ok(command) = decode_control_command(&envelope.payload, 16 * 1024) else { return false; };
+                matches!(command.command, PlacementControlCommand::NodeStopCompleted { epoch, node }
+                    if epoch == RunEpoch::INITIAL && node == stopped_node)
+                    && command.coordinator_term == Some(2)
+            });
+            if sent {
+                break;
+            }
+            assert!(Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert!(!leave.is_finished());
+        assert!(!service.lifecycle_driver.runtime_stop_requested());
+        controls
+            .apply(
+                replacement.key().clone(),
+                control_stream_id(&CoordinatorScope::Cluster),
+                CommandId::generate(),
+                encode_control_command_for_term(
+                    &CoordinatorScope::Cluster,
+                    2,
+                    &PlacementControlCommand::NodeStopConfirmed {
+                        epoch: RunEpoch::INITIAL,
+                        node: stopped_node,
+                    },
+                    16 * 1024,
+                )
+                .unwrap(),
             )
             .await
             .unwrap();

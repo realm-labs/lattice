@@ -1,5 +1,7 @@
 //! Fixtures shared by the `lattice-service` node-level test modules.
 
+use lattice_coordination::storage::candidates::provision_candidate;
+use lattice_model::cluster::CoordinatorScope;
 use std::{collections::BTreeSet, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
@@ -197,6 +199,13 @@ pub(super) async fn coordinator_service_for_groups(
         incarnation,
     ))
     .unwrap();
+    for scope in std::iter::once(CoordinatorScope::Cluster)
+        .chain(groups.iter().cloned().map(CoordinatorScope::Group))
+    {
+        provision_candidate(store.as_ref(), scope, node_id.to_owned())
+            .await
+            .unwrap();
+    }
     let host = CoordinatorHost::elect(
         store,
         builder.association_manager(),

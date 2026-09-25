@@ -21,6 +21,7 @@ mod exact_tell_routes;
 pub mod ingress;
 pub mod lifecycle;
 pub mod registration;
+pub mod shutdown;
 pub mod supervisor;
 
 #[cfg(test)]

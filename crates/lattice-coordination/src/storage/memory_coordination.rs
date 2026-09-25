@@ -1,6 +1,10 @@
-use std::time::Duration;
+use std::{collections::BTreeSet, time::Duration};
 
-use lattice_model::{cluster::CoordinatorScope, framework::LatticeVersion};
+use lattice_model::{
+    cluster::CoordinatorScope,
+    framework::LatticeVersion,
+    run::{ClusterLifecycle, RunEpoch},
+};
 
 use super::{InMemoryCoordinationStore, LeaseState, StorageError, initial_revision};
 use crate::coordinator::LeaderRecord;
@@ -37,17 +41,28 @@ mod framework_tests {
 }
 
 impl InMemoryCoordinationStore {
-    pub(super) async fn ensure_framework(&self) -> Result<(), StorageError> {
+    pub(super) async fn ensure_framework(&self) -> Result<RunEpoch, StorageError> {
         let mut state = self.inner.lock().expect("placement memory store poisoned");
         match state.framework_identity.as_deref() {
-            Some(LatticeVersion::CURRENT) if state.membership_revision.is_some() => Ok(()),
+            Some(LatticeVersion::CURRENT) if state.membership_revision.is_some() => state
+                .lifecycle
+                .as_ref()
+                .ok_or(StorageError::StorageMetadataMismatch)
+                .and_then(|lifecycle| {
+                    if lifecycle.permits_election() {
+                        Ok(lifecycle.epoch)
+                    } else {
+                        Err(StorageError::RunNotRunning)
+                    }
+                }),
             Some(LatticeVersion::CURRENT) => Err(StorageError::StorageMetadataMismatch),
             Some(_) => Err(StorageError::FrameworkMismatch),
             None if state.membership_revision.is_some() => Err(StorageError::FrameworkMismatch),
             None => {
                 state.framework_identity = Some(LatticeVersion::CURRENT.to_owned());
                 state.membership_revision = Some(initial_revision());
-                Ok(())
+                state.lifecycle = Some(ClusterLifecycle::initial());
+                Ok(RunEpoch::INITIAL)
             }
         }
     }
@@ -77,8 +92,20 @@ impl InMemoryCoordinationStore {
 
     pub(super) async fn revoke_lease(&self, lease_id: i64) -> Result<(), StorageError> {
         let mut state = self.inner.lock().expect("placement memory store poisoned");
+        let removed = state
+            .members
+            .values()
+            .filter(|member| member.lease_id == lease_id)
+            .map(|member| member.node.clone())
+            .collect::<BTreeSet<_>>();
+        state
+            .group_members
+            .retain(|_, member| !removed.contains(&member.node));
         state.leases.remove(&lease_id);
         state.leaders.retain(|_, (lease, _)| *lease != lease_id);
+        state
+            .candidate_registrations
+            .retain(|_, registration| registration.lease_id != lease_id);
         state
             .members
             .retain(|_, member| member.lease_id != lease_id);
@@ -106,6 +133,17 @@ impl InMemoryCoordinationStore {
     ) -> Result<bool, StorageError> {
         leader.validate().map_err(|_| StorageError::InvalidRecord)?;
         let mut state = self.inner.lock().expect("placement memory store poisoned");
+        let lifecycle = state
+            .lifecycle
+            .as_ref()
+            .ok_or(StorageError::StorageMetadataMismatch)?;
+        if lifecycle.epoch != leader.epoch {
+            return Err(StorageError::RunMismatch);
+        }
+        if !lifecycle.permits_election() {
+            return Err(StorageError::RunNotRunning);
+        }
+        super::validate_candidate(&state, leader)?;
         if !state.leases.contains_key(&lease_id) || state.leaders.contains_key(&leader.scope) {
             return Ok(false);
         }

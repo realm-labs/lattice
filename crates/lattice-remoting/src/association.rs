@@ -14,11 +14,13 @@ use tokio::sync::{Notify, mpsc};
 use crate::{
     config::{RemotingConfig, RemotingConfigError},
     control::{ReliableControl, ReliableControlError},
+    handshake::NodeIdentity,
     protocol::{CatalogueError, ProtocolCatalogue},
     wire::Frame,
 };
 
 mod admission;
+mod authentication;
 pub(crate) mod budget;
 mod control_plane;
 mod lanes;
@@ -109,6 +111,9 @@ impl AssociationState {
 #[derive(Debug)]
 struct AssociationInner {
     lanes: HashMap<LaneKind, u128>,
+    authenticated_control_peer: Option<(u128, NodeIdentity)>,
+    #[cfg(any(feature = "tls", test))]
+    authenticated_peer_identity: Option<NodeIdentity>,
 }
 
 #[derive(Debug)]
@@ -209,6 +214,9 @@ impl Association {
             wake_pending_lanes: AtomicU64::new(0),
             inner: Mutex::new(AssociationInner {
                 lanes: HashMap::new(),
+                authenticated_control_peer: None,
+                #[cfg(any(feature = "tls", test))]
+                authenticated_peer_identity: None,
             }),
             control,
             interactive,
@@ -459,6 +467,8 @@ pub enum AssociationError {
     InvalidBulkStripe(u8),
     #[error("association is not active")]
     NotActive,
+    #[error("authenticated control identity does not match the attached lane")]
+    AuthenticatedPeerMismatch,
     #[error("association is closed")]
     Closed,
     #[error("association lane queue is full")]

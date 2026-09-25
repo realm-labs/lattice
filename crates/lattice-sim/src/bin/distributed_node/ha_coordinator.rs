@@ -40,6 +40,7 @@ async fn coordinator(artifact: PathBuf, node_id: String, port: u16) -> Result<()
     };
     let mut next_term = 1_u64;
     let scope = CoordinatorScope::Group(actor_group());
+    provision_fixture_candidate(store.as_ref(), scope.clone(), node_id.clone()).await?;
     loop {
         match store.get_leader(&scope).await {
             Ok(Some(current)) => {

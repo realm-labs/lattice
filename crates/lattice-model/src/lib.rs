@@ -8,6 +8,7 @@ mod primitives;
 pub mod actor;
 pub mod cluster;
 pub mod framework;
+pub mod run;
 pub mod service;
 pub mod trace;
 

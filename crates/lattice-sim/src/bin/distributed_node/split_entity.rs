@@ -215,7 +215,7 @@ fn split_entity_config(group: &str) -> Result<EntityConfig, Box<dyn Error>> {
     )?)
 }
 
-/// Member associations are dialled explicitly, so a proxying node can only reach the current owner
+/// Fixture member associations are dialled explicitly (capabilities are negotiated on connect), so a proxying node can only reach the current owner
 /// once it has one. Reconciling before every probe keeps a healed node reachable again without
 /// waiting for traffic to fail first.
 async fn connect_split_peers(service: &LatticeService, node_id: &str) {
@@ -226,11 +226,7 @@ async fn connect_split_peers(service: &LatticeService, node_id: &str) {
         .filter(|member| {
             member.status == MemberStatus::Up
                 && member.node.node_id != node_id
-                && member
-                    .hello
-                    .protocols
-                    .iter()
-                    .any(|descriptor| descriptor.protocol_id.get() == SPLIT_PROTOCOL_ID)
+
         })
         .collect::<Vec<_>>();
     for peer in peers {

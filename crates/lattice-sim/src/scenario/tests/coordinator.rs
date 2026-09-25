@@ -631,7 +631,16 @@ async fn persisted_plan_is_never_started() -> Vec<FaultEvidence> {
     harness.arm(Failpoint::RebalanceAfterPlanPersist, FailAction::Crash);
     let error = harness.step(LeaderStep::Relocate).await.unwrap_err();
     assert!(storage_failure(&error), "{error}");
-    assert_eq!(harness.leader().stored_plans().await.unwrap(), 1);
+    assert_eq!(
+        harness.leader().stored_plans().await.unwrap(),
+        0,
+        "unstarted policy proposals must not become durable recovery work"
+    );
+    assert_eq!(
+        harness.leader().stored_admin_operations().await.unwrap(),
+        1,
+        "the accepted proposal receipt must survive the interrupted response"
+    );
     assert_eq!(
         harness.leader().tracked_plans(),
         0,
@@ -641,6 +650,19 @@ async fn persisted_plan_is_never_started() -> Vec<FaultEvidence> {
         harness.leader().slot_state(HARNESS_SHARD).await.unwrap(),
         Some(PlacementSlotState::Running),
         "a move started despite the cut-off plan"
+    );
+    harness.step(LeaderStep::Reelect).await.unwrap();
+    assert!(
+        matches!(
+            harness.step(LeaderStep::Relocate).await,
+            Err(CoordinatorRuntimeError::OperationExpired)
+        ),
+        "a receipt cannot replay a proposal that never reached atomic admission"
+    );
+    assert_eq!(harness.leader().stored_plans().await.unwrap(), 0);
+    assert_eq!(
+        harness.leader().slot_state(HARNESS_SHARD).await.unwrap(),
+        Some(PlacementSlotState::Running)
     );
     recorded(
         &harness,

@@ -1,10 +1,10 @@
 # Cluster Control-Plane Implementation Contracts
 
-> Status: implementation contracts for work packages 2/3; the three business-behavior choices were approved on 2026-09-25. Protocol validation gates remain open; no runtime changes are implemented by this document.
+> Status: contracts implemented by the coupled W2/W3 changes, with focused evidence and deployment-validation qualifications tracked in the parent memo. Business behavior and administration/clock boundaries were approved on 2026-09-25.
 > Parent plan and completion tracking: [control-plane memo](cluster-control-plane-memo.md), sections 9.1-9.6.
-> Evidence: [preparation inventory](cluster-control-plane-preparation.md). W1 is complete; these contracts do not mark P0 or W2/W3 complete.
+> Historical evidence baseline: [preparation inventory](cluster-control-plane-preparation.md). Current verification results are in memo section 9.6.
 
-This document makes the next delivery slices reviewable in terms of state transitions, transaction predicates, and failure tests. It supplements the memo rather than introducing another implementation backlog. Items marked **approved behavior** are agreed requirements, not implemented guarantees. Items marked **validation gate** must be resolved before the affected serving path is enabled. Examples are conceptual contracts, not finalized Rust signatures.
+This document describes the state transitions, transaction predicates, and failure tests for the implemented control plane. It supplements the memo rather than introducing another implementation backlog. Items marked **approved behavior** define the required semantics. Deployment validation gates still apply; examples describe contracts and are not necessarily literal Rust signatures.
 
 ## 1. Shared transaction and run boundary
 
@@ -34,7 +34,7 @@ Replace receipt-time TTL installation with owner-initiated, request-correlated r
 
 1. The owner records local monotonic request start `s`, a fresh request ID, and its exact run/session/slot authority. Bound outstanding requests and their lifetimes.
 2. The Coordinator confirms backing-lease validity and then performs an authoritative guarded grant commit. The commit binds the request, exact owner/session, assignment generation, leader authorization and grant sequence. A successful keepalive alone is not permission to issue a grant.
-3. The reply carries the correlated identity and a conservative usable duration `d`, capped by a configured maximum grant interval `G`. It must not assert more backing validity than the lease observation supports after elapsed time and clock uncertainty are deducted.
+3. The reply carries the correlated identity and a conservative usable duration `d`, capped by the protocol-wide maximum grant interval `G = 15 seconds`. Per-node configuration can shorten this interval but cannot increase it or shorten a successor's replacement wait. It must not assert more backing validity than the lease observation supports after elapsed time and clock uncertainty are deducted.
 4. The owner computes `deadline = s + d`, never `receive_time + d`. Reject an already elapsed result, unknown/consumed request, old session, wrong generation, stale sequence, or result for a retired instance. Processing and network delays consume the request's existing interval.
 5. A timeout, ambiguous keepalive/commit, duplicate reply, or reconnect does not extend the installed deadline. Retry with a new bounded request; the Coordinator must revalidate authority. No reliable-outbox replay may manufacture fresh validity.
 
@@ -54,7 +54,26 @@ Deleting a claim does not retract a previously delivered grant. Candidate revoca
 
 The holdoff is deliberately conservative. Reducing it requires validated durable evidence, not an estimated watch delay. Persist the replacement phase and its reason; no wall-clock timestamp alone is completion evidence.
 
+**Approved deployment boundary (2026-09-25):** enable automatic takeover only on platforms whose suspension-aware clock behavior has been validated. Refuse automatic takeover on unvalidated platforms. Restoring an old virtual-machine snapshot must not resume the saved process identity; restart with a fresh incarnation. This is a deployment requirement, not something lease expiry can detect reliably.
+
 **Validation gate:** supported platforms need a time source that accounts for suspension, or an independently reliable resume-invalidates-authority mechanism before business execution resumes. Plain use of a monotonic API is not a cross-platform suspension proof. Specify clock drift assumptions for both grant deadlines and replacement waiting. If the deployment cannot satisfy them, do not advertise timer-based exclusive ownership; fail closed or require a separately designed external fencing contract. Arbitrary pauses inside already-running application work remain outside admission control.
+
+The implemented timing boundary uses Windows `GetTickCount64` and Linux
+`CLOCK_BOOTTIME`, both suspension-aware. Other operating systems refuse automatic
+authority; a failed clock read refuses issuance and replacement rather than
+treating it as elapsed time. Deployments must maintain clock-rate error within
+1,000 ppm and must restart restored VM snapshots with a fresh process incarnation.
+Platform selection is not an attestation that an arbitrary hypervisor satisfies
+these requirements.
+
+The etcd adapter deducts one second from integer TTL observations to cover
+quantization. Grant issuance also deducts the entire keepalive/TTL RPC elapsed
+interval, 0.2% rate slack and 32 ms resolution slack, then applies the owner's
+safety margin to its original request-start deadline. Without positive exact-stop
+proof, replacement waits at least 15.062 seconds after observing the guarded
+fenced boundary; coordinator restart repeats this whole wait. Deterministic unit
+tests inject Tokio virtual elapsed time; production deadlines do not use Tokio's
+platform-dependent suspension behavior.
 
 ### 2.3 Shared admission and retirement boundary
 
@@ -79,12 +98,14 @@ Bind a stable candidate principal to the authenticated control/transport identit
 
 Use separate bounded records:
 
-- Persistent per-scope candidate authorization with an enable/disable state and monotonic authorization generation.
+- Persistent per-scope enabled candidate authorization plus a monotonic scope revision/high-water mark. Removal deletes authorization; re-addition allocates a newer generation from that retained revision. No unbounded disabled-principal tombstones.
 - A small per-scope membership revision and eligible count, updated with authorization changes in the same transaction.
 - Leased online registration containing the exact process incarnation, endpoint, and authorization generation.
 - Leader records and write guards carrying the same authorization generation and incarnation.
 
-Keep the authorization generation across removal/re-addition. An old registration, election attempt, or delayed cleanup cannot become valid because the same principal is enabled again. Registration deletion compares the exact incarnation/generation.
+Keep the authorization generation high-water mark across removal/re-addition. An old registration, election attempt, or delayed cleanup cannot become valid because the same principal is enabled again. Registration deletion compares the exact incarnation/generation.
+
+**Approved administrative boundary (2026-09-25):** remote candidate-management and cluster-shutdown requests use the existing mTLS-authenticated node identity and an explicit administrator allowlist. Authorization uses the verified transport principal, never a node name supplied in the request. Default to denial when no administrator is configured; neither a discovery role nor candidate eligibility implies administrative permission. Bind authorization to the requested cluster and operation scope. Offline reset uses separate privileged etcd credentials and is not authorized by ordinary node credentials. Plaintext test transport must not enable remote administration implicitly.
 
 ### 3.2 Transitions and administration
 
@@ -135,6 +156,15 @@ Start with the memo's proposed 4 KiB encoded-value ceiling. Finalize key size, t
 
 Transfer completion and reservation release are one guarded transition. Reclaim evidence only after live slot/authority references no longer depend on it and deduplication obligations are satisfied. Keep bounded terminal retry evidence with an explicit retention horizon; old requests outside it return an expired/unknown outcome, not silent re-execution.
 
+Rebalance administration uses inspection-issued identities bound to run epoch, actor group, leader
+term, base group revision, and nonce. Look up a retained receipt before checking the current
+context, so retained results remain retryable across leader changes. An absent receipt is eligible
+only at the exact issuing context; every receipt-producing mutation consumes that revision in its
+guarded commit. Receipt GC therefore cannot re-enable an old operation and does not need unbounded
+tombstones or a wall-clock expiry proof. Multi-step force removal may return an expired/unknown
+outcome after a partial committed change, but cannot replay that old identity. Free-form labels are
+not valid runtime operation identities.
+
 Required focused tests: crash after each batch, compaction during build, leader loss before/after sealing, joining sessions during construction, missing/stale acknowledgements, double admission, budget lowering, failover accounting, byte limits, and repeated transfer reclamation. Fixed-revision reads and resume behavior must be verified against real etcd as well as the memory backend.
 
 ## 5. Cluster shutdown, cleanup, and reset
@@ -183,15 +213,21 @@ Finalize a retained `ResetCompleted` result and a closed epoch. Only a separate 
 
 Required focused tests: request retry/conflict, caller loss, Group Coordinator allocation racing `Closing`, multiple groups, join/leave/transfer races, long handler and queued ask, background/stop failure, lost reports, leader failure per cleanup batch, final result retrieval, reset/startup races, unrelated-prefix preservation, and repeated stop/restart without old-run resurrection.
 
-## 6. Next implementation slice and remaining gates
+## 6. Implementation and remaining deployment validation
 
 Start with W3.1 plus W2.1: lifecycle/epoch and operation guard types, namespace codecs, bounded discovery hints, shared provider/cache and required-scope readiness. Static/DNS providers keep bootstrap fallback; etcd discovery reads only lifecycle/framework hints and leader/candidate endpoints. A healthy session does not require periodic new probe connections. No discovery result is serving authority.
 
 Before migrating each writer, extend the inventory with its exact predicates and retained/deleted fields. Keep all dependent producers and consumers aligned; do not claim a deployable intermediate protocol. Then implement candidate/grant/retirement, transfer/rebalance, and shutdown/reset in the memo's coupled order.
 
-The three business-behavior choices above (no revival, queued/in-flight drain treatment, and graceful completion semantics) are approved. The following remain gates, not silently completed decisions:
+The no-revival, queued/in-flight drain and graceful completion contracts are
+implemented, together with the approved mTLS administrator allowlist and
+fail-closed suspension-aware clock boundary. Values/pages/operations are bounded;
+fixed-revision and guarded-transaction behavior has focused real-etcd tests.
 
-1. Timing/lease proof and platform suspension support; candidate credential-to-principal policy; concrete public API/error types.
-2. Final inventory/byte budgets, fixed-revision and guarded-transaction acceptance tests, and representative grant/transfer workload measurements.
+Production rollout still requires deployment-specific clock-rate/suspend/VM
+compliance and representative discovery, grant-renewal, transfer and shutdown
+load measurements. Deterministic tests do not certify a hypervisor or establish
+thousands-node throughput. Exhaustive crash injection and Docker chaos profiles
+remain release validation, not evidence supplied by the focused suite.
 
 Do not rerun the full workspace test suite merely to begin this work. Use focused deterministic race tests, isolated real-etcd acceptance, touched-crate checks, and structure checks as applicable. The new protocols are not validated by W1's passing tests.

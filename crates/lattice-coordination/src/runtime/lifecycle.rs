@@ -6,16 +6,18 @@ use lattice_model::cluster::{ActorGroupId, EntityType, NodeIncarnation};
 
 use super::{
     ActorGroupStore, AllocationError, CoordinatorLeaseStore, CoordinatorRuntimeError,
-    GroupCoordinator, HandoffEvent, HandoffMachine, Instant, LeaderLeaseKeepalive, MembershipStore,
-    MoveProgress, PlacementControlEvent, PlacementSlotKey, PlacementSlotState, PlanStatus,
-    RebalanceTrigger, ScopedElectionStore, membership::control_dispatch_error, mpsc, watch,
+    GroupCoordinator, HandoffEvent, HandoffMachine, HandoffPhase, Instant, LeaderLeaseKeepalive,
+    MembershipStore, MoveProgress, PlacementControlEvent, PlacementSlotKey, PlacementSlotState,
+    PlanStatus, RebalanceTrigger, ScopedElectionStore, membership::control_dispatch_error, mpsc,
+    watch,
 };
 use crate::{
     control::PlacementControlEventKind,
     coordinator::MemberRemovalReason,
     storage::{
         StorageError,
-        records::{DeletePlan, ReserveMove, UpdatePlan},
+        barrier::BarrierProgress,
+        records::{DeletePlan, UpdatePlan},
     },
     types::AssignmentGeneration,
 };
@@ -58,6 +60,7 @@ where
                 .get(&plan_id)
                 .cloned()
                 .ok_or(CoordinatorRuntimeError::UnknownPlan)?;
+            let original_plan = plan.clone();
             let mut plan_changed = false;
             for movement in plan.moves.clone() {
                 let key = PlacementSlotKey::Shard {
@@ -65,7 +68,7 @@ where
                     entity_type: plan.entity_type.clone(),
                     shard_id: movement.shard_id,
                 };
-                let Some(mut slot) = self.store.get_slot(&key).await? else {
+                let Some(slot) = self.store.get_slot(&key).await? else {
                     if movement.progress == MoveProgress::Pending {
                         plan.cancel_pending_move(movement.shard_id)
                             .map_err(CoordinatorRuntimeError::Plan)?;
@@ -100,52 +103,15 @@ where
                             plan_changed = true;
                             continue;
                         }
-                        let (barrier_version, barrier_sessions) = if slot.state
-                            == PlacementSlotState::Running
-                            && slot.owner.as_ref() == Some(&movement.source)
-                            && slot.assignment_generation == movement.expected_generation
-                            && slot.active_move.is_none()
-                        {
-                            let expected_plan = plan.clone();
-                            let barrier_version = self.next_version()?;
-                            let barrier_sessions = movement.barrier_sessions.clone();
-                            if let Some(current) = plan
-                                .moves
-                                .iter_mut()
-                                .find(|current| current.shard_id == movement.shard_id)
-                            {
-                                current.barrier_version = Some(barrier_version.clone());
-                            }
-                            plan.record_revision = plan
-                                .record_revision
-                                .next()
-                                .map_err(|_| CoordinatorRuntimeError::RevisionExhausted)?;
-                            let expected_slot = slot.clone();
-                            slot.target = Some(movement.target.clone());
-                            slot.state = PlacementSlotState::BeginHandoff;
-                            slot.active_move = Some(plan_id);
-                            slot.barrier_sessions = barrier_sessions.clone();
-                            slot.version = barrier_version.clone();
-                            let committed = self
-                                .store
-                                .reserve_move(
-                                    &self.leader_guard,
-                                    ReserveMove {
-                                        expected_plan,
-                                        plan,
-                                        expected_slot,
-                                        slot,
-                                    },
-                                )
-                                .await?;
-                            plan = committed.plan;
-                            slot = committed.slot;
-                            self.observe_slot(&slot);
-                            self.version = barrier_version.clone();
-                            (barrier_version, barrier_sessions)
-                        } else {
-                            (slot.version.clone(), slot.barrier_sessions.clone())
-                        };
+                        if slot.active_move != Some(plan_id) {
+                            self.quarantine(
+                                &key,
+                                "admitted transfer has no matching slot reservation",
+                            );
+                            continue;
+                        }
+                        let barrier_version = slot.version.clone();
+                        let barrier_sessions = slot.barrier_sessions.clone();
                         let handoff = HandoffMachine::recover(
                             &slot,
                             plan_id,
@@ -162,7 +128,7 @@ where
                 }
             }
             if plan_changed {
-                let expected_plan = plan.clone();
+                let expected_plan = original_plan;
                 plan.record_revision = plan
                     .record_revision
                     .next()
@@ -190,30 +156,16 @@ where
             let plan_id = slot
                 .active_move
                 .ok_or(CoordinatorRuntimeError::StaleHandoff)?;
-            let (source, target, source_generation) =
-                if slot.state == PlacementSlotState::Allocating {
-                    let target = slot
-                        .owner
-                        .clone()
-                        .ok_or(CoordinatorRuntimeError::StaleHandoff)?;
-                    let previous = slot
-                        .assignment_generation
-                        .get()
-                        .checked_sub(1)
-                        .and_then(|value| AssignmentGeneration::new(value).ok())
-                        .ok_or(CoordinatorRuntimeError::StaleHandoff)?;
-                    (target.clone(), target, previous)
-                } else {
-                    (
-                        slot.owner
-                            .clone()
-                            .ok_or(CoordinatorRuntimeError::StaleHandoff)?,
-                        slot.target
-                            .clone()
-                            .ok_or(CoordinatorRuntimeError::StaleHandoff)?,
-                        slot.assignment_generation,
-                    )
-                };
+            let (source, target) = self.store.transfer_parties(&slot.key, plan_id).await?;
+            let source_generation = if slot.state == PlacementSlotState::Allocating {
+                slot.assignment_generation
+                    .get()
+                    .checked_sub(1)
+                    .and_then(|value| AssignmentGeneration::new(value).ok())
+                    .ok_or(CoordinatorRuntimeError::StaleHandoff)?
+            } else {
+                slot.assignment_generation
+            };
             let handoff = HandoffMachine::recover(
                 &slot,
                 plan_id,
@@ -235,29 +187,57 @@ where
             .collect::<BTreeSet<_>>();
         let keys = self.handoffs.keys().cloned().collect::<Vec<_>>();
         for key in keys {
-            let effects = {
-                let handoff = self
-                    .handoffs
-                    .get_mut(&key)
-                    .ok_or(CoordinatorRuntimeError::UnknownHandoff)?;
-                let departed = handoff
-                    .required_sessions()
-                    .iter()
-                    .filter(|session| !live_members.contains(session))
-                    .copied()
-                    .collect::<Vec<_>>();
-                let mut effects = Vec::new();
-                for session in departed {
-                    effects.extend(
-                        handoff
-                            .transition(HandoffEvent::FenceSession(session))
-                            .map_err(CoordinatorRuntimeError::Handoff)?,
-                    );
+            let handoff = self
+                .handoffs
+                .get(&key)
+                .ok_or(CoordinatorRuntimeError::UnknownHandoff)?;
+            let snapshot = self.store.transfer_barrier(&key, handoff.plan_id).await?;
+            if snapshot.required() != *handoff.required_sessions() {
+                return Err(StorageError::StorageMetadataMismatch.into());
+            }
+            if handoff.phase != HandoffPhase::Invalidating {
+                if snapshot
+                    .participants
+                    .values()
+                    .any(|progress| *progress == BarrierProgress::Pending)
+                {
+                    return Err(StorageError::StorageMetadataMismatch.into());
                 }
-                effects.extend(handoff.start());
-                effects
-            };
-            self.apply_handoff_effects(key, effects).await?;
+                continue;
+            }
+            let mut recovered_effects = Vec::new();
+            for (participant, progress) in snapshot.participants {
+                let event = match progress {
+                    BarrierProgress::Pending if !live_members.contains(&participant) => {
+                        self.transition_handoff(
+                            key.clone(),
+                            HandoffEvent::FenceSession(participant),
+                        )
+                        .await?;
+                        continue;
+                    }
+                    BarrierProgress::Pending => continue,
+                    BarrierProgress::Applied => HandoffEvent::AppliedRevision {
+                        session: participant,
+                        version: snapshot.manifest.version.clone(),
+                    },
+                    BarrierProgress::SessionFenced => HandoffEvent::FenceSession(participant),
+                };
+                recovered_effects.extend(
+                    self.handoffs
+                        .get_mut(&key)
+                        .ok_or(CoordinatorRuntimeError::UnknownHandoff)?
+                        .transition(event)
+                        .map_err(CoordinatorRuntimeError::Handoff)?,
+                );
+            }
+            recovered_effects.extend(
+                self.handoffs
+                    .get_mut(&key)
+                    .ok_or(CoordinatorRuntimeError::UnknownHandoff)?
+                    .start(),
+            );
+            self.apply_handoff_effects(key, recovered_effects).await?;
         }
         self.compact_plan_history().await?;
         Ok(())
@@ -291,6 +271,18 @@ where
                 .get(&plan_id)
                 .cloned()
                 .ok_or(CoordinatorRuntimeError::UnknownPlan)?;
+            for movement in &expected.moves {
+                if movement.progress != MoveProgress::Pending {
+                    let key = PlacementSlotKey::Shard {
+                        group: expected.group.clone(),
+                        entity_type: expected.entity_type.clone(),
+                        shard_id: movement.shard_id,
+                    };
+                    self.store
+                        .reclaim_transfer_barrier(&self.leader_guard, &key, plan_id)
+                        .await?;
+                }
+            }
             self.store
                 .delete_plan(&self.leader_guard, DeletePlan { expected })
                 .await?;
@@ -426,6 +418,21 @@ where
     }
 
     pub(super) async fn renew(&mut self) -> Result<(), CoordinatorRuntimeError> {
+        let expected = self.leader.candidate_registration();
+        if self
+            .store
+            .candidate_authorization(&self.leader.scope, &self.leader.node.node_id)
+            .await?
+            .as_ref()
+            != Some(&expected.authorization)
+            || !self
+                .store
+                .online_candidates(&self.leader.scope)
+                .await?
+                .contains(&expected)
+        {
+            return Err(StorageError::LeadershipLost.into());
+        }
         let now = Instant::now();
         let expired = self
             .sessions
@@ -453,8 +460,12 @@ where
             .map(|claim| (claim.lease_id, claim.grant.clone()))
             .collect::<Vec<_>>();
         for (lease_id, grant) in claims {
-            match self.store.keep_lease_alive(lease_id).await {
-                Ok(()) => self.replay_claim_if_connected(&grant)?,
+            match self.store.lease_time_to_live(lease_id).await {
+                // Only a correlated owner request may renew a claim lease. A live
+                // member heartbeat alone must not keep an expired/retired slot stuck
+                // indefinitely under the same generation.
+                Ok(Some(_)) => self.replay_claim_if_connected(&grant)?,
+                Ok(None) => self.focus_reconciliation(&grant.slot),
                 Err(StorageError::LeadershipLost) => {
                     self.leadership_loss_count = self.leadership_loss_count.saturating_add(1);
                     return Err(StorageError::LeadershipLost.into());
@@ -466,7 +477,7 @@ where
                         group = %self.version.group.as_str(),
                         slot = ?grant.slot,
                         %error,
-                        "claim lease keep-alive failed; scheduling focused slot reconciliation"
+                        "claim lease observation failed; scheduling focused slot reconciliation"
                     );
                 }
             }
@@ -656,6 +667,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
+    use lattice_model::run::RunEpoch;
 
     struct CountingLeaseStore {
         renewals: AtomicUsize,
@@ -663,8 +675,8 @@ mod tests {
 
     #[async_trait::async_trait]
     impl CoordinatorLeaseStore for CountingLeaseStore {
-        async fn ensure_framework(&self) -> Result<(), StorageError> {
-            Ok(())
+        async fn ensure_framework(&self) -> Result<RunEpoch, StorageError> {
+            Ok(RunEpoch::INITIAL)
         }
 
         async fn grant_lease(&self, _ttl: Duration) -> Result<i64, StorageError> {

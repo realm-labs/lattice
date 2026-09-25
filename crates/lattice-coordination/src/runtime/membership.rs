@@ -64,6 +64,22 @@ where
                     PlacementControlCommand::ActorGroupHello(hello) => {
                         self.register(hello, inbound.association).await?;
                     }
+                    PlacementControlCommand::RequestClaim {
+                        request_id,
+                        slot,
+                        generation,
+                    } => {
+                        if inbound.coordinator_term != Some(self.leader.term.get()) {
+                            return Err(CoordinatorRuntimeError::UnauthorizedCommand);
+                        }
+                        self.issue_requested_claim(
+                            &inbound.association,
+                            request_id,
+                            slot,
+                            generation,
+                        )
+                        .await?;
+                    }
                     PlacementControlCommand::NodeHeartbeat {
                         incarnation,
                         sequence,
@@ -80,6 +96,18 @@ where
                             session.last_heartbeat = Instant::now();
                             self.store.keep_lease_alive(session.lease_id).await?;
                         }
+                        let association = self
+                            .associations
+                            .get(&inbound.association)
+                            .ok_or(CoordinatorRuntimeError::AssociationUnavailable)?;
+                        let payload = encode_control_command_for_term(
+                            &self.leader.scope,
+                            self.leader.term.get(),
+                            &PlacementControlCommand::NodeHeartbeatAck { sequence },
+                            self.config.maximum_control_payload,
+                        )
+                        .map_err(CoordinatorRuntimeError::Control)?;
+                        association.admit_ephemeral_control(payload)?;
                     }
                     PlacementControlCommand::JoinReady { snapshot_version } => {
                         self.mark_member_up(remote, snapshot_version, &inbound.association)
@@ -335,7 +363,18 @@ where
                             Err(error) => return Err(error),
                         }
                     }
-                    PlacementControlCommand::SnapshotBegin(_)
+                    PlacementControlCommand::ClusterRunning { .. }
+                    | PlacementControlCommand::NodeHeartbeatAck { .. }
+                    | PlacementControlCommand::NodeStopCompleted { .. }
+                    | PlacementControlCommand::NodeStopConfirmed { .. }
+                    | PlacementControlCommand::RequestClusterShutdown { .. }
+                    | PlacementControlCommand::ClusterShutdownResult { .. }
+                    | PlacementControlCommand::ChangeCandidate(_)
+                    | PlacementControlCommand::CandidateChanged { .. }
+                    | PlacementControlCommand::ClusterClosing { .. }
+                    | PlacementControlCommand::ClusterStopReport { .. }
+                    | PlacementControlCommand::ClusterClosed { .. }
+                    | PlacementControlCommand::SnapshotBegin(_)
                     | PlacementControlCommand::SnapshotChunk(_)
                     | PlacementControlCommand::SnapshotEnd(_)
                     | PlacementControlCommand::StateDelta(_)
@@ -398,6 +437,7 @@ where
     }
 
     pub(super) fn remember_claim(&mut self, lease_id: i64, grant: ClaimGrant) {
+        self.reconciliation.replacement_waits.remove(&grant.slot);
         self.expiring_claims.remove(&grant.slot);
         self.claims
             .insert(grant.slot.clone(), ClaimLease { lease_id, grant });
@@ -439,7 +479,11 @@ where
             &association,
             &self.version.group,
             self.version.term.get(),
-            grant.clone(),
+            {
+                let mut hint = grant.clone();
+                hint.request_id = 0;
+                hint
+            },
             &self.config,
         )
     }
@@ -583,7 +627,7 @@ where
         Ok(())
     }
 
-    async fn synchronize_sessions(&mut self) -> Result<(), CoordinatorRuntimeError> {
+    pub(super) async fn synchronize_sessions(&mut self) -> Result<(), CoordinatorRuntimeError> {
         let version = self.version.clone();
         let sessions = self
             .sessions
@@ -738,7 +782,6 @@ where
             .clone()
             .ok_or(CoordinatorRuntimeError::StaleMember)?;
         let mut member = expected.clone();
-        member.hello = hello.clone();
         member.version = self.next_version()?;
         let member = self
             .store
@@ -836,7 +879,6 @@ where
         let member = match existing {
             Some(current)
                 if current.node == hello.node
-                    && current.hello == hello
                     && current.status == GroupMemberStatus::Up
                     && current.version.term == self.version.term =>
             {
@@ -859,7 +901,6 @@ where
                         .await?;
                     let member = GroupMemberRecord {
                         node: hello.node.clone(),
-                        hello,
                         status: GroupMemberStatus::Up,
                         version: self.next_version()?,
                     };
@@ -876,7 +917,6 @@ where
                 } else {
                     let member = GroupMemberRecord {
                         node: hello.node.clone(),
-                        hello,
                         status: GroupMemberStatus::Up,
                         version: self.next_version()?,
                     };
@@ -896,7 +936,6 @@ where
             None => {
                 let member = GroupMemberRecord {
                     node: hello.node.clone(),
-                    hello,
                     status: GroupMemberStatus::Up,
                     version: self.next_version()?,
                 };

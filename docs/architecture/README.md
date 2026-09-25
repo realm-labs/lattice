@@ -13,13 +13,15 @@
 > Ongoing source review (opened 2026-09-17): [current findings and deferred decisions](../code-review-2026-09-17.md).
 > Review remediation progress and validation: [review-remediation-plan.md](../review-remediation-plan.md).
 > Coordinator correctness hardening execution plan: [../coordinator-correctness-implementation-plan.md](../coordinator-correctness-implementation-plan.md).
-> Cluster lifecycle and control-plane redesign (implementation in progress): [cluster shutdown, etcd state lifecycle, and Coordinator candidacy](../cluster-control-plane-memo.md).
-> Proposed W2/W3 protocol contracts and review gates: [authority, transfers, and shutdown/reset](../cluster-control-plane-contracts.md).
+> Cluster lifecycle and control-plane redesign (implemented; validation scope recorded): [cluster shutdown, etcd state lifecycle, and Coordinator candidacy](../cluster-control-plane-memo.md).
+> W2/W3 protocol contracts and validation boundaries: [authority, transfers, and shutdown/reset](../cluster-control-plane-contracts.md).
 
 These documents describe the complete target model, not a disposable minimal v1. Implementation may land in dependency order, but target capabilities are simplified through shared internal mechanisms and narrow fault domains rather than omitted in ways that require later identity, wire, or ownership redesign.
 
 Deployment and rollout: [actor-group deployment](../operations/placement-domain-deployment.md)
 and [full-stop framework upgrades](../operations/code-only-rolling-upgrade.md).
+Operations: [cluster shutdown](../operations/cluster-shutdown.md),
+[reset, new-run startup and candidate administration](../operations/cluster-reset.md).
 
 ---
 

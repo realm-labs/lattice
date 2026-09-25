@@ -1,5 +1,6 @@
 use super::*;
-use crate::runtime::cluster::{ClusterCoordinator, ClusterCoordinatorConfig};
+use crate::candidate_fixture::{elect_cluster, elect_group};
+use crate::runtime::cluster::ClusterCoordinatorConfig;
 
 #[tokio::test]
 async fn membership_rejoin_replaces_stale_group_session_and_ignores_late_removal() {
@@ -22,7 +23,7 @@ async fn membership_rejoin_replaces_stale_group_session_and_ignores_late_removal
         100,
     );
     let store = Arc::new(InMemoryCoordinationStore::new(16, 16).unwrap());
-    let mut membership = ClusterCoordinator::elect(
+    let mut membership = elect_cluster(
         store.clone(),
         coordinator.clone(),
         CoordinatorTerm::new(1).unwrap(),
@@ -33,7 +34,7 @@ async fn membership_rejoin_replaces_stale_group_session_and_ignores_late_removal
     let hello = empty_hello(member.clone());
     membership.join(hello.member.clone()).await.unwrap();
     membership.mark_up(&member).await.unwrap();
-    let mut leader = GroupCoordinator::elect(
+    let mut leader = elect_group(
         store.clone(),
         associations,
         coordinator,
@@ -116,7 +117,7 @@ async fn placement_drain_commit_replays_from_durable_absence_after_leader_replac
         100,
     );
     let store = Arc::new(InMemoryCoordinationStore::new(16, 16).unwrap());
-    let mut membership = ClusterCoordinator::elect(
+    let mut membership = elect_cluster(
         store.clone(),
         coordinator.clone(),
         CoordinatorTerm::new(1).unwrap(),
@@ -127,7 +128,7 @@ async fn placement_drain_commit_replays_from_durable_absence_after_leader_replac
     let hello = empty_hello(departing.clone());
     membership.join(hello.member).await.unwrap();
     membership.mark_up(&departing).await.unwrap();
-    let mut leader = GroupCoordinator::elect(
+    let mut leader = elect_group(
         store.clone(),
         associations.clone(),
         coordinator.clone(),
@@ -175,7 +176,7 @@ async fn placement_drain_commit_replays_from_durable_absence_after_leader_replac
     let old_lease = leader.leader_lease_id;
     drop(leader);
     store.revoke_lease(old_lease).await.unwrap();
-    let mut replacement = GroupCoordinator::elect(
+    let mut replacement = elect_group(
         store,
         associations.clone(),
         coordinator,
@@ -236,7 +237,7 @@ async fn draining_a_member_that_owns_a_shard_plans_the_handoff_off_it() {
         shard_id,
     };
     let store = Arc::new(InMemoryCoordinationStore::new(16, 16).unwrap());
-    let mut leader = GroupCoordinator::elect(
+    let mut leader = elect_group(
         store.clone(),
         associations,
         coordinator_node,
@@ -486,7 +487,7 @@ async fn join_drain_and_force_remove_are_revisioned_idempotent_and_fenced() {
         4000,
     );
     let store = Arc::new(InMemoryCoordinationStore::new(16, 16).unwrap());
-    let mut membership = ClusterCoordinator::elect(
+    let mut membership = elect_cluster(
         store.clone(),
         coordinator.clone(),
         CoordinatorTerm::new(1).unwrap(),
@@ -494,7 +495,7 @@ async fn join_drain_and_force_remove_are_revisioned_idempotent_and_fenced() {
     )
     .await
     .unwrap();
-    let mut leader = GroupCoordinator::elect(
+    let mut leader = elect_group(
         store.clone(),
         associations,
         coordinator,
@@ -609,7 +610,7 @@ async fn join_drain_and_force_remove_are_revisioned_idempotent_and_fenced() {
     register_up(&mut leader, forced_hello, forced_key).await;
     let request = ForceRemoveRequest {
         group: group(),
-        operation_id: "force-1".to_string(),
+        operation_id: leader.inspect().await.unwrap().new_operation_id(),
         node_id: forced.node_id.clone(),
         expected_incarnation: forced.incarnation,
     };

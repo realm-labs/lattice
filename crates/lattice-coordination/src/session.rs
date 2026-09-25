@@ -8,6 +8,7 @@ use std::{
 use lattice_model::{
     cluster::CoordinatorScope,
     cluster::{ActorGroupId, NodeIncarnation},
+    run::{ClusterLifecycle, ControlOperationId, RunEpoch},
 };
 use lattice_remoting::{
     association::{AssociationError, AssociationKey, AssociationManager, AssociationState},
@@ -20,7 +21,7 @@ use tokio::{
 };
 
 use crate::{
-    authority::{AuthorityEffect, AuthorityError, PlacementAuthority},
+    authority::{AuthorityEffect, AuthorityError, PlacementAuthority, clock::AuthorityClock},
     control::{
         DEFAULT_MAX_CONTROL_PAYLOAD, PlacementControlCommand, PlacementControlError,
         PlacementControlEvent, PlacementControlEventKind, PlacementResolutionFailure,
@@ -93,6 +94,11 @@ impl GroupSessionConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LogicPlacementEffect {
+    ClusterClosing {
+        epoch: RunEpoch,
+        operation: ControlOperationId,
+    },
+    ClusterClosed(ClusterLifecycle),
     Authority {
         slot: PlacementSlotKey,
         effect: AuthorityEffect,
@@ -120,11 +126,20 @@ pub struct LogicPlacementState {
     authorities: BTreeMap<PlacementSlotKey, PlacementAuthority>,
     resolution_failures: BTreeMap<PlacementSlotKey, (u128, PlacementResolutionFailure)>,
     group_up: bool,
-    origin: Instant,
+    origin: AuthorityClock,
     changed: Arc<Notify>,
 }
 
 impl LogicPlacementState {
+    /// Test coordinators must answer the request actually emitted by the owner,
+    /// not inject receipt-relative grants. This accessor does not install authority.
+    #[cfg(any(test, feature = "test-harness"))]
+    #[doc(hidden)]
+    pub fn pending_claim_request(&self, slot: &PlacementSlotKey) -> Option<u128> {
+        self.authorities
+            .get(slot)
+            .and_then(PlacementAuthority::pending_request_id)
+    }
     pub fn slot(&self, key: &PlacementSlotKey) -> Option<&PlacementSlot> {
         self.slots.get(key)
     }
@@ -215,8 +230,10 @@ pub struct GroupSession {
     effects: mpsc::Sender<LogicPlacementEffect>,
     local_events: mpsc::Receiver<LocalAuthorityEvent>,
     local_event_sender: mpsc::Sender<LocalAuthorityEvent>,
-    origin: Instant,
+    origin: AuthorityClock,
     heartbeat_sequence: u64,
+    heartbeat_ack_sequence: u64,
+    last_heartbeat_ack: Instant,
     coordinator_term: u64,
     shared_coordinator_term: Arc<AtomicU64>,
     hello_pending: bool,
@@ -264,7 +281,7 @@ impl GroupSession {
         let (local_event_sender, local_events) = mpsc::channel(effect_capacity);
         let local_node = group_hello.node.clone();
         let group = group_hello.group.clone();
-        let origin = Instant::now();
+        let origin = AuthorityClock::new().ok_or(GroupSessionError::UnsupportedClock)?;
         let shared_coordinator_term = Arc::new(AtomicU64::new(coordinator_term));
         Ok((
             Self {
@@ -289,6 +306,8 @@ impl GroupSession {
                 local_event_sender,
                 origin,
                 heartbeat_sequence: 0,
+                heartbeat_ack_sequence: 0,
+                last_heartbeat_ack: Instant::now(),
                 coordinator_term,
                 shared_coordinator_term,
                 hello_pending: true,
@@ -431,12 +450,18 @@ impl GroupSession {
                     self.tick_authorities().await?;
                 }
                 _ = heartbeat.tick() => {
+                    // Draining deliberately stops heartbeats; retain the control path
+                    // for the final application-level stop proof and confirmation.
+                    // Authority ticking remains independent and cannot be extended here.
+                    if self.drain_confirmation.requested() {
+                        continue;
+                    }
                     if last_heartbeat.elapsed() > self.config.heartbeat_interval.saturating_mul(2) {
                         return Err(GroupSessionError::HeartbeatInterrupted);
                     }
                     last_heartbeat = Instant::now();
-                    if self.drain_confirmation.requested() {
-                        continue;
+                    if self.heartbeat_sequence > 0 && self.last_heartbeat_ack.elapsed() > self.config.heartbeat_interval.saturating_mul(3) {
+                        return Err(GroupSessionError::HeartbeatInterrupted);
                     }
                     if self.hello_pending {
                         // Domain registration can race global membership recovery. Retry the
@@ -444,6 +469,7 @@ impl GroupSession {
                         self.send_hello_wait().await?;
                         continue;
                     }
+                    if self.heartbeat_sequence == 0 { self.last_heartbeat_ack = Instant::now(); }
                     self.heartbeat_sequence = self
                         .heartbeat_sequence
                         .checked_add(1)
@@ -453,6 +479,9 @@ impl GroupSession {
                         sequence: self.heartbeat_sequence,
                     }).await?;
                     self.replay_runtime_progress()?;
+                    let owned = self.state.lock().expect("logic placement state poisoned")
+                        .authorities.keys().cloned().collect::<Vec<_>>();
+                    for key in owned { self.request_claim(&key)?; }
                     if self.config.automatic_node_load_reporting {
                         let report = self
                             .state
@@ -673,8 +702,8 @@ fn event_name(event: &PlacementControlEventKind) -> &'static str {
     }
 }
 
-fn monotonic_since(origin: Instant) -> MonotonicTime {
-    MonotonicTime::from_millis(u64::try_from(origin.elapsed().as_millis()).unwrap_or(u64::MAX))
+fn monotonic_since(origin: AuthorityClock) -> MonotonicTime {
+    origin.now()
 }
 
 fn session_dispatch_error(error: &GroupSessionError) -> ControlDispatchError {
@@ -696,6 +725,8 @@ fn session_dispatch_error(error: &GroupSessionError) -> ControlDispatchError {
 
 #[derive(Debug, Error)]
 pub enum GroupSessionError {
+    #[error("serving authority requires a validated suspension-aware clock")]
+    UnsupportedClock,
     #[error("logic Coordinator session configuration is invalid")]
     InvalidConfig,
     #[error("logic Coordinator control stream closed")]

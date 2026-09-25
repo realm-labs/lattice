@@ -28,6 +28,7 @@ use crate::{
 
 #[async_trait]
 trait ErasedActorHost: Send + Sync {
+    fn close_business_admission(&self);
     fn protocol_id(&self) -> ProtocolId;
     fn is_current(&self, target: &ExactActorTarget) -> bool;
     fn subscribe_terminated(
@@ -93,6 +94,9 @@ impl<D: ActorDefinition<Protocol = P>, A: Actor, P: Protocol> ActorHost<D, A, P>
 impl<D: ActorDefinition<Protocol = P>, A: Actor, P: Protocol> ErasedActorHost
     for ActorHost<D, A, P>
 {
+    fn close_business_admission(&self) {
+        self.registry.close_business_admission();
+    }
     fn protocol_id(&self) -> ProtocolId {
         self.protocol.protocol_id()
     }
@@ -291,11 +295,19 @@ impl ProtocolHostRegistry {
     }
 
     pub async fn drain_all(&self) -> Vec<ActorCellDiagnostics> {
+        self.close_business_admission();
         let mut cells = Vec::new();
         for host in self.hosts.values() {
             cells.extend(host.drain_all().await);
         }
         cells
+    }
+
+    /// Irreversibly closes every hosted registry before asynchronous draining.
+    pub fn close_business_admission(&self) {
+        for host in self.hosts.values() {
+            host.close_business_admission();
+        }
     }
 
     pub async fn force_shutdown_all(

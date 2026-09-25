@@ -1,3 +1,4 @@
+use crate::candidate_fixture::elect_group;
 use lattice_model::actor::ProtocolId;
 use lattice_model::cluster::SingletonKind;
 use lattice_remoting::protocol::{ProtocolDescriptor, ProtocolFingerprint};
@@ -63,7 +64,7 @@ async fn leader_recovery_resumes_persisted_handoff() {
         )
         .unwrap(),
     );
-    let mut leader = GroupCoordinator::elect(
+    let mut leader = elect_group(
         store.clone(),
         associations,
         coordinator,
@@ -102,6 +103,30 @@ async fn leader_recovery_resumes_persisted_handoff() {
         )
         .await
         .unwrap();
+    let target_hello = MemberHello {
+        node: target.clone(),
+        roles: BTreeSet::new(),
+        failure_domains: BTreeMap::new(),
+        protocols: Vec::new(),
+        remoting_capabilities: BTreeSet::new(),
+    };
+    let target_global = ensure_test_global_member(&mut leader, &target_hello).await;
+    let target_record = GroupMemberRecord {
+        node: target.clone(),
+        status: GroupMemberStatus::Up,
+        version: leader.next_version().unwrap(),
+    };
+    let target_commit = store
+        .create_group_member(
+            &leader.leader_guard,
+            CreateGroupMember {
+                expected_global_member: target_global,
+                member: target_record,
+            },
+        )
+        .await
+        .unwrap();
+    leader.version = target_commit.member.version;
     let barrier_version = leader.next_version().unwrap();
     started
         .install_barrier(shard_id, barrier_version.clone(), Default::default())
@@ -117,6 +142,7 @@ async fn leader_recovery_resumes_persisted_handoff() {
         .reserve_move(
             &leader.leader_guard,
             ReserveMove {
+                limits: Default::default(),
                 expected_plan: pending,
                 plan: started.clone(),
                 expected_slot,
@@ -135,7 +161,7 @@ async fn leader_recovery_resumes_persisted_handoff() {
     assert_eq!(leader.handoffs[&slot_key].phase, HandoffPhase::Draining);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn singleton_owner_loss_recovers_forward_after_leader_restart() {
     let cluster_id = ClusterId::new("singleton-recovery-test").unwrap();
     let (coordinator, _) = node(&cluster_id, "coordinator", 26400, 400);
@@ -164,7 +190,7 @@ async fn singleton_owner_loss_recovers_forward_after_leader_restart() {
         60,
     );
     let store = Arc::new(InMemoryCoordinationStore::new(8, 8).unwrap());
-    let mut leader = GroupCoordinator::elect(
+    let mut leader = elect_group(
         store.clone(),
         associations,
         coordinator,
@@ -254,6 +280,12 @@ async fn singleton_owner_loss_recovers_forward_after_leader_restart() {
 
     store.revoke_lease(leased_claim.lease_id).await.unwrap();
     leader.reconcile_bounded_pass().await.unwrap();
+    assert_eq!(
+        store.get_slot(&slot_key).await.unwrap().unwrap().state,
+        PlacementSlotState::Fenced
+    );
+    tokio::time::advance(Duration::from_secs(16)).await;
+    leader.reconcile_bounded_pass().await.unwrap();
     let allocating = store.get_slot(&slot_key).await.unwrap().unwrap();
     assert_eq!(allocating.state, PlacementSlotState::Allocating);
     assert_eq!(allocating.owner.as_ref(), Some(&target));
@@ -269,6 +301,10 @@ async fn singleton_owner_loss_recovers_forward_after_leader_restart() {
         target
     );
 
+    leader.handoffs.clear();
+    leader.recover_persisted_plans().await.unwrap();
+    assert_eq!(leader.handoffs[&slot_key].source, source);
+    assert_eq!(leader.handoffs[&slot_key].target, target);
     leader
         .transition_handoff(
             slot_key.clone(),

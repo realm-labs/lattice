@@ -62,7 +62,7 @@ pub struct PlacementView {
     pub degraded: bool,
     pub nodes: Vec<PlacementNode>,
     pub shards: Vec<PlacedShard>,
-    pub active_cluster_moves: usize,
+    pub active_group_moves: usize,
     pub active_entity_moves: BTreeMap<EntityType, usize>,
     pub active_source_moves: BTreeMap<NodeKey, usize>,
     pub active_target_moves: BTreeMap<NodeKey, usize>,
@@ -114,17 +114,29 @@ impl RebalanceTrigger {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RebalanceLimits {
     pub moves_per_round: usize,
-    pub concurrent_cluster: usize,
+    pub concurrent_group: usize,
     pub concurrent_entity: usize,
     pub concurrent_source: usize,
     pub concurrent_target: usize,
+}
+
+impl Default for RebalanceLimits {
+    fn default() -> Self {
+        Self {
+            moves_per_round: 16,
+            concurrent_group: 8,
+            concurrent_entity: 2,
+            concurrent_source: 1,
+            concurrent_target: 1,
+        }
+    }
 }
 
 impl RebalanceLimits {
     pub fn validate(self) -> Result<Self, AllocationError> {
         if [
             self.moves_per_round,
-            self.concurrent_cluster,
+            self.concurrent_group,
             self.concurrent_entity,
             self.concurrent_source,
             self.concurrent_target,
@@ -237,7 +249,7 @@ impl ShardAllocationStrategy for WeightedLeastLoad {
     ) -> Result<RebalanceProposal, AllocationError> {
         require_reconciled(view)?;
         let limits = limits.validate()?;
-        if view.active_cluster_moves >= limits.concurrent_cluster
+        if view.active_group_moves >= limits.concurrent_group
             || view
                 .active_entity_moves
                 .get(entity_type)
@@ -249,7 +261,7 @@ impl ShardAllocationStrategy for WeightedLeastLoad {
         }
         let proposal_limit = limits
             .moves_per_round
-            .min(limits.concurrent_cluster - view.active_cluster_moves)
+            .min(limits.concurrent_group - view.active_group_moves)
             .min(
                 limits.concurrent_entity
                     - view
@@ -611,7 +623,7 @@ mod tests {
                 assigned_at: MonotonicTime::from_millis(0),
                 active_move: false,
             }],
-            active_cluster_moves: 0,
+            active_group_moves: 0,
             active_entity_moves: BTreeMap::new(),
             active_source_moves: BTreeMap::new(),
             active_target_moves: BTreeMap::new(),
@@ -623,7 +635,7 @@ mod tests {
     fn limits() -> RebalanceLimits {
         RebalanceLimits {
             moves_per_round: 4,
-            concurrent_cluster: 4,
+            concurrent_group: 4,
             concurrent_entity: 4,
             concurrent_source: 4,
             concurrent_target: 4,
@@ -780,11 +792,11 @@ mod tests {
         let mut second = view.shards[0].clone();
         second.shard_id = ShardId::new(2);
         view.shards.push(second);
-        view.active_cluster_moves = 1;
+        view.active_group_moves = 1;
         view.active_entity_moves.insert(entity.clone(), 1);
         let bounded = RebalanceLimits {
             moves_per_round: 4,
-            concurrent_cluster: 2,
+            concurrent_group: 2,
             concurrent_entity: 2,
             concurrent_source: 2,
             concurrent_target: 2,
@@ -804,7 +816,7 @@ mod tests {
             1
         );
 
-        view.active_cluster_moves = 0;
+        view.active_group_moves = 0;
         view.active_entity_moves.clear();
         view.active_source_moves.insert(source, 1);
         view.active_target_moves.insert(target, 1);
@@ -887,7 +899,7 @@ mod tests {
             degraded: false,
             nodes,
             shards,
-            active_cluster_moves: 0,
+            active_group_moves: 0,
             active_entity_moves: BTreeMap::new(),
             active_source_moves: BTreeMap::new(),
             active_target_moves: BTreeMap::new(),
@@ -919,7 +931,7 @@ mod tests {
                 &view,
                 RebalanceLimits {
                     moves_per_round: 4,
-                    concurrent_cluster: 4,
+                    concurrent_group: 4,
                     concurrent_entity: 4,
                     concurrent_source: 4,
                     concurrent_target: 4,

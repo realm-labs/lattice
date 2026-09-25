@@ -21,7 +21,7 @@ use lattice_model::{
 use thiserror::Error;
 
 use lattice_actor::{
-    attachments::ActorRuntimeAttachments,
+    attachments::{ActorExecutionGate, ActorRuntimeAttachments},
     environment::ActorEnvironment,
     error::{ActorAdminError, ActorFailure},
     handle::{ActorHandle, StopFailureRecord},
@@ -121,6 +121,7 @@ pub struct ActorRegistry<D: ActorDefinition, A: Actor> {
     quarantined: Arc<DashMap<LocalActorRef, QuarantinedEntry<A>>>,
     actor_system: Arc<OnceLock<ActorSystem>>,
     fencing_token_resolvers: Arc<RwLock<BTreeMap<String, ActorFencingTokenResolver>>>,
+    business_admission: Arc<RwLock<bool>>,
     spawner: ActorSpawner,
 }
 
@@ -285,6 +286,7 @@ impl<D: ActorDefinition, A: Actor> ActorRegistry<D, A> {
             quarantined: Arc::new(DashMap::new()),
             actor_system,
             fencing_token_resolvers: Arc::new(RwLock::new(BTreeMap::new())),
+            business_admission: Arc::new(RwLock::new(true)),
             spawner,
         }
     }
@@ -314,6 +316,7 @@ impl<D: ActorDefinition, A: Actor> ActorRegistry<D, A> {
             quarantined: Arc::new(DashMap::new()),
             actor_system,
             fencing_token_resolvers: Arc::new(RwLock::new(BTreeMap::new())),
+            business_admission: Arc::new(RwLock::new(true)),
             spawner,
         }
     }
@@ -656,7 +659,7 @@ impl<D: ActorDefinition, A: Actor> ActorRegistry<D, A> {
                 Entry::Occupied(_) => Err(ActorActivationError::AlreadyExists),
                 Entry::Vacant(entry) => {
                     let handle = self
-                        .spawn_actor(actor_id.clone(), actor)
+                        .spawn_actor(actor_id.clone(), actor, fencing_token)
                         .map_err(ActorActivationError::ActivationFailed)?;
                     entry.insert(RegistryEntry::Running(handle.clone(), fencing_token));
                     Ok(handle)
@@ -732,7 +735,7 @@ impl<D: ActorDefinition, A: Actor> ActorRegistry<D, A> {
             Ok(actor) => {
                 let spawned = self.with_actor_authority(&actor_id, fencing_token, || match self.entries.entry(actor_id.clone()) {
                     Entry::Occupied(mut entry) if matches!(entry.get(), RegistryEntry::Activating(existing) if Arc::ptr_eq(existing, &activation)) => {
-                        match self.spawn_actor(actor_id.clone(), actor) {
+                        match self.spawn_actor(actor_id.clone(), actor, fencing_token) {
                             Ok(handle) => {
                                 entry.insert(RegistryEntry::Running(handle.clone(), fencing_token));
                                 Ok(handle)
@@ -926,6 +929,13 @@ impl<D: ActorDefinition, A: Actor> ActorRegistry<D, A> {
         expected: Option<ActorFencingToken>,
         operation: impl FnOnce() -> Result<R, ActorActivationError>,
     ) -> Result<R, ActorActivationError> {
+        let admission = self
+            .business_admission
+            .read()
+            .expect("actor registry admission poisoned");
+        if !*admission {
+            return Err(authority_error("actor registry is shutting down"));
+        }
         let (token, resolver) = self.resolve_authority(actor_id)?;
         if token != expected {
             return Err(authority_error(
@@ -957,6 +967,23 @@ impl<D: ActorDefinition, A: Actor> ActorRegistry<D, A> {
 
     fn registry_identity(&self) -> usize {
         Arc::as_ptr(&self.entries) as usize
+    }
+
+    /// Permanently closes publication and business execution before asynchronous
+    /// shutdown begins. The write lock serializes with loader publication; queued
+    /// and cached-reference execution also observes this gate.
+    #[doc(hidden)]
+    pub fn close_business_admission(&self) {
+        let mut admission = self
+            .business_admission
+            .write()
+            .expect("actor registry admission poisoned");
+        *admission = false;
+        for entry in self.entries.iter() {
+            if let RegistryEntry::Running(handle, _) = entry.value() {
+                handle.fence_business_admission();
+            }
+        }
     }
 
     fn remove_stopped_running_entry(&self, actor_id: &ActorId) {
@@ -1016,7 +1043,12 @@ impl<D: ActorDefinition, A: Actor> ActorRegistry<D, A> {
             })
     }
 
-    fn spawn_actor(&self, actor_id: ActorId, actor: A) -> Result<ActorHandle<A>, ActorFailure> {
+    fn spawn_actor(
+        &self,
+        actor_id: ActorId,
+        actor: A,
+        fencing_token: Option<ActorFencingToken>,
+    ) -> Result<ActorHandle<A>, ActorFailure> {
         let self_address = self
             .actor_address_for(actor_id.clone())
             .map(|address| address.erase());
@@ -1042,6 +1074,40 @@ impl<D: ActorDefinition, A: Actor> ActorRegistry<D, A> {
             }
         });
         let mut runtime_attachments = ActorRuntimeAttachments::builder();
+        {
+            let registry_admission = self.business_admission.clone();
+            let resolvers = self
+                .fencing_token_resolvers
+                .read()
+                .expect("actor fencing token resolver poisoned")
+                .clone();
+            let gate_actor_id = actor_id.clone();
+            runtime_attachments
+                .insert(ActorExecutionGate(Arc::new(move || {
+                    if !*registry_admission
+                        .read()
+                        .expect("actor registry admission poisoned")
+                    {
+                        return false;
+                    }
+                    let Some(expected) = fencing_token else {
+                        return true;
+                    };
+                    let mut found = false;
+                    for resolver in resolvers.values() {
+                        let mut token = None;
+                        resolver(&gate_actor_id, &mut |value| token = value);
+                        if let Some(token) = token {
+                            if token != expected.get() {
+                                return false;
+                            }
+                            found = true;
+                        }
+                    }
+                    found
+                })))
+                .map_err(|error| ActorFailure::new(error.to_string()))?;
+        }
         runtime_attachments
             .insert(DistributedActorRuntime::new(self.actor_system.clone()))
             .map_err(|error| ActorFailure::new(error.to_string()))?;

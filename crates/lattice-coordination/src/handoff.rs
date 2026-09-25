@@ -64,6 +64,7 @@ pub struct HandoffMachine {
     pub target_generation: AssignmentGeneration,
     pub phase: HandoffPhase,
     barrier: VersionBarrier,
+    source_stopped: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -94,6 +95,7 @@ impl HandoffMachine {
             source_generation,
             target_generation,
             phase: HandoffPhase::Invalidating,
+            source_stopped: false,
             barrier: VersionBarrier {
                 version: barrier_version,
                 required: barrier_sessions,
@@ -138,6 +140,12 @@ impl HandoffMachine {
         Ok(machine)
     }
 
+    /// True only after an exact source-generation graceful stop report.
+    /// Recovery deliberately starts false until durable stop evidence is restored.
+    pub fn source_stopped(&self) -> bool {
+        self.source_stopped
+    }
+
     pub fn barrier_version(&self) -> PlacementVersion {
         self.barrier.version.clone()
     }
@@ -157,6 +165,7 @@ impl HandoffMachine {
     }
 
     pub fn transition(&mut self, event: HandoffEvent) -> Result<Vec<HandoffEffect>, HandoffError> {
+        let graceful_stop = matches!(&event, HandoffEvent::SourceDrained { .. });
         match event {
             HandoffEvent::AppliedRevision { session, version }
                 if self.phase == HandoffPhase::Invalidating =>
@@ -175,7 +184,10 @@ impl HandoffMachine {
                 }
             }
             HandoffEvent::FenceSession(session) if self.phase == HandoffPhase::Invalidating => {
-                self.barrier.required.remove(&session);
+                if !self.barrier.required.contains(&session) {
+                    return Err(HandoffError::UnexpectedBarrierMember);
+                }
+                self.barrier.applied.insert(session);
                 if self.barrier.required == self.barrier.applied {
                     self.phase = HandoffPhase::Draining;
                     Ok(vec![HandoffEffect::DrainSource])
@@ -189,6 +201,7 @@ impl HandoffMachine {
                     && source == self.source
                     && generation == self.source_generation =>
             {
+                self.source_stopped = graceful_stop;
                 self.phase = HandoffPhase::ReplacingAuthority;
                 Ok(vec![HandoffEffect::ReplaceAuthority])
             }

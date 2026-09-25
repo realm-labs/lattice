@@ -1,3 +1,4 @@
+use crate::candidate_fixture::elect_host;
 use std::{collections::BTreeSet, sync::Arc, time::Duration};
 
 use lattice_model::{
@@ -12,7 +13,7 @@ use lattice_remoting::{
 use tokio::sync::{mpsc, oneshot};
 
 use super::{
-    ClusterCoordinatorConfig, CoordinatorHost, CoordinatorHostConfig, CoordinatorHostScopeState,
+    ClusterCoordinatorConfig, CoordinatorHostConfig, CoordinatorHostScopeState,
     CoordinatorRuntimeError, GroupCoordinatorConfig, helpers::dispatch_error,
 };
 use crate::{
@@ -78,7 +79,7 @@ async fn membership_removal_reaches_groups_from_the_event_stream() {
     let local = node("removal-host", 50, 33050);
     let departed = node("departed", 51, 33051);
     let group = ActorGroupId::new("removal-group").unwrap();
-    let mut host = CoordinatorHost::elect(
+    let mut host = elect_host(
         store,
         associations(&local),
         local,
@@ -129,7 +130,7 @@ async fn stale_coordinator_term_is_fenced_before_membership_dispatch() {
     let local = node("membership-host", 20, 33020);
     let remote = node("member", 21, 33021);
     let manager = associations(&local);
-    let mut host = CoordinatorHost::elect(store, manager, local.clone(), BTreeSet::new(), config())
+    let mut host = elect_host(store, manager, local.clone(), BTreeSet::new(), config())
         .await
         .unwrap();
     let active_term = host
@@ -167,7 +168,7 @@ async fn standby_scope_fences_old_control_instead_of_retrying_it() {
     let leader_node = node("leader", 30, 33030);
     let standby_node = node("standby", 31, 33031);
     let remote = node("member", 32, 33032);
-    let leader = CoordinatorHost::elect(
+    let leader = elect_host(
         store.clone(),
         associations(&leader_node),
         leader_node,
@@ -176,7 +177,7 @@ async fn standby_scope_fences_old_control_instead_of_retrying_it() {
     )
     .await
     .unwrap();
-    let mut standby = CoordinatorHost::elect(
+    let mut standby = elect_host(
         store,
         associations(&standby_node),
         standby_node.clone(),

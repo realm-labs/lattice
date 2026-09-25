@@ -4,12 +4,19 @@
 //! checks the safety properties the reducer must hold in every reachable state, independently of
 //! the seeded workload.
 
-use lattice_coordination::handoff::{HandoffEffect, HandoffMachine, HandoffPhase};
+use lattice_coordination::handoff::{HandoffEffect, HandoffEvent, HandoffMachine, HandoffPhase};
 
 use crate::{
     explorer::Explorable,
     scenario::{HandoffStep, handoff::handoff_event, incarnation},
 };
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) enum ExplorationEvent {
+    Step(HandoffStep),
+    SourceDrained,
+    SourceStopFailed,
+}
 
 #[derive(Debug, Clone)]
 pub(super) struct HandoffExploration {
@@ -49,11 +56,11 @@ impl Ord for HandoffExploration {
 }
 
 impl Explorable for HandoffExploration {
-    type Event = HandoffStep;
+    type Event = ExplorationEvent;
     type Error = ();
 
     fn enabled(&self) -> Vec<Self::Event> {
-        vec![
+        let mut events = vec![
             HandoffStep::ApplyBarrier(incarnation(1)),
             HandoffStep::ApplyBarrier(incarnation(2)),
             HandoffStep::ApplyBarrier(incarnation(9)),
@@ -63,18 +70,38 @@ impl Explorable for HandoffExploration {
             HandoffStep::TargetClaimInstalled,
             HandoffStep::TargetReady,
         ]
+        .into_iter()
+        .map(ExplorationEvent::Step)
+        .collect::<Vec<_>>();
+        events.extend([
+            ExplorationEvent::SourceDrained,
+            ExplorationEvent::SourceStopFailed,
+        ]);
+        events
     }
 
     fn step(&self, event: &Self::Event) -> Result<Self, Self::Error> {
         let mut next = self.clone();
         let before = format!("{:?}", next.machine);
-        match next.machine.transition(handoff_event(*event)) {
+        let event = match event {
+            ExplorationEvent::Step(step) => handoff_event(*step),
+            ExplorationEvent::SourceDrained => HandoffEvent::SourceDrained {
+                source: next.machine.source.clone(),
+                generation: next.machine.source_generation,
+            },
+            ExplorationEvent::SourceStopFailed => HandoffEvent::SourceStopFailed {
+                source: next.machine.source.clone(),
+                generation: next.machine.source_generation,
+            },
+        };
+        match next.machine.transition(event) {
             Ok(effects) => {
                 for effect in effects {
                     match effect {
                         HandoffEffect::PublishActive => next.published = true,
                         HandoffEffect::StopFailed => next.stop_failed = true,
-                        HandoffEffect::DrainSource | HandoffEffect::ReplaceAuthority => {}
+                        HandoffEffect::ReplaceAuthority => next.stop_failed = false,
+                        HandoffEffect::DrainSource => {}
                     }
                 }
             }
@@ -95,8 +122,12 @@ impl Explorable for HandoffExploration {
         if self.machine.target_generation.get() != self.machine.source_generation.get() + 1 {
             return Err("handoff target generation is not the exact successor".to_owned());
         }
-        if self.stop_failed {
-            return Err("an unexpected voluntary stop failure was emitted".to_owned());
+        if self.stop_failed
+            && (self.machine.phase != HandoffPhase::Draining || self.machine.source_stopped())
+        {
+            return Err(
+                "stop failure escaped draining without new stop/authority-loss evidence".to_owned(),
+            );
         }
         Ok(())
     }

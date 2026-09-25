@@ -80,6 +80,8 @@ impl LogicEffectApplier {
         handle: &GroupSessionHandle,
     ) -> Result<(), ()> {
         match effect {
+            LogicPlacementEffect::ClusterClosing { .. }
+            | LogicPlacementEffect::ClusterClosed(_) => Err(()),
             LogicPlacementEffect::MemberSnapshot { version, members } => self
                 .peers
                 .install_snapshot(version, members)
@@ -635,6 +637,8 @@ impl LogicJoinRuntime {
     }
 
     fn set_group_state(&self, state: ActorGroupState) {
+        self.controller
+            .set_session_healthy(state == ActorGroupState::Ready);
         self.lifecycle_driver
             .set_group_state(self.group_hello.group.clone(), state);
     }

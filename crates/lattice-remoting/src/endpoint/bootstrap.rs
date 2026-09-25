@@ -200,6 +200,10 @@ impl RemotingEndpoint {
             .expect("bootstrap handler lock poisoned")
             .route(request);
         let result = match route {
+            BootstrapRoute::Closed { lifecycle } => BootstrapResult::Closed {
+                remote: self.local.clone(),
+                lifecycle,
+            },
             BootstrapRoute::Accept { leader } => {
                 if self
                     .associations

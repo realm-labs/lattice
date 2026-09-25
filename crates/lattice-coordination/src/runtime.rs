@@ -8,6 +8,7 @@ use bytes::Bytes;
 use lattice_model::{
     cluster::CoordinatorScope,
     cluster::{ActorGroupId, EntityType, NodeIncarnation, SingletonKind},
+    run::RunEpoch,
 };
 use lattice_remoting::association::{
     Association, AssociationError, AssociationKey, AssociationManager, AssociationState,
@@ -25,6 +26,7 @@ use crate::{
         RebalanceLimits, RebalanceProposal, RebalanceTrigger, ShardAllocationStrategy,
         registry::ShardAllocationStrategies,
     },
+    authority::clock::AuthorityClock,
     control::{
         DEFAULT_MAX_CONTROL_PAYLOAD, PlacementControlCommand, PlacementControlError,
         PlacementControlEvent,
@@ -35,7 +37,7 @@ use crate::{
         SingletonConfig, SnapshotLimits, SnapshotRecord, build_snapshot,
     },
     handoff::{HandoffEffect, HandoffError, HandoffEvent, HandoffMachine, HandoffPhase},
-    plan::{MoveProgress, PlanError, PlanReason, PlanStatus, RebalancePlan},
+    plan::{MAXIMUM_PLAN_MOVES, MoveProgress, PlanError, PlanReason, PlanStatus, RebalancePlan},
     region::EntityConfig,
     storage::{
         ActorGroupStore, CoordinatorLeaseStore, MembershipStore, ScopedElectionStore, StorageError,
@@ -52,12 +54,14 @@ use crate::{
 mod admin;
 mod allocation;
 pub mod cluster;
+mod grants;
 #[cfg(feature = "test-harness")]
 #[doc(hidden)]
 pub mod harness;
 pub mod host;
 mod lifecycle;
 mod membership;
+mod operation_id;
 mod rebalance;
 mod reconciliation;
 
@@ -148,7 +152,7 @@ impl Default for GroupCoordinatorConfig {
             maximum_singleton_configs: 1024,
             rebalance_limits: RebalanceLimits {
                 moves_per_round: 16,
-                concurrent_cluster: 8,
+                concurrent_group: 8,
                 concurrent_entity: 2,
                 concurrent_source: 1,
                 concurrent_target: 1,
@@ -220,6 +224,7 @@ impl GroupCoordinatorConfig {
             || self.maximum_operations == 0
             || self.maximum_admin_operation_records == 0
             || self.maximum_plan_moves == 0
+            || self.maximum_plan_moves > MAXIMUM_PLAN_MOVES
             || self.maximum_completed_plan_history == 0
             || self.maximum_entity_configs == 0
             || self.maximum_singleton_configs == 0
@@ -340,6 +345,7 @@ pub struct ForceRemoveRequest {
 
 #[derive(Debug, Clone)]
 pub struct CoordinatorInspection {
+    pub epoch: RunEpoch,
     pub version: PlacementVersion,
     pub automatic_globally_paused: bool,
     pub paused_entity_types: Vec<EntityType>,
@@ -359,6 +365,10 @@ pub struct CoordinatorInspection {
 
 #[derive(Default)]
 struct ReconciliationState {
+    unrecovered_members: BTreeMap<NodeIncarnation, GroupMemberRecord>,
+    barrier_gc_cursor: Option<String>,
+    replacement_waits:
+        BTreeMap<PlacementSlotKey, (AssignmentGeneration, AuthorityClock, MonotonicTime)>,
     initial_complete: bool,
     cursor: Option<PageCursor>,
     backlog: usize,
@@ -651,8 +661,7 @@ where
         strategies: ShardAllocationStrategies,
     ) -> Result<Self, CoordinatorRuntimeError> {
         config.validate()?;
-        store.ensure_framework().await?;
-        let leader_lease_id = store.grant_lease(config.leader_lease_ttl).await?;
+        let epoch = store.ensure_framework().await?;
         let group = match &scope {
             CoordinatorScope::Group(group) => group.clone(),
             CoordinatorScope::Cluster => {
@@ -661,14 +670,44 @@ where
                 ));
             }
         };
+        let authorization = store
+            .candidate_authorization(&scope, &node.node_id)
+            .await?
+            .ok_or(StorageError::CandidateNotEligible)?;
+        let leader_lease_id = store.grant_lease(config.leader_lease_ttl).await?;
+        let registration = store
+            .online_candidates(&authorization.scope)
+            .await?
+            .into_iter()
+            .find(|existing| existing.authorization == authorization && existing.node == node);
+        let candidate_lease_id = registration
+            .as_ref()
+            .map_or(leader_lease_id, |existing| existing.lease_id);
         let leader = LeaderRecord {
+            candidate_generation: authorization.generation,
+            candidate_lease_id,
+            epoch,
             scope,
             node: node.clone(),
             term,
         };
-        if !store.campaign_leader(&leader, leader_lease_id).await? {
+        if let Err(error) = store
+            .register_candidate(&leader.candidate_registration())
+            .await
+        {
             let _ = store.revoke_lease(leader_lease_id).await;
-            return Err(CoordinatorRuntimeError::NotLeader);
+            return Err(error.into());
+        }
+        match store.campaign_leader(&leader, leader_lease_id).await {
+            Ok(true) => {}
+            result => {
+                let _ = store.revoke_lease(leader_lease_id).await;
+                return Err(match result {
+                    Ok(false) => CoordinatorRuntimeError::NotLeader,
+                    Err(error) => error.into(),
+                    Ok(true) => unreachable!(),
+                });
+            }
         }
         let leader_lease_keepalive = LeaderLeaseKeepalive::spawn(
             store.clone(),
@@ -911,6 +950,10 @@ pub enum CoordinatorRuntimeError {
     UnknownSlot,
     #[error("rebalance plan does not exist")]
     UnknownPlan,
+    #[error(
+        "administrative operation context or leader-local proposal expired; inspect before making a new decision"
+    )]
+    OperationExpired,
     #[error("handoff state does not exist")]
     UnknownHandoff,
     #[error("handoff state no longer matches persisted placement truth")]

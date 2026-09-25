@@ -1,26 +1,32 @@
-use etcd_client::{Compare, CompareOp, PutOptions, Txn, TxnOp};
-use lattice_model::cluster::CoordinatorScope;
-use serde::de::DeserializeOwned;
+use crate::admin_operation::matches_committed;
+use etcd_client::{Compare, CompareOp, GetOptions, PutOptions, Txn, TxnOp};
+use lattice_model::{
+    cluster::CoordinatorScope,
+    run::{ClusterLifecycle, RunPhase},
+};
+use serde::{Serialize, de::DeserializeOwned};
 
+use super::plan_records::{plan_deletes, plan_puts};
 use super::{EtcdCoordinationStore, decode, encode, parse_revision_value};
 use crate::{
     coordinator::{
         ClusterLeaderGuard, ExactLeaderGuard, GroupLeaderGuard, GroupMemberRecord,
         GroupMemberStatus, MemberRecord, MemberStatus, SessionLimits,
     },
-    plan::{MoveProgress, RebalancePlan},
+    plan::{MAXIMUM_PLAN_MOVES, MoveProgress, RebalancePlan},
     storage::{
-        ActorGroupStore, StorageError,
+        ActorGroupStore, ClusterLifecycleStore, StorageError,
+        plan_records::validate_plan_payload,
         records::{
             ActivateAuthority, AdminOperationRecord, AdoptAuthority, AllocateInitial,
             AuthorityCommit, AutomaticBalanceSettings, ClaimPredicate, CommitAutomaticSettings,
             CompactAdminOperations, CompleteMove, CreateGroupMember, CreateMember, CreatePlan,
             CreatePlanWithOperation, DeletePlan, EntityConfigCommit, FenceAuthority,
-            FenceMissingAuthority, GroupMemberCommit, InstallAuthority, LeasedClaim, MemberCommit,
-            MoveCommit, PlanCommit, PutEntityConfig, PutSingletonConfig, RecordAdminOperation,
-            RemoveExpiredMember, RemoveGroupMember, RemoveMember, ReserveHandoff, ReserveMove,
-            SingletonConfigCommit, SlotCommit, TransitionSlot, UpdateGroupMember, UpdateMember,
-            UpdatePlan, UpdatePlanWithOperation,
+            FenceMissingAuthority, GroupMemberCommit, InstallAuthority, LeasedClaim,
+            MAX_ADMIN_GC_BATCH, MemberCommit, MoveCommit, PlanCommit, PutEntityConfig,
+            PutSingletonConfig, RecordAdminOperation, RemoveExpiredMember, RemoveGroupMember,
+            RemoveMember, ReserveHandoff, ReserveMove, SingletonConfigCommit, SlotCommit,
+            TransitionSlot, UpdateGroupMember, UpdateMember, UpdatePlan, UpdatePlanWithOperation,
         },
     },
     types::{
@@ -48,7 +54,7 @@ async fn cardinality_counter(
 ) -> Result<CardinalityCounter, StorageError> {
     let key = store.scope_key(scope, &format!("counters/{name}"));
     let current_record = store.read_raw(&key).await?;
-    let current = current_record
+    let stored_count = current_record
         .as_ref()
         .map(|(bytes, _, _)| {
             std::str::from_utf8(bytes)
@@ -58,6 +64,21 @@ async fn cardinality_counter(
         })
         .transpose()?
         .unwrap_or(0);
+    // Leased membership keys can disappear without a counter transaction. The
+    // counter's mod-revision still serializes writers, but occupancy comes from
+    // live keys. Expiry between this read and commit only reduces occupancy.
+    let current = if name == "members" {
+        let mut client = store.client.clone();
+        store
+            .read_deadline(client.get(
+                store.scope_key(scope, "members/"),
+                Some(GetOptions::new().with_prefix().with_count_only()),
+            ))
+            .await?
+            .count()
+    } else {
+        stored_count
+    };
     let next = current
         .checked_add(delta)
         .ok_or(StorageError::CounterExhausted)?;
@@ -102,11 +123,25 @@ async fn state_counter(
     })
 }
 
-fn guard_compares(
+pub(super) fn leader_compares(
     store: &EtcdCoordinationStore,
     guard: &impl ExactLeaderGuard,
-) -> Result<[Compare; 2], StorageError> {
+) -> Result<[Compare; 4], StorageError> {
+    if store.bound_epoch()? != guard.record().epoch {
+        return Err(StorageError::RunMismatch);
+    }
+    let registration = guard.record().candidate_registration();
     Ok([
+        Compare::value(
+            store.candidate_authorization_key(guard.scope(), &guard.record().node.node_id),
+            CompareOp::Equal,
+            encode(&registration.authorization)?,
+        ),
+        Compare::value(
+            store.candidate_registration_key(guard.scope(), &guard.record().node.node_id),
+            CompareOp::Equal,
+            encode(&registration)?,
+        ),
         Compare::value(
             store.scope_key(guard.scope(), "leader"),
             CompareOp::Equal,
@@ -124,6 +159,13 @@ async fn diagnose_false(
     store: &EtcdCoordinationStore,
     guard: &impl ExactLeaderGuard,
 ) -> Result<(), StorageError> {
+    let lifecycle = store.lifecycle().await?;
+    if lifecycle.epoch != guard.record().epoch {
+        return Err(StorageError::RunMismatch);
+    }
+    if !lifecycle.is_running() {
+        return Err(StorageError::RunNotRunning);
+    }
     let leader = store
         .read_raw(&store.scope_key(guard.scope(), "leader"))
         .await?;
@@ -141,6 +183,24 @@ async fn diagnose_false(
         .and_then(|value| value.parse::<u64>().ok())
         == Some(guard.term().get());
     if leader_matches && term_matches {
+        let expected_registration = guard.record().candidate_registration();
+        let current_authorization = store
+            .read_raw(
+                &store.candidate_authorization_key(guard.scope(), &guard.record().node.node_id),
+            )
+            .await?;
+        let current_registration = store
+            .read_raw(
+                &store.candidate_registration_key(guard.scope(), &guard.record().node.node_id),
+            )
+            .await?;
+        if current_authorization.as_ref().map(|(value, _, _)| value)
+            != Some(&encode(&expected_registration.authorization)?)
+            || current_registration.as_ref().map(|(value, _, _)| value)
+                != Some(&encode(&expected_registration)?)
+        {
+            return Err(StorageError::CandidateNotEligible);
+        }
         Err(StorageError::CompareFailed)
     } else {
         Err(StorageError::LeadershipLost)
@@ -158,13 +218,21 @@ async fn ensure_guard_live(
     }
 }
 
-async fn commit(
+pub(super) async fn commit(
     store: &EtcdCoordinationStore,
     guard: &impl ExactLeaderGuard,
     mut compares: Vec<Compare>,
     operations: Vec<TxnOp>,
 ) -> Result<(), StorageError> {
-    compares.extend(guard_compares(store, guard)?);
+    compares.extend(leader_compares(store, guard)?);
+    compares.push(Compare::value(
+        store.key("meta/lifecycle"),
+        CompareOp::Equal,
+        encode(&ClusterLifecycle {
+            epoch: guard.record().epoch,
+            phase: RunPhase::Running,
+        })?,
+    ));
     let mut client = store.client.clone();
     let response = store
         .write_deadline(client.txn(Txn::new().when(compares).and_then(operations)))
@@ -177,7 +245,7 @@ async fn commit(
 }
 
 fn validate_member(member: &MemberRecord) -> Result<(), StorageError> {
-    if member.node != member.hello.node || member.lease_id <= 0 || member.node.validate().is_err() {
+    if member.lease_id <= 0 || member.node.validate().is_err() {
         return Err(StorageError::InvalidRecord);
     }
     Ok(())
@@ -193,7 +261,7 @@ fn validate_group_member(
     member
         .validate(&SessionLimits::default())
         .map_err(|_| StorageError::InvalidRecord)?;
-    if &member.version.group != group || &member.hello.group != group {
+    if &member.version.group != group {
         return Err(StorageError::InvalidRecord);
     }
     Ok(())
@@ -243,6 +311,19 @@ fn validate_plan_update(
     plan: &RebalancePlan,
 ) -> Result<(), StorageError> {
     if expected.plan_id != plan.plan_id
+        || expected.moves.len() != plan.moves.len()
+        || expected.entity_type != plan.entity_type
+        || expected
+            .moves
+            .iter()
+            .zip(&plan.moves)
+            .any(|(before, after)| {
+                before.shard_id != after.shard_id
+                    || before.source != after.source
+                    || before.target != after.target
+                    || before.expected_generation != after.expected_generation
+                    || before.estimated_weight != after.estimated_weight
+            })
         || plan.record_revision
             != expected
                 .record_revision
@@ -255,10 +336,15 @@ fn validate_plan_update(
 }
 
 fn validate_plan_group(guard: &GroupLeaderGuard, plan: &RebalancePlan) -> Result<(), StorageError> {
+    validate_plan_payload(plan)?;
     let CoordinatorScope::Group(group) = guard.scope() else {
         return Err(StorageError::InvalidRecord);
     };
-    if &plan.group != group || plan.coordinator_term != guard.term() {
+    if &plan.group != group
+        || plan.coordinator_term != guard.term()
+        || plan.moves.is_empty()
+        || plan.moves.len() > MAXIMUM_PLAN_MOVES
+    {
         return Err(StorageError::InvalidRecord);
     }
     Ok(())
@@ -271,18 +357,35 @@ fn validate_claim(claim: &LeasedClaim, slot: &PlacementSlot) -> Result<(), Stora
     Ok(())
 }
 
+async fn exact_plan(
+    store: &EtcdCoordinationStore,
+    key: &str,
+    expected: &RebalancePlan,
+) -> Result<i64, StorageError> {
+    match (store.read_plan_record(key).await?, expected.durable()) {
+        (None, None) => Ok(0),
+        (Some((current, revision)), Some(expected))
+            if serde_json::to_vec(&current).map_err(|_| StorageError::Codec)?
+                == serde_json::to_vec(&expected).map_err(|_| StorageError::Codec)? =>
+        {
+            Ok(revision)
+        }
+        _ => Err(StorageError::CompareFailed),
+    }
+}
+
 async fn exact_record<T>(
     store: &EtcdCoordinationStore,
     key: &str,
     expected: &T,
 ) -> Result<i64, StorageError>
 where
-    T: DeserializeOwned + PartialEq,
+    T: DeserializeOwned + Serialize + PartialEq,
 {
     let Some((bytes, mod_revision, _)) = store.read_raw(key).await? else {
         return Err(StorageError::CompareFailed);
     };
-    if decode::<T>(&bytes)? != *expected {
+    if encode(&decode::<T>(&bytes)?)? != encode(expected)? {
         return Err(StorageError::CompareFailed);
     }
     Ok(mod_revision)
@@ -296,7 +399,7 @@ async fn exact_claim(
     exact_record(store, key, expected).await
 }
 
-async fn assignment_compares(
+pub(super) async fn assignment_compares(
     store: &EtcdCoordinationStore,
     global_member: &MemberRecord,
     group_member: &GroupMemberRecord,
@@ -329,6 +432,30 @@ pub(super) async fn create_member(
     }
     ensure_guard_live(store, guard).await?;
     validate_member(&request.member)?;
+    // Unresolved departed incarnations are safety obligations, not an unbounded
+    // historical log. Reaching the bound requires positive stop proof or reset.
+    let obligation_key = store.key(&format!(
+        "shutdown/obligations/{}",
+        crate::shutdown::participant_key(&request.member.node)
+    ));
+    if store.read_raw(&obligation_key).await?.is_none() {
+        let mut client = store.client.clone();
+        let obligations = store
+            .read_deadline(
+                client.get(
+                    store.key("shutdown/obligations/"),
+                    Some(
+                        etcd_client::GetOptions::new()
+                            .with_prefix()
+                            .with_count_only(),
+                    ),
+                ),
+            )
+            .await?;
+        if obligations.count() >= store.limits.maximum_members as i64 {
+            return Err(StorageError::Capacity);
+        }
+    }
     let state = state_counter(store, guard.scope(), request.member.version.revision).await?;
     let count = cardinality_counter(
         store,
@@ -351,6 +478,14 @@ pub(super) async fn create_member(
             count.compare,
         ],
         vec![
+            TxnOp::put(
+                store.key(&format!(
+                    "shutdown/obligations/{}",
+                    crate::shutdown::participant_key(&request.member.node)
+                )),
+                encode(&request.member.node)?,
+                None,
+            ),
             TxnOp::put(
                 key,
                 encode(&request.member)?,
@@ -469,7 +604,7 @@ pub(super) async fn remove_expired_member(
         store,
         guard.scope(),
         "members",
-        -1,
+        0,
         store.limits.maximum_members,
     )
     .await?;
@@ -535,7 +670,11 @@ pub(super) async fn create_group_member(
             count.compare,
         ],
         vec![
-            TxnOp::put(member_key, encode(&request.member)?, None),
+            TxnOp::put(
+                member_key,
+                encode(&request.member)?,
+                Some(PutOptions::new().with_lease(request.expected_global_member.lease_id)),
+            ),
             state.put,
             count.put,
         ],
@@ -581,7 +720,11 @@ pub(super) async fn update_group_member(
             state.compare,
         ],
         vec![
-            TxnOp::put(member_key, encode(&request.member)?, None),
+            TxnOp::put(
+                member_key,
+                encode(&request.member)?,
+                Some(PutOptions::new().with_lease(request.expected_global_member.lease_id)),
+            ),
             state.put,
         ],
     )

@@ -1,3 +1,4 @@
+use crate::candidate_fixture::elect_host;
 use std::{collections::BTreeSet, sync::Arc, time::Duration};
 
 use lattice_model::{
@@ -8,7 +9,7 @@ use lattice_remoting::{association::AssociationManager, config::RemotingConfig};
 use tokio::sync::{mpsc, watch};
 
 use super::{
-    ClusterCoordinatorConfig, CoordinatorHost, CoordinatorHostConfig, CoordinatorHostScopeState,
+    ClusterCoordinatorConfig, CoordinatorHostConfig, CoordinatorHostScopeState,
     GroupCoordinatorConfig, election::candidate_delay_duration,
 };
 use crate::{
@@ -62,7 +63,7 @@ async fn panicked_group_is_unadvertised_and_recampaigned_without_losing_other_sc
     let local = node("panic-host", 90, 33190);
     let failed = ActorGroupId::new("failed-group").unwrap();
     let healthy = ActorGroupId::new("healthy-group").unwrap();
-    let mut host = CoordinatorHost::elect(
+    let mut host = elect_host(
         store.clone(),
         associations(&local),
         local,
@@ -179,7 +180,7 @@ async fn placement_group_campaigns_run_concurrently_off_the_host_loop() {
         );
     assert!(serialized > concurrent * 2);
 
-    let holder_host = CoordinatorHost::elect(
+    let holder_host = elect_host(
         store.clone(),
         associations(&holder),
         holder,
@@ -188,7 +189,7 @@ async fn placement_group_campaigns_run_concurrently_off_the_host_loop() {
     )
     .await
     .unwrap();
-    let candidate_host = CoordinatorHost::elect(
+    let candidate_host = elect_host(
         store.clone(),
         associations(&candidate),
         candidate,
@@ -237,7 +238,7 @@ async fn placement_group_campaigns_run_concurrently_off_the_host_loop() {
 async fn dedicated_membership_host_needs_no_placement_groups() {
     let store = Arc::new(InMemoryCoordinationStore::new(32, 32).unwrap());
     let local = node("membership-host", 10, 33010);
-    let host = CoordinatorHost::elect(
+    let host = elect_host(
         store.clone(),
         associations(&local),
         local.clone(),
@@ -269,7 +270,7 @@ async fn competing_hosts_produce_exactly_one_active_leader_per_group() {
     let group = ActorGroupId::new("single-leader-group").unwrap();
     let first = node("first-candidate", 11, 33011);
     let second = node("second-candidate", 12, 33012);
-    let first_host = CoordinatorHost::elect(
+    let first_host = elect_host(
         store.clone(),
         associations(&first),
         first.clone(),
@@ -278,7 +279,7 @@ async fn competing_hosts_produce_exactly_one_active_leader_per_group() {
     )
     .await
     .unwrap();
-    let second_host = CoordinatorHost::elect(
+    let second_host = elect_host(
         store.clone(),
         associations(&second),
         second,
@@ -314,7 +315,7 @@ async fn different_hosts_can_lead_different_groups_concurrently() {
     let host_b_node = node("host-b", 2, 33002);
     let group_a = ActorGroupId::new("group-a").unwrap();
     let group_b = ActorGroupId::new("group-b").unwrap();
-    let host_a = CoordinatorHost::elect(
+    let host_a = elect_host(
         store.clone(),
         associations(&host_a_node),
         host_a_node.clone(),
@@ -323,7 +324,7 @@ async fn different_hosts_can_lead_different_groups_concurrently() {
     )
     .await
     .unwrap();
-    let host_b = CoordinatorHost::elect(
+    let host_b = elect_host(
         store.clone(),
         associations(&host_b_node),
         host_b_node.clone(),
@@ -367,7 +368,7 @@ async fn losing_one_group_lease_reenters_only_that_election() {
     let local = node("host", 3, 33103);
     let group_a = ActorGroupId::new("isolated-a").unwrap();
     let group_b = ActorGroupId::new("isolated-b").unwrap();
-    let host = CoordinatorHost::elect(
+    let host = elect_host(
         store.clone(),
         associations(&local),
         local,
