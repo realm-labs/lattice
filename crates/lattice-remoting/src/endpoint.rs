@@ -12,7 +12,10 @@ use tokio::{
     task::{JoinError, JoinHandle, JoinSet},
 };
 #[cfg(feature = "tls")]
-use tokio_rustls::rustls::{ClientConfig, ServerConfig};
+use tokio_rustls::{
+    TlsAcceptor,
+    rustls::{ClientConfig, ServerConfig},
+};
 
 #[cfg(feature = "tls")]
 use crate::transport::{connect_tls, verify_peer_certificate_identity};
@@ -48,7 +51,7 @@ use diagnostics::{
     AcceptDiagnostics, AcceptRecovery, classify_accept_failure, observe_connection_result,
     wait_for_disconnect,
 };
-use lifecycle::wait_for_shutdown;
+use lifecycle::{during_setup, wait_for_shutdown};
 use stream::EndpointStream;
 
 const ACCEPT_BACKOFF_MIN: Duration = Duration::from_millis(10);
@@ -540,13 +543,15 @@ impl RemotingEndpoint {
         stream.set_nodelay(true).map_err(WireError::Io)?;
         #[cfg(feature = "tls")]
         let (stream, peer_certificate) = if let Some(security) = &self.security {
-            let stream = tokio::select! {
-                biased;
-                () = wait_for_shutdown(&mut shutdown) => return Ok(()),
-                () = tokio::time::sleep_until(setup_deadline) => return Err(EndpointError::InboundSetupTimeout),
-                result = tokio_rustls::TlsAcceptor::from(security.server.clone()).accept(stream) => {
-                    result.map_err(|_| WireError::Tls("server handshake failed"))?
-                }
+            let Some(stream) = during_setup(&mut shutdown, setup_deadline, async {
+                TlsAcceptor::from(security.server.clone())
+                    .accept(stream)
+                    .await
+                    .map_err(|_| WireError::Tls("server handshake failed"))
+            })
+            .await?
+            else {
+                return Ok(());
             };
             let certificate = stream
                 .get_ref()
@@ -563,31 +568,34 @@ impl RemotingEndpoint {
         let (stream, peer_certificate) = (EndpointStream::Plain(stream), Option::<Vec<u8>>::None);
         let mut connection =
             FramedConnection::new(stream, FrameCodec::new(self.config.max_frame_size)?);
-        let first_frame = tokio::select! {
-            biased;
-            () = wait_for_shutdown(&mut shutdown) => return Ok(()),
-            () = tokio::time::sleep_until(setup_deadline) => return Err(EndpointError::InboundSetupTimeout),
-            result = connection.read_frame() => result?,
+        let Some(first_frame) =
+            during_setup(&mut shutdown, setup_deadline, connection.read_frame()).await?
+        else {
+            return Ok(());
         };
         if first_frame.kind == FrameKind::BootstrapRequest {
-            return tokio::select! {
-                biased;
-                () = wait_for_shutdown(&mut shutdown) => Ok(()),
-                () = tokio::time::sleep_until(setup_deadline) => Err(EndpointError::InboundSetupTimeout),
-                result = self.accept_bootstrap(connection, peer_certificate.as_deref(), first_frame) => result,
-            };
+            return during_setup(
+                &mut shutdown,
+                setup_deadline,
+                self.accept_bootstrap(connection, peer_certificate.as_deref(), first_frame),
+            )
+            .await
+            .map(|_| ());
         }
-        let (handshake, peer_catalogue) = tokio::select! {
-            biased;
-            () = wait_for_shutdown(&mut shutdown) => return Ok(()),
-            () = tokio::time::sleep_until(setup_deadline) => return Err(EndpointError::InboundSetupTimeout),
-            result = negotiate_inbound_from_frame(
+        let Some((handshake, peer_catalogue)) = during_setup(
+            &mut shutdown,
+            setup_deadline,
+            negotiate_inbound_from_frame(
                 &mut connection,
                 first_frame,
                 &validator,
                 &self.catalogue,
                 self.config.max_protocols_per_peer,
-            ) => result?,
+            ),
+        )
+        .await?
+        else {
+            return Ok(());
         };
         #[cfg(feature = "tls")]
         {
