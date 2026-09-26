@@ -70,7 +70,7 @@ impl RemotingEndpoint {
             let Poll::Ready(result) = Pin::new(task).poll(cx) else {
                 return Poll::Pending;
             };
-            drop(tasks.remove(0));
+            drop(tasks.swap_remove(0));
             Poll::Ready(Some(result))
         })
         .await
