@@ -1,12 +1,9 @@
-use std::{
-    future::{Future, poll_fn},
-    pin::Pin,
-    task::Poll,
-};
+use std::future::{Future, poll_fn};
 
 use crate::failpoints;
 use tokio::{
     sync::watch,
+    task::JoinError,
     time::{Instant, sleep_until},
 };
 
@@ -31,14 +28,10 @@ impl RemotingEndpoint {
                     Ok(completed) => completed,
                     Err(_) => {
                         timed_out = true;
-                        for task in self
-                            .tasks
+                        self.tasks
                             .lock()
                             .expect("endpoint task list poisoned")
-                            .iter()
-                        {
-                            task.abort();
-                        }
+                            .abort_all();
                         continue;
                     }
                 }
@@ -59,19 +52,15 @@ impl RemotingEndpoint {
 
     async fn join_next_shutdown_task(
         &self,
-    ) -> Option<Result<Result<(), EndpointError>, tokio::task::JoinError>> {
-        // Poll in place: cancelling shutdown or returning an earlier task error must not detach
-        // the remaining tasks. The async shutdown lock ensures only one join waiter at a time.
+    ) -> Option<Result<Result<(), EndpointError>, JoinError>> {
+        // Keep the JoinSet owned by the endpoint so cancelling shutdown or returning a task
+        // error leaves the remaining tasks available for a retry. Only hold the synchronous
+        // lock during each poll; the async shutdown lock ensures one join waiter at a time.
         poll_fn(|cx| {
-            let mut tasks = self.tasks.lock().expect("endpoint task list poisoned");
-            let Some(task) = tasks.first_mut() else {
-                return Poll::Ready(None);
-            };
-            let Poll::Ready(result) = Pin::new(task).poll(cx) else {
-                return Poll::Pending;
-            };
-            drop(tasks.swap_remove(0));
-            Poll::Ready(Some(result))
+            self.tasks
+                .lock()
+                .expect("endpoint task list poisoned")
+                .poll_join_next(cx)
         })
         .await
     }

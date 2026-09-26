@@ -9,7 +9,7 @@ use thiserror::Error;
 use tokio::{
     net::{TcpListener, TcpStream},
     sync::{Mutex as AsyncMutex, Semaphore, broadcast, mpsc::Receiver, watch},
-    task::{JoinError, JoinHandle, JoinSet},
+    task::{JoinError, JoinSet},
 };
 #[cfg(feature = "tls")]
 use tokio_rustls::{
@@ -69,7 +69,7 @@ pub struct RemotingEndpoint {
     accept_diagnostics: AcceptDiagnostics,
     shutdown_tx: watch::Sender<bool>,
     disconnect_tx: broadcast::Sender<AssociationId>,
-    tasks: Mutex<Vec<JoinHandle<Result<(), EndpointError>>>>,
+    tasks: Mutex<JoinSet<Result<(), EndpointError>>>,
     shutdown_lock: AsyncMutex<()>,
     #[cfg(feature = "tls")]
     security: Option<EndpointSecurity>,

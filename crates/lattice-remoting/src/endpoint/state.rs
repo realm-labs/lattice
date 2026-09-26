@@ -14,7 +14,10 @@ use crate::{
     messaging::{inbound::InboundDispatch, outbound::OutboundMessaging},
     protocol::ProtocolDescriptor,
 };
-use tokio::sync::{Semaphore, broadcast, watch};
+use tokio::{
+    sync::{Semaphore, broadcast, watch},
+    task::JoinSet,
+};
 
 #[cfg(feature = "tls")]
 use super::EndpointSecurity;
@@ -71,7 +74,7 @@ impl RemotingEndpointBuilder {
             accept_diagnostics: AcceptDiagnostics::default(),
             shutdown_tx,
             disconnect_tx,
-            tasks: Mutex::new(Vec::new()),
+            tasks: Mutex::new(JoinSet::new()),
             shutdown_lock: tokio::sync::Mutex::new(()),
             #[cfg(feature = "tls")]
             security: self.security,
@@ -161,11 +164,24 @@ impl RemotingEndpoint {
     {
         let mut tasks = self.tasks.lock().expect("endpoint task list poisoned");
         self.ensure_running()?;
-        tasks.retain(|task| !task.is_finished());
+        // Reap completed tasks before enforcing the cap. Background failures must not prevent
+        // unrelated tasks from being admitted, but should not disappear without diagnostics.
+        while let Some(result) = tasks.try_join_next() {
+            match result {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    tracing::warn!(error = ?error, "remoting endpoint task failed");
+                }
+                Err(error) if error.is_cancelled() => {}
+                Err(error) => {
+                    tracing::warn!(error = ?error, "remoting endpoint task join failed");
+                }
+            }
+        }
         if tasks.len() >= self.config.required_socket_budget() {
             return Err(EndpointError::TaskLimit);
         }
-        tasks.push(tokio::spawn(future));
+        tasks.spawn(future);
         Ok(())
     }
 }
