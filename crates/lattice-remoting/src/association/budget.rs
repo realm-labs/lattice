@@ -9,6 +9,8 @@ use super::{Association, AssociationError, BulkAdmission, LaneKind};
 
 #[derive(Debug)]
 pub(super) struct OutboundByteBudget {
+    // This counter only accounts for capacity; it does not publish frame data. Relaxed atomic
+    // updates preserve the budget invariant; channels and Notify handle data transfer and wakeups.
     used: AtomicUsize,
     available: Notify,
 }
@@ -39,7 +41,7 @@ impl OutboundByteBudget {
 
     fn try_reserve(&self, bytes: usize, maximum: usize) -> bool {
         self.used
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 let next = current.checked_add(bytes)?;
                 (next <= maximum).then_some(next)
             })
@@ -49,7 +51,7 @@ impl OutboundByteBudget {
     fn release(&self, bytes: usize) {
         let _ = self
             .used
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 current.checked_sub(bytes)
             })
             .expect("outbound byte reservations are released exactly once");
