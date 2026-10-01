@@ -22,26 +22,37 @@ use lattice_actor::{
 };
 
 use crate::{
-    protocol::{ActorProtocolBinding, DispatchError, DispatchMode, DispatchReply, Protocol},
+    protocol::{
+        ActorProtocolBinding, DispatchError, DispatchMode, DispatchReply, Protocol,
+        tell::ProtocolTellDispatch,
+    },
     registry::{ActorCellDiagnostics, ActorDefinition, ActorQuarantineError, ActorRegistry},
 };
 
 #[async_trait]
 trait ErasedActorHost: Send + Sync {
     fn close_business_admission(&self);
+
     fn protocol_id(&self) -> ProtocolId;
+
     fn is_current(&self, target: &ExactActorTarget) -> bool;
+
     fn subscribe_terminated(
         &self,
         target: &ExactActorTarget,
     ) -> Option<ActorTerminationSubscription>;
+
     async fn drain_all(&self) -> Vec<ActorCellDiagnostics>;
+
     async fn force_shutdown_all(&self, reason: &str, ticket: &str) -> Vec<ActorCellDiagnostics>;
+
     fn live_cells(&self) -> Vec<ActorCellDiagnostics>;
+
     async fn retry_stop(
         &self,
         local_ref: LocalActorRef,
     ) -> Option<Result<(), ActorQuarantineError>>;
+
     async fn force_stop(
         &self,
         local_ref: LocalActorRef,
@@ -172,17 +183,15 @@ impl<D: ActorDefinition<Protocol = P>, A: Actor, P: Protocol> ErasedActorHost
             .protocol
             .try_dispatch_tell(&handle, message_id, payload)
         {
-            crate::protocol::tell::ProtocolTellDispatch::Accepted => {
-                ImmediateTellDispatch::Complete(Ok(()))
-            }
-            crate::protocol::tell::ProtocolTellDispatch::Deferred { payload, .. } => {
+            ProtocolTellDispatch::Accepted => ImmediateTellDispatch::Complete(Ok(())),
+            ProtocolTellDispatch::Deferred { payload, .. } => {
                 ImmediateTellDispatch::Deferred(InboundTell {
                     target,
                     message_id,
                     payload,
                 })
             }
-            crate::protocol::tell::ProtocolTellDispatch::Rejected(error) => {
+            ProtocolTellDispatch::Rejected(error) => {
                 ImmediateTellDispatch::Complete(Err(map_dispatch(error)))
             }
         }

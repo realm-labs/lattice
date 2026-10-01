@@ -19,6 +19,7 @@ use tokio::{
 };
 
 use crate::{association::AssociationId, failpoints, messaging::target::ExactActorTarget};
+use watch_control_envelope_wire::Command as WatchCommandWire;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WatchCommand {
@@ -45,7 +46,7 @@ const WATCH_CONTROL_MAGIC: &[u8; 4] = b"LWCH";
 #[derive(Clone, PartialEq, Message)]
 struct WatchControlEnvelopeWire {
     #[prost(oneof = "watch_control_envelope_wire::Command", tags = "2, 3, 4, 5")]
-    command: Option<watch_control_envelope_wire::Command>,
+    command: Option<WatchCommandWire>,
 }
 
 mod watch_control_envelope_wire {
@@ -172,25 +173,23 @@ pub fn decode_watch_command(
 }
 
 fn command_to_wire(command: &WatchCommand) -> WatchControlEnvelopeWire {
-    use watch_control_envelope_wire::Command;
-
     let command = match command {
-        WatchCommand::Watch { watch_id, target } => Command::Watch(WatchWire {
+        WatchCommand::Watch { watch_id, target } => WatchCommandWire::Watch(WatchWire {
             watch_id: Some(watch_id_to_wire(*watch_id)),
             target: Some(target_to_wire(target)),
         }),
-        WatchCommand::WatchAck { watch_id, target } => Command::WatchAck(WatchAckWire {
+        WatchCommand::WatchAck { watch_id, target } => WatchCommandWire::WatchAck(WatchAckWire {
             watch_id: Some(watch_id_to_wire(*watch_id)),
             target: Some(target_to_wire(target)),
         }),
-        WatchCommand::Unwatch { watch_id } => Command::Unwatch(UnwatchWire {
+        WatchCommand::Unwatch { watch_id } => WatchCommandWire::Unwatch(UnwatchWire {
             watch_id: Some(watch_id_to_wire(*watch_id)),
         }),
         WatchCommand::Terminated {
             watch_id,
             target,
             reason,
-        } => Command::Terminated(TerminatedWire {
+        } => WatchCommandWire::Terminated(TerminatedWire {
             watch_id: Some(watch_id_to_wire(*watch_id)),
             target: Some(target_to_wire(target)),
             reason: reason_to_wire(*reason) as i32,
@@ -202,21 +201,19 @@ fn command_to_wire(command: &WatchCommand) -> WatchControlEnvelopeWire {
 }
 
 fn command_from_wire(envelope: WatchControlEnvelopeWire) -> Result<WatchCommand, WatchError> {
-    use watch_control_envelope_wire::Command;
-
     match envelope.command.ok_or(WatchError::InvalidCommand)? {
-        Command::Watch(wire) => Ok(WatchCommand::Watch {
+        WatchCommandWire::Watch(wire) => Ok(WatchCommand::Watch {
             watch_id: watch_id_from_wire(wire.watch_id)?,
             target: target_from_wire(wire.target)?,
         }),
-        Command::WatchAck(wire) => Ok(WatchCommand::WatchAck {
+        WatchCommandWire::WatchAck(wire) => Ok(WatchCommand::WatchAck {
             watch_id: watch_id_from_wire(wire.watch_id)?,
             target: target_from_wire(wire.target)?,
         }),
-        Command::Unwatch(wire) => Ok(WatchCommand::Unwatch {
+        WatchCommandWire::Unwatch(wire) => Ok(WatchCommand::Unwatch {
             watch_id: watch_id_from_wire(wire.watch_id)?,
         }),
-        Command::Terminated(wire) => Ok(WatchCommand::Terminated {
+        WatchCommandWire::Terminated(wire) => Ok(WatchCommand::Terminated {
             watch_id: watch_id_from_wire(wire.watch_id)?,
             target: target_from_wire(wire.target)?,
             reason: reason_from_wire(wire.reason)?,

@@ -1,7 +1,7 @@
 use std::sync::atomic::Ordering;
 
 use super::{Association, AssociationError, BulkAdmission, LaneKind};
-use crate::wire::Frame;
+use crate::{messaging::target_dictionary::MAX_EXACT_TARGET_DICTIONARY_ENTRIES, wire::Frame};
 
 impl Association {
     pub fn try_admit_interactive(&self, frame: Frame) -> Result<(), AssociationError> {
@@ -39,9 +39,7 @@ impl Association {
     pub(crate) fn allocate_exact_target_dictionary_id(&self, stripe: usize) -> Option<u64> {
         let next = self.next_outbound_exact_target_ids.get(stripe)?;
         next.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-            (current
-                < crate::messaging::target_dictionary::MAX_EXACT_TARGET_DICTIONARY_ENTRIES as u64)
-                .then_some(current + 1)
+            (current < MAX_EXACT_TARGET_DICTIONARY_ENTRIES as u64).then_some(current + 1)
         })
         .ok()
         .map(|previous| previous + 1)

@@ -22,6 +22,7 @@
 
 ## Imports and qualified paths
 
+- Keep `use` declarations at module scope. Avoid function- or block-local imports unless required for macro hygiene or conditional compilation.
 - Prefer importing types, traits, and functions in the file's top-level `use` section instead of writing fully qualified paths inside signatures, trait bounds, implementations, or expressions.
 - When imported names conflict, first use an explicit alias such as `use tokio::time::interval as time_interval`. If an alias would be less clear, keep the shortest module-qualified path that resolves the ambiguity.
 - Do not use wildcard imports to shorten paths. Keep imports explicit and grouped by origin.
