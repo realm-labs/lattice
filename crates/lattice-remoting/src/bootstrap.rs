@@ -25,8 +25,8 @@ pub struct BootstrapProbeTarget {
 pub struct BootstrapRequest {
     pub purpose: BootstrapPurpose,
     pub scope: CoordinatorScope,
+    /// Requester identity, whose cluster is also the bootstrap target cluster.
     pub local: NodeIdentity,
-    pub requested_cluster_id: ClusterId,
     pub expected_node_id: Option<String>,
 
     pub nonce: u128,
@@ -36,7 +36,6 @@ impl BootstrapRequest {
     pub fn new(
         scope: CoordinatorScope,
         local: NodeIdentity,
-        requested_cluster_id: ClusterId,
         expected_node_id: Option<String>,
     ) -> Self {
         let nonce = uuid::Uuid::new_v4().as_u128().max(1);
@@ -44,18 +43,15 @@ impl BootstrapRequest {
             purpose: BootstrapPurpose::CoordinatorDiscovery,
             scope,
             local,
-            requested_cluster_id,
             expected_node_id,
             nonce,
         }
     }
 
     pub fn direct_peer(local: NodeIdentity, expected: &NodeIdentity) -> Self {
-        let requested_cluster_id = local.cluster_id.clone();
         let mut request = Self::new(
             CoordinatorScope::Cluster,
             local,
-            requested_cluster_id,
             Some(expected.node_id.clone()),
         );
         request.purpose = BootstrapPurpose::DirectPeer;
@@ -78,19 +74,17 @@ impl BootstrapRequest {
         Self::try_from(wire)
     }
 
-    pub fn rejection(&self, local: &NodeIdentity) -> Option<BootstrapRejectionCode> {
+    pub fn rejection(&self, receiver: &NodeIdentity) -> Option<BootstrapRejectionCode> {
         if self.nonce == 0 || validate_identity(&self.local).is_err() {
             return Some(BootstrapRejectionCode::InvalidIdentity);
         }
-        if self.requested_cluster_id != local.cluster_id
-            || self.local.cluster_id != self.requested_cluster_id
-        {
+        if self.local.cluster_id != receiver.cluster_id {
             return Some(BootstrapRejectionCode::ClusterMismatch);
         }
         if self
             .expected_node_id
             .as_ref()
-            .is_some_and(|expected| expected != &local.node_id)
+            .is_some_and(|expected| expected != &receiver.node_id)
         {
             return Some(BootstrapRejectionCode::ExpectedNodeMismatch);
         }
@@ -272,8 +266,7 @@ pub enum BootstrapError {
 
 #[derive(Clone, PartialEq, Message)]
 struct BootstrapRequestWire {
-    #[prost(string, tag = "4")]
-    requested_cluster_id: String,
+    // Tag 4 is retired; the cluster ID is carried by the requester identity.
     #[prost(message, optional, tag = "5")]
     local: Option<NodeIdentityWire>,
     #[prost(string, optional, tag = "6")]
@@ -348,7 +341,6 @@ enum BootstrapResultKind {
 impl From<&BootstrapRequest> for BootstrapRequestWire {
     fn from(value: &BootstrapRequest) -> Self {
         Self {
-            requested_cluster_id: value.requested_cluster_id.as_str().to_string(),
             local: Some(NodeIdentityWire::from(&value.local)),
             expected_node_id: value.expected_node_id.clone(),
             nonce: value.nonce.to_be_bytes().to_vec(),
@@ -371,8 +363,6 @@ impl TryFrom<BootstrapRequestWire> for BootstrapRequest {
                 .local
                 .ok_or(BootstrapError::InvalidIdentity)?
                 .try_into()?,
-            requested_cluster_id: ClusterId::new(value.requested_cluster_id)
-                .map_err(|_| BootstrapError::InvalidIdentity)?,
             expected_node_id: value.expected_node_id,
             nonce: parse_u128(&value.nonce)?,
         })
@@ -571,7 +561,7 @@ fn validate_remote(
     remote: &NodeIdentity,
 ) -> Result<(), BootstrapError> {
     validate_identity(remote)?;
-    if remote.cluster_id != request.requested_cluster_id
+    if remote.cluster_id != request.local.cluster_id
         || request
             .expected_node_id
             .as_ref()
@@ -587,7 +577,7 @@ fn validate_leader(
     leader: &BootstrapLeader,
 ) -> Result<(), BootstrapError> {
     validate_identity(&leader.identity)?;
-    if leader.identity.cluster_id != request.requested_cluster_id
+    if leader.identity.cluster_id != request.local.cluster_id
         || leader.scope != request.scope
         || leader.term == 0
     {
@@ -656,10 +646,10 @@ mod tests {
         let request = BootstrapRequest::new(
             CoordinatorScope::Cluster,
             identity("client", 1, 7447),
-            ClusterId::new("test").unwrap(),
             Some("server".to_string()),
         );
-        let request = BootstrapRequest::from_frame(&request.to_frame()).unwrap();
+        let decoded_request = BootstrapRequest::from_frame(&request.to_frame()).unwrap();
+        assert_eq!(decoded_request, request);
         let response = BootstrapResponse::new(
             request.nonce,
             BootstrapResult::Identity {
@@ -678,7 +668,6 @@ mod tests {
         let request = BootstrapRequest::new(
             CoordinatorScope::Cluster,
             identity("client", 1, 7447),
-            ClusterId::new("test").unwrap(),
             Some("expected".to_string()),
         );
         let response = BootstrapResponse::new(
@@ -699,12 +688,45 @@ mod tests {
     }
 
     #[test]
+    fn response_clusters_must_match_the_requester_identity() {
+        let request = BootstrapRequest::new(
+            CoordinatorScope::Cluster,
+            identity("client", 1, 7447),
+            Some("server".to_owned()),
+        );
+        let request = BootstrapRequest::from_frame(&request.to_frame()).unwrap();
+        let mut foreign = identity("server", 2, 7448);
+        foreign.cluster_id = ClusterId::new("other").unwrap();
+
+        for result in [
+            BootstrapResult::Identity {
+                remote: foreign.clone(),
+                leader: None,
+            },
+            BootstrapResult::Redirect {
+                remote: identity("server", 2, 7448),
+                leader: BootstrapLeader {
+                    scope: CoordinatorScope::Cluster,
+                    identity: foreign,
+                    term: 1,
+                },
+            },
+        ] {
+            let response = BootstrapResponse::new(request.nonce, result);
+            let response = BootstrapResponse::from_frame(&response.to_frame()).unwrap();
+            assert!(matches!(
+                response.validate_for(&request),
+                Err(BootstrapError::IdentityMismatch)
+            ));
+        }
+    }
+
+    #[test]
     fn terminal_result_round_trips_without_a_leader_and_rejects_nonterminal_payload() {
         use lattice_model::run::{ControlOperationId, RunCompletion, RunEpoch};
         let request = BootstrapRequest::new(
             CoordinatorScope::Cluster,
             identity("client", 1, 7447),
-            ClusterId::new("test").unwrap(),
             Some("server".to_owned()),
         );
         let closed = ClusterLifecycle {

@@ -54,12 +54,8 @@ impl RemotingEndpoint {
         &self,
         target: BootstrapProbeTarget,
     ) -> Result<BootstrapResponse, EndpointError> {
-        let request = BootstrapRequest::new(
-            target.scope,
-            self.local.clone(),
-            self.local.cluster_id.clone(),
-            target.expected_node_id,
-        );
+        let request =
+            BootstrapRequest::new(target.scope, self.local.clone(), target.expected_node_id);
         self.probe_request_inner(target.address, target.tls_server_name, request)
             .await
     }

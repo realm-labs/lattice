@@ -929,10 +929,9 @@ async fn tls_association_exposes_verified_control_identity_in_both_directions() 
                 &lower_identity.cluster_id,
                 &lower_identity.address,
                 lower_identity.incarnation,
-            ) {
-                if inbound.authenticated_control_peer() == Some(lower_identity.clone()) {
-                    break;
-                }
+            ) && inbound.authenticated_control_peer() == Some(lower_identity.clone())
+            {
+                break;
             }
             tokio::task::yield_now().await;
         }

@@ -446,11 +446,12 @@ impl RemotingEndpoint {
             return Err(error.into());
         }
         #[cfg(feature = "tls")]
-        if lane == LaneKind::Control && self.security.is_some() {
-            if let Err(error) = association.record_authenticated_control_peer(nonce, peer.clone()) {
-                association.detach(lane, nonce);
-                return Err(error.into());
-            }
+        if lane == LaneKind::Control
+            && self.security.is_some()
+            && let Err(error) = association.record_authenticated_control_peer(nonce, peer.clone())
+        {
+            association.detach(lane, nonce);
+            return Err(error.into());
         }
         Ok((connection.into_inner(), nonce))
     }
@@ -636,15 +637,16 @@ impl RemotingEndpoint {
                 error => EndpointError::Association(error),
             })?;
         #[cfg(feature = "tls")]
-        if handshake.lane == LaneKind::Control && peer_certificate.is_some() {
-            if let Err(error) = association.record_authenticated_control_peer(
+        if handshake.lane == LaneKind::Control
+            && peer_certificate.is_some()
+            && let Err(error) = association.record_authenticated_control_peer(
                 handshake.connection_nonce,
                 handshake.source.clone(),
-            ) {
-                association.detach(handshake.lane, handshake.connection_nonce);
-                association.return_lane_receiver(handshake.lane, receiver)?;
-                return Err(error.into());
-            }
+            )
+        {
+            association.detach(handshake.lane, handshake.connection_nonce);
+            association.return_lane_receiver(handshake.lane, receiver)?;
+            return Err(error.into());
         }
         let result = self
             .run_lane_connection(
