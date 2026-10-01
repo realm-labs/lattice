@@ -14,6 +14,8 @@ pub enum RemoteFailureCode {
     ProtocolMismatch = 9,
     Internal = 10,
     ActorPanicked = 11,
+    AdmissionClosed = 12,
+    LogicalRoutingUnavailable = 13,
 }
 
 impl TryFrom<u32> for RemoteFailureCode {
@@ -32,6 +34,8 @@ impl TryFrom<u32> for RemoteFailureCode {
             9 => Ok(Self::ProtocolMismatch),
             10 => Ok(Self::Internal),
             11 => Ok(Self::ActorPanicked),
+            12 => Ok(Self::AdmissionClosed),
+            13 => Ok(Self::LogicalRoutingUnavailable),
             _ => Err(()),
         }
     }
@@ -99,6 +103,12 @@ pub enum RemoteMessageError {
     DeadlineExceeded,
     #[error("message is unauthorized")]
     Unauthorized,
+    /// The node's lifecycle gate currently refuses new messages in this scope.
+    #[error("node is not accepting messages in this admission scope")]
+    AdmissionClosed,
+    /// The node has no router configured for Entity or Singleton messaging.
+    #[error("logical routing is not configured on this node")]
+    LogicalRoutingUnavailable,
     #[error("remote handler failed")]
     HandlerFailed,
     #[error("remote actor panicked")]

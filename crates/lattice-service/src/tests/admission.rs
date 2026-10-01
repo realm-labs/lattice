@@ -12,6 +12,7 @@ use lattice_actor_distributed::registry::ActorDefinition;
 use std::{collections::BTreeSet, sync::Arc, time::Duration};
 
 use lattice_actor_distributed::ActorId;
+use lattice_actor_distributed::recipient::RecipientError;
 use lattice_actor_distributed::{
     registry::{ActorAddressConfig, ActorRegistry, ActorRegistryConfig},
     traits::StopReason,
@@ -24,6 +25,7 @@ use lattice_model::{
     cluster::{ClusterId, EntityType, NodeEndpoint, NodeIncarnation},
 };
 use lattice_remoting::handshake::NodeIdentity;
+use lattice_remoting::messaging::error::{AskError, RemoteMessageError};
 
 use super::support::*;
 use crate::{
@@ -230,11 +232,15 @@ async fn membership_loss_sheds_the_edge_while_local_and_exact_traffic_keep_servi
     assert!(member.recovering_membership());
     assert!(!member.external_ingress().is_open());
     assert!(
-        member
-            .external_ingress()
-            .ask(&target, Ping(100), Duration::from_secs(1))
-            .await
-            .is_err(),
+        matches!(
+            member
+                .external_ingress()
+                .ask(&target, Ping(100), Duration::from_secs(1))
+                .await,
+            Err(RecipientError::Ask(AskError::Protocol(
+                RemoteMessageError::AdmissionClosed
+            )))
+        ),
         "external ingress must refuse while the node has no membership session"
     );
 
@@ -479,11 +485,15 @@ async fn cordon_closes_every_admission_scope_including_local_dispatch() {
     );
     assert!(!admission.serves_cluster_traffic());
     assert!(
-        service
-            .actor_system()
-            .ask(&target, Ping(2), Duration::from_secs(2))
-            .await
-            .is_err(),
+        matches!(
+            service
+                .actor_system()
+                .ask(&target, Ping(2), Duration::from_secs(2))
+                .await,
+            Err(RecipientError::Ask(AskError::Protocol(
+                RemoteMessageError::AdmissionClosed
+            )))
+        ),
         "draining must refuse the local dispatch that a membership loss preserves"
     );
     assert!(!service.external_ingress().is_open());
@@ -532,13 +542,15 @@ async fn force_stop_closes_every_admission_scope() {
     assert!(!admission.external);
     assert!(!admission.exact);
     assert!(!admission.logical);
-    assert!(
+    assert!(matches!(
         service
             .actor_system()
             .ask(&target, Ping(1), Duration::from_secs(1))
-            .await
-            .is_err()
-    );
+            .await,
+        Err(RecipientError::Ask(AskError::Protocol(
+            RemoteMessageError::AdmissionClosed
+        )))
+    ));
 }
 
 #[derive(Debug)]

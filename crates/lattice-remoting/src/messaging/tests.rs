@@ -21,6 +21,31 @@ fn actor_panicked_maps_to_the_dedicated_remote_failure_code() {
     );
 }
 
+#[test]
+fn admission_and_routing_failures_preserve_their_reason_on_the_wire() {
+    for (error, code, number) in [
+        (
+            RemoteMessageError::AdmissionClosed,
+            RemoteFailureCode::AdmissionClosed,
+            12,
+        ),
+        (
+            RemoteMessageError::LogicalRoutingUnavailable,
+            RemoteFailureCode::LogicalRoutingUnavailable,
+            13,
+        ),
+    ] {
+        assert_eq!(failure_code(&error), code);
+        assert_eq!(code as u32, number);
+        let failure = RemoteFailure {
+            correlation_id: CorrelationId::new(9, 1).unwrap(),
+            code,
+            safe_detail: None,
+        };
+        assert_eq!(decode_failure(&failure_frame(&failure)).unwrap(), failure);
+    }
+}
+
 fn active_association(
     protocol_id: ProtocolId,
     fingerprint: ProtocolFingerprint,

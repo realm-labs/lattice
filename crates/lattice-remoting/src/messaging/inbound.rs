@@ -94,6 +94,10 @@ pub(crate) fn failure_code(error: &RemoteMessageError) -> RemoteFailureCode {
         RemoteMessageError::InvalidPayload => RemoteFailureCode::DecodeFailed,
         RemoteMessageError::DeadlineExceeded => RemoteFailureCode::DeadlineExceeded,
         RemoteMessageError::Unauthorized => RemoteFailureCode::Unauthorized,
+        RemoteMessageError::AdmissionClosed => RemoteFailureCode::AdmissionClosed,
+        RemoteMessageError::LogicalRoutingUnavailable => {
+            RemoteFailureCode::LogicalRoutingUnavailable
+        }
         RemoteMessageError::ActorPanicked => RemoteFailureCode::ActorPanicked,
         RemoteMessageError::ShardUnavailable
         | RemoteMessageError::ZeroPendingLimit

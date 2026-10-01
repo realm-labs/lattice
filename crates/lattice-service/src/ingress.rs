@@ -35,7 +35,7 @@ pub struct ExternalAdmissionClosed;
 
 impl From<ExternalAdmissionClosed> for RecipientError {
     fn from(_: ExternalAdmissionClosed) -> Self {
-        RecipientError::Tell(TellError::Remote(RemoteMessageError::Unauthorized))
+        RecipientError::Tell(TellError::Remote(RemoteMessageError::AdmissionClosed))
     }
 }
 
@@ -101,7 +101,7 @@ impl ExternalIngress {
     {
         if !self.is_open() {
             return Err(RecipientError::Ask(AskError::Protocol(
-                RemoteMessageError::Unauthorized,
+                RemoteMessageError::AdmissionClosed,
             )));
         }
         self.actor_system.ask(target, request, timeout).await
