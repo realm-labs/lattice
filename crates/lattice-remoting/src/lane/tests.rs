@@ -1,21 +1,33 @@
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
+
 use async_trait::async_trait;
+use bytes::Bytes;
 use lattice_model::actor::{ActivationId, ActorAddress, ActorPath, ProtocolId};
 use lattice_model::cluster::{ClusterId, NodeEndpoint, NodeIncarnation};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::{
+    net::{TcpListener, TcpStream},
+    sync::watch,
+    task::JoinSet,
+};
 
-use super::*;
+use super::{BidirectionalLane, BidirectionalLaneConfig, LaneError, LaneExit, LaneServices};
 use crate::{
-    association::{AssociationKey, LaneAttachment},
+    association::{Association, AssociationKey, LaneAttachment, LaneKind},
     config::RemotingConfig,
     control::RejectControlDispatch,
     messaging::{
         codec::reply_frame,
-        error::RemoteMessageError,
-        outbound::OutboundMessage,
+        error::{AskError, RemoteMessageError},
+        inbound::InboundDispatch,
+        outbound::{OutboundMessage, OutboundMessaging},
         target::{CorrelationId, ExactActorTarget},
     },
     protocol::{ProtocolDescriptor, ProtocolFingerprint},
     transport::FramedConnection,
+    wire::{Frame, FrameCodec, FrameKind},
 };
 
 struct EchoDispatch {

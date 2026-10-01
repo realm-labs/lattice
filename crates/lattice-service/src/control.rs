@@ -4,8 +4,11 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use lattice_actor::handle::ActorTerminationSubscription;
 use lattice_actor_distributed::host::ProtocolHostRegistry;
+use lattice_model::actor::WatchId;
 use lattice_remoting::{
-    association::{Association, AssociationError, AssociationKey, AssociationManager},
+    association::{
+        Association, AssociationError, AssociationId, AssociationKey, AssociationManager,
+    },
     control::{
         CommandId, ControlDispatch, ControlDispatchError, ControlGap, ControlRejectReason,
         ControlRetryReason, ControlStreamId, ReliableControlError,
@@ -86,15 +89,15 @@ impl ServiceControlDispatch {
 
     fn supervise_termination(
         &self,
-        association_id: lattice_remoting::association::AssociationId,
-        watch_id: lattice_model::actor::WatchId,
+        association_id: AssociationId,
+        watch_id: WatchId,
         target: ExactActorTarget,
         mut terminated: ActorTerminationSubscription,
     ) -> Result<(), ControlDispatchError> {
         let watches = self.watches.clone();
         let associations = self.associations.clone();
         let maximum_payload = self.maximum_payload;
-        let task = match self.supervisor.spawn_abortable(async move {
+        let termination_task = async move {
             let Ok(terminated) = terminated.recv().await else {
                 return;
             };
@@ -108,16 +111,12 @@ impl ServiceControlDispatch {
                     target,
                     reason,
                 } = &command
-                    && watches
-                        .lock()
-                        .expect("watch registry poisoned")
-                        .contains_desired(*watch_id)
                 {
-                    watches
-                        .lock()
-                        .expect("watch registry poisoned")
-                        .receive_terminated(*watch_id, target, *reason);
-                    continue;
+                    let mut registry = watches.lock().expect("watch registry poisoned");
+                    if registry.contains_desired(*watch_id) {
+                        registry.receive_terminated(*watch_id, target, *reason);
+                        continue;
+                    }
                 }
                 let Some(association) = associations.get_by_id(association_id) else {
                     continue;
@@ -129,7 +128,8 @@ impl ServiceControlDispatch {
                     .admit_control_command_in_wait_configured(ControlStreamId::WATCH, payload)
                     .await;
             }
-        }) {
+        };
+        let task = match self.supervisor.spawn_abortable(termination_task) {
             Ok(task) => task,
             Err(_) => {
                 self.watches

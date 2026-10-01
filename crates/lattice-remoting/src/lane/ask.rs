@@ -18,6 +18,16 @@ pub(super) enum InboundAskWork {
     Singleton(InboundSingletonAsk),
 }
 
+impl InboundAskWork {
+    pub(super) fn correlation_id(&self) -> CorrelationId {
+        match self {
+            Self::Exact(ask) => ask.correlation_id,
+            Self::Entity(ask) => ask.correlation_id,
+            Self::Singleton(ask) => ask.correlation_id,
+        }
+    }
+}
+
 pub(super) async fn dispatch_inbound_ask(
     dispatch: Arc<dyn InboundDispatch>,
     work: InboundAskWork,

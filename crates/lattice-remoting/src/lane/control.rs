@@ -1,5 +1,3 @@
-use std::sync::Arc;
-
 use crate::failpoints;
 
 use super::LaneError;
@@ -12,17 +10,11 @@ use crate::{
     wire::{Frame, FrameKind},
 };
 
-pub(super) struct ControlWorkerGuard(pub(super) tokio::task::JoinHandle<()>);
-
-impl Drop for ControlWorkerGuard {
-    fn drop(&mut self) {
-        self.0.abort();
-    }
-}
+pub(super) mod worker;
 
 pub(super) async fn apply_control_frame(
-    association: Arc<Association>,
-    control_dispatch: Arc<dyn ControlDispatch>,
+    association: &Association,
+    control_dispatch: &dyn ControlDispatch,
     frame: Frame,
 ) -> Result<Option<Frame>, LaneError> {
     match frame.kind {
@@ -91,11 +83,11 @@ pub(super) async fn apply_control_frame(
 }
 
 pub(super) async fn apply_ephemeral_control_frame(
-    association: Arc<Association>,
-    control_dispatch: Arc<dyn ControlDispatch>,
+    association: &Association,
+    control_dispatch: &dyn ControlDispatch,
     frame: Frame,
 ) -> Result<(), LaneError> {
-    match apply_control_frame(association.clone(), control_dispatch, frame).await {
+    match apply_control_frame(association, control_dispatch, frame).await {
         Ok(_) => Ok(()),
         Err(error @ LaneError::ControlDispatch(ControlDispatchError::RetryLater(_)))
         | Err(error @ LaneError::ControlDispatch(ControlDispatchError::Rejected(_))) => {
