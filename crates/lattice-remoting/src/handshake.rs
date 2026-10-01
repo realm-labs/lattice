@@ -4,6 +4,7 @@ use prost::Message;
 use thiserror::Error;
 
 use crate::association::{AssociationId, LaneKind};
+use crate::config::{ABSOLUTE_MAX_BULK_STRIPES, MIN_BULK_STRIPES};
 use crate::wire::{Frame, FrameKind, WireError};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -111,7 +112,9 @@ impl HandshakeValidator {
         bulk_stripes: usize,
     ) -> Result<Self, HandshakeError> {
         validate_node(&local)?;
-        if maximum_frame_size == 0 || !(1..=4).contains(&bulk_stripes) {
+        if maximum_frame_size == 0
+            || !(MIN_BULK_STRIPES..=ABSOLUTE_MAX_BULK_STRIPES).contains(&bulk_stripes)
+        {
             return Err(HandshakeError::InvalidLimits);
         }
         Ok(Self {

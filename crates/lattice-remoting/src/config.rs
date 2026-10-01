@@ -6,6 +6,13 @@ pub const ABSOLUTE_MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
 pub const ABSOLUTE_MAX_READY_WRITE_BATCH_FRAMES: usize = 512;
 pub const ABSOLUTE_MAX_READY_READ_BATCH_FRAMES: usize = 128;
 
+/// Minimum number of Bulk lanes in an association's configured lane group.
+pub const MIN_BULK_STRIPES: usize = 1;
+/// Maximum number of Bulk lanes supported per association.
+pub const ABSOLUTE_MAX_BULK_STRIPES: usize = 4;
+/// Number of Bulk lanes used by the default remoting configuration.
+pub const DEFAULT_BULK_STRIPES: usize = 1;
+
 /// One Control connection and one Interactive connection per association.
 const FIXED_CONNECTIONS_PER_ASSOCIATION: usize = 2;
 
@@ -49,7 +56,7 @@ impl Default for RemotingConfig {
     fn default() -> Self {
         Self {
             max_associations: 256,
-            bulk_stripes: 1,
+            bulk_stripes: DEFAULT_BULK_STRIPES,
             max_frame_size: 256 * 1024,
             control_queue_frames: 1024,
             interactive_queue_frames: 4096,
@@ -137,7 +144,7 @@ impl RemotingConfig {
                 return Err(RemotingConfigError::Zero { name });
             }
         }
-        if !(1..=4).contains(&self.bulk_stripes) {
+        if !(MIN_BULK_STRIPES..=ABSOLUTE_MAX_BULK_STRIPES).contains(&self.bulk_stripes) {
             return Err(RemotingConfigError::BulkStripeCount {
                 actual: self.bulk_stripes,
             });
@@ -235,7 +242,11 @@ pub enum RemotingConfigError {
     Zero { name: &'static str },
     #[error("remoting duration {name} must be nonzero")]
     ZeroDuration { name: &'static str },
-    #[error("bulk stripe count must be in 1..=4, got {actual}")]
+    #[error(
+        "bulk stripe count must be in {minimum}..={maximum}, got {actual}",
+        minimum = MIN_BULK_STRIPES,
+        maximum = ABSOLUTE_MAX_BULK_STRIPES
+    )]
     BulkStripeCount { actual: usize },
     #[error("frame size {actual} exceeds absolute maximum {maximum}")]
     FrameSize { actual: usize, maximum: usize },

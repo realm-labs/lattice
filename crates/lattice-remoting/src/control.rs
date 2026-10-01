@@ -31,6 +31,8 @@ pub struct ControlStreamId(u128);
 impl ControlStreamId {
     pub const DEFAULT: Self = Self(1);
     pub const WATCH: Self = Self(2);
+    /// The reserved stream for cluster membership control commands.
+    pub const CLUSTER: Self = Self(3);
 
     pub const fn new(value: u128) -> Option<Self> {
         if value == 0 { None } else { Some(Self(value)) }
@@ -240,10 +242,6 @@ pub enum ControlDispatchError {
 }
 
 impl ControlDispatchError {
-    pub const fn retry_later(reason: ControlRetryReason) -> Self {
-        Self::RetryLater(reason)
-    }
-
     pub const fn consumer_closed() -> Self {
         Self::Fatal(ControlFatalReason::ConsumerClosed)
     }

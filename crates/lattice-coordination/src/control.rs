@@ -38,9 +38,7 @@ pub const DEFAULT_MAX_CONTROL_PAYLOAD: usize = 256 * 1024;
 
 pub fn control_stream_id(scope: &CoordinatorScope) -> ControlStreamId {
     match scope {
-        CoordinatorScope::Cluster => {
-            ControlStreamId::new(3).expect("membership control stream ID is nonzero")
-        }
+        CoordinatorScope::Cluster => ControlStreamId::CLUSTER,
         CoordinatorScope::Group(group) => {
             let mut canonical = b"lattice-placement-control-stream-v1\0".to_vec();
             canonical.extend_from_slice(group.as_str().as_bytes());
@@ -1195,7 +1193,7 @@ mod tests {
             ActorGroupId::new("player").unwrap(),
         ));
 
-        assert_eq!(membership, ControlStreamId::new(3).unwrap());
+        assert_eq!(membership, ControlStreamId::CLUSTER);
         assert_eq!(
             world,
             control_stream_id(&CoordinatorScope::Group(
