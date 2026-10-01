@@ -59,7 +59,7 @@ impl RemotingEndpointBuilder {
         if self.catalogue.len() > self.config.max_protocols_per_peer {
             return Err(EndpointError::ProtocolLimit);
         }
-        let connection_limit = self.config.required_socket_budget().saturating_sub(1);
+        let connection_limit = self.config.connection_capacity();
         let (shutdown_tx, _) = watch::channel(false);
         let (disconnect_tx, _) = broadcast::channel(self.config.max_associations);
         Ok(RemotingEndpoint {
@@ -111,8 +111,7 @@ impl RemotingEndpoint {
 
     pub fn open_connection_count(&self) -> usize {
         self.config
-            .required_socket_budget()
-            .saturating_sub(1)
+            .connection_capacity()
             .saturating_sub(self.connections.available_permits())
     }
 
@@ -158,6 +157,12 @@ impl RemotingEndpoint {
         }
     }
 
+    pub(super) fn task_limit(&self) -> usize {
+        // Allow one supervisor per configured connection and one listener accept loop.
+        // Inbound connection tasks are owned by the accept loop's separate JoinSet.
+        self.config.connection_capacity().saturating_add(1)
+    }
+
     pub(super) fn spawn<F>(self: &Arc<Self>, future: F) -> Result<(), EndpointError>
     where
         F: Future<Output = Result<(), EndpointError>> + Send + 'static,
@@ -178,7 +183,7 @@ impl RemotingEndpoint {
                 }
             }
         }
-        if tasks.len() >= self.config.required_socket_budget() {
+        if tasks.len() >= self.task_limit() {
             return Err(EndpointError::TaskLimit);
         }
         tasks.spawn(future);

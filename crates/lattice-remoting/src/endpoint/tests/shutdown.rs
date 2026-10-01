@@ -37,7 +37,7 @@ fn shutdown_endpoint(timeout: Duration) -> Arc<RemotingEndpoint> {
 #[tokio::test]
 async fn spawning_reaps_completed_tasks_before_enforcing_limit() {
     let endpoint = shutdown_endpoint(Duration::from_secs(1));
-    let limit = endpoint.config.required_socket_budget();
+    let limit = endpoint.task_limit();
     // Retain abort handles to wait for completion without consuming the JoinSet entries.
     let completed: Vec<_> = {
         let mut tasks = endpoint.tasks.lock().unwrap();
@@ -68,7 +68,7 @@ async fn spawning_reaps_completed_tasks_before_enforcing_limit() {
 #[tokio::test]
 async fn shutdown_joins_all_tasks_at_the_cap_without_aborting_them() {
     let endpoint = shutdown_endpoint(Duration::from_secs(1));
-    let limit = endpoint.config.required_socket_budget();
+    let limit = endpoint.task_limit();
     let mut completions = Vec::new();
     for _ in 0..limit {
         let mut shutdown = endpoint.shutdown_tx.subscribe();

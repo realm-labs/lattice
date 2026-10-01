@@ -6,6 +6,9 @@ pub const ABSOLUTE_MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
 pub const ABSOLUTE_MAX_READY_WRITE_BATCH_FRAMES: usize = 512;
 pub const ABSOLUTE_MAX_READY_READ_BATCH_FRAMES: usize = 128;
 
+/// One Control connection and one Interactive connection per association.
+const FIXED_CONNECTIONS_PER_ASSOCIATION: usize = 2;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemotingConfig {
     pub max_associations: usize,
@@ -198,13 +201,21 @@ impl RemotingConfig {
     }
 
     pub fn physical_connections_per_association(&self) -> usize {
-        2 + self.bulk_stripes
+        FIXED_CONNECTIONS_PER_ASSOCIATION + self.bulk_stripes
     }
 
-    pub fn required_socket_budget(&self) -> usize {
+    /// Maximum concurrent connections admitted by the endpoint's semaphore.
+    pub fn connection_capacity(&self) -> usize {
         self.max_associations
             .saturating_mul(self.physical_connections_per_association())
-            .saturating_add(1)
+    }
+
+    /// Socket count for full connection capacity plus one TCP listener.
+    ///
+    /// This reports resource requirements; admission is enforced separately using
+    /// [`Self::connection_capacity`].
+    pub fn required_socket_budget(&self) -> usize {
+        self.connection_capacity().saturating_add(1)
     }
 
     /// The longest silence a healthy peer may produce before its own control lane fails.
@@ -249,6 +260,7 @@ mod tests {
         let config = RemotingConfig::default();
         config.validate().unwrap();
         assert_eq!(config.physical_connections_per_association(), 3);
+        assert_eq!(config.connection_capacity(), 768);
         assert_eq!(config.required_socket_budget(), 769);
     }
 }

@@ -114,7 +114,7 @@ async fn silent_inbound_connections_expire_and_release_the_connection_cap() {
     })
     .await;
     let address = ("127.0.0.1", server.local.address.port());
-    let limit = server.config.required_socket_budget() - 1;
+    let limit = server.config.connection_capacity();
     let mut sockets = Vec::new();
     for _ in 0..limit {
         sockets.push(TcpStream::connect(address).await.unwrap());

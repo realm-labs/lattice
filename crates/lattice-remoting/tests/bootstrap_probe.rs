@@ -691,7 +691,7 @@ async fn stalled_tls_handshakes_release_capacity_before_a_legitimate_probe() {
         establishing_timeout: Duration::from_millis(150),
         ..test_config()
     };
-    let capacity = config.required_socket_budget() - 1;
+    let capacity = config.connection_capacity();
     let (server, _) =
         endpoint_with_security_config(server_identity.clone(), server_security, config);
     let (client, _) = endpoint_with_security(client_identity, client_security);

@@ -348,7 +348,7 @@ async fn accept_loop_sheds_connections_at_the_cap_and_keeps_accepting() {
         shutdown_timeout: Duration::from_secs(2),
         ..RemotingConfig::default()
     };
-    let limit = config.required_socket_budget() - 1;
+    let limit = config.connection_capacity();
     let server_identity = NodeIdentity {
         cluster_id: ClusterId::new("accept-cap-test").unwrap(),
         node_id: "server".to_owned(),
