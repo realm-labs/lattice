@@ -58,21 +58,6 @@ impl Association {
         }
     }
 
-    pub(crate) fn lane_receiver_available(&self, lane: LaneKind) -> bool {
-        let slots = self
-            .receivers
-            .lock()
-            .expect("association receivers poisoned");
-        match lane {
-            LaneKind::Control => slots.control.is_some(),
-            LaneKind::Interactive => slots.interactive.is_some(),
-            LaneKind::Bulk(index) => slots
-                .bulk
-                .get(usize::from(index))
-                .is_some_and(Option::is_some),
-        }
-    }
-
     pub fn return_lane_receiver(
         &self,
         lane: LaneKind,
@@ -167,38 +152,6 @@ impl Association {
             self.state_changed.notify_waiters();
         }
         Ok((decision, activated))
-    }
-
-    /// Attaches a lane to the connection that owns its queue receiver.
-    ///
-    /// Attaching and taking the receiver must not be separable: a connection that attaches
-    /// without going on to run the lane leaves an entry in the lane map that only its own
-    /// nonce could ever remove, which permanently pins the association as live. Claiming
-    /// the receiver first means every attachment has a running lane behind it, and every
-    /// failure after the attachment undoes it.
-    pub(crate) fn attach_owned_lane(
-        &self,
-        attachment: LaneAttachment,
-    ) -> Result<mpsc::Receiver<Frame>, AssociationError> {
-        if matches!(
-            self.state(),
-            AssociationState::Closing | AssociationState::Closed
-        ) {
-            return Err(AssociationError::Closed);
-        }
-        let lane = attachment.lane;
-        let connection_nonce = attachment.connection_nonce;
-        let receiver = self
-            .take_lane_receiver(lane)
-            .ok_or(AssociationError::LaneReceiverConflict)?;
-        match self.attach_and_replay(attachment) {
-            Ok(_) => Ok(receiver),
-            Err(error) => {
-                self.detach(lane, connection_nonce);
-                let _ = self.return_lane_receiver(lane, receiver);
-                Err(error)
-            }
-        }
     }
 
     pub(crate) fn attach_and_replay(

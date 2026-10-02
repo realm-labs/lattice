@@ -2366,6 +2366,7 @@ dependencies = [
  "blake3",
  "bytes",
  "futures-util",
+ "lattice-actor",
  "lattice-failpoint",
  "lattice-model",
  "prost",

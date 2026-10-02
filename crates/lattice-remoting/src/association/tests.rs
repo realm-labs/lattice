@@ -547,46 +547,13 @@ fn an_inbound_generation_cannot_take_over_an_association_the_peer_keeps_proving(
     assert_eq!(manager.get(&key()).unwrap().id(), live_id);
 }
 
-/// A duplicate connection that loses the lane must not leave an attachment behind: only
-/// its own nonce could ever detach it, so the association would stay live forever and
-/// fence every later rejoin.
-#[test]
-fn a_lane_attachment_is_owned_by_the_connection_that_holds_its_receiver() {
-    let association = Association::new(key(), RemotingConfig::default()).unwrap();
-    let running = association
-        .attach_owned_lane(LaneAttachment {
-            association_id: association.id(),
-            key: key(),
-            lane: LaneKind::Control,
-            connection_nonce: 20,
-        })
-        .unwrap();
-
-    assert!(matches!(
-        association.attach_owned_lane(LaneAttachment {
-            association_id: association.id(),
-            key: key(),
-            lane: LaneKind::Control,
-            connection_nonce: 10,
-        }),
-        Err(AssociationError::LaneReceiverConflict)
-    ));
-
-    association.detach(LaneKind::Control, 20);
-    association
-        .return_lane_receiver(LaneKind::Control, running)
-        .unwrap();
-    assert_eq!(association.attached_lane_count(), 0);
-    assert!(!association.has_live_connection());
-}
-
 #[test]
 fn a_rejected_attachment_does_not_leave_the_lane_marked_attached() {
     let association = Association::new(key(), RemotingConfig::default()).unwrap();
     association.begin_close();
 
     assert!(matches!(
-        association.attach_owned_lane(LaneAttachment {
+        association.attach(LaneAttachment {
             association_id: association.id(),
             key: key(),
             lane: LaneKind::Control,
@@ -595,7 +562,7 @@ fn a_rejected_attachment_does_not_leave_the_lane_marked_attached() {
         Err(AssociationError::Closed)
     ));
     assert_eq!(association.attached_lane_count(), 0);
-    assert!(!association.lane_receiver_available(LaneKind::Control));
+    assert!(association.take_lane_receiver(LaneKind::Control).is_none());
 }
 
 #[test]

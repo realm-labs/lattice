@@ -965,6 +965,7 @@ impl LatticeServiceBuilder {
             messaging.clone(),
             inbound,
         )
+        .actor_spawner(self.actor_runtime.spawner())
         .control_dispatch(control_dispatch)
         .catalogue(
             self.protocols

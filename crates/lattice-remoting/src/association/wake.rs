@@ -5,6 +5,10 @@ use super::{Association, AssociationError, AssociationManager, LaneKind, lane_ma
 use crate::wire::{Frame, FrameKind};
 
 impl Association {
+    pub(crate) fn is_lane_attached(&self, lane: LaneKind) -> bool {
+        self.attached_lanes.load(Ordering::Acquire) & lane_mask(lane) != 0
+    }
+
     pub(crate) async fn wait_for_lane_wake(&self, lane: LaneKind) {
         match lane {
             LaneKind::Control => std::future::pending().await,

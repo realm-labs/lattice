@@ -20,6 +20,15 @@ impl RemotingEndpoint {
             .await
             .map_err(|_| EndpointError::ShutdownTimeout)?;
         let mut timed_out = false;
+        // Lifetime owners are cancelled at the deadline. Keep their socket ledgers reachable
+        // until cancellation has actually dropped every I/O future and connection permit.
+        let supervisors: Vec<_> = self
+            .supervisors
+            .lock()
+            .expect("association supervisors poisoned")
+            .values()
+            .cloned()
+            .collect();
         loop {
             let completed = if timed_out {
                 self.join_next_shutdown_task().await
@@ -44,6 +53,9 @@ impl RemotingEndpoint {
             }
         }
         if timed_out {
+            for supervisor in supervisors {
+                supervisor.abort_and_join_io().await;
+            }
             Err(EndpointError::ShutdownTimeout)
         } else {
             Ok(())

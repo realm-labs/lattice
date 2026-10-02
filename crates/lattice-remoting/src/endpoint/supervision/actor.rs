@@ -1,0 +1,272 @@
+//! Lifecycle events are serialized here; handlers never wait for network I/O.
+
+use std::sync::{Arc, Weak};
+
+use lattice_actor::{
+    context::{ActorContext, HandlerContext},
+    error::ActorStopError,
+    state_machine::Stateless,
+    traits::{Actor, Handler, StopReason},
+};
+use tokio::{runtime::Handle, time::sleep};
+
+use crate::{
+    association::{Association, AssociationReceivers, AssociationState, LaneKind},
+    handshake::NodeIdentity,
+    lane::LaneExit,
+};
+
+use super::{
+    ConnectionEvent, EndpointError, RemotingEndpoint, endpoint,
+    state::{LanePhase, LaneState, lane_index},
+    tasks::IoTasks,
+};
+
+pub(super) struct AssociationSupervisor {
+    pub(super) endpoint: Weak<RemotingEndpoint>,
+    pub(super) association: Arc<Association>,
+    pub(super) peer: NodeIdentity,
+    pub(super) executor: Handle,
+    pub(super) tasks: Arc<IoTasks>,
+    pub(super) lanes: Vec<LaneState>,
+    pub(super) dialer: bool,
+}
+
+impl AssociationSupervisor {
+    pub(super) fn new(
+        owner: Weak<RemotingEndpoint>,
+        association: Arc<Association>,
+        peer: NodeIdentity,
+        receivers: AssociationReceivers,
+        executor: Handle,
+        tasks: Arc<IoTasks>,
+    ) -> Self {
+        let endpoint = owner
+            .upgrade()
+            .expect("endpoint owns supervisor construction");
+        let dialer = endpoint
+            .associations
+            .should_dial(&peer.address, peer.incarnation);
+        let queues = [receivers.control, receivers.interactive]
+            .into_iter()
+            .chain(receivers.bulk);
+        let lanes = endpoint
+            .lanes()
+            .zip(queues)
+            .map(|(kind, receiver)| {
+                LaneState::new(kind, receiver, endpoint.config.reconnect_backoff_min)
+            })
+            .collect();
+        Self {
+            endpoint: owner,
+            association,
+            peer,
+            executor,
+            tasks,
+            lanes,
+            dialer,
+        }
+    }
+
+    pub(super) fn closed(&self) -> bool {
+        matches!(
+            self.association.state(),
+            AssociationState::Closing | AssociationState::Closed
+        )
+    }
+
+    fn arm_wake(&self, ctx: &mut ActorContext<Self>, lane: LaneKind) -> Result<(), EndpointError> {
+        let association = self.association.clone();
+        ctx.pipe_to_self(
+            async move { association.wait_for_lane_wake(lane).await },
+            move |()| ConnectionEvent::Wake(lane),
+        )
+        .map_err(|_| EndpointError::SupervisorUnavailable)?;
+        Ok(())
+    }
+
+    fn handle_event(
+        &mut self,
+        ctx: &mut ActorContext<Self>,
+        event: ConnectionEvent,
+    ) -> Result<(), EndpointError> {
+        if self.closed() {
+            ctx.request_stop();
+            return Ok(());
+        }
+        match event {
+            #[cfg(test)]
+            ConnectionEvent::Panic => panic!("injected connection supervisor failure"),
+            #[cfg(test)]
+            ConnectionEvent::HoldTurn { .. } => unreachable!("handled by the test turn gate"),
+            ConnectionEvent::EnsureConnected => {
+                if self.dialer {
+                    for index in 0..self.lanes.len() {
+                        if self.lanes[index].can_start() {
+                            self.start_dial(ctx, index)?;
+                        }
+                    }
+                }
+            }
+            ConnectionEvent::Inbound {
+                connection,
+                accepted,
+            } => {
+                if !accepted.is_closed() {
+                    let result = self.accept_inbound(ctx, *connection);
+                    let _ = accepted.send(result);
+                }
+            }
+            ConnectionEvent::DialCompleted {
+                lane,
+                attempt,
+                result,
+            } => {
+                let index = lane_index(lane);
+                if !self.lanes[index].is_current_dial(attempt) {
+                    return Ok(());
+                }
+                let result = result.and_then(|outcome| {
+                    self.lanes[index].permit = Some(outcome.permit);
+                    outcome
+                        .opened
+                        .and_then(|opened| self.adopt(ctx, index, attempt, *opened))
+                });
+                if let Err(error) = result {
+                    tracing::debug!(?lane, %error, "association dial failed");
+                    self.dial_failed(ctx, index)?;
+                }
+            }
+            ConnectionEvent::LaneStopped {
+                lane,
+                attempt,
+                nonce,
+                result,
+            } => {
+                let index = lane_index(lane);
+                if !self.lanes[index].is_current_connection(attempt, nonce) {
+                    return Ok(());
+                }
+                // A panicked/aborted task cannot return its receiver. Retire the generation
+                // instead of presenting a connected association whose queue has no consumer.
+                let (lease, result) = result?;
+                let slot = &mut self.lanes[index];
+                slot.receiver = Some(lease.receiver);
+                slot.backoff = endpoint(&self.endpoint)?.config.reconnect_backoff_min;
+                if matches!(result, Ok(LaneExit::QueueClosed | LaneExit::Shutdown)) {
+                    self.association.begin_close();
+                    ctx.request_stop();
+                    return Ok(());
+                }
+                if !self.dialer {
+                    slot.phase = LanePhase::WaitingInbound;
+                } else if matches!(result, Ok(LaneExit::Idle)) && lane != LaneKind::Control {
+                    if slot.wake_requested
+                        || !slot
+                            .receiver
+                            .as_ref()
+                            .expect("returned receiver")
+                            .is_empty()
+                    {
+                        self.schedule_retry(ctx, index)?;
+                    } else {
+                        slot.phase = LanePhase::Sleeping;
+                    }
+                } else {
+                    // Preserve a reconnecting lane's connection reservation. Sleeping lanes
+                    // release theirs and acquire a fresh permit when woken.
+                    slot.permit = Some(lease.permit);
+                    self.schedule_retry(ctx, index)?;
+                }
+            }
+            ConnectionEvent::Wake(lane) => {
+                self.arm_wake(ctx, lane)?;
+                let index = lane_index(lane);
+                if !self.association.is_lane_attached(lane) {
+                    self.lanes[index].wake_requested = true;
+                }
+                if self.dialer && self.lanes[index].phase == LanePhase::Sleeping {
+                    self.schedule_retry(ctx, index)?;
+                }
+            }
+            ConnectionEvent::RetryDue { lane, attempt } => {
+                let index = lane_index(lane);
+                if self.lanes[index].phase == LanePhase::Backoff(attempt) {
+                    self.start_dial(ctx, index)?;
+                }
+            }
+            ConnectionEvent::EstablishExpired => {
+                if !self.association.has_activated() {
+                    self.association.begin_close();
+                    ctx.request_stop();
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Actor for AssociationSupervisor {
+    type Error = EndpointError;
+    type Behavior = Stateless;
+
+    async fn started(&mut self, ctx: &mut ActorContext<Self>) -> Result<(), Self::Error> {
+        let timeout = endpoint(&self.endpoint)?.config.establishing_timeout;
+        ctx.pipe_to_self(sleep(timeout), |()| ConnectionEvent::EstablishExpired)
+            .map_err(|_| EndpointError::SupervisorUnavailable)?;
+        for slot in &self.lanes {
+            if slot.kind != LaneKind::Control {
+                self.arm_wake(ctx, slot.kind)?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn stopping(
+        &mut self,
+        _ctx: &mut ActorContext<Self>,
+        _reason: StopReason,
+    ) -> Result<(), ActorStopError> {
+        self.association.begin_close();
+        self.tasks.abort_all();
+        self.tasks.wait_empty().await;
+        for slot in &mut self.lanes {
+            slot.phase = LanePhase::Closed;
+            slot.receiver.take();
+            slot.permit.take();
+        }
+        Ok(())
+    }
+}
+
+impl Handler<ConnectionEvent> for AssociationSupervisor {
+    async fn handle(
+        &mut self,
+        ctx: &mut HandlerContext<'_, Self>,
+        event: ConnectionEvent,
+    ) -> Result<(), Self::Error> {
+        #[cfg(test)]
+        let event = match event {
+            ConnectionEvent::HoldTurn { entered, release } => {
+                let _ = entered.send(());
+                let _ = release.await;
+                return Ok(());
+            }
+            event => event,
+        };
+        let result = self.handle_event(ctx, event);
+        if result.is_err() {
+            self.association.begin_close();
+            ctx.request_stop();
+        }
+        result
+    }
+}
+
+impl Drop for AssociationSupervisor {
+    fn drop(&mut self) {
+        // Covers actor panic and cancellation of an externally owned actor runtime.
+        self.association.begin_close();
+        self.tasks.abort_all();
+    }
+}

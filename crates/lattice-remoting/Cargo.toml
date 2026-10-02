@@ -17,6 +17,7 @@ blake3.workspace = true
 bytes.workspace = true
 futures-util.workspace = true
 lattice-failpoint.workspace = true
+lattice-actor.workspace = true
 lattice-model.workspace = true
 prost.workspace = true
 serde.workspace = true

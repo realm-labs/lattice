@@ -345,10 +345,9 @@ Associations are lazy and single-flight:
 ```text
 first remote send
   -> get_or_connect(AssociationKey)
-  -> establish and authenticate control connection
-  -> check exact Lattice version; establish AssociationId, incarnations and limits
-  -> attach interactive connection
-  -> attach configured bulk stripes
+  -> get or create the generation's AssociationSupervisor actor
+  -> negotiate and authenticate the configured lanes outside actor turns
+  -> adopt each validated socket and its queue receiver in the actor
   -> Association Ready
 ```
 
@@ -362,18 +361,40 @@ Connections are not eagerly created as a cluster-wide full mesh. An idle bulk or
 
 ### 4.4 Lifecycle and Partial Failure
 
-The logical Association follows the Rust `AssociationState` reducer:
+Each Association generation has one process-local `AssociationSupervisor` actor. It owns the lane
+phases, dial attempts, retry deadlines, parked queue receivers and connection-task lifecycle.
+Inbound and outbound negotiation both return socket candidates to this owner. Concurrent connect
+requests share the actor; stale dial, retry and lane-exit events cannot change a newer connection.
+
+The sending path remains `OutboundMessaging -> Association admission -> lane queue -> LaneWriter`.
+Receiving remains `FramedReader -> InboundLane -> InboundDispatch`, and replies complete pending
+asks directly. No business frame, payload or heartbeat passes through the supervisor mailbox.
+Queue capacity, byte reservations, peer-activity counters and the published admission snapshot
+remain accessible without an actor round trip. The lane publishes detach/failure immediately;
+the actor subsequently decides whether to sleep, reconnect or wait for an inbound connection.
+
+Socket tasks run on the endpoint's Tokio executor. The actor uses bounded off-turn work for their
+completion events, wake notifications and retry timers; it never awaits socket I/O in a handler.
+Wake notifications are coalesced, and completion/retry delivery waits for mailbox capacity. A wake
+arriving between socket detach and processing `LaneStopped` is retained, so a queued frame cannot
+be stranded by mailbox congestion or event ordering.
+
+Services inject their `ActorSpawner`; standalone endpoints own a one-worker local actor runtime.
+The actor runtime must outlive endpoint shutdown. Retirement fences admission before cancellation;
+the endpoint retains a join boundary for the actor and a socket-task ledger until I/O resources
+have been released. Cancelling a shutdown wait retains these owners for a later shutdown call.
+
+The published logical Association state follows:
 
 ```text
 Establishing -> Active -> Reconnecting -> Active
 Establishing/Active/Reconnecting -> Closing -> Closed
 ```
 
-Each physical TCP/TLS lane separately passes through connection and handshake phases such as
-`Disconnected -> Connecting -> Handshaking -> Ready` and may become degraded while it reconnects.
-Those lane phases describe socket health; `Ready` and `Degraded` are not `AssociationState`
-variants. The Association remains the logical peer/incarnation epoch and supervises all of its
-physical lanes.
+The actor tracks each physical lane as `WaitingInbound`, `Dialing`, `Running`, `Sleeping`,
+`Backoff` or `Closed`. Dialing includes TCP/TLS and handshake work. Those phases describe socket
+ownership and are separate from `AssociationState`: sleeping data lanes preserve an active
+logical Association, while loss of Control revokes admission and publishes `Reconnecting`.
 
 - Control connection failure immediately stops new interactive/bulk admission for the whole Association, fails queued-but-unwritten work, and starts bounded reconnect/failure-detection handling. Already running remote Handlers are unaffected; no data lane continues independently in v1.
 - Interactive failure completes affected pending asks according to dispatch knowledge, including `UnknownResult` where necessary.

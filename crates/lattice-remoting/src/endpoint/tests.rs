@@ -1,9 +1,28 @@
-use std::io::{Error, ErrorKind};
+use std::{
+    io::{Error, ErrorKind},
+    sync::{Arc, Mutex},
+};
 
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
 
-use super::*;
-use crate::{association::AssociationState, lane::LaneError, messaging::outbound::OutboundMessage};
+use super::{
+    EndpointError, RemotingEndpoint,
+    diagnostics::{AcceptRecovery, classify_accept_failure, is_peer_disconnect},
+};
+use crate::{
+    association::{AssociationId, AssociationManager, AssociationState, LaneKind},
+    config::RemotingConfig,
+    control::ControlDispatch,
+    handshake::{Handshake, HandshakeValidator, NodeIdentity},
+    lane::LaneError,
+    messaging::{
+        inbound::InboundDispatch,
+        outbound::{OutboundMessage, OutboundMessaging},
+    },
+    protocol::ProtocolDescriptor,
+    transport::FramedConnection,
+    wire::{FrameCodec, FrameKind, WireError},
+};
 
 #[test]
 fn classifies_normal_peer_disconnects_without_hiding_protocol_failures() {
@@ -521,7 +540,7 @@ async fn an_association_that_never_activates_is_abandoned_and_releases_its_permi
     .await;
 
     assert_eq!(client.open_connection_count(), 0);
-    assert_eq!(client.connect_lock_count(), 0);
+    assert_eq!(client.supervisor_count(), 0);
     client.shutdown().await.unwrap();
 }
 

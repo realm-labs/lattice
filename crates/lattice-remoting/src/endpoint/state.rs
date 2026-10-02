@@ -4,6 +4,8 @@ use std::{
     sync::{Arc, Mutex, RwLock},
 };
 
+use lattice_actor::runtime::{ActorRuntime, ActorRuntimeConfig, spawner::ActorSpawner};
+
 use crate::{
     association::{AssociationError, AssociationId, AssociationManager},
     bootstrap::{AcceptBootstrap, BootstrapHandler},
@@ -26,6 +28,16 @@ use super::{
 };
 
 impl RemotingEndpointBuilder {
+    /// Shares the owner's local actor runtime for connection supervision.
+    ///
+    /// The runtime must outlive the endpoint and its shutdown. Without an injected spawner,
+    /// a standalone endpoint owns a one-worker actor runtime. Socket tasks always run on the
+    /// Tokio executor that created the association supervisor.
+    pub fn actor_spawner(mut self, spawner: ActorSpawner) -> Self {
+        self.actor_spawner = Some(spawner);
+        self
+    }
+
     pub fn control_dispatch(mut self, control_dispatch: Arc<dyn ControlDispatch>) -> Self {
         self.control_dispatch = control_dispatch;
         self
@@ -62,6 +74,18 @@ impl RemotingEndpointBuilder {
         let connection_limit = self.config.connection_capacity();
         let (shutdown_tx, _) = watch::channel(false);
         let (disconnect_tx, _) = broadcast::channel(self.config.max_associations);
+        let actor_runtime = self.actor_spawner.is_none().then(|| {
+            ActorRuntime::new(ActorRuntimeConfig {
+                task_worker_count: 1,
+                ..ActorRuntimeConfig::default()
+            })
+        });
+        let actor_spawner = self.actor_spawner.unwrap_or_else(|| {
+            actor_runtime
+                .as_ref()
+                .expect("standalone actor runtime")
+                .spawner()
+        });
         Ok(RemotingEndpoint {
             local: self.local,
             config: self.config,
@@ -78,7 +102,9 @@ impl RemotingEndpointBuilder {
             shutdown_lock: tokio::sync::Mutex::new(()),
             #[cfg(feature = "tls")]
             security: self.security,
-            connect_locks: Mutex::new(HashMap::new()),
+            supervisors: Mutex::new(HashMap::new()),
+            actor_spawner,
+            _actor_runtime: actor_runtime,
             bootstrap_handler: RwLock::new(Arc::new(AcceptBootstrap)),
         })
     }
@@ -100,6 +126,7 @@ impl RemotingEndpoint {
             dispatch,
             control_dispatch: Arc::new(RejectControlDispatch),
             catalogue: Vec::new(),
+            actor_spawner: None,
             #[cfg(feature = "tls")]
             security: None,
         }
@@ -158,7 +185,8 @@ impl RemotingEndpoint {
     }
 
     pub(super) fn task_limit(&self) -> usize {
-        // Allow one supervisor per configured connection and one listener accept loop.
+        // Include headroom for a retired generation while its replacement is being adopted.
+        // Each association has one lifetime owner; socket work is bounded by connection permits.
         // Inbound connection tasks are owned by the accept loop's separate JoinSet.
         self.config.connection_capacity().saturating_add(1)
     }
