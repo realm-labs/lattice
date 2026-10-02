@@ -1,3 +1,9 @@
+//! Outbound TCP/TLS negotiation without association-state publication.
+//!
+//! A dial task produces a candidate. Only the supervisor, after checking its current attempt,
+//! can register that candidate or publish Control authentication. Cancelling negotiation drops
+//! its socket; it cannot leave an attached lane whose receiver has no consumer.
+
 use tokio::time::timeout;
 
 use super::{EndpointError, RemotingEndpoint, stream::EndpointStream};
@@ -11,10 +17,15 @@ use crate::{
     wire::FrameCodec,
 };
 
+/// Fully negotiated outgoing socket awaiting synchronous actor adoption.
 pub(super) struct OpenedLane {
+    /// Socket after negotiation; no lane registration has been published yet.
     pub(super) stream: EndpointStream,
+    /// Random per-socket identifier negotiated on the wire.
     pub(super) nonce: u128,
+    /// Descriptors received on Control, empty for data lanes.
     pub(super) peer_catalogue: Vec<ProtocolDescriptor>,
+    /// Whether TLS setup verified the exact peer certificate identity.
     pub(super) authenticated: bool,
 }
 
@@ -30,6 +41,7 @@ impl RemotingEndpoint {
         }
     }
 
+    /// Bounds TCP, optional TLS and remoting negotiation by one outbound-attempt timeout.
     pub(super) async fn open_outbound_lane(
         &self,
         association: &Association,
@@ -44,6 +56,7 @@ impl RemotingEndpoint {
         .map_err(|_| EndpointError::ConnectTimeout)?
     }
 
+    /// Negotiates the generation and lane against the exact expected peer, returning a candidate.
     async fn open_outbound_lane_inner(
         &self,
         association: &Association,

@@ -1,3 +1,9 @@
+//! Short-lived discovery probes and reverse-dial authorization.
+//!
+//! A bootstrap socket uses a connection permit but never owns a lane receiver or becomes an
+//! association lane. It exchanges one request/response and closes. Validated incoming bootstrap
+//! can reconcile a remote incarnation and schedule reverse connection establishment afterward.
+
 use std::{sync::Arc, time::Duration};
 
 #[cfg(feature = "tls")]
@@ -16,6 +22,16 @@ use super::{
 };
 
 impl RemotingEndpoint {
+    /// Probes a candidate address before its complete peer identity is known.
+    ///
+    /// Uses a short-lived socket under the configured connect timeout. The response may identify
+    /// the peer, redirect to a leader, request reverse dialing, or report a retry/rejection.
+    /// No lane is registered by this probe. Dropping the future releases its socket and permit.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid target fields, shutdown, unavailable connection capacity,
+    /// timeout, authentication failure or an invalid bootstrap exchange.
     pub async fn probe_candidate(
         self: &Arc<Self>,
         target: BootstrapProbeTarget,

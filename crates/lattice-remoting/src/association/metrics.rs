@@ -1,21 +1,41 @@
+//! Cumulative transport counters for one association generation.
+//!
+//! Independent relaxed atomic loads keep measurement off the lifecycle mailbox. A snapshot may
+//! combine observations from slightly different instants; it is not a transactional accounting
+//! record or a synchronization mechanism for connection state.
+
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// A lock-free point-in-time view of one Association's transport hot-path counters.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct AssociationMetricsSnapshot {
+    /// Attempts rejected for lack of a queue slot during Bulk reservation.
     pub outbound_queue_rejections: u64,
+    /// Outbound reservations rejected by this association's payload budget.
     pub association_byte_budget_rejections: u64,
+    /// Outbound reservations rejected by the shared node payload budget.
     pub node_byte_budget_rejections: u64,
+    /// Completed outbound frame batches.
     pub outbound_write_batches: u64,
+    /// Frames included in completed outbound batches.
     pub outbound_written_frames: u64,
+    /// Socket write calls used by completed outbound batches.
     pub outbound_socket_writes: u64,
+    /// Inbound exact-target resolutions served from a lane's cache.
     pub exact_target_cache_hits: u64,
+    /// Inbound exact-target resolutions that required a cache miss.
     pub exact_target_cache_misses: u64,
+    /// Replies discarded because they could not complete a matching pending ask.
     pub discarded_replies: u64,
+    /// Malformed inbound one-way message frames dropped during decoding.
     pub dropped_inbound_frames: u64,
+    /// Retry attempts for transient control application failures.
     pub control_apply_retries: u64,
+    /// Reliable control applications that exhausted their retry window.
     pub control_retry_exhaustions: u64,
+    /// Reliable control commands rejected by application policy.
     pub rejected_control_commands: u64,
+    /// Ephemeral control events dropped instead of being retried.
     pub dropped_ephemeral_control: u64,
 }
 

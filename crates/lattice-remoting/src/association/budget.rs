@@ -1,3 +1,11 @@
+//! Payload reservations shared by queued frames and cancelled admission attempts.
+//!
+//! Queue slots and payload bytes are separate bounds. A frame owns its byte reservation through
+//! `QueuedBytes`; dropping a written or discarded frame returns both the association and node
+//! budgets. Async reservation registers capacity and retirement notifications before checking
+//! either condition, preventing lost wakeups. A node-budget rejection rolls back the earlier
+//! association reservation so a failed send cannot leak capacity.
+
 use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
@@ -7,11 +15,13 @@ use tokio::sync::{Notify, futures::Notified};
 
 use super::{Association, AssociationError, BulkAdmission, LaneKind};
 
+/// Shared payload accounting whose lifetime can exceed the association's registry entry.
 #[derive(Debug)]
 pub(super) struct OutboundByteBudget {
     // This counter only accounts for capacity; it does not publish frame data. Relaxed atomic
     // updates preserve the budget invariant; channels and Notify handle data transfer and wakeups.
     used: AtomicUsize,
+    /// Capacity-change signal; waiters must register before trying a reservation.
     available: Notify,
 }
 
@@ -19,8 +29,11 @@ pub(super) struct OutboundByteBudget {
 /// The counters outlive the Association when a lane still owns a queued batch.
 #[derive(Debug)]
 pub(crate) struct QueuedBytes {
+    /// Association reservation released on Drop.
     association: Arc<OutboundByteBudget>,
+    /// Manager-wide reservation released by the same Drop.
     node: Arc<OutboundByteBudget>,
+    /// Payload size charged once to each budget.
     pub(super) bytes: usize,
 }
 
@@ -39,6 +52,7 @@ impl OutboundByteBudget {
         }
     }
 
+    /// Atomically charges bytes only if the resulting count is within the supplied bound.
     fn try_reserve(&self, bytes: usize, maximum: usize) -> bool {
         self.used
             .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
@@ -48,6 +62,7 @@ impl OutboundByteBudget {
             .is_ok()
     }
 
+    /// Returns a previously charged reservation and wakes capacity waiters.
     fn release(&self, bytes: usize) {
         let _ = self
             .used
@@ -64,6 +79,10 @@ impl OutboundByteBudget {
 }
 
 impl Association {
+    /// Claims a prepared stripe's queue slot, then both payload budgets, without waiting.
+    ///
+    /// Wake admission happens first. If byte reservation fails, dropping the local queue permit
+    /// returns the slot. Success is a local reservation and does not imply socket availability.
     pub(crate) fn try_reserve_prepared_bulk(
         &self,
         stripe: usize,
@@ -86,6 +105,11 @@ impl Association {
         })
     }
 
+    /// Waits for a prepared stripe's queue slot and byte capacity while observing retirement.
+    ///
+    /// Rejects frames that can never fit before waiting. Holds the queue slot while waiting for
+    /// bytes, keeping reservation order explicit. Cancellation releases all acquired resources;
+    /// no frame is visible to a consumer until the returned admission is sent.
     pub(crate) async fn reserve_prepared_bulk(
         &self,
         stripe: usize,
@@ -152,6 +176,7 @@ impl Association {
             })
     }
 
+    /// Charges association then node capacity, rolling back the first if the second fails.
     fn try_reserve_bytes(&self, bytes: usize) -> Result<QueuedBytes, AssociationError> {
         if !self
             .queued_bytes
@@ -173,6 +198,10 @@ impl Association {
         })
     }
 
+    /// Parks on the exhausted budget and rechecks admission whenever retirement is signalled.
+    ///
+    /// Register both budget notifications before trying to charge: a release between the failed
+    /// attempt and the await must not strand the sender until another unrelated frame completes.
     async fn reserve_bytes_when_available(
         &self,
         bytes: usize,

@@ -1,4 +1,12 @@
 //! Lifecycle events are serialized here; handlers never wait for network I/O.
+//!
+//! A completed socket has already published detach before its event reaches this actor. The
+//! actor restores its receiver and chooses between inbound waiting, outgoing sleep and retry.
+//! Ordinary network failure preserves the receiver and generation. A task join failure cannot
+//! recover the receiver, so continuing would leave a queue with no consumer; retire instead.
+//!
+//! Initial establishment expiry is armed once. A sticky activation flag distinguishes a peer
+//! that never connected from an established peer temporarily reconnecting after that deadline.
 
 use std::sync::{Arc, Weak};
 
@@ -22,17 +30,28 @@ use super::{
     tasks::IoTasks,
 };
 
+/// Sole lifecycle decision maker for one association generation and its lane resources.
 pub(super) struct AssociationSupervisor {
+    /// Shared endpoint services accessed transiently without making the actor its lifetime owner.
     pub(super) endpoint: Weak<RemotingEndpoint>,
+    /// Admission snapshot and queues used directly by messaging and socket paths.
     pub(super) association: Arc<Association>,
+    /// Full peer identity fixed at actor creation and rechecked for every incoming candidate.
     pub(super) peer: NodeIdentity,
+    /// Original endpoint executor; socket work must not migrate to actor-runtime worker threads.
     pub(super) executor: Handle,
+    /// Cancellation and destruction ledger shared with the endpoint lifetime owner.
     pub(super) tasks: Arc<IoTasks>,
+    /// Receiver owners, phases and retry tokens, indexed by Control/Interactive/Bulk order.
     pub(super) lanes: Vec<LaneState>,
+    /// Whether this endpoint alone is responsible for establishing the pair's outgoing sockets.
     pub(super) dialer: bool,
 }
 
 impl AssociationSupervisor {
+    /// Transfers the complete receiver group into initially parked lane slots.
+    ///
+    /// The endpoint must still exist and the receiver order must match its lane enumeration.
     pub(super) fn new(
         owner: Weak<RemotingEndpoint>,
         association: Arc<Association>,
@@ -68,6 +87,7 @@ impl AssociationSupervisor {
         }
     }
 
+    /// Checks the externally published retirement fence before accepting lifecycle work.
     pub(super) fn closed(&self) -> bool {
         matches!(
             self.association.state(),
@@ -75,6 +95,9 @@ impl AssociationSupervisor {
         )
     }
 
+    /// Installs one scoped, reliable completion waiter for a coalesced data-lane wake.
+    ///
+    /// Processing each wake rearms this waiter; Notify retains a concurrent wake in the gap.
     fn arm_wake(&self, ctx: &mut ActorContext<Self>, lane: LaneKind) -> Result<(), EndpointError> {
         let association = self.association.clone();
         ctx.pipe_to_self(
@@ -85,6 +108,11 @@ impl AssociationSupervisor {
         Ok(())
     }
 
+    /// Applies a lifecycle input synchronously, launching off-turn work where necessary.
+    ///
+    /// Validate operation tokens before touching returned resources or publishing attachments.
+    /// Incoming rejection is replied to its setup caller without retiring a healthy actor;
+    /// unrecoverable management failures propagate to the handler's retirement path.
     fn handle_event(
         &mut self,
         ctx: &mut ActorContext<Self>,
@@ -113,6 +141,8 @@ impl AssociationSupervisor {
                 accepted,
             } => {
                 if !accepted.is_closed() {
+                    // A setup caller that already timed out must not leave an orphan candidate
+                    // queued for adoption. Rejection drops the event's socket and permit.
                     let result = self.accept_inbound(ctx, *connection);
                     let _ = accepted.send(result);
                 }
@@ -182,6 +212,9 @@ impl AssociationSupervisor {
             ConnectionEvent::Wake(lane) => {
                 self.arm_wake(ctx, lane)?;
                 let index = lane_index(lane);
+                // The I/O path can detach before its LaneStopped event is delivered. Retain
+                // this wake even while the actor's phase still says Running; the exit branch
+                // consults it before parking an otherwise empty receiver in Sleeping.
                 if !self.association.is_lane_attached(lane) {
                     self.lanes[index].wake_requested = true;
                 }
@@ -229,6 +262,8 @@ impl Actor for AssociationSupervisor {
     ) -> Result<(), ActorStopError> {
         self.association.begin_close();
         self.tasks.abort_all();
+        // The actor runtime has already joined cancelled off-turn completion work. This ledger
+        // covers the remaining socket futures; only afterward can parked leases be released.
         self.tasks.wait_empty().await;
         for slot in &mut self.lanes {
             slot.phase = LanePhase::Closed;

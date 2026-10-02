@@ -1,3 +1,9 @@
+//! Endpoint construction, shared resources and owned-task admission.
+//!
+//! A standalone endpoint owns a small actor runtime. Services inject their existing spawner and
+//! retain runtime ownership. Socket work always uses the Tokio executor captured when a supervisor
+//! is created, even if actor turns execute on the actor runtime's workers.
+
 use std::{
     collections::HashMap,
     future::Future,
@@ -38,22 +44,33 @@ impl RemotingEndpointBuilder {
         self
     }
 
+    /// Sets the handler for reliable and ephemeral inbound control operations.
+    ///
+    /// The default handler rejects control application. Business message dispatch is separate.
     pub fn control_dispatch(mut self, control_dispatch: Arc<dyn ControlDispatch>) -> Self {
         self.control_dispatch = control_dispatch;
         self
     }
 
+    /// Sets the local protocol descriptors advertised during Control negotiation.
     pub fn catalogue(mut self, catalogue: Vec<ProtocolDescriptor>) -> Self {
         self.catalogue = catalogue;
         self
     }
 
+    /// Enables TLS using application-provided client/server settings and a default server name.
     #[cfg(feature = "tls")]
     pub fn security(mut self, security: EndpointSecurity) -> Self {
         self.security = Some(security);
         self
     }
 
+    /// Validates settings and allocates an endpoint without binding or connecting.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid remoting limits, an empty TLS server name or an oversized
+    /// local protocol catalogue. Peer catalogue compatibility is checked during negotiation.
     pub fn build(self) -> Result<RemotingEndpoint, EndpointError> {
         self.config
             .validate()
@@ -111,6 +128,10 @@ impl RemotingEndpointBuilder {
 }
 
 impl RemotingEndpoint {
+    /// Creates a builder using the local identity and shared messaging components.
+    ///
+    /// The association manager and messaging layer should use the same identity and resource
+    /// limits as the endpoint. TLS is disabled until security settings are supplied.
     pub fn builder(
         local: NodeIdentity,
         config: RemotingConfig,
@@ -132,24 +153,34 @@ impl RemotingEndpoint {
         }
     }
 
+    /// Returns the identity advertised by this endpoint's handshakes and bootstrap responses.
     pub fn local_identity(&self) -> &NodeIdentity {
         &self.local
     }
 
+    /// Returns the number of reserved connection permits.
+    ///
+    /// Includes inbound setup, outbound dialing and reservations retained during reconnect
+    /// backoff, so it may exceed the number of currently open sockets. Excludes the listener.
     pub fn open_connection_count(&self) -> usize {
         self.config
             .connection_capacity()
             .saturating_sub(self.connections.available_permits())
     }
 
+    /// Returns the cumulative count of accepted sockets rejected for lack of connection permits.
     pub fn shed_connection_count(&self) -> u64 {
         self.accept_diagnostics.connection_limit_rejections()
     }
 
+    /// Returns the cumulative count of listener accept failures, including recoverable failures.
     pub fn accept_failure_count(&self) -> u64 {
         self.accept_diagnostics.accept_failures()
     }
 
+    /// Replaces the synchronous routing policy for future cluster bootstrap requests.
+    ///
+    /// Direct-peer reverse-dial requests use the endpoint's deterministic direction policy.
     pub fn install_bootstrap_handler(&self, handler: Arc<dyn BootstrapHandler>) {
         *self
             .bootstrap_handler
@@ -157,6 +188,14 @@ impl RemotingEndpoint {
             .expect("bootstrap handler lock poisoned") = handler;
     }
 
+    /// Requests that current sockets for a generation disconnect, allowing normal reconnection.
+    ///
+    /// This is a fault-injection operation; it does not logically retire the association.
+    /// Success reports broadcast delivery to a subscriber, not completion of disconnection.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EndpointError::NoActiveConnections`] when the broadcast has no subscribers.
     pub fn disconnect_association(
         &self,
         association_id: AssociationId,

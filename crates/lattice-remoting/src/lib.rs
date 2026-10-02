@@ -1,5 +1,14 @@
 //! Bounded TCP and TLS remoting for Lattice.
 //!
+//! Start with [`endpoint`] for connection orchestration, [`association`] for admission and
+//! lifecycle semantics, and [`config`] for resource limits. [`lane`] drives individual sockets;
+//! [`messaging`] supplies business message dispatch and ask completion.
+//!
+//! Internal implementation documentation includes ownership transfers, state transitions and
+//! cancellation boundaries. Build it with
+//! `cargo doc -p lattice-remoting --no-deps --document-private-items` to read those module and
+//! helper descriptions alongside the public API.
+//!
 //! # TLS crypto providers
 //!
 //! The default `rustls-ring` feature enables TLS with the ring provider. Applications that prefer

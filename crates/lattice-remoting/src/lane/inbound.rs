@@ -1,3 +1,14 @@
+//! Frame classification, decoding and direct inbound dispatch.
+//!
+//! Bulk carries one-way Tell traffic; Interactive carries asks, replies and failures. Control
+//! carries heartbeats, acknowledgements, wake requests and application commands. Wrong-lane
+//! frames fail the socket. Malformed Bulk tells are dropped, while request/reply decoding errors
+//! propagate because their completion obligations cannot be silently ignored.
+//!
+//! Dispatch returns an action to the event loop instead of borrowing its writer or pending-ask
+//! collection. Outbound replies complete pending asks immediately through shared messaging state.
+//! Inbound asks become separately polled work; control application goes to its ordered worker.
+
 use bytes::Bytes;
 
 use super::{
@@ -21,11 +32,17 @@ use crate::{
     wire::{Frame, FrameKind},
 };
 
+/// Follow-up work performed by the socket loop after classification and direct dispatch.
 pub(super) enum InboundAction {
+    /// The frame has been consumed and requires no socket-loop work.
     Continue,
+    /// Poll a newly admitted inbound ask alongside socket I/O.
     EnqueueAsk(InboundAskWork),
+    /// Write a protocol response, such as a heartbeat acknowledgement or ask rejection.
     Write(Frame),
+    /// Submit application work without blocking the read loop on control retries.
     ApplyControl(Frame),
+    /// End this socket in response to a peer Close frame.
     Close,
 }
 
@@ -35,7 +52,9 @@ pub(super) struct InboundLane<'a> {
     lane: LaneKind,
     services: &'a LaneServices,
     maximum_concurrent_asks: usize,
+    /// Cache of resolved local actor targets; entries are scoped to this socket runtime.
     target_cache: &'a mut ExactTargetCache,
+    /// Peer-defined compact target IDs; socket replacement creates a fresh dictionary.
     target_dictionary: &'a mut ExactTargetDictionary,
 }
 
@@ -58,6 +77,10 @@ impl<'a> InboundLane<'a> {
         }
     }
 
+    /// Consumes a frame or returns follow-up work, checking its kind against this lane's role.
+    ///
+    /// `pending_asks` is supplied by the loop so decoding can reject capacity overflow with a
+    /// correlated failure frame before adding another request future.
     pub(super) async fn dispatch(
         &mut self,
         frame: Frame,
@@ -153,6 +176,7 @@ impl<'a> InboundLane<'a> {
         Ok(InboundAction::Continue)
     }
 
+    /// Rejects a request at the inbound concurrency limit without invoking actor dispatch.
     fn admit_ask(&self, ask: InboundAskWork, pending_asks: usize) -> InboundAction {
         if pending_asks == self.maximum_concurrent_asks {
             InboundAction::Write(failure_frame(&RemoteFailure {

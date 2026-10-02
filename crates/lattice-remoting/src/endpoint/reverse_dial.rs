@@ -1,3 +1,9 @@
+//! Requests connection establishment from the deterministic dialer.
+//!
+//! The non-dialing endpoint uses a short-lived direct-peer bootstrap socket, validates the exact
+//! identity and reverse-dial authorization, releases that socket's permit, then waits for the
+//! inbound generation to activate. It never creates competing outgoing data/control lanes.
+
 use std::{sync::Arc, time::Duration};
 
 use super::{EndpointError, RemotingEndpoint};
@@ -10,6 +16,10 @@ use crate::{
 const REVERSE_DIAL_POLL_INTERVAL: Duration = Duration::from_millis(5);
 
 impl RemotingEndpoint {
+    /// Exchanges reverse-dial authorization, then waits for the exact incoming association.
+    ///
+    /// Probe and activation waits each have a connect timeout; the temporary probe reservation
+    /// is released before waiting so incoming setup can use the endpoint's connection capacity.
     pub(super) async fn request_reverse_peer(
         self: &Arc<Self>,
         peer: NodeIdentity,

@@ -1,3 +1,9 @@
+//! Persistent shutdown fencing and cancellation-safe joining of endpoint-owned tasks.
+//!
+//! The JoinSet remains in the endpoint throughout shutdown; a cancelled wait cannot detach its
+//! tasks. One absolute deadline covers lock acquisition and normal joins. After that deadline,
+//! owners are cancelled and socket ledgers are joined to finish releasing actual I/O resources.
+
 use std::future::{Future, poll_fn};
 
 use crate::failpoints;
@@ -12,6 +18,15 @@ use super::{EndpointError, RemotingEndpoint};
 impl RemotingEndpoint {
     /// Stops endpoint admission and joins owned tasks. Cancelling this future or returning a task
     /// error leaves unfinished tasks owned by the endpoint so a later call can continue cleanup.
+    /// The shutdown fence remains set; the endpoint cannot be restarted.
+    ///
+    /// On deadline expiry, remaining owners are cancelled and their I/O ledgers are drained.
+    /// Resource destruction can therefore extend the call beyond the configured timeout.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EndpointError::ShutdownTimeout`] on deadline expiry, or an owned task's error
+    /// if joining fails. A later call may continue cleanup after an early error or cancellation.
     pub async fn shutdown(&self) -> Result<(), EndpointError> {
         self.shutdown_tx.send_replace(true);
         lattice_failpoint::hit(failpoints::SHUTDOWN_AFTER_FENCE_BEFORE_TASK_JOIN);

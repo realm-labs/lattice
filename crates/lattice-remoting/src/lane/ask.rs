@@ -1,3 +1,9 @@
+//! Inbound ask execution and correlated reply/failure construction.
+//!
+//! The socket loop polls these futures alongside I/O. Each request carries a remaining timeout
+//! budget, converted to a local deadline when dispatch begins. Application failures become wire
+//! failure codes without exporting internal error details.
+
 use std::{sync::Arc, time::Instant};
 
 use bytes::Bytes;
@@ -12,6 +18,7 @@ use crate::{
     wire::Frame,
 };
 
+/// Decoded ask awaiting exact, entity or singleton routing.
 pub(super) enum InboundAskWork {
     Exact(InboundAsk),
     Entity(InboundEntityAsk),
@@ -28,6 +35,10 @@ impl InboundAskWork {
     }
 }
 
+/// Executes one routed ask and constructs the response for its original correlation ID.
+///
+/// Dispatch errors are encoded as failure replies. A timeout budget that cannot form a local
+/// deadline is returned as a local error instead of invoking the target.
 pub(super) async fn dispatch_inbound_ask(
     dispatch: Arc<dyn InboundDispatch>,
     work: InboundAskWork,

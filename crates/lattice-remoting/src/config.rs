@@ -1,9 +1,26 @@
+//! Resource limits and timeouts for remoting.
+//!
+//! Each association has one Control lane, one Interactive lane and a configurable number
+//! of Bulk lanes. Queue limits bound frame counts; byte budgets independently bound retained
+//! outbound payloads. The endpoint shares one connection semaphore across inbound setup,
+//! outbound dialing and established lanes.
+//!
+//! Data lanes may release their sockets after an idle timeout while Control remains connected.
+//! The initial establishment timeout retires a generation that has never become active;
+//! individual dial attempts use the shorter connect timeout. Neither timeout is an idle lifetime
+//! for an already active association.
+
+#![deny(missing_docs)]
+
 use std::time::Duration;
 
 use thiserror::Error;
 
+/// Largest encoded frame body accepted by the remoting implementation, in bytes.
 pub const ABSOLUTE_MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
+/// Largest number of ready frames that may be collected in one outbound batch.
 pub const ABSOLUTE_MAX_READY_WRITE_BATCH_FRAMES: usize = 512;
+/// Largest number of already buffered frames processed in one inbound batch.
 pub const ABSOLUTE_MAX_READY_READ_BATCH_FRAMES: usize = 128;
 
 /// Minimum number of Bulk lanes in an association's configured lane group.
@@ -16,39 +33,95 @@ pub const DEFAULT_BULK_STRIPES: usize = 1;
 /// One Control connection and one Interactive connection per association.
 const FIXED_CONNECTIONS_PER_ASSOCIATION: usize = 2;
 
+/// Bounds the resources and waiting time used by an endpoint and its associations.
+///
+/// Start with [`Self::default`] and override the limits needed by the application.
+/// Constructors validate these settings; changing a value does not resize an existing endpoint.
+///
+/// # Examples
+///
+/// ```
+/// use lattice_remoting::config::RemotingConfig;
+///
+/// let config = RemotingConfig {
+///     bulk_stripes: 2,
+///     ..RemotingConfig::default()
+/// };
+/// config.validate()?;
+/// assert_eq!(config.physical_connections_per_association(), 4);
+/// # Ok::<(), lattice_remoting::config::RemotingConfigError>(())
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemotingConfig {
+    /// Maximum number of registered association generations. Defaults to 256.
     pub max_associations: usize,
+    /// Number of Bulk lanes per association, from 1 through 4. Defaults to 1.
     pub bulk_stripes: usize,
+    /// Maximum encoded frame body size, including its header. Defaults to 256 KiB.
     pub max_frame_size: usize,
+    /// Number of frames retained in each Control lane queue. Defaults to 1,024.
     pub control_queue_frames: usize,
+    /// Number of frames retained in each Interactive lane queue. Defaults to 4,096.
     pub interactive_queue_frames: usize,
+    /// Number of frames retained in each Bulk lane queue. Defaults to 8,192.
     pub bulk_queue_frames_per_stripe: usize,
+    /// Maximum queued outbound payload bytes per association. Defaults to 16 MiB.
     pub max_outbound_bytes_per_association: usize,
+    /// Maximum queued outbound payload bytes shared by a manager's associations. Defaults to 256 MiB.
     pub max_outbound_bytes_per_node: usize,
+    /// Maximum pending outbound asks; also supplies the endpoint's per-lane inbound ask limit.
     pub max_pending_asks: usize,
+    /// Maximum unacknowledged reliable control commands per association. Defaults to 1,024.
     pub max_control_outbox_frames: usize,
+    /// Maximum reliable control payload bytes retained per association. Defaults to 4 MiB.
     pub max_control_outbox_bytes: usize,
+    /// Maximum tracked reliable control streams per association. Defaults to 1,024.
     pub max_control_streams: usize,
+    /// Maximum unacknowledged commands in one reliable control stream. Defaults to 512.
     pub max_control_outbox_frames_per_stream: usize,
+    /// Maximum payload bytes retained in one reliable control stream. Defaults to 2 MiB.
     pub max_control_outbox_bytes_per_stream: usize,
+    /// Maximum protocol descriptors accepted in a peer catalogue. Defaults to 1,024.
     pub max_protocols_per_peer: usize,
+    /// Maximum cached inbound exact-target resolutions per lane. Defaults to 1,024.
     pub max_cached_exact_targets_per_lane: usize,
+    /// Maximum cached prepared outbound exact-Tell routes; zero disables caching.
     pub max_prepared_exact_tell_routes: usize,
+    /// Bytes reserved for buffered socket reads per connection. Defaults to 64 KiB.
     pub socket_read_ahead_bytes: usize,
+    /// Maximum ready frames gathered in one outbound batch. Defaults to 256.
     pub max_ready_write_batch_frames: usize,
+    /// Maximum ready frames dispatched in one inbound batch. Defaults to 1.
     pub max_ready_read_batch_frames: usize,
+    /// Byte limit used to coalesce outbound writes. Defaults to 128 KiB.
     pub max_coalesced_write_batch_bytes: usize,
+    /// Deadline for an outbound connection attempt or bootstrap exchange. Defaults to 3 seconds.
     pub connect_timeout: Duration,
     /// Maximum initial association establishment time, and the absolute inbound
     /// setup budget from TCP accept through TLS, handshake and catalogue/bootstrap.
+    /// Defaults to 30 seconds.
     pub establishing_timeout: Duration,
+    /// Initial delay before retrying a failed lane connection. Defaults to 100 milliseconds.
     pub reconnect_backoff_min: Duration,
+    /// Upper bound on exponential connection retry delays. Defaults to 5 seconds.
     pub reconnect_backoff_max: Duration,
+    /// Interval between Control heartbeats. Defaults to 2 seconds.
     pub heartbeat_interval: Duration,
+    /// Number of heartbeat intervals of silence tolerated on Control. Defaults to 3.
     pub heartbeat_miss_limit: u32,
+    /// Maximum retry age after a reliable command's first transient application failure.
+    ///
+    /// Also bounds configured reliable outbox waits. Defaults to 30 seconds.
     pub control_apply_retry_timeout: Duration,
+    /// Idle time before an Interactive or Bulk socket sleeps. Defaults to 60 seconds.
+    ///
+    /// Control does not sleep. Interactive also stays awake while inbound asks or pending
+    /// outbound asks for the association remain unfinished.
     pub idle_data_connection_timeout: Duration,
+    /// Time allowed for endpoint shutdown before remaining tasks are cancelled.
+    ///
+    /// Cancellation is followed by resource cleanup, so this is not a strict bound on the
+    /// entire shutdown call. Defaults to 10 seconds.
     pub shutdown_timeout: Duration,
 }
 
@@ -90,6 +163,12 @@ impl Default for RemotingConfig {
 }
 
 impl RemotingConfig {
+    /// Checks that resource bounds and timeout relationships are supported.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a required zero limit or timeout, an unsupported stripe or batch
+    /// count, or a per-association/per-stream budget exceeding its enclosing budget.
     pub fn validate(&self) -> Result<(), RemotingConfigError> {
         let nonzero_limits = [
             ("max_associations", self.max_associations),
@@ -207,6 +286,9 @@ impl RemotingConfig {
         Ok(())
     }
 
+    /// Returns the socket count of a fully connected association: `2 + bulk_stripes`.
+    ///
+    /// Sleeping data lanes use fewer sockets without changing this configured count.
     pub fn physical_connections_per_association(&self) -> usize {
         FIXED_CONNECTIONS_PER_ASSOCIATION + self.bulk_stripes
     }
@@ -236,28 +318,62 @@ impl RemotingConfig {
     }
 }
 
+/// An unsupported resource limit or timeout in [`RemotingConfig`].
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum RemotingConfigError {
+    /// A required count or byte limit is zero.
     #[error("remoting limit {name} must be nonzero")]
-    Zero { name: &'static str },
+    Zero {
+        /// Name of the configuration field.
+        name: &'static str,
+    },
+    /// A required timeout is zero.
     #[error("remoting duration {name} must be nonzero")]
-    ZeroDuration { name: &'static str },
+    ZeroDuration {
+        /// Name of the configuration field.
+        name: &'static str,
+    },
+    /// The number of Bulk lanes is outside the supported range.
     #[error(
         "bulk stripe count must be in {minimum}..={maximum}, got {actual}",
         minimum = MIN_BULK_STRIPES,
         maximum = ABSOLUTE_MAX_BULK_STRIPES
     )]
-    BulkStripeCount { actual: usize },
+    BulkStripeCount {
+        /// Requested number of Bulk lanes.
+        actual: usize,
+    },
+    /// The maximum frame body exceeds the implementation limit.
     #[error("frame size {actual} exceeds absolute maximum {maximum}")]
-    FrameSize { actual: usize, maximum: usize },
+    FrameSize {
+        /// Requested frame body limit in bytes.
+        actual: usize,
+        /// Largest supported frame body in bytes.
+        maximum: usize,
+    },
+    /// An outbound batch contains more frames than supported.
     #[error("ready write batch frame count {actual} exceeds maximum {maximum}")]
-    WriteBatchFrames { actual: usize, maximum: usize },
+    WriteBatchFrames {
+        /// Requested frame count.
+        actual: usize,
+        /// Largest supported frame count.
+        maximum: usize,
+    },
+    /// An inbound batch contains more frames than supported.
     #[error("ready read batch frame count {actual} exceeds maximum {maximum}")]
-    ReadBatchFrames { actual: usize, maximum: usize },
+    ReadBatchFrames {
+        /// Requested frame count.
+        actual: usize,
+        /// Largest supported frame count.
+        maximum: usize,
+    },
+    /// One association's outbound byte budget exceeds the shared node budget.
     #[error("per-association outbound bytes exceed the node-wide bound")]
     AssociationBytesExceedNodeBytes,
+    /// A reliable control stream's budget exceeds the association's outbox budget.
     #[error("per-stream reliable control outbox exceeds its association-wide bound")]
     StreamOutboxExceedsAssociation,
+    /// The initial retry delay exceeds the maximum retry delay.
     #[error("minimum reconnect backoff exceeds maximum reconnect backoff")]
     ReconnectBackoffOrder,
 }

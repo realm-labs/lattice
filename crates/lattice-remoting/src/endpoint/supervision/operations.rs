@@ -1,4 +1,9 @@
 //! Actor decisions launch bounded work and adopt its results; no socket I/O runs in a turn.
+//!
+//! Negotiation returns candidates without publishing connection state. Adoption runs as one
+//! synchronous actor decision: check retirement, install Control catalogue, register the nonce,
+//! publish verified identity, and transfer the receiver/permit to a socket task. Failures before
+//! transfer roll back registration; losing completion delivery after transfer retires the group.
 
 use lattice_actor::context::ActorContext;
 use tokio::time::{Instant, sleep};
@@ -14,6 +19,11 @@ use super::{
 use crate::endpoint::connection::OpenedLane;
 
 impl AssociationSupervisor {
+    /// Reserves connection capacity and starts one outbound negotiation attempt off-turn.
+    ///
+    /// Capacity exhaustion schedules backoff instead of waiting inside a handler. The task
+    /// owns its permit through negotiation, returning it even on a normal dial error. The
+    /// attempt token is published before spawn and later checked by `DialCompleted` handling.
     pub(super) fn start_dial(
         &mut self,
         ctx: &mut ActorContext<Self>,
@@ -60,6 +70,9 @@ impl AssociationSupervisor {
         Ok(())
     }
 
+    /// Changes the lane to a fresh backoff token and reliably queues its elapsed timer.
+    ///
+    /// Delivery waits for mailbox capacity; an obsolete tick is ignored by token matching.
     pub(super) fn schedule_retry(
         &mut self,
         ctx: &mut ActorContext<Self>,
@@ -79,6 +92,10 @@ impl AssociationSupervisor {
         Ok(())
     }
 
+    /// Doubles the retry delay and preserves only a reservation inherited from reconnection.
+    ///
+    /// A newly acquired failed-attempt reservation is released, so unreachable initial peers
+    /// do not monopolize capacity. A previously running lane keeps its reserved reconnect slot.
     pub(super) fn dial_failed(
         &mut self,
         ctx: &mut ActorContext<Self>,
@@ -93,6 +110,10 @@ impl AssociationSupervisor {
         self.schedule_retry(ctx, index)
     }
 
+    /// Checks an incoming candidate's deadline, full identity and receiver availability.
+    ///
+    /// Adopts only a parked lane. Failure drops the candidate resources and is returned to the
+    /// setup caller; a duplicate cannot displace an already running supervisor-owned consumer.
     pub(super) fn accept_inbound(
         &mut self,
         ctx: &mut ActorContext<Self>,
@@ -132,6 +153,15 @@ impl AssociationSupervisor {
         result
     }
 
+    /// Publishes one validated candidate and transfers the parked receiver to its socket task.
+    ///
+    /// Requires a receiver and permit in the lane slot and a current attempt validated by the
+    /// caller. Socket I/O runs on the captured endpoint executor. The completion future owns
+    /// the task's join waiter, whose cancellation aborts I/O instead of detaching it.
+    ///
+    /// Successful registration can restore `Active` and enqueue reliable replay before socket
+    /// consumption starts. Catalogue or authentication failure rolls attachment back in this
+    /// turn. Completion-channel failure after transfer fences the entire generation.
     pub(super) fn adopt(
         &mut self,
         ctx: &mut ActorContext<Self>,

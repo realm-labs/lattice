@@ -1,3 +1,14 @@
+//! Outbound batching, ask write commitment and byte-reservation lifetime.
+//!
+//! Queued asks can expire or be cancelled before socket admission. Preparation filters those
+//! frames and updates remaining timeout budgets. The transport's first-write callback marks
+//! committed asks so disconnect handling can distinguish an unsent request from an unknown
+//! remote outcome. Batch frames retain their byte reservations until writing finishes or the
+//! writer is destroyed by cancellation.
+//!
+//! A reconnected Bulk socket has a new compact-target dictionary. Before writing, expand frames
+//! whose target definition belongs to an old lane epoch, avoiding references unknown to the peer.
+
 use std::{future::Future, sync::Arc, time::Duration};
 
 use futures_util::{FutureExt, StreamExt, stream::FuturesUnordered};
@@ -25,8 +36,11 @@ pub(super) struct LaneWriter<W> {
     lane: LaneKind,
     write_timeout: Option<Duration>,
     maximum_batch_frames: usize,
+    /// Frames dequeued but not yet checked for cancellation, deadline or dictionary epoch.
     candidates: Vec<Frame>,
+    /// Prepared frames retaining payload reservations through their socket write.
     batch: Vec<Frame>,
+    /// Ask IDs aligned with batch positions for first-write commitment callbacks.
     correlations: Vec<Option<CorrelationId>>,
 }
 
@@ -62,6 +76,10 @@ impl<W: AsyncWrite + Send + Unpin> LaneWriter<W> {
         write_within(self.write_timeout, self.writer.flush()).await
     }
 
+    /// Writes one completed inbound reply and batches other replies already ready to complete.
+    ///
+    /// Does not wait for another ask merely to fill a batch; completion order is independent of
+    /// request arrival order and each reply carries its own correlation ID.
     pub(super) async fn write_replies<F>(
         &mut self,
         first: Frame,
@@ -91,6 +109,9 @@ impl<W: AsyncWrite + Send + Unpin> LaneWriter<W> {
     }
 
     /// Returns false when every dequeued frame was cancelled before socket admission.
+    ///
+    /// Prepared frames retain byte reservations until the write result is known. Only asks whose
+    /// bytes reach the transport's commit boundary are marked as potentially executed remotely.
     pub(super) async fn write_queued(
         &mut self,
         first: Frame,
@@ -141,6 +162,9 @@ impl<W: AsyncWrite + Send + Unpin> LaneWriter<W> {
         Ok(true)
     }
 
+    /// Drains only immediately available frames, preserving queue order and the configured bound.
+    ///
+    /// Control is limited to one frame so batch collection does not delay protocol progress.
     fn collect_batch(&mut self, first: Frame, receiver: &mut mpsc::Receiver<Frame>) {
         self.candidates.clear();
         self.candidates.push(first);
@@ -157,6 +181,7 @@ impl<W: AsyncWrite + Send + Unpin> LaneWriter<W> {
         }
     }
 
+    /// Expands stale dictionary references and filters asks no longer eligible for socket write.
     fn prepare_batch(&mut self) {
         self.batch.clear();
         self.correlations.clear();
@@ -179,6 +204,7 @@ impl<W: AsyncWrite + Send + Unpin> LaneWriter<W> {
     }
 }
 
+/// Bounds Control writes by its liveness window; data writes rely on socket/shutdown completion.
 async fn write_within<T, F>(limit: Option<Duration>, write: F) -> Result<T, LaneError>
 where
     F: Future<Output = Result<T, WireError>>,

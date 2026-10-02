@@ -1,3 +1,18 @@
+//! Ordered control application with independent per-stream retry scheduling.
+//!
+//! The socket loop only submits work and consumes results, leaving heartbeats and reads free to
+//! progress while application work waits. A retrying reliable command blocks later commands in
+//! its own stream; unrelated streams and ephemeral events can be attempted in the meantime.
+//! Deferred frames are bounded. Once that bound is reached, scheduling waits for a retry rather
+//! than continuing to drain inbound work into unbounded storage.
+//!
+//! Application calls are awaited serially by this worker. Stream isolation applies between retry
+//! attempts, not to a single application call that has not returned. Retry age starts at the first
+//! transient failure and persists across exponential delays; success releases the next deferred
+//! command of that stream. Fatal failure is returned to the socket loop and ends the worker.
+
+#![cfg_attr(not(test), deny(clippy::missing_docs_in_private_items))]
+
 use std::{
     collections::{BTreeMap, VecDeque},
     sync::Arc,
@@ -24,12 +39,16 @@ use crate::{
 
 /// Owns the apply task so cancelling a lane also cancels its control consumer.
 pub(in crate::lane) struct ControlWorker {
+    /// Bounded submission channel used by the socket read loop.
     commands: mpsc::Sender<Frame>,
+    /// Acknowledgements or fatal results returned for socket-loop handling.
     results: mpsc::Receiver<Result<Option<Frame>, LaneError>>,
+    /// Apply task aborted when the containing lane runtime is destroyed.
     task: JoinHandle<()>,
 }
 
 impl ControlWorker {
+    /// Starts the independent apply task with bounded input, output and deferred storage.
     pub(in crate::lane) fn spawn(
         association: Arc<Association>,
         dispatch: Arc<dyn ControlDispatch>,
@@ -53,12 +72,14 @@ impl ControlWorker {
         }
     }
 
+    /// Offers work without blocking socket reads; a full/closed channel fails the lane.
     pub(in crate::lane) fn submit(&self, frame: Frame) -> Result<(), LaneError> {
         self.commands
             .try_send(frame)
             .map_err(|_| LaneError::ControlApplyBackpressure)
     }
 
+    /// Receives an apply result; `None` reports worker termination to the socket loop.
     pub(in crate::lane) async fn recv(&mut self) -> Option<Result<Option<Frame>, LaneError>> {
         self.results.recv().await
     }
@@ -70,33 +91,49 @@ impl Drop for ControlWorker {
     }
 }
 
+/// Retry age and delay carried with the same logical command across attempts.
 #[derive(Debug, Clone, Copy)]
 struct ControlRetryState {
+    /// Instant of the first retryable application failure.
     started: Instant,
+    /// Delay used if this command fails transiently again.
     next_backoff: Duration,
 }
 
+/// One command selected for its next application attempt.
 struct ControlWork {
+    /// Original encoded operation, retained unchanged for reliable retry.
     frame: Frame,
+    /// Existing retry age/delay, absent on the first attempt.
     retry_state: Option<ControlRetryState>,
 }
 
+/// A stream-blocking command waiting for its next eligible retry instant.
 struct PendingControlRetry {
+    /// Original operation to apply again.
     frame: Frame,
+    /// Retry age preserved across attempts.
     state: ControlRetryState,
+    /// Earliest time the scheduler should select this retry.
     retry_at: Instant,
 }
 
 /// Keeps later commands behind their stream's retry while other streams can progress.
 struct ControlSchedule {
+    /// Deferred commands whose preceding retry just completed, ready to continue in order.
     ready: VecDeque<ControlWork>,
+    /// Later commands blocked behind a retry in their own stream.
     deferred: VecDeque<Frame>,
+    /// At most one retrying command per blocked stream.
     pending: BTreeMap<ControlStreamId, PendingControlRetry>,
+    /// Whether input ended; retained work is processed before normal termination.
     command_closed: bool,
+    /// Bound on later commands held behind retries, independent of channel capacity.
     maximum_deferred: usize,
 }
 
 impl ControlSchedule {
+    /// Creates an empty schedule with a finite deferred-command bound.
     fn new(maximum_deferred: usize) -> Self {
         Self {
             ready: VecDeque::new(),
@@ -107,6 +144,10 @@ impl ControlSchedule {
         }
     }
 
+    /// Selects released work, an unrelated incoming command, or the earliest retry.
+    ///
+    /// Frames from blocked streams enter deferred storage. Once storage is full, stop accepting
+    /// additional commands until a retry can progress; the input channel then provides backpressure.
     async fn next(
         &mut self,
         commands: &mut mpsc::Receiver<Frame>,
@@ -163,6 +204,7 @@ impl ControlSchedule {
         }
     }
 
+    /// Removes the earliest pending retry while preserving its accumulated retry age.
     fn take_retry(&mut self) -> ControlWork {
         let stream_id = self
             .pending
@@ -180,6 +222,10 @@ impl ControlSchedule {
         }
     }
 
+    /// Parks a transiently failed command, or fails the lane once its retry age reaches the limit.
+    ///
+    /// Delays start at 25 milliseconds and double up to one second. The original start instant
+    /// is never renewed, so repeated transient failures cannot extend the command's retry age.
     fn retry(
         &mut self,
         work: ControlWork,
@@ -215,6 +261,9 @@ impl ControlSchedule {
         Ok(())
     }
 
+    /// Releases only the next blocked command from a stream whose preceding work completed.
+    ///
+    /// Releasing one at a time preserves order if that next command also needs to retry.
     fn release_deferred(&mut self, stream_id: ControlStreamId) {
         if let Some(index) = self.deferred.iter().position(|candidate| {
             decode_control_envelope(candidate).is_ok_and(|envelope| envelope.stream_id == stream_id)
@@ -231,6 +280,10 @@ impl ControlSchedule {
     }
 }
 
+/// Applies selected work, retries reliable transient failures and returns terminal results.
+///
+/// Ephemeral events have one best-effort attempt. Reliable results carry acknowledgements back
+/// to the socket loop; inability to return a result ends work rather than silently losing it.
 async fn run_control_worker(
     association: Arc<Association>,
     dispatch: Arc<dyn ControlDispatch>,

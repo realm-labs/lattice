@@ -1,3 +1,10 @@
+//! Exact-peer registry, dial direction and connection-generation reconciliation.
+//!
+//! Address-to-incarnation bindings prevent an old process from taking over a current peer's
+//! address. A trusted authority or validated bootstrap exchange explicitly replaces the binding.
+//! Within one incarnation, an incoming generation may replace a locally inactive or sufficiently
+//! silent generation; recently responsive live connections reject that takeover.
+
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
@@ -12,6 +19,11 @@ use super::{
 use crate::config::RemotingConfig;
 
 impl AssociationManager {
+    /// Creates an empty registry with a shared node-wide outbound payload budget.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AssociationError::InvalidConfig`] for unsupported limits or timeouts.
     pub fn new(
         local_address: NodeEndpoint,
         local_incarnation: NodeIncarnation,
@@ -28,6 +40,14 @@ impl AssociationManager {
         })
     }
 
+    /// Returns the registered exact peer, or allocates a new outgoing generation and queues.
+    ///
+    /// Does not establish connections. The remote address is bound to its first observed
+    /// incarnation until explicitly reconciled, even if the association is later removed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a conflicting incarnation or an exhausted association limit.
     pub fn get_or_create(
         &self,
         cluster_id: ClusterId,
@@ -75,6 +95,16 @@ impl AssociationManager {
         Ok(association)
     }
 
+    /// Resolves an incoming handshake to its exact association generation.
+    ///
+    /// A matching identifier reuses the current entry. A different identifier replaces it only
+    /// when no live lane remains or peer silence has reached the liveness window. Replacement
+    /// logically retires the old generation; its lifetime owner handles asynchronous cleanup.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a conflicting incarnation, a recently responsive live generation,
+    /// or an exhausted association limit.
     pub fn get_or_accept(
         &self,
         cluster_id: ClusterId,
@@ -143,6 +173,10 @@ impl AssociationManager {
         Ok(association)
     }
 
+    /// Returns whether this node is the deterministic dialer for the exact peer pair.
+    ///
+    /// The lower `(endpoint, incarnation)` tuple dials every lane. The other side requests
+    /// reverse dialing, avoiding competing outbound lane groups.
     pub fn should_dial(
         &self,
         remote_address: &NodeEndpoint,
@@ -152,6 +186,10 @@ impl AssociationManager {
             < (remote_address, remote_incarnation.get())
     }
 
+    /// Removes and logically closes the entry only if its key and generation still match.
+    ///
+    /// Returns `false` if the entry is absent or has been replaced. This protects a new
+    /// generation from delayed cleanup belonging to its predecessor; it does not join tasks.
     pub fn remove(&self, key: &AssociationKey, id: AssociationId) -> bool {
         let mut associations = self
             .associations
@@ -172,6 +210,7 @@ impl AssociationManager {
         }
     }
 
+    /// Returns the registered association for an exact key, regardless of lifecycle state.
     pub fn get(&self, key: &AssociationKey) -> Option<Arc<Association>> {
         self.associations
             .lock()
@@ -180,6 +219,7 @@ impl AssociationManager {
             .cloned()
     }
 
+    /// Looks up a peer using this manager's local incarnation.
     pub fn get_exact(
         &self,
         cluster_id: &ClusterId,
@@ -194,6 +234,7 @@ impl AssociationManager {
         })
     }
 
+    /// Finds a currently registered generation by identifier.
     pub fn get_by_id(&self, id: AssociationId) -> Option<Arc<Association>> {
         self.associations
             .lock()
@@ -235,6 +276,10 @@ impl AssociationManager {
         false
     }
 
+    /// Binds an address to an authoritative incarnation and retires its other incarnations.
+    ///
+    /// Returns the number of associations removed. The caller must establish that the new
+    /// incarnation is authoritative; this method does not authenticate a peer or join cleanup.
     pub fn replace_remote_incarnation(
         &self,
         address: NodeEndpoint,
@@ -262,6 +307,7 @@ impl AssociationManager {
         old_keys.len()
     }
 
+    /// Returns the number of registered associations, including non-active entries.
     pub fn len(&self) -> usize {
         self.associations
             .lock()
@@ -269,6 +315,7 @@ impl AssociationManager {
             .len()
     }
 
+    /// Returns whether the registry has no associations.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }

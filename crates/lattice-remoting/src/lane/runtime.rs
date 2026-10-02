@@ -1,3 +1,11 @@
+//! The socket event loop and its fairness, liveness and idle boundaries.
+//!
+//! The biased select prioritizes shutdown and ordered Control results before business work.
+//! Read and write batch limits bound how much ready traffic one turn processes. Inbound asks
+//! remain futures polled by this loop; their completion writes replies without a management
+//! actor round trip. Control application uses a worker so one retrying command cannot block
+//! heartbeat or socket reads, while preserving application order within each control stream.
+
 use std::time::Instant;
 
 use bytes::Bytes;
@@ -22,6 +30,13 @@ use crate::{
     wire::{Frame, FrameCodec, FrameKind},
 };
 
+/// Drives one socket while retaining per-connection target caches and unfinished inbound asks.
+///
+/// Receiving a frame, writing queued data or writing a completed reply resets the data idle
+/// timer. Control never selects the idle branch. Its heartbeat timer measures received traffic,
+/// not local writes, so continuously sending cannot hide a silent peer.
+///
+/// Normal exit leaves nonce-qualified detach and ask failure handling to the public run epilogue.
 pub(super) async fn run_bidirectional_lane_inner<S>(
     runtime: &BidirectionalLane,
     receiver: &mut mpsc::Receiver<Frame>,
@@ -159,6 +174,8 @@ where
                 }
             }
             () = &mut idle, if lane != LaneKind::Control => {
+                // An unanswered Ask is still active work even if no socket bytes are moving.
+                // Bulk has no request/reply obligation and may release its socket independently.
                 if lane == LaneKind::Interactive
                     && (!asks.is_empty() || messaging.has_pending_for_association(association.id()))
                 {

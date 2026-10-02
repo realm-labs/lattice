@@ -1,3 +1,9 @@
+//! Coalesced requests to restore sleeping data lanes.
+//!
+//! A sender wakes the local supervisor and sends a `LaneWake` frame over the existing Control
+//! connection. The deterministic dialer establishes the replacement socket; its peer waits for
+//! an inbound candidate. Control never sleeps and is restored by the retry path if it fails.
+
 use bytes::Bytes;
 use std::sync::atomic::Ordering;
 
@@ -5,10 +11,15 @@ use super::{Association, AssociationError, AssociationManager, LaneKind, lane_ma
 use crate::wire::{Frame, FrameKind};
 
 impl Association {
+    /// Reads the published presence bit without acquiring the registration lock.
     pub(crate) fn is_lane_attached(&self, lane: LaneKind) -> bool {
         self.attached_lanes.load(Ordering::Acquire) & lane_mask(lane) != 0
     }
 
+    /// Waits for one coalesced data-lane wake; Control has no wake event.
+    ///
+    /// `notify_one` retains a permit when no waiter exists yet, so rearming after handling an
+    /// event does not lose a concurrent wake. Retirement cancels the waiter through actor cleanup.
     pub(crate) async fn wait_for_lane_wake(&self, lane: LaneKind) {
         match lane {
             LaneKind::Control => std::future::pending().await,
@@ -21,6 +32,7 @@ impl Association {
         }
     }
 
+    /// Signals local supervision for a data lane, without dialing or contacting the peer.
     pub(crate) fn notify_lane_wake(&self, lane: LaneKind) -> Result<(), AssociationError> {
         match lane {
             LaneKind::Control => return Err(AssociationError::InvalidLaneWake),
@@ -34,10 +46,21 @@ impl Association {
         Ok(())
     }
 
+    /// Returns the number of locally registered connections, excluding sleeping data lanes.
+    ///
+    /// This is a concurrent snapshot, not a network liveness probe.
     pub fn attached_lane_count(&self) -> usize {
         self.attached_lanes.load(Ordering::Acquire).count_ones() as usize
     }
 
+    /// Requests restoration of an absent data lane before admitting its business frame.
+    ///
+    /// Requires `Active`; a missing Control connection is handled by supervision, not this
+    /// path. The pending bit coalesces repeated sends until attachment clears it. Rechecking
+    /// state and presence after claiming the bit handles concurrent retirement or attachment.
+    ///
+    /// Success means the lane is attached or a wake has been requested, not that socket setup
+    /// has completed. The frame can wait in its bounded queue while the connection is restored.
     pub(super) fn prepare_data_lane(&self, lane: LaneKind) -> Result<(), AssociationError> {
         self.ensure_active()?;
         let mask = lane_mask(lane);
@@ -69,6 +92,7 @@ impl Association {
 }
 
 impl AssociationManager {
+    /// Returns the sum of registered lanes across current associations.
     pub fn attached_lane_count(&self) -> usize {
         self.associations
             .lock()

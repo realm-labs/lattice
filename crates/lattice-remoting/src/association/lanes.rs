@@ -1,3 +1,9 @@
+//! Receiver ownership and nonce-qualified connection registration.
+//!
+//! Registration does not transfer a socket or a receiver. The supervisor coordinates those
+//! resources separately. The nonce check on detach prevents an old socket completion from
+//! unregistering its replacement.
+
 use std::sync::atomic::Ordering;
 
 use tokio::sync::mpsc;
@@ -9,6 +15,7 @@ use super::{
 use crate::{control::control_envelope_frame, wire::Frame};
 
 impl Association {
+    /// Drops only receivers still held in the association, releasing their queued frames.
     pub(super) fn discard_unowned_receivers(&self) {
         let mut slots = self
             .receivers
@@ -21,6 +28,10 @@ impl Association {
         }
     }
 
+    /// Transfers all configured receivers if none has already been taken.
+    ///
+    /// Returns `None` without transferring anything if any receiver is unavailable.
+    /// Endpoint supervisors call this once when taking ownership of a generation.
     pub fn take_receivers(&self) -> Option<AssociationReceivers> {
         let mut slots = self
             .receivers
@@ -46,6 +57,9 @@ impl Association {
         })
     }
 
+    /// Transfers a single lane receiver, or returns `None` if it is unavailable or invalid.
+    ///
+    /// Intended for standalone lane runners. Do not take a receiver already owned by a supervisor.
     pub fn take_lane_receiver(&self, lane: LaneKind) -> Option<mpsc::Receiver<Frame>> {
         let mut slots = self
             .receivers
@@ -58,6 +72,13 @@ impl Association {
         }
     }
 
+    /// Returns a stopped standalone lane's receiver for reuse.
+    ///
+    /// A retiring association discards the receiver instead of storing it again.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid Bulk stripe or a receiver slot that is already occupied.
     pub fn return_lane_receiver(
         &self,
         lane: LaneKind,
@@ -88,6 +109,15 @@ impl Association {
         Ok(())
     }
 
+    /// Registers a negotiated connection and publishes activation once all lanes are present.
+    ///
+    /// Duplicate connections are resolved by keeping the lower nonce. This method does not
+    /// open or close sockets, transfer receivers, or replay reliable control commands.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the generation/key does not match, the Bulk stripe is invalid, or
+    /// retirement has begun.
     pub fn attach(
         &self,
         attachment: LaneAttachment,
@@ -96,6 +126,11 @@ impl Association {
             .map(|(decision, _)| decision)
     }
 
+    /// Registers a lane and reports whether this attachment transitioned the group to `Active`.
+    ///
+    /// The registration lock also serializes `begin_close`, preventing an attachment from
+    /// reviving a retiring generation. Publish the mask before activation so active senders
+    /// observe the corresponding lane presence.
     pub(crate) fn attach_with_activation(
         &self,
         attachment: LaneAttachment,
@@ -154,6 +189,11 @@ impl Association {
         Ok((decision, activated))
     }
 
+    /// Registers a lane and queues unacknowledged control commands when activation is restored.
+    ///
+    /// Holding the reliable-control lock across activation prevents newly admitted commands
+    /// from overtaking the replay. If replay fails after registration, the caller must detach
+    /// the candidate; the endpoint supervisor performs that rollback in the same turn.
     pub(crate) fn attach_and_replay(
         &self,
         attachment: LaneAttachment,
@@ -171,6 +211,12 @@ impl Association {
         Ok(decision)
     }
 
+    /// Unregisters a lane only if `connection_nonce` still identifies its current connection.
+    ///
+    /// A stale completion has no effect. Detaching an active data lane preserves `Active`,
+    /// allowing independent sleep or reconnection. Detaching Control publishes `Reconnecting`,
+    /// invalidates its authentication proof, and wakes data-lane supervision for restoration.
+    /// This method does not close the socket or release the consumer's receiver.
     pub fn detach(&self, lane: LaneKind, connection_nonce: u128) {
         let mut inner = self.inner.lock().expect("association state poisoned");
         if inner.lanes.get(&lane) != Some(&connection_nonce) {

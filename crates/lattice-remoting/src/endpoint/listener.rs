@@ -1,3 +1,13 @@
+//! Bounded inbound acceptance, authentication and transfer to association supervision.
+//!
+//! The listener reserves connection capacity before launching a setup task. One absolute
+//! deadline starts at TCP accept and covers TLS, the first frame, bootstrap or handshake,
+//! catalogue exchange, and actor adoption. Each step observes endpoint shutdown.
+//!
+//! Setup never takes a lane receiver. Once identity and dial direction are valid, it transfers
+//! the negotiated socket and its permit to the actor. Until that transfer succeeds, cancellation
+//! or rejection destroys the candidate locally. Bootstrap sockets remain short-lived setup work.
+
 use super::{
     ACCEPT_BACKOFF_MAX, ACCEPT_BACKOFF_MIN, EndpointError, RemotingEndpoint,
     diagnostics::{AcceptRecovery, classify_accept_failure, observe_connection_result},
@@ -23,6 +33,10 @@ use tokio::{
 use tokio_rustls::TlsAcceptor;
 
 impl RemotingEndpoint {
+    /// Accepts sockets under a permit cap and retains setup tasks in a listener-owned JoinSet.
+    ///
+    /// Recoverable accept failures are retried with bounded delay where needed. Successful
+    /// adoption transfers ownership away from setup; shutdown joins the remaining setup tasks.
     pub(super) async fn accept_loop(
         self: Arc<Self>,
         listener: TcpListener,
@@ -96,6 +110,9 @@ impl RemotingEndpoint {
         Ok(())
     }
 
+    /// Validates one accepted socket and dispatches bootstrap or exact-generation adoption.
+    ///
+    /// Uses the same deadline through all stages so a slow peer cannot restart its setup budget.
     async fn accept_connection(
         self: Arc<Self>,
         stream: TcpStream,

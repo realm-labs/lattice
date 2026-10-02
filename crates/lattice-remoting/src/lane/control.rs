@@ -1,3 +1,10 @@
+//! Control application, duplicate handling and acknowledgement generation.
+//!
+//! Reliable commands are previewed before application and committed only after an accepted
+//! terminal result. Transient failures leave the watermark unchanged for retry. Invalid or
+//! policy-rejected commands are acknowledged to prevent endless replay. Gaps and epoch changes
+//! request reconciliation instead of applying an out-of-order operation.
+
 use crate::failpoints;
 
 use super::LaneError;
@@ -12,6 +19,11 @@ use crate::{
 
 pub(super) mod worker;
 
+/// Applies one control operation or returns its protocol acknowledgement/reconciliation result.
+///
+/// The worker owns retries and ordering; this function performs one attempt. A duplicate is
+/// acknowledged without dispatching its application effect again. Ephemeral events bypass
+/// reliable sequence tracking and have no acknowledgement.
 pub(super) async fn apply_control_frame(
     association: &Association,
     control_dispatch: &dyn ControlDispatch,
@@ -82,6 +94,9 @@ pub(super) async fn apply_control_frame(
     }
 }
 
+/// Makes one best-effort attempt, dropping retryable or policy-rejected ephemeral events.
+///
+/// Other failures propagate to the worker. Ephemeral traffic does not enter its retry schedule.
 pub(super) async fn apply_ephemeral_control_frame(
     association: &Association,
     control_dispatch: &dyn ControlDispatch,
@@ -104,6 +119,9 @@ pub(super) async fn apply_ephemeral_control_frame(
     }
 }
 
+/// Decodes Interactive as byte zero and Bulk stripe `n` as byte `n + 1`.
+///
+/// The association validates the resulting stripe against its configured lane group.
 pub(super) fn decode_lane_wake(frame: &Frame) -> Result<LaneKind, LaneError> {
     let [encoded] = frame.payload() else {
         return Err(LaneError::InvalidLaneWake);

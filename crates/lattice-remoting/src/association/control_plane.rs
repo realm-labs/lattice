@@ -1,3 +1,10 @@
+//! Reliable control admission, replay watermarks and the immutable peer catalogue.
+//!
+//! The reliable outbox survives socket reconnection. A command first enters the outbox and,
+//! while active, the Control frame queue. Queue rejection rolls that new command back so a
+//! caller can retry without leaving an unreported command behind. Activation replays outstanding
+//! commands under the same lock. An acknowledgement frees outbox capacity and wakes waiters.
+
 use lattice_model::actor::ProtocolId;
 
 use super::{Association, AssociationError, AssociationState};
@@ -14,10 +21,19 @@ use crate::{
 };
 
 impl Association {
+    /// Enqueues a Control frame without waiting or retaining it for reliable replay.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if admission is not active, the frame queue is full, or a payload budget
+    /// is exhausted. Reliable commands should use [`Self::admit_control_command_in`] instead.
     pub fn try_admit_control(&self, frame: Frame) -> Result<(), AssociationError> {
         self.try_admit(&self.control, frame)
     }
 
+    /// Admits a replayable command to the default reliable control stream.
+    ///
+    /// See [`Self::admit_control_command_in`] for buffering and error behavior.
     pub fn admit_control_command(
         &self,
         payload: bytes::Bytes,
@@ -25,6 +41,15 @@ impl Association {
         self.admit_control_command_in(ControlStreamId::DEFAULT, payload)
     }
 
+    /// Records a replayable command and returns its generated identifier.
+    ///
+    /// While active, also enqueues the command's frame. Otherwise the outbox retains it for
+    /// a later activation replay. Success means local acceptance, not remote application.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for outbox/stream limits or failure to enqueue an active command.
+    /// Frame admission failure rolls back the newly recorded command and its sequence number.
     pub fn admit_control_command_in(
         &self,
         stream_id: ControlStreamId,
@@ -88,6 +113,9 @@ impl Association {
         }
     }
 
+    /// Admits a reliable command using the configured control retry timeout for capacity waits.
+    ///
+    /// See [`Self::admit_control_command_in_wait`] for the wait and returned errors.
     pub async fn admit_control_command_in_wait_configured(
         &self,
         stream_id: ControlStreamId,
@@ -101,10 +129,14 @@ impl Association {
         .await
     }
 
+    /// Enqueues a coordinator event without reliable replay or acknowledgement tracking.
+    ///
+    /// Returns the same admission errors as [`Self::try_admit_control`].
     pub fn admit_ephemeral_control(&self, payload: bytes::Bytes) -> Result<(), AssociationError> {
         self.try_admit_control(Frame::new(FrameKind::CoordinatorEvent, payload))
     }
 
+    /// Builds frames for all currently unacknowledged outbound commands without removing them.
     pub fn replay_control_frames(&self) -> Vec<Frame> {
         self.reliable_control
             .lock()
@@ -114,6 +146,7 @@ impl Association {
             .collect()
     }
 
+    /// Returns the number of commands retained for acknowledgement or reconnection replay.
     pub fn control_outbox_len(&self) -> usize {
         self.reliable_control
             .lock()
@@ -122,6 +155,7 @@ impl Association {
             .len()
     }
 
+    /// Returns whether an outbound command is still retained in the reliable outbox.
     pub fn control_command_pending(&self, command_id: CommandId) -> bool {
         self.reliable_control
             .lock()
@@ -129,6 +163,10 @@ impl Association {
             .contains_outbound(command_id)
     }
 
+    /// Checks whether an inbound command can be applied without advancing its stream watermark.
+    ///
+    /// The control worker applies the operation before calling [`Self::commit_control`], so a
+    /// transient application failure can retry without acknowledging an unapplied command.
     pub fn preview_control(&self, envelope: &ControlEnvelope) -> ControlApply {
         self.reliable_control
             .lock()
@@ -136,6 +174,9 @@ impl Association {
             .preview(envelope)
     }
 
+    /// Commits an applied inbound command's watermark and returns the cumulative acknowledgement.
+    ///
+    /// Call only after preview and successful application; this does not run the operation itself.
     pub fn commit_control(&self, envelope: ControlEnvelope) -> ControlAck {
         self.reliable_control
             .lock()
@@ -143,6 +184,13 @@ impl Association {
             .commit(envelope)
     }
 
+    /// Releases outbound commands covered by a peer's cumulative acknowledgement.
+    ///
+    /// Wakes callers waiting for outbox capacity after accepting the acknowledgement.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AssociationError::ReliableControl`] if the acknowledgement fails validation.
     pub fn acknowledge_control(&self, ack: ControlAck) -> Result<(), AssociationError> {
         self.reliable_control
             .lock()
@@ -153,6 +201,7 @@ impl Association {
         Ok(())
     }
 
+    /// Returns the acknowledgement for the current inbound watermark of a control stream.
     pub fn current_control_ack(&self, stream_id: ControlStreamId) -> ControlAck {
         self.reliable_control
             .lock()
@@ -160,6 +209,14 @@ impl Association {
             .current_ack(stream_id)
     }
 
+    /// Installs the peer's protocol catalogue for this generation.
+    ///
+    /// Reinstalling identical descriptors is allowed; changing them requires another generation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AssociationError::Catalogue`] for invalid descriptors, excessive entries or a
+    /// catalogue that differs from the one already installed.
     pub fn install_peer_catalogue<I>(&self, descriptors: I) -> Result<(), AssociationError>
     where
         I: IntoIterator<Item = ProtocolDescriptor>,
@@ -187,6 +244,9 @@ impl Association {
         }
     }
 
+    /// Compares an expected protocol fingerprint with the peer's installed catalogue.
+    ///
+    /// Returns [`CatalogueDecision::Unsupported`] if no catalogue has been installed.
     pub fn protocol_decision(
         &self,
         protocol_id: ProtocolId,
