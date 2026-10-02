@@ -66,7 +66,8 @@ pub(super) async fn run_actor<A>(
                 &mut normal_rx,
                 &mut system_rx,
                 panic,
-            );
+            )
+            .await;
             return;
         }
     };
@@ -94,13 +95,15 @@ pub(super) async fn run_actor<A>(
                 &mut normal_rx,
                 &mut system_rx,
                 panic,
-            );
+            )
+            .await;
             return;
         }
     };
 
     ctx.cancel_deferred_replies(ActorCallError::MailboxClosed);
     ctx.cancel_all_tasks();
+    ctx.join_cancelled_tasks().await;
     ctx.stop_all_children(reason);
     let previous_phase = match reason {
         StopReason::Passivated(_) => ActorLifecycleState::Passivating,
@@ -129,7 +132,8 @@ pub(super) async fn run_actor<A>(
                 &mut normal_rx,
                 &mut system_rx,
                 panic,
-            );
+            )
+            .await;
             return;
         }
     };

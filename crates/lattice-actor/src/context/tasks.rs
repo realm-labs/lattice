@@ -157,6 +157,20 @@ impl<A: Actor> ActorContext<A> {
         }
     }
 
+    /// Cancellation only schedules destruction. Lifecycle completion must also join off-turn
+    /// work: its future or completed output can still own resources needed by a stopping hook.
+    pub(crate) async fn join_cancelled_tasks(&mut self) {
+        for tasks in [&mut self.tasks, &mut self.deferred_tasks] {
+            while let Some(result) = tasks.join_next().await {
+                if let Err(error) = result
+                    && !error.is_cancelled()
+                {
+                    tracing::warn!(%error, "actor cancelled task failed during cleanup");
+                }
+            }
+        }
+    }
+
     pub(crate) fn reap_runtime_work(&mut self) {
         if self.tasks.is_empty()
             && self.deferred_tasks.is_empty()

@@ -35,7 +35,7 @@ impl ActorPanic {
     }
 }
 
-pub(super) fn terminate_panicked_actor<A>(
+pub(super) async fn terminate_panicked_actor<A>(
     actor: A,
     ctx: &mut ActorContext<A>,
     handle: &ActorHandle<A>,
@@ -50,6 +50,7 @@ pub(super) fn terminate_panicked_actor<A>(
     system_rx.close();
     ctx.cancel_deferred_replies(ActorCallError::ActorPanicked);
     ctx.cancel_all_tasks();
+    ctx.join_cancelled_tasks().await;
     ctx.stop_all_children(StopReason::Requested);
     reject_queued_commands(
         normal_rx,
